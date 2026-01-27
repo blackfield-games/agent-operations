@@ -1,0 +1,35 @@
+[project]
+name = "blackfield-agents"
+version = "0.0.1"
+description = "Agent mesh that authors OpenUSD scene patches for the BLACKFIELD world."
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=0.6",
+    "langchain-anthropic>=0.3",
+    "temporalio>=1.10",
+    "ray[default]>=2.40",
+    "usd-core>=25.05",
+    "pydantic>=2.9",
+    "anyio>=4.6",
+    "structlog>=24.4",
+    "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+    "pyright>=1.1.390",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
