@@ -5,7 +5,7 @@ import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /// @notice Player-authored artifact templates (weapons, gear, structures).
-///         Minted as ERC-1155 once a $TOKEN burn pays the rarity-scaled mint fee
+///         Minted as ERC-1155 once a $BLCKFLD burn pays the rarity-scaled mint fee
 ///         via ComputeMeter. Each templateId points to an offchain USD artifact
 ///         manifest committed in a Merkle root tied to the template URI.
 contract ArtifactTemplate is ERC1155, Ownable2Step {

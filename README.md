@@ -1,6 +1,8 @@
-# blackfield
+# blackfield — agent operations
 
-agent-rendered open world. operators light it up.
+BF6-register combined-arms combat. arenas hand-tuned. ambient frontier rendered by every operator on the mesh.
+
+built on UE5 Lyra. $BLCKFLD on base.
 
 ## layout
 
