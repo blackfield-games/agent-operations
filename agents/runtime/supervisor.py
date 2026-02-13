@@ -53,6 +53,33 @@ def _make_specialist_node(name: str):
     return node
 
 
+# Pipeline order = the static edge chain director → … → optimization. Re-entering
+# a node replays every downstream specialist before the validator runs again, so
+# routing back to the *earliest* failing node repairs upstream causes first.
+PIPELINE_ORDER = list(SPECIALISTS)
+
+
+def _failing_specialist(issues: list[str]) -> str:
+    """Map validator issues to the earliest pipeline node that should re-run.
+
+    The validator phrases issues with the offending specialist's name, e.g.
+    "missing specialist layers: ['biome', 'prop']" or "triangle budget exceeded
+    — re-run optimization with stricter LODs". We scan for those names and route
+    back to whichever appears earliest in the pipeline. Unattributable failures
+    (e.g. a pure style rejection naming no specialist) fall back to director,
+    which owns the world brief / style intent.
+    """
+    candidates = {
+        name
+        for issue in issues
+        for name in PIPELINE_ORDER
+        if name in issue.lower()
+    }
+    if not candidates:
+        return "director"
+    return min(candidates, key=PIPELINE_ORDER.index)
+
+
 async def _validator_node(state: State) -> dict:
     verdict = await validator.run(state["brief"], state.get("layers", []))
     return {"verdict": verdict, "rounds": state.get("rounds", 0) + 1}
@@ -66,8 +93,7 @@ def _after_validator(state: State) -> str:
         return END
     if state.get("rounds", 0) >= 3:  # recursion guard from research-agent-runtime.md
         return END
-    # naive: re-run the specialist whose layer was rejected; future = parse verdict.issues
-    return "director"
+    return _failing_specialist(verdict.issues)
 
 
 def build_graph():
