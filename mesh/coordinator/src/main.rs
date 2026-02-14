@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+mod verify;
+
 #[derive(Parser)]
 struct Args {
     #[arg(long, env = "COORDINATOR_BIND", default_value = "127.0.0.1:8787")]
@@ -156,6 +158,17 @@ async fn submit(
     if result.job_id != id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // Verify the earner's recoverable secp256k1 attestation: the signer must be
+    // the claimed earner_address. Rejected submissions never enter `completed`.
+    if let Err(e) = verify::verify_signature(
+        &result.job_id,
+        &result.output_hash,
+        &result.earner_address,
+        &result.signature_hex,
+    ) {
+        tracing::warn!(?id, earner = %result.earner_address, ?e, "rejected: bad attestation");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     tracing::info!(?id, earner = %result.earner_address, "result received");
     // TODO validator gate, EAS attestation relay
     state.completed.lock().await.push(result);
@@ -270,6 +283,38 @@ mod tests {
         assert!(json.is_null(), "second poll should return null");
     }
 
+    use k256::ecdsa::SigningKey;
+    use sha3::{Digest, Keccak256};
+
+    fn dev_signing_key() -> SigningKey {
+        let bytes =
+            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+                .unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    fn dev_address() -> String {
+        let sk = dev_signing_key();
+        let vk = sk.verifying_key();
+        let point = vk.to_encoded_point(false);
+        let hash = Keccak256::digest(&point.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&hash[12..]))
+    }
+
+    /// A `JobResult` validly signed by the dev key for the given job/hash.
+    fn signed_result(job_id: Uuid, output_hash: &str) -> JobResult {
+        let sk = dev_signing_key();
+        let sig = verify::sign_for_test(&sk, &job_id, output_hash);
+        JobResult {
+            job_id,
+            earner_address: dev_address(),
+            output_hash: output_hash.into(),
+            output_url: "memory://x".into(),
+            render_seconds: 1,
+            signature_hex: sig,
+        }
+    }
+
     #[tokio::test]
     async fn submit_matching_id_accepted_mismatch_rejected() {
         let state = test_state();
@@ -277,14 +322,7 @@ mod tests {
         let job_id = job.id;
         state.queue.lock().await.push(job);
 
-        let good = JobResult {
-            job_id,
-            earner_address: "0xabc".into(),
-            output_hash: "deadbeef".into(),
-            output_url: "memory://x".into(),
-            render_seconds: 1,
-            signature_hex: "00".repeat(65),
-        };
+        let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
         let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -298,5 +336,38 @@ mod tests {
         // completed count reflects the one accepted submit
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_completed"], 1);
+    }
+
+    #[tokio::test]
+    async fn submit_with_tampered_signature_rejected() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let mut bad = signed_result(job_id, "deadbeef");
+        // Corrupt the trailing recovery/s byte.
+        bad.signature_hex.pop();
+        bad.signature_hex.push('f');
+
+        let uri = format!("/jobs/{}/submit", job_id);
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&bad).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
+    }
+
+    #[tokio::test]
+    async fn submit_with_mismatched_earner_address_rejected() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let mut bad = signed_result(job_id, "deadbeef");
+        // Valid signature, but claim a different address than the signer.
+        bad.earner_address = "0x000000000000000000000000000000000000dead".into();
+
+        let uri = format!("/jobs/{}/submit", job_id);
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&bad).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
     }
 }
