@@ -7,18 +7,28 @@
 
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     http::StatusCode,
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
-use proto::{EarnerMsg, JobKind, JobResult, JobSpec, RegionCoord};
+use proto::{CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec, RegionCoord};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Placeholder EAS attestation UID returned on acceptance until the real
+/// RenderReceipts.sol relay lands (later task). 32 zero bytes, 0x-prefixed.
+const PLACEHOLDER_ATTESTATION_UID: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 mod verify;
 
@@ -94,6 +104,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/stats", get(stats))
         .route("/jobs/next", get(next_job))
         .route("/jobs/{id}/submit", post(submit))
+        .route("/ws", get(ws_handler))
         .with_state(state)
 }
 
@@ -173,6 +184,237 @@ async fn submit(
     // TODO validator gate, EAS attestation relay
     state.completed.lock().await.push(result);
     Ok("accepted")
+}
+
+/// Websocket job dispatch (the v1 upgrade). Protocol, all JSON text frames:
+///
+///   1. earner → `EarnerMsg::Hello` (required first message; registers like
+///      `/register`). Any other first message closes the socket.
+///   2. coordinator polls the queue; when a job whose `kind` the earner
+///      advertised in `supported` is available, it pops it and sends
+///      `CoordinatorMsg::JobOffer(job)`. Only one job is offered at a time.
+///   3. earner → `EarnerMsg::Accept { job_id }` marks the offer in-flight; an
+///      `Accept` for a different/unknown job is ignored.
+///   4. earner → `EarnerMsg::Submit(result)`: the signature + job_id are
+///      verified. Valid → push to `completed` and reply
+///      `CoordinatorMsg::Accepted { job_id, attestation_uid }`. Invalid →
+///      `CoordinatorMsg::Rejected { job_id, reason }` and the job is requeued.
+///   5. earner → `EarnerMsg::Heartbeat { .. }` is logged and ignored.
+///
+/// The earner registration and queue/completed state are shared with the HTTP
+/// endpoints, so `/stats` reflects ws activity identically.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    ws.on_upgrade(move |socket| ws_session(socket, state))
+}
+
+/// Send a `CoordinatorMsg` as a JSON text frame. Returns `false` if the socket
+/// is closed / the send failed (caller should end the session).
+async fn send_msg(socket: &mut WebSocket, msg: &CoordinatorMsg) -> bool {
+    match serde_json::to_string(msg) {
+        Ok(text) => socket.send(Message::Text(text.into())).await.is_ok(),
+        Err(e) => {
+            tracing::error!(?e, "failed to serialize coordinator message");
+            false
+        }
+    }
+}
+
+async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
+    // 1. First message MUST be a Hello.
+    let earner_address = match recv_hello(&mut socket, &state).await {
+        Some(addr) => addr,
+        None => return,
+    };
+
+    // The set of job kinds this earner advertised support for.
+    let supported: Vec<JobKind> = state
+        .earners
+        .lock()
+        .await
+        .get(&earner_address)
+        .map(|info| info.supported.clone())
+        .unwrap_or_default();
+
+    // The job we've currently offered (and whether the earner accepted it).
+    let mut offered: Option<JobSpec> = None;
+    let mut accepted = false;
+    // Poll the queue on this cadence when we have nothing offered.
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+
+    loop {
+        // If we have no outstanding offer, try to grab a supported job.
+        if offered.is_none() {
+            if let Some(job) = take_supported_job(&state, &supported).await {
+                if !send_msg(&mut socket, &CoordinatorMsg::JobOffer(job.clone())).await {
+                    requeue(&state, job).await;
+                    return;
+                }
+                tracing::info!(earner = %earner_address, job_id = %job.id, "job offered");
+                offered = Some(job);
+                accepted = false;
+            }
+        }
+
+        tokio::select! {
+            // Poll for new jobs while idle.
+            _ = tick.tick(), if offered.is_none() => { continue; }
+            incoming = socket.recv() => {
+                let Some(frame) = incoming else { break }; // socket closed
+                let frame = match frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(earner = %earner_address, ?e, "ws recv error");
+                        break;
+                    }
+                };
+                let text = match frame {
+                    Message::Text(t) => t,
+                    Message::Close(_) => break,
+                    // Ping/Pong/Binary: ignore (axum auto-replies to pings).
+                    _ => continue,
+                };
+                let msg: EarnerMsg = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(earner = %earner_address, ?e, "undecodable earner message");
+                        continue;
+                    }
+                };
+                match msg {
+                    EarnerMsg::Hello { .. } => {
+                        // Re-hello mid-session is unexpected; log and ignore.
+                        tracing::warn!(earner = %earner_address, "unexpected Hello mid-session");
+                    }
+                    EarnerMsg::Accept { job_id } => {
+                        match &offered {
+                            Some(job) if job.id == job_id => {
+                                accepted = true;
+                                tracing::info!(earner = %earner_address, %job_id, "offer accepted");
+                            }
+                            _ => tracing::warn!(earner = %earner_address, %job_id, "accept for unknown/stale job"),
+                        }
+                    }
+                    EarnerMsg::Submit(result) => {
+                        let reply = handle_submit(&state, &offered, accepted, result).await;
+                        let ok = matches!(reply, CoordinatorMsg::Accepted { .. });
+                        if !send_msg(&mut socket, &reply).await {
+                            // Couldn't deliver the verdict; requeue any offer.
+                            if let (false, Some(job)) = (ok, offered.take()) {
+                                requeue(&state, job).await;
+                            }
+                            return;
+                        }
+                        if ok {
+                            offered = None;
+                            accepted = false;
+                        } else if let Some(job) = offered.take() {
+                            // Rejected → requeue so another earner can try.
+                            requeue(&state, job).await;
+                            accepted = false;
+                        }
+                    }
+                    EarnerMsg::Heartbeat { job_id, progress_pct } => {
+                        tracing::debug!(earner = %earner_address, ?job_id, progress_pct, "heartbeat");
+                    }
+                }
+            }
+        }
+    }
+
+    // Socket ended with an un-submitted offer in flight → requeue it.
+    if let Some(job) = offered.take() {
+        requeue(&state, job).await;
+    }
+    tracing::info!(earner = %earner_address, "ws session ended");
+}
+
+/// Block on the first frame, requiring an `EarnerMsg::Hello`. Registers the
+/// earner (shared with `/register`) and returns its address, or `None` if the
+/// socket closed / sent something other than a Hello.
+async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<String> {
+    loop {
+        let frame = socket.recv().await?.ok()?;
+        let text = match frame {
+            Message::Text(t) => t,
+            Message::Close(_) => return None,
+            _ => continue, // ignore pings/binary before Hello
+        };
+        let msg: EarnerMsg = serde_json::from_str(&text).ok()?;
+        let EarnerMsg::Hello {
+            earner_address,
+            gpu_model,
+            vram_gb,
+            supported,
+        } = msg
+        else {
+            tracing::warn!("ws: first message was not Hello; closing");
+            return None;
+        };
+        tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered (ws)");
+        state.earners.lock().await.insert(
+            earner_address.clone(),
+            EarnerInfo { gpu_model, vram_gb, supported },
+        );
+        return Some(earner_address);
+    }
+}
+
+/// Pop the most recent queued job whose kind the earner supports. Leaves
+/// unsupported jobs in place for other earners.
+async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Option<JobSpec> {
+    let mut q = state.queue.lock().await;
+    let idx = q.iter().rposition(|job| supported.contains(&job.kind))?;
+    Some(q.remove(idx))
+}
+
+/// Put a job back on the queue (rejected submission or dropped connection).
+async fn requeue(state: &Arc<AppState>, job: JobSpec) {
+    state.queue.lock().await.push(job);
+}
+
+/// Verify a ws `Submit` against the outstanding offer and produce the verdict.
+/// On `Accepted`, the result is pushed into `completed`.
+async fn handle_submit(
+    state: &Arc<AppState>,
+    offered: &Option<JobSpec>,
+    accepted: bool,
+    result: JobResult,
+) -> CoordinatorMsg {
+    let job_id = result.job_id;
+    let reject = |reason: &str| CoordinatorMsg::Rejected {
+        job_id,
+        reason: reason.to_string(),
+    };
+
+    match offered {
+        Some(job) if job.id == job_id => {}
+        Some(_) => return reject("submit job_id does not match the offered job"),
+        None => return reject("no job was offered on this connection"),
+    }
+    if !accepted {
+        return reject("submit before accept");
+    }
+
+    if let Err(e) = verify::verify_signature(
+        &result.job_id,
+        &result.output_hash,
+        &result.earner_address,
+        &result.signature_hex,
+    ) {
+        tracing::warn!(%job_id, earner = %result.earner_address, ?e, "ws rejected: bad attestation");
+        return reject("attestation signature verification failed");
+    }
+
+    tracing::info!(%job_id, earner = %result.earner_address, "ws result accepted");
+    // TODO validator gate, real EAS attestation relay (placeholder uid for now).
+    state.completed.lock().await.push(result);
+    CoordinatorMsg::Accepted {
+        job_id,
+        attestation_uid: PLACEHOLDER_ATTESTATION_UID.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +611,161 @@ mod tests {
 
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_completed"], 0);
+    }
+
+    // ---- websocket dispatch integration tests ----
+
+    use futures_util::{SinkExt, StreamExt};
+    use proto::CoordinatorMsg;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    /// Bind the router on an ephemeral port and serve it on a spawned task.
+    /// Returns the bound `host:port` so tests can build ws/http URLs.
+    async fn serve_ephemeral(state: Arc<AppState>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    fn ws_hello() -> EarnerMsg {
+        EarnerMsg::Hello {
+            earner_address: dev_address(),
+            gpu_model: "RTX 4090".into(),
+            vram_gb: 24,
+            supported: vec![
+                JobKind::Terrain,
+                JobKind::Foliage,
+                JobKind::NpcTick,
+                JobKind::DiffusionTile,
+                JobKind::Optimization,
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_offer_accept_submit_flows_to_completed() {
+        let state = test_state();
+        let job = seed_job();
+        let job_id = job.id;
+        state.queue.lock().await.push(job);
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        // 1. Hello
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+
+        // 2. Expect a JobOffer for the seeded job.
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+        assert_eq!(offered.kind, JobKind::Terrain);
+
+        // 3. Accept then 4. submit a validly-signed result.
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        let result = signed_result(job_id, "deadbeef");
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(result)).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // 5. Expect Accepted with the placeholder attestation uid.
+        let verdict = next_coordinator_msg(&mut ws).await;
+        match verdict {
+            CoordinatorMsg::Accepted { job_id: jid, attestation_uid } => {
+                assert_eq!(jid, job_id);
+                assert_eq!(attestation_uid, PLACEHOLDER_ATTESTATION_UID);
+            }
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+
+        // /stats reflects the completed job.
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 1);
+        assert_eq!(json["gpus_joined"], 1);
+    }
+
+    #[tokio::test]
+    async fn ws_invalid_signature_yields_rejected() {
+        let state = test_state();
+        let job = seed_job();
+        let job_id = job.id;
+        state.queue.lock().await.push(job);
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Corrupt the signature's trailing byte.
+        let mut bad = signed_result(job_id, "deadbeef");
+        bad.signature_hex.pop();
+        bad.signature_hex.push('f');
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(bad)).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        let verdict = next_coordinator_msg(&mut ws).await;
+        match verdict {
+            CoordinatorMsg::Rejected { job_id: jid, .. } => assert_eq!(jid, job_id),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // Nothing reached `completed`.
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
+    }
+
+    /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
+    /// ping/pong control frames the server may interleave).
+    async fn next_coordinator_msg(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> CoordinatorMsg {
+        loop {
+            let frame = ws.next().await.expect("ws closed").expect("ws error");
+            match frame {
+                WsMessage::Text(t) => {
+                    return serde_json::from_str(&t).expect("decode CoordinatorMsg")
+                }
+                WsMessage::Close(_) => panic!("server closed before sending a message"),
+                _ => continue,
+            }
+        }
     }
 }
