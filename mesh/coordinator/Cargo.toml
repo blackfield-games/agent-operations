@@ -23,8 +23,10 @@ clap = { workspace = true }
 k256 = { workspace = true }
 sha3 = { workspace = true }
 hex = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+tempfile = { workspace = true }
