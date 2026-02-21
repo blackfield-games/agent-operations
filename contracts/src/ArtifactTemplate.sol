@@ -26,7 +26,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     error NotMinter();
     error UnknownTemplate();
 
-    constructor(address owner_, string memory baseURI_) ERC1155(baseURI_) Ownable(owner_) {}
+    constructor(address owner_, string memory baseUri_) ERC1155(baseUri_) Ownable(owner_) {}
 
     function setMinter(address minter_) external onlyOwner {
         minter = minter_;

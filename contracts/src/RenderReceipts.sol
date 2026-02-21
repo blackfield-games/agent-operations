@@ -10,7 +10,7 @@ interface IEAS {
         address recipient;
         uint64 expirationTime;
         bool revocable;
-        bytes32 refUID;
+        bytes32 refUid;
         bytes data;
         uint256 value;
     }
@@ -48,7 +48,7 @@ interface ISchemaRegistry {
 ///         jobKind: 0=terrain, 1=foliage, 2=npc_tick, 3=diffusion_tile, 4=optimization
 contract RenderReceipts is Ownable2Step {
     IEAS public immutable EAS;
-    bytes32 public schemaUID;
+    bytes32 public schemaUid;
     mapping(address coordinator => bool authorized) public authorizedCoordinators;
 
     event ReceiptIssued(
@@ -70,7 +70,7 @@ contract RenderReceipts is Ownable2Step {
             address(0),
             true
         );
-        schemaUID = uid;
+        schemaUid = uid;
         emit SchemaRegistered(uid);
         return uid;
     }
@@ -89,17 +89,17 @@ contract RenderReceipts is Ownable2Step {
         bytes32 regionId
     ) external returns (bytes32 uid) {
         if (!authorizedCoordinators[msg.sender]) revert NotAuthorized();
-        if (schemaUID == bytes32(0)) revert SchemaNotSet();
+        if (schemaUid == bytes32(0)) revert SchemaNotSet();
 
         bytes memory data = abi.encode(earner, jobId, renderSeconds, jobKind, outputHash, regionId);
         uid = EAS.attest(
             IEAS.AttestationRequest({
-                schema: schemaUID,
+                schema: schemaUid,
                 data: IEAS.AttestationRequestData({
                     recipient: earner,
                     expirationTime: 0,
                     revocable: true,
-                    refUID: bytes32(0),
+                    refUid: bytes32(0),
                     data: data,
                     value: 0
                 })

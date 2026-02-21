@@ -19,6 +19,12 @@ BLOCKERS.md
 *.pem
 keypairs/
 
+# --- runtime state ---
+# coordinator SQLite store (default coordinator.db) + WAL sidecars
+*.db
+*.db-wal
+*.db-shm
+
 # --- build / generated ---
 target/
 node_modules/

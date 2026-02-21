@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-import "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 import {ComputeMeter} from "../src/ComputeMeter.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
@@ -22,7 +22,7 @@ contract ComputeMeterTest is Test {
         token = new MockToken();
         meter = new ComputeMeter(address(token), owner);
 
-        token.transfer(buyer, 1000 ether);
+        assertTrue(token.transfer(buyer, 1000 ether));
         vm.prank(owner);
         meter.setSpender(spender, true);
     }
