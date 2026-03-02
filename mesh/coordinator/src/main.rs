@@ -43,6 +43,10 @@ struct Args {
     /// first run; a restart reloads queue/completed state from it.
     #[arg(long, env = "COORDINATOR_DB", default_value = "coordinator.db")]
     db: String,
+    /// How often (seconds) the background reaper scans for in-flight jobs whose
+    /// deadline has elapsed and requeues them.
+    #[arg(long, env = "COORDINATOR_REAP_INTERVAL_SECS", default_value = "5")]
+    reap_interval_secs: u64,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -67,6 +71,12 @@ impl AppState {
     /// jobs yet, so a fresh DB gives earners something to do while a restart
     /// with existing jobs does NOT double-seed.
     fn with_store(store: Store) -> Result<Arc<Self>> {
+        // Reclaim any jobs left `in_flight` by a previous crash before we decide
+        // whether to seed: a recovered job means the queue is not empty.
+        let recovered = store.recover_in_flight()?;
+        if recovered > 0 {
+            tracing::info!(recovered, "reclaimed in-flight jobs orphaned by a crash");
+        }
         if store.jobs_empty()? {
             store.enqueue(&seed_job())?;
         }
@@ -84,6 +94,7 @@ struct Stats {
     gpus_joined: usize,
     total_vram_gb: u64,
     jobs_queued: usize,
+    jobs_in_flight: usize,
     jobs_completed: usize,
     /// How many registered earners advertise support for each job kind.
     supported_breakdown: HashMap<JobKind, usize>,
@@ -97,8 +108,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let store = Store::open(&args.db)?;
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
+    // `with_store` also reclaims jobs left in_flight by a previous crash.
     let state = AppState::with_store(store)?;
     tracing::info!(db = %args.db, "store ready");
+
+    // Background reaper: periodically requeue in-flight jobs past their
+    // deadline so a stalled/vanished earner doesn't strand a job forever. The
+    // router-based tests don't spawn this; it only runs in the real binary.
+    spawn_reaper(state.clone(), args.reap_interval_secs);
 
     let app = router(state);
 
@@ -106,6 +123,35 @@ async fn main() -> Result<()> {
     tracing::info!(bind = %args.bind, "coordinator up");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Current time as epoch seconds. Saturates to 0 if the clock is before the
+/// epoch (it never is in practice).
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
+/// whose deadline has elapsed. Logs how many were requeued; store errors are
+/// logged and the loop continues.
+fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            tick.tick().await;
+            let store = state.store.lock().await;
+            match store.reap_expired(now_secs()) {
+                Ok(requeued) if !requeued.is_empty() => {
+                    tracing::info!(count = requeued.len(), "requeued expired in-flight jobs");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(?e, "reaper: reap_expired failed"),
+            }
+        }
+    });
 }
 
 fn seed_job() -> JobSpec {
@@ -170,17 +216,19 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         }
     }
     let store = state.store.lock().await;
-    let (jobs_queued, jobs_completed) = match (store.queued_count(), store.completed_count()) {
-        (Ok(q), Ok(c)) => (q, c),
-        (q, c) => {
-            tracing::error!(?q, ?c, "stats: store count failed");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+    let (jobs_queued, jobs_in_flight, jobs_completed) =
+        match (store.queued_count(), store.in_flight_count(), store.completed_count()) {
+            (Ok(q), Ok(f), Ok(c)) => (q, f, c),
+            (q, f, c) => {
+                tracing::error!(?q, ?f, ?c, "stats: store count failed");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
     Ok(Json(Stats {
         gpus_joined: earners.len(),
         total_vram_gb,
         jobs_queued,
+        jobs_in_flight,
         jobs_completed,
         supported_breakdown,
     }))
@@ -216,9 +264,27 @@ async fn submit(
         tracing::warn!(?id, earner = %result.earner_address, ?e, "rejected: bad attestation");
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // Gate on lifecycle: a result is only valid for a job the earner actually
+    // took (which marked it in_flight). Checked after signature verification so
+    // we don't reveal job state to unauthenticated callers.
+    let mut store = state.store.lock().await;
+    match store.job_status(&id) {
+        Ok(Some(status)) if status == "in_flight" => {}
+        Ok(Some(_)) => {
+            tracing::warn!(?id, earner = %result.earner_address, "rejected: job not in_flight");
+            return Err(StatusCode::CONFLICT);
+        }
+        Ok(None) => {
+            tracing::warn!(?id, earner = %result.earner_address, "rejected: unknown job");
+            return Err(StatusCode::NOT_FOUND);
+        }
+        Err(e) => {
+            tracing::error!(?id, ?e, "submit: job_status lookup failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     tracing::info!(?id, earner = %result.earner_address, "result received");
     // TODO validator gate, EAS attestation relay
-    let mut store = state.store.lock().await;
     if let Err(e) = store.record_completed(&result) {
         tracing::error!(?id, ?e, "submit: failed to persist result");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -638,6 +704,9 @@ mod tests {
         let job = seed_job();
         let job_id = job.id;
         enqueue(&state, &job).await;
+        // The submit gate accepts results only for in_flight jobs; move it there
+        // as a real earner would by polling /jobs/next.
+        state.store.lock().await.take_next(|_| true).unwrap();
 
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
@@ -844,6 +913,11 @@ mod tests {
             let job = seed_job();
             let job_id = job.id;
             enqueue(&state, &job).await;
+            // Move it in_flight first (submit gate requires it). take_next pops
+            // the most-recently inserted queued job — the one we just enqueued —
+            // leaving the auto-seeded job queued.
+            let taken = state.store.lock().await.take_next(|_| true).unwrap();
+            assert_eq!(taken.unwrap().id, job_id);
 
             let result = signed_result(job_id, "deadbeef");
             let uri = format!("/jobs/{}/submit", job_id);
@@ -873,6 +947,187 @@ mod tests {
             completed_before,
             "completed count must survive restart"
         );
+    }
+
+    // ---- crash recovery + deadline reaper ----
+
+    /// A `seed_job` clone with a fresh id and the given deadline, for tests that
+    /// need to control the reaper's deadline comparison.
+    fn job_with_deadline(deadline_secs: u32) -> JobSpec {
+        let mut job = seed_job();
+        job.id = Uuid::new_v4();
+        job.deadline_secs = deadline_secs;
+        job
+    }
+
+    #[test]
+    fn recover_in_flight_requeues_stale() {
+        let store = Store::open_in_memory().unwrap();
+        let a = job_with_deadline(60);
+        let b = job_with_deadline(60);
+        store.enqueue(&a).unwrap();
+        store.enqueue(&b).unwrap();
+
+        // Take both → both in_flight, queue empty.
+        store.take_next(|_| true).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.queued_count().unwrap(), 0);
+
+        // Simulated crash recovery reclaims both.
+        assert_eq!(store.recover_in_flight().unwrap(), 2);
+        assert_eq!(store.queued_count().unwrap(), 2);
+        assert_eq!(store.in_flight_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_store_recovers_in_flight_on_restart() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        // First "process": take the auto-seeded job in_flight, then drop state.
+        let taken_id;
+        {
+            let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+            let store = state.store.lock().await;
+            let job = store.take_next(|_| true).unwrap().expect("seeded job");
+            taken_id = job.id;
+            assert_eq!(store.in_flight_count().unwrap(), 1);
+            assert_eq!(store.queued_count().unwrap(), 0);
+        } // state dropped → "crash" with a job stuck in_flight.
+
+        // Second "process": reopen the SAME db. with_store must reclaim the
+        // orphaned in_flight job on startup.
+        let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+        let store = state.store.lock().await;
+        assert_eq!(
+            store.job_status(&taken_id).unwrap().as_deref(),
+            Some("queued"),
+            "orphaned in_flight job must be queued again after restart"
+        );
+        assert_eq!(store.in_flight_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn reap_expired_requeues_only_past_deadline() {
+        let store = Store::open_in_memory().unwrap();
+        let a = job_with_deadline(0); // expires immediately
+        let b = job_with_deadline(3600); // not for an hour
+        let a_id = a.id;
+        store.enqueue(&a).unwrap();
+        store.enqueue(&b).unwrap();
+
+        // Both in_flight (each take_next stamps started_at = now).
+        store.take_next(|_| true).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.in_flight_count().unwrap(), 2);
+
+        let reaped = store.reap_expired(now_secs()).unwrap();
+        assert_eq!(reaped, vec![a_id], "only the past-deadline job is reaped");
+        assert_eq!(store.queued_count().unwrap(), 1);
+        assert_eq!(store.in_flight_count().unwrap(), 1);
+    }
+
+    // ---- idempotent + gated submit ----
+
+    #[tokio::test]
+    async fn submit_rejected_for_unknown_job() {
+        let state = test_state_empty().await;
+        // Validly-signed result for a job the store has never seen.
+        let job_id = Uuid::new_v4();
+        let good = signed_result(job_id, "deadbeef");
+        let uri = format!("/jobs/{}/submit", job_id);
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn submit_rejected_when_not_in_flight() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await; // left queued — never polled
+
+        let good = signed_result(job_id, "deadbeef");
+        let uri = format!("/jobs/{}/submit", job_id);
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
+    }
+
+    #[tokio::test]
+    async fn double_submit_does_not_double_count() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        // Poll → in_flight.
+        let resp = get(state.clone(), "/jobs/next").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let good = signed_result(job_id, "deadbeef");
+        let uri = format!("/jobs/{}/submit", job_id);
+
+        // First submit: accepted (in_flight → done).
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second submit: job is now done, so the gate rejects with CONFLICT and
+        // nothing is double-counted.
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 1);
+    }
+
+    #[test]
+    fn record_completed_is_idempotent() {
+        let mut store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        let job_id = job.id;
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap();
+
+        let result = signed_result(job_id, "deadbeef");
+        // Recording twice must not double-count the result.
+        store.record_completed(&result).unwrap();
+        store.record_completed(&result).unwrap();
+        assert_eq!(store.completed_count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_in_flight() {
+        // Build state on a non-seeded in-memory store so the queue truly starts
+        // empty (test_state_empty parks the auto-seeded job in_flight, which
+        // would skew the in_flight count this test asserts on).
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+        });
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        // Poll → job in_flight.
+        let resp = get(state.clone(), "/jobs/next").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_in_flight"], 1);
+        assert_eq!(json["jobs_queued"], 0);
+
+        // Submit → job done.
+        let good = signed_result(job_id, "deadbeef");
+        let uri = format!("/jobs/{}/submit", job_id);
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_in_flight"], 0);
+        assert_eq!(json["jobs_completed"], 1);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
