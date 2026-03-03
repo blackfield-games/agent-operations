@@ -12,8 +12,8 @@ Temporal activity (see runtime/workflow.py) so individual steps survive crashes.
 
 from __future__ import annotations
 from typing import TypedDict, Annotated
+
 from langgraph.graph import StateGraph, END
-from operator import add
 
 from common.types import WorldBrief, LayerSpec, ValidatorVerdict
 from director import director
@@ -26,9 +26,28 @@ from optimization import optimization
 from validator import validator
 
 
+def merge_layers(existing: list[LayerSpec], new: list[LayerSpec]) -> list[LayerSpec]:
+    """Reducer for State.layers: concatenate, then keep only the latest layer
+    per (specialist, region_id).
+
+    A validator route-back re-enters an upstream node, and the static edge chain
+    then replays every downstream specialist before the validator runs again (see
+    the PIPELINE_ORDER note below). With a plain operator.add reducer those replays
+    would append a SECOND LayerSpec for the same (specialist, region_id), and
+    compose_world — which groups by specialist — would emit duplicate sublayers.
+    De-duping here keeps the fresh re-run layer (latest wins) and drops the stale
+    one. Insertion order is preserved for first-seen layers; compose_world re-sorts
+    by STRENGTH_ORDER anyway, so the order of this list does not matter.
+    """
+    merged: dict[tuple[str, str], LayerSpec] = {}
+    for layer in [*existing, *new]:
+        merged[(layer.specialist, layer.region_id)] = layer  # latest wins
+    return list(merged.values())
+
+
 class State(TypedDict, total=False):
     brief: WorldBrief
-    layers: Annotated[list[LayerSpec], add]
+    layers: Annotated[list[LayerSpec], merge_layers]
     verdict: ValidatorVerdict
     route_back: str  # specialist name if validator wants a re-run
     rounds: int
