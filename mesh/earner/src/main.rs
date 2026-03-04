@@ -49,6 +49,10 @@ fn all_supported() -> Vec<JobKind> {
 const DEV_SESSION_KEY: &str =
     "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
 
+/// Base delay for the websocket reconnect backoff. The delay doubles per
+/// consecutive failure (1s, 2s, 4s, …) up to `--reconnect-max-secs`.
+const BACKOFF_BASE_SECS: u64 = 1;
+
 #[derive(Parser)]
 struct Args {
     #[arg(long, env = "COORDINATOR_URL", default_value = "http://127.0.0.1:8787")]
@@ -64,6 +68,11 @@ struct Args {
     gpu_model: String,
     #[arg(long, env = "VRAM_GB", default_value_t = 24)]
     vram_gb: u32,
+    /// Ceiling for the websocket reconnect backoff, in seconds. The backoff
+    /// starts at `BACKOFF_BASE_SECS` and doubles per consecutive failure up to
+    /// this cap, so a coordinator that's down doesn't get hammered.
+    #[arg(long, env = "RECONNECT_MAX_SECS", default_value_t = 30)]
+    reconnect_max_secs: u64,
     /// Transport: `http` (default, legacy poll loop) or `ws` (websocket job
     /// dispatch). `--ws` is shorthand for `--mode ws`.
     #[arg(long, value_enum, env = "EARNER_MODE", default_value_t = Mode::Http)]
@@ -181,16 +190,60 @@ fn ws_url(coordinator: &str) -> String {
     format!("{base}/ws")
 }
 
-/// Websocket job dispatch (v1). Connects, sends `Hello`, then handles
-/// `JobOffer` → render → sign → `Accept` + `Submit`, reading the
-/// `Accepted`/`Rejected` verdict.
+/// Websocket job dispatch (v1), run as a durable daemon. Connects, runs one
+/// [`ws_session`], and on session end *or* connect failure logs, sleeps an
+/// exponential backoff, and reconnects — forever. The coordinator reclaims and
+/// requeues this earner's in-flight job when it bounces, so reconnecting is
+/// enough to resume work. Mirrors the resilience of [`run_http`]'s poll loop.
+///
+/// Backoff starts at [`BACKOFF_BASE_SECS`] and doubles per *consecutive*
+/// failure up to `--reconnect-max-secs`; it RESETS to the base once a
+/// connection is successfully established, so a transient drop reconnects fast
+/// while a downed coordinator isn't hammered. Never returns `Ok(())`.
 async fn run_ws(args: &Args, session: &Session) -> Result<()> {
     let url = ws_url(&args.coordinator);
-    tracing::info!(%url, "connecting websocket");
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .with_context(|| format!("ws connect to {url} failed"))?;
+    let mut consecutive_failures: u32 = 0;
 
+    loop {
+        tracing::info!(%url, "connecting websocket");
+        match tokio_tungstenite::connect_async(&url).await {
+            Ok((ws, _resp)) => {
+                // A successful connect resets the backoff: a transient drop
+                // reconnects fast.
+                consecutive_failures = 0;
+                match ws_session(ws, args, session).await {
+                    Ok(()) => tracing::info!("websocket session ended; reconnecting"),
+                    Err(e) => tracing::warn!(error = %e, "websocket session error; reconnecting"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %url, "ws connect failed; retrying");
+            }
+        }
+
+        consecutive_failures = consecutive_failures.saturating_add(1);
+        let delay = backoff_delay(consecutive_failures, args.reconnect_max_secs);
+        tracing::info!(secs = delay.as_secs(), "backing off before reconnect");
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Run a single websocket connection: send `Hello`, then handle `JobOffer` →
+/// render → sign → `Accept` + `Submit`, reading the `Accepted`/`Rejected`
+/// verdict, until the stream ends.
+///
+/// Returns `Ok(())` on a clean `Close` or stream end and `Err` on a transport
+/// recv error — either way [`run_ws`] reconnects. In-session DECODE failures
+/// (one malformed frame) and `handle_offer` errors are non-fatal: log a `warn`
+/// and keep the session alive, mirroring how the coordinator tolerates
+/// undecodable earner messages.
+async fn ws_session<S>(mut ws: S, args: &Args, session: &Session) -> Result<()>
+where
+    S: SinkExt<WsMessage>
+        + StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+    <S as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
+{
     let hello = EarnerMsg::Hello {
         earner_address: session.address.clone(),
         gpu_model: args.gpu_model.clone(),
@@ -199,6 +252,7 @@ async fn run_ws(args: &Args, session: &Session) -> Result<()> {
     };
     ws.send(WsMessage::text(serde_json::to_string(&hello)?))
         .await
+        .map_err(|e| anyhow!(e))
         .context("sending Hello")?;
     tracing::info!("registered with coordinator (ws)");
 
@@ -214,8 +268,15 @@ async fn run_ws(args: &Args, session: &Session) -> Result<()> {
                 continue
             }
         };
-        let msg: CoordinatorMsg =
-            serde_json::from_str(&text).context("decoding coordinator message")?;
+        // One malformed frame must not drop the session: log and skip it, as
+        // the coordinator does for undecodable earner messages.
+        let msg: CoordinatorMsg = match serde_json::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "undecodable coordinator message");
+                continue;
+            }
+        };
         match msg {
             CoordinatorMsg::JobOffer(job) => {
                 if let Err(e) = handle_offer(&mut ws, session, job).await {
@@ -231,6 +292,26 @@ async fn run_ws(args: &Args, session: &Session) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Exponential reconnect backoff: `min(2^(failures - 1), max_secs)` seconds.
+/// `consecutive_failures` is 1 on the first failure (→ `BACKOFF_BASE_SECS`).
+/// The shift is guarded against overflow — large failure counts saturate to
+/// `max_secs` rather than panicking.
+fn backoff_delay(consecutive_failures: u32, max_secs: u64) -> Duration {
+    let secs = if consecutive_failures == 0 {
+        BACKOFF_BASE_SECS
+    } else {
+        // 1u64 << shift overflows for shift >= 64; saturate past that. Any
+        // shift >= 6 already exceeds the default 30s cap anyway.
+        let shift = consecutive_failures - 1;
+        let scaled = 1u64
+            .checked_shl(shift)
+            .and_then(|f| f.checked_mul(BACKOFF_BASE_SECS))
+            .unwrap_or(u64::MAX);
+        scaled.min(max_secs)
+    };
+    Duration::from_secs(secs.min(max_secs))
 }
 
 /// Render a single offered job, then `Accept` + `Submit` it over the socket.
@@ -312,4 +393,57 @@ async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> 
     let resp = client.post(&submit_url).json(&result).send().await?;
     tracing::info!(status = %resp.status(), "submitted");
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_url_maps_http_to_ws_and_https_to_wss() {
+        assert_eq!(ws_url("http://h:1"), "ws://h:1/ws");
+        assert_eq!(ws_url("https://h:1"), "wss://h:1/ws");
+    }
+
+    #[test]
+    fn ws_url_trims_a_trailing_slash_on_the_base() {
+        assert_eq!(ws_url("http://h:1/"), "ws://h:1/ws");
+        assert_eq!(ws_url("https://h:1/"), "wss://h:1/ws");
+    }
+
+    #[test]
+    fn ws_url_passes_through_other_schemes_then_appends_ws() {
+        // No http(s) prefix to rewrite: the scheme is left as-is and `/ws` is
+        // appended. A `ws://` base therefore stays `ws://`, and a bare host is
+        // left bare.
+        assert_eq!(ws_url("ws://h:1"), "ws://h:1/ws");
+        assert_eq!(ws_url("wss://h:1"), "wss://h:1/ws");
+        assert_eq!(ws_url("h:1"), "h:1/ws");
+        // The trailing-slash trim happens before the scheme check.
+        assert_eq!(ws_url("ws://h:1/"), "ws://h:1/ws");
+    }
+
+    #[test]
+    fn backoff_delay_doubles_per_failure() {
+        let max = 1000; // high enough not to clamp these.
+        assert_eq!(backoff_delay(1, max), Duration::from_secs(1));
+        assert_eq!(backoff_delay(2, max), Duration::from_secs(2));
+        assert_eq!(backoff_delay(3, max), Duration::from_secs(4));
+        assert_eq!(backoff_delay(4, max), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn backoff_delay_caps_at_max_secs() {
+        assert_eq!(backoff_delay(10, 30), Duration::from_secs(30));
+        // Once the doubled value exceeds the cap it stays pinned.
+        assert_eq!(backoff_delay(6, 30), Duration::from_secs(30)); // 2^5 = 32 > 30
+        assert_eq!(backoff_delay(5, 30), Duration::from_secs(16)); // 2^4 = 16 < 30
+    }
+
+    #[test]
+    fn backoff_delay_never_panics_on_large_failure_counts() {
+        // The shift would overflow a naive `1 << (n - 1)`; we must saturate.
+        assert_eq!(backoff_delay(100, 30), Duration::from_secs(30));
+        assert_eq!(backoff_delay(u32::MAX, 30), Duration::from_secs(30));
+    }
 }
