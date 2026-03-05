@@ -47,6 +47,10 @@ struct Args {
     /// deadline has elapsed and requeues them.
     #[arg(long, env = "COORDINATOR_REAP_INTERVAL_SECS", default_value = "5")]
     reap_interval_secs: u64,
+    /// Maximum number of dispatch attempts before a job is dead-lettered into
+    /// the terminal `failed` state and removed from the active queue forever.
+    #[arg(long, env = "COORDINATOR_MAX_ATTEMPTS", default_value = "5")]
+    max_attempts: u32,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -64,13 +68,16 @@ struct AppState {
     /// restart. Earner registrations stay in-memory by design.
     store: Mutex<Store>,
     earners: Mutex<HashMap<String, EarnerInfo>>,
+    /// Maximum dispatch attempts before a job is dead-lettered to `failed`.
+    /// Mirrors `--max-attempts` / `COORDINATOR_MAX_ATTEMPTS`.
+    max_attempts: u32,
 }
 
 impl AppState {
     /// Build state backed by `store`. Seeds one job only when the DB has no
     /// jobs yet, so a fresh DB gives earners something to do while a restart
     /// with existing jobs does NOT double-seed.
-    fn with_store(store: Store) -> Result<Arc<Self>> {
+    fn with_store(store: Store, max_attempts: u32) -> Result<Arc<Self>> {
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -83,6 +90,7 @@ impl AppState {
         Ok(Arc::new(AppState {
             store: Mutex::new(store),
             earners: Mutex::new(HashMap::new()),
+            max_attempts,
         }))
     }
 }
@@ -96,6 +104,8 @@ struct Stats {
     jobs_queued: usize,
     jobs_in_flight: usize,
     jobs_completed: usize,
+    /// Jobs dead-lettered after exhausting the configured `max_attempts`.
+    jobs_failed: usize,
     /// How many registered earners advertise support for each job kind.
     supported_breakdown: HashMap<JobKind, usize>,
 }
@@ -109,7 +119,7 @@ async fn main() -> Result<()> {
     let store = Store::open(&args.db)?;
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
     // `with_store` also reclaims jobs left in_flight by a previous crash.
-    let state = AppState::with_store(store)?;
+    let state = AppState::with_store(store, args.max_attempts)?;
     tracing::info!(db = %args.db, "store ready");
 
     // Background reaper: periodically requeue in-flight jobs past their
@@ -135,19 +145,31 @@ fn now_secs() -> i64 {
 }
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
-/// whose deadline has elapsed. Logs how many were requeued; store errors are
-/// logged and the loop continues.
+/// whose deadline has elapsed (or dead-letter it when it has exhausted all
+/// attempts). Logs requeued and dead-lettered counts separately; store errors
+/// are logged and the loop continues.
 fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             tick.tick().await;
+            let max_attempts = state.max_attempts;
             let store = state.store.lock().await;
-            match store.reap_expired(now_secs()) {
-                Ok(requeued) if !requeued.is_empty() => {
-                    tracing::info!(count = requeued.len(), "requeued expired in-flight jobs");
+            match store.reap_expired(now_secs(), max_attempts) {
+                Ok(outcome) => {
+                    if !outcome.requeued.is_empty() {
+                        tracing::info!(
+                            count = outcome.requeued.len(),
+                            "requeued expired in-flight jobs"
+                        );
+                    }
+                    if !outcome.failed.is_empty() {
+                        tracing::warn!(
+                            count = outcome.failed.len(),
+                            "dead-lettered jobs (max attempts exhausted)"
+                        );
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => tracing::error!(?e, "reaper: reap_expired failed"),
             }
         }
@@ -216,11 +238,16 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         }
     }
     let store = state.store.lock().await;
-    let (jobs_queued, jobs_in_flight, jobs_completed) =
-        match (store.queued_count(), store.in_flight_count(), store.completed_count()) {
-            (Ok(q), Ok(f), Ok(c)) => (q, f, c),
-            (q, f, c) => {
-                tracing::error!(?q, ?f, ?c, "stats: store count failed");
+    let (jobs_queued, jobs_in_flight, jobs_completed, jobs_failed) =
+        match (
+            store.queued_count(),
+            store.in_flight_count(),
+            store.completed_count(),
+            store.failed_count(),
+        ) {
+            (Ok(q), Ok(f), Ok(c), Ok(d)) => (q, f, c, d),
+            (q, f, c, d) => {
+                tracing::error!(?q, ?f, ?c, ?d, "stats: store count failed");
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         };
@@ -230,6 +257,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         jobs_queued,
         jobs_in_flight,
         jobs_completed,
+        jobs_failed,
         supported_breakdown,
     }))
 }
@@ -481,11 +509,16 @@ async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Opt
     }
 }
 
-/// Put a job back on the queue (rejected submission or dropped connection).
+/// Put a job back on the queue (rejected submission or dropped connection), or
+/// dead-letter it if it has exhausted `state.max_attempts` dispatches.
 async fn requeue(state: &Arc<AppState>, job: JobSpec) {
     let store = state.store.lock().await;
-    if let Err(e) = store.requeue(&job) {
-        tracing::error!(job_id = %job.id, ?e, "requeue failed");
+    match store.requeue(&job, state.max_attempts) {
+        Ok(true) => {
+            tracing::warn!(job_id = %job.id, "job dead-lettered (max attempts exhausted)");
+        }
+        Ok(false) => {}
+        Err(e) => tracing::error!(job_id = %job.id, ?e, "requeue failed"),
     }
 }
 
@@ -548,7 +581,7 @@ mod tests {
     /// because the in-memory DB starts empty; tests that need an empty queue
     /// drain it first via `/jobs/next` or use `test_state_empty`.
     fn test_state() -> Arc<AppState> {
-        AppState::with_store(Store::open_in_memory().unwrap()).unwrap()
+        AppState::with_store(Store::open_in_memory().unwrap(), 5).unwrap()
     }
 
     /// In-memory state with the auto-seeded job removed, so the queue starts
@@ -907,7 +940,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -935,7 +968,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -987,7 +1020,7 @@ mod tests {
         // First "process": take the auto-seeded job in_flight, then drop state.
         let taken_id;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
             let store = state.store.lock().await;
             let job = store.take_next(|_| true).unwrap().expect("seeded job");
             taken_id = job.id;
@@ -997,7 +1030,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight job on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -1016,15 +1049,80 @@ mod tests {
         store.enqueue(&a).unwrap();
         store.enqueue(&b).unwrap();
 
-        // Both in_flight (each take_next stamps started_at = now).
+        // Both in_flight (each take_next stamps started_at = now and bumps
+        // attempts to 1).
         store.take_next(|_| true).unwrap();
         store.take_next(|_| true).unwrap();
         assert_eq!(store.in_flight_count().unwrap(), 2);
 
-        let reaped = store.reap_expired(now_secs()).unwrap();
-        assert_eq!(reaped, vec![a_id], "only the past-deadline job is reaped");
+        // max_attempts = 5: after one attempt job `a` should be requeued, not
+        // failed.
+        let reaped = store.reap_expired(now_secs(), 5).unwrap();
+        assert_eq!(reaped.requeued, vec![a_id], "only the past-deadline job is reaped");
+        assert!(reaped.failed.is_empty(), "no jobs should be dead-lettered yet");
         assert_eq!(store.queued_count().unwrap(), 1);
         assert_eq!(store.in_flight_count().unwrap(), 1);
+    }
+
+    /// Lifecycle: a job with deadline_secs=0 and max_attempts=2 is taken,
+    /// reaped (requeued, attempts=1), taken again, and then reaped again
+    /// (dead-lettered, attempts=2). The job ends in `failed` status.
+    #[test]
+    fn reap_dead_letters_after_max_attempts() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(0); // expires the moment it is in_flight
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+
+        // Attempt 1: take → attempts becomes 1.
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.in_flight_count().unwrap(), 1);
+
+        // Reap: attempts=1 < max_attempts=2 → requeued.
+        let outcome = store.reap_expired(now_secs(), 2).unwrap();
+        assert_eq!(outcome.requeued, vec![id]);
+        assert!(outcome.failed.is_empty());
+        assert_eq!(store.queued_count().unwrap(), 1);
+        assert_eq!(store.failed_count().unwrap(), 0);
+
+        // Attempt 2: take → attempts becomes 2.
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.in_flight_count().unwrap(), 1);
+
+        // Reap: attempts=2 >= max_attempts=2 → dead-lettered.
+        let outcome = store.reap_expired(now_secs(), 2).unwrap();
+        assert!(outcome.requeued.is_empty());
+        assert_eq!(outcome.failed, vec![id]);
+        assert_eq!(store.queued_count().unwrap(), 0);
+        assert_eq!(store.in_flight_count().unwrap(), 0);
+        assert_eq!(store.failed_count().unwrap(), 1);
+        assert_eq!(
+            store.job_status(&id).unwrap().as_deref(),
+            Some("failed"),
+            "dead-lettered job must have status 'failed'"
+        );
+    }
+
+    /// A single attempt is enough to dead-letter when max_attempts=1.
+    #[test]
+    fn reap_dead_letters_after_single_attempt() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(0);
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+
+        // Attempt 1: take → attempts becomes 1.
+        store.take_next(|_| true).unwrap();
+
+        // Reap: attempts=1 >= max_attempts=1 → dead-lettered immediately.
+        let outcome = store.reap_expired(now_secs(), 1).unwrap();
+        assert!(outcome.requeued.is_empty());
+        assert_eq!(outcome.failed, vec![id]);
+        assert_eq!(store.failed_count().unwrap(), 1);
+        assert_eq!(
+            store.job_status(&id).unwrap().as_deref(),
+            Some("failed")
+        );
     }
 
     // ---- idempotent + gated submit ----
@@ -1106,6 +1204,7 @@ mod tests {
         let state = Arc::new(AppState {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -1128,6 +1227,18 @@ mod tests {
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_in_flight"], 0);
         assert_eq!(json["jobs_completed"], 1);
+    }
+
+    /// `/stats` always exposes a `jobs_failed` field, even when it is 0.
+    #[tokio::test]
+    async fn stats_reports_jobs_failed_field() {
+        let state = test_state_empty().await;
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        // Field must be present and equal 0 when no jobs have been dead-lettered.
+        assert_eq!(
+            json["jobs_failed"], 0,
+            "jobs_failed must be present and zero when no jobs are dead-lettered"
+        );
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping

@@ -17,6 +17,19 @@ use rusqlite::Connection;
 const STATUS_QUEUED: &str = "queued";
 const STATUS_IN_FLIGHT: &str = "in_flight";
 const STATUS_DONE: &str = "done";
+/// Terminal failure state: the job has been dispatched `max_attempts` times
+/// without a successful result and will no longer be requeued.
+const STATUS_FAILED: &str = "failed";
+
+/// Outcome returned by `reap_expired`, split into jobs that were requeued for
+/// another attempt and jobs that have been dead-lettered into `failed`.
+#[derive(Debug, Default, PartialEq)]
+pub struct ReapOutcome {
+    /// Job ids moved back to `queued` (still have remaining attempts).
+    pub requeued: Vec<uuid::Uuid>,
+    /// Job ids moved to the terminal `failed` status (exhausted all attempts).
+    pub failed: Vec<uuid::Uuid>,
+}
 
 /// Treat an `ALTER TABLE ... ADD COLUMN` that fails only because the column
 /// already exists as a success — that is the expected case for a DB created on
@@ -57,7 +70,8 @@ impl Store {
                  id         TEXT PRIMARY KEY,
                  spec_json  TEXT NOT NULL,
                  status     TEXT NOT NULL,
-                 started_at INTEGER
+                 started_at INTEGER,
+                 attempts   INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS results (
                  job_id      TEXT NOT NULL,
@@ -73,6 +87,15 @@ impl Store {
         // error and let any other failure propagate.
         ignore_duplicate_column(
             conn.execute("ALTER TABLE jobs ADD COLUMN started_at INTEGER", []),
+        )?;
+        // Migrate pre-existing DBs (created before `attempts` was added). The
+        // column already exists on a later boot, so we swallow only that one
+        // error and let any other failure propagate.
+        ignore_duplicate_column(
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                [],
+            ),
         )?;
         Ok(Self { conn })
     }
@@ -121,7 +144,9 @@ impl Store {
             if accept(&job) {
                 self.conn.execute(
                     "UPDATE jobs
-                     SET status = ?1, started_at = CAST(strftime('%s','now') AS INTEGER)
+                     SET status     = ?1,
+                         started_at = CAST(strftime('%s','now') AS INTEGER),
+                         attempts   = attempts + 1
                      WHERE id = ?2",
                     (STATUS_IN_FLIGHT, &id),
                 )?;
@@ -131,17 +156,42 @@ impl Store {
         Ok(None)
     }
 
-    /// Put a job back on the queue (rejected submission / dropped connection).
-    /// Stores the latest spec so requeue works even for jobs not currently in
-    /// the table.
-    pub fn requeue(&self, job: &JobSpec) -> Result<()> {
+    /// Put a job back on the queue (rejected submission / dropped connection),
+    /// or dead-letter it if it has already been dispatched `max_attempts` times.
+    ///
+    /// Reads the job's current `attempts` from the table (treats it as 0 if the
+    /// row does not exist yet, mirroring the `QueryReturnedNoRows` handling in
+    /// `job_status`). If `attempts >= max_attempts` the job is moved to the
+    /// terminal `failed` status; otherwise it is returned to `queued`. In both
+    /// cases `started_at` is cleared. The latest `spec` is always upserted so
+    /// this works even for jobs not yet in the table.
+    ///
+    /// Returns `true` iff the job was dead-lettered (i.e. moved to `failed`).
+    pub fn requeue(&self, job: &JobSpec, max_attempts: u32) -> Result<bool> {
+        // Read the current attempt count for this job (0 if not yet inserted).
+        let attempts: u32 = self
+            .conn
+            .query_row(
+                "SELECT attempts FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |row| row.get::<_, u32>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?
+            .unwrap_or(0);
+
+        let new_status = if attempts >= max_attempts { STATUS_FAILED } else { STATUS_QUEUED };
         let spec_json = serde_json::to_string(job)?;
         self.conn.execute(
-            "INSERT INTO jobs (id, spec_json, status, started_at) VALUES (?1, ?2, ?3, NULL)
+            "INSERT INTO jobs (id, spec_json, status, started_at)
+             VALUES (?1, ?2, ?3, NULL)
              ON CONFLICT(id) DO UPDATE SET spec_json = ?2, status = ?3, started_at = NULL",
-            (job.id.to_string(), spec_json, STATUS_QUEUED),
+            (job.id.to_string(), spec_json, new_status),
         )?;
-        Ok(())
+        Ok(new_status == STATUS_FAILED)
     }
 
     /// Record a validated result: insert into `results` and mark the job
@@ -198,37 +248,52 @@ impl Store {
         Ok(recovered)
     }
 
-    /// Requeue in-flight jobs whose deadline has elapsed and return their ids.
+    /// Requeue (or dead-letter) in-flight jobs whose deadline has elapsed.
     ///
     /// A job's deadline is `started_at + JobSpec::deadline_secs`. Any in-flight
-    /// job at or past that point (relative to `now_secs`) is put back on the
-    /// queue so another earner can pick it up. `now_secs` is passed in (epoch
-    /// seconds) so callers — and tests — control the clock.
-    pub fn reap_expired(&self, now_secs: i64) -> Result<Vec<uuid::Uuid>> {
+    /// job at or past that point (relative to `now_secs`) is processed:
+    ///
+    /// * If its `attempts >= max_attempts` it is moved to the terminal `failed`
+    ///   status and its id is pushed to `ReapOutcome::failed`.
+    /// * Otherwise it is returned to `queued` and its id is pushed to
+    ///   `ReapOutcome::requeued`.
+    ///
+    /// `now_secs` is passed in (epoch seconds) so callers — and tests — control
+    /// the clock.
+    pub fn reap_expired(&self, now_secs: i64, max_attempts: u32) -> Result<ReapOutcome> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, spec_json, started_at FROM jobs
+            "SELECT id, spec_json, started_at, attempts FROM jobs
              WHERE status = ?1 AND started_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([STATUS_IN_FLIGHT], |row| {
             let id: String = row.get(0)?;
             let spec_json: String = row.get(1)?;
             let started_at: i64 = row.get(2)?;
-            Ok((id, spec_json, started_at))
+            let attempts: u32 = row.get(3)?;
+            Ok((id, spec_json, started_at, attempts))
         })?;
 
-        let mut expired = Vec::new();
+        let mut outcome = ReapOutcome::default();
         for row in rows {
-            let (id, spec_json, started_at) = row?;
+            let (id, spec_json, started_at, attempts) = row?;
             let job: JobSpec = serde_json::from_str(&spec_json)?;
             if now_secs - started_at >= job.deadline_secs as i64 {
-                self.conn.execute(
-                    "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2",
-                    (STATUS_QUEUED, &id),
-                )?;
-                expired.push(job.id);
+                if attempts >= max_attempts {
+                    self.conn.execute(
+                        "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2",
+                        (STATUS_FAILED, &id),
+                    )?;
+                    outcome.failed.push(job.id);
+                } else {
+                    self.conn.execute(
+                        "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2",
+                        (STATUS_QUEUED, &id),
+                    )?;
+                    outcome.requeued.push(job.id);
+                }
             }
         }
-        Ok(expired)
+        Ok(outcome)
     }
 
     /// Current lifecycle status of a job, or `None` if the id is unknown.
@@ -274,6 +339,17 @@ impl Store {
         let count: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM results", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Count of jobs in the terminal `failed` status (dead-lettered after
+    /// exhausting `max_attempts` dispatches). Exposed via `/stats`.
+    pub fn failed_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = ?1",
+            [STATUS_FAILED],
+            |row| row.get(0),
+        )?;
         Ok(count as usize)
     }
 }
