@@ -1,35 +1,50 @@
-# blackfield — agent operations
+# Blackfield
 
-BF6-register combined-arms combat. arenas hand-tuned. ambient frontier rendered by every operator on the mesh.
+**Combined-arms tactical combat with a living, operator-rendered frontier.**
 
-built on UE5 Lyra. $BLCKFLD on base.
+Blackfield pairs hand-tuned competitive arenas with an ambient open world rendered by a distributed network of operators. The project is built on Unreal Engine 5 (Lyra), and its compute economy settles on Base.
 
-## layout
+Website: [blackfield.games](https://blackfield.games)
 
-```
-mesh/         proprietary gpu pool + earner client
-agents/       langgraph + temporal + ray runtime
-contracts/    base / clanker (foundry)
-engine/       ue5 project
-assets/       brand
-docs/         public docs only (internal docs gitignored)
-```
+## Repository Layout
 
-## architecture
+| Directory   | Contents                                          |
+| ----------- | ------------------------------------------------- |
+| `engine/`   | Unreal Engine 5 project                           |
+| `mesh/`     | Distributed GPU pool and earner client            |
+| `agents/`   | World-generation content pipeline                 |
+| `contracts/`| On-chain contracts (Base, Foundry)                |
+| `assets/`   | Brand and art assets                              |
+| `docs/`     | Public documentation                              |
 
-three backends behind the game, loosely coupled.
+## Architecture
 
-- **mesh** — the gpu pool. `coordinator` (rust / axum) queues render jobs and dispatches them to `earner` clients over a websocket, or an http poll. earners register their gpu and the job kinds they handle, and sign every result with a secp256k1 session key; the coordinator verifies the signer before a result counts. queue and results persist in sqlite, so a restart reclaims in-flight work instead of dropping it. `proto` holds the wire types shared by both sides. gpus joined and queue depth are exposed at `/stats`.
-- **contracts** — foundry, targeting base. `ComputeMeter` burns $BLCKFLD into per-buyer compute credit, debited per validated job. `RegionAuthority` mints a region nft against a $BLCKFLD stake — holders earn a cut of the fees inside their region. `RenderReceipts` relays a validated render's attestation to EAS. `ArtifactTemplate` mints player-authored gear / structure templates (erc-1155) once a $BLCKFLD burn pays the rarity-scaled fee.
-- **agents** — the content pipeline. a langgraph supervisor walks a world brief through eight specialists (director → terrain → biome → prop → lighting → npc → optimization → validator). each writes its own openusd layer; `compose` sublayers them into one `world.usda` in fixed strength order. the validator can route a rejection back to the earliest failing specialist for a re-run. each node wraps as a temporal activity so a single step can crash and resume.
+Three loosely coupled backends sit behind the game client.
 
-the seam: agents author scene patches, those become render jobs the mesh dispatches, earners render and sign them, and validated work is metered by `ComputeMeter` and attested by `RenderReceipts` on base.
+### Mesh
 
-## build + test
+A distributed render pool. The coordinator service (Rust, Axum) queues render jobs and dispatches them to earner clients over WebSocket or HTTP polling. Each earner registers its available GPU and the job types it can handle, and signs every result with a secp256k1 session key; the coordinator verifies the signature before accepting the result. The job queue and results persist in SQLite, so an interrupted coordinator reclaims in-flight work on restart rather than dropping it. Shared wire types live in `proto`. Connected GPUs and queue depth are exposed at `/stats`.
 
-each backend builds and tests on its own.
+### Contracts
 
-mesh — rust workspace (`proto`, `coordinator`, `earner`):
+A Foundry project targeting Base.
+
+- **ComputeMeter** converts $BLCKFLD into per-buyer compute credit, debited as validated jobs complete.
+- **RegionAuthority** mints a region NFT against a $BLCKFLD stake; holders earn a share of the fees generated within their region.
+- **RenderReceipts** publishes each validated render's attestation to the Ethereum Attestation Service.
+- **ArtifactTemplate** mints player-authored equipment and structure templates as ERC-1155 tokens, gated by a rarity-scaled $BLCKFLD fee.
+
+### Agents
+
+The world-generation pipeline. A LangGraph supervisor routes a world brief through eight specialist stages: director, terrain, biome, prop, lighting, NPC, optimization, and validation. Each stage writes its own OpenUSD layer, which `compose` then sublayers into a single `world.usda` in a fixed strength order. When validation fails, the supervisor can return the brief to the earliest failing stage for revision. Each stage runs as a Temporal activity, so an individual step can fail and resume without restarting the pipeline.
+
+These pieces connect end to end: the agents author scene patches, which become render jobs; the mesh dispatches those jobs to earners, who render and cryptographically sign the output; and validated work is metered by `ComputeMeter` and attested by `RenderReceipts` on Base.
+
+## Building and Testing
+
+Each backend builds and tests independently.
+
+**Mesh** — Rust workspace (`proto`, `coordinator`, `earner`):
 
 ```
 cd mesh
@@ -37,14 +52,14 @@ cargo test
 cargo run -p coordinator   # serves 127.0.0.1:8787
 ```
 
-contracts — foundry (deps vendored under `contracts/lib`):
+**Contracts** — Foundry (dependencies vendored under `contracts/lib`):
 
 ```
 cd contracts
 forge test
 ```
 
-agents — python (deps in `pyproject.toml`):
+**Agents** — Python (dependencies in `pyproject.toml`):
 
 ```
 cd agents
@@ -53,6 +68,6 @@ python -m venv .venv
 .venv/bin/python -m pytest
 ```
 
-## status
+## Project Status
 
-phase 0. nothing here is shippable yet.
+Blackfield is in pre-production. The codebase is under active development and is not yet ready for release.
