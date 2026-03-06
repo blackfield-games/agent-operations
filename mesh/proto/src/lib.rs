@@ -152,4 +152,218 @@ mod tests {
 
         assert_eq!(recovered, expected);
     }
+
+    // -----------------------------------------------------------------------
+    // Wire-shape contract tests — lock the JSON serialization of every public
+    // type so an accidental rename or tag change fails CI immediately.
+    // -----------------------------------------------------------------------
+
+    const FIXED_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn jobkind_tags_are_stable() {
+        // Each variant must round-trip to exactly the documented snake_case tag.
+        let cases = [
+            (JobKind::Terrain, "terrain"),
+            (JobKind::Foliage, "foliage"),
+            (JobKind::NpcTick, "npc_tick"),
+            (JobKind::DiffusionTile, "diffusion_tile"),
+            (JobKind::Optimization, "optimization"),
+        ];
+        for (variant, tag) in cases {
+            let serialized = serde_json::to_value(variant).unwrap();
+            assert_eq!(
+                serialized,
+                serde_json::json!(tag),
+                "JobKind::{:?} tag drifted",
+                variant
+            );
+            let deserialized: JobKind = serde_json::from_value(serialized).unwrap();
+            assert_eq!(
+                deserialized, variant,
+                "JobKind::{:?} did not round-trip",
+                variant
+            );
+        }
+
+        // as_u16() is part of the on-chain versioning contract — pin it.
+        assert_eq!(JobKind::Terrain.as_u16(), 0);
+        assert_eq!(JobKind::Foliage.as_u16(), 1);
+        assert_eq!(JobKind::NpcTick.as_u16(), 2);
+        assert_eq!(JobKind::DiffusionTile.as_u16(), 3);
+        assert_eq!(JobKind::Optimization.as_u16(), 4);
+    }
+
+    #[test]
+    fn jobspec_wire_shape_is_stable() {
+        let canonical = serde_json::json!({
+            "id": FIXED_UUID,
+            "kind": "diffusion_tile",
+            "region": { "x": 10, "y": -5, "layer": 1 },
+            "deadline_secs": 120,
+            "max_payout_wei": "1000000000000000000",
+            "inputs": { "asset_url": "https://cdn.example.com/tile.usd", "lod": 2 }
+        });
+
+        let parsed: JobSpec = serde_json::from_value(canonical.clone()).unwrap();
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reserialized, canonical, "JobSpec wire shape drifted");
+    }
+
+    #[test]
+    fn jobresult_wire_shape_is_stable() {
+        let canonical = serde_json::json!({
+            "job_id": FIXED_UUID,
+            "earner_address": "0xabcdef1234567890abcdef1234567890abcdef12",
+            "output_hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "output_url": "https://cdn.example.com/output/tile.usd",
+            "render_seconds": 47,
+            "signature_hex": "0xcafebabe"
+        });
+
+        let parsed: JobResult = serde_json::from_value(canonical.clone()).unwrap();
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(reserialized, canonical, "JobResult wire shape drifted");
+    }
+
+    #[test]
+    fn coordinator_msg_wire_shapes_are_stable() {
+        // JobOffer — newtype variant: inner JobSpec fields are flattened next to "type".
+        let canonical_offer = serde_json::json!({
+            "type": "job_offer",
+            "id": FIXED_UUID,
+            "kind": "diffusion_tile",
+            "region": { "x": 10, "y": -5, "layer": 1 },
+            "deadline_secs": 120,
+            "max_payout_wei": "1000000000000000000",
+            "inputs": { "asset_url": "https://cdn.example.com/tile.usd", "lod": 2 }
+        });
+        let parsed_offer: CoordinatorMsg =
+            serde_json::from_value(canonical_offer.clone()).unwrap();
+        let reserialized_offer = serde_json::to_value(&parsed_offer).unwrap();
+        assert_eq!(
+            reserialized_offer, canonical_offer,
+            "CoordinatorMsg::JobOffer wire shape drifted"
+        );
+
+        // Accepted — struct variant.
+        let canonical_accepted = serde_json::json!({
+            "type": "accepted",
+            "job_id": FIXED_UUID,
+            "attestation_uid": "0xaabbccddeeff"
+        });
+        let parsed_accepted: CoordinatorMsg =
+            serde_json::from_value(canonical_accepted.clone()).unwrap();
+        let reserialized_accepted = serde_json::to_value(&parsed_accepted).unwrap();
+        assert_eq!(
+            reserialized_accepted, canonical_accepted,
+            "CoordinatorMsg::Accepted wire shape drifted"
+        );
+
+        // Rejected — struct variant.
+        let canonical_rejected = serde_json::json!({
+            "type": "rejected",
+            "job_id": FIXED_UUID,
+            "reason": "output hash mismatch"
+        });
+        let parsed_rejected: CoordinatorMsg =
+            serde_json::from_value(canonical_rejected.clone()).unwrap();
+        let reserialized_rejected = serde_json::to_value(&parsed_rejected).unwrap();
+        assert_eq!(
+            reserialized_rejected, canonical_rejected,
+            "CoordinatorMsg::Rejected wire shape drifted"
+        );
+    }
+
+    #[test]
+    fn earner_msg_wire_shapes_are_stable() {
+        // Hello — struct variant.
+        let canonical_hello = serde_json::json!({
+            "type": "hello",
+            "earner_address": "0xabcdef1234567890abcdef1234567890abcdef12",
+            "gpu_model": "RTX 4090",
+            "vram_gb": 24,
+            "supported": ["terrain", "foliage"]
+        });
+        let parsed_hello: EarnerMsg =
+            serde_json::from_value(canonical_hello.clone()).unwrap();
+        let reserialized_hello = serde_json::to_value(&parsed_hello).unwrap();
+        assert_eq!(
+            reserialized_hello, canonical_hello,
+            "EarnerMsg::Hello wire shape drifted"
+        );
+
+        // Accept — struct variant.
+        let canonical_accept = serde_json::json!({
+            "type": "accept",
+            "job_id": FIXED_UUID
+        });
+        let parsed_accept: EarnerMsg =
+            serde_json::from_value(canonical_accept.clone()).unwrap();
+        let reserialized_accept = serde_json::to_value(&parsed_accept).unwrap();
+        assert_eq!(
+            reserialized_accept, canonical_accept,
+            "EarnerMsg::Accept wire shape drifted"
+        );
+
+        // Submit — newtype variant: inner JobResult fields are flattened next to "type".
+        let canonical_submit = serde_json::json!({
+            "type": "submit",
+            "job_id": FIXED_UUID,
+            "earner_address": "0xabcdef1234567890abcdef1234567890abcdef12",
+            "output_hash": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "output_url": "https://cdn.example.com/output/tile.usd",
+            "render_seconds": 47,
+            "signature_hex": "0xcafebabe"
+        });
+        let parsed_submit: EarnerMsg =
+            serde_json::from_value(canonical_submit.clone()).unwrap();
+        let reserialized_submit = serde_json::to_value(&parsed_submit).unwrap();
+        assert_eq!(
+            reserialized_submit, canonical_submit,
+            "EarnerMsg::Submit wire shape drifted"
+        );
+
+        // Heartbeat with Some(uuid) — job_id is present as a string.
+        let canonical_hb_some = serde_json::json!({
+            "type": "heartbeat",
+            "job_id": FIXED_UUID,
+            "progress_pct": 55
+        });
+        let parsed_hb_some: EarnerMsg =
+            serde_json::from_value(canonical_hb_some.clone()).unwrap();
+        let reserialized_hb_some = serde_json::to_value(&parsed_hb_some).unwrap();
+        assert_eq!(
+            reserialized_hb_some, canonical_hb_some,
+            "EarnerMsg::Heartbeat(Some) wire shape drifted"
+        );
+
+        // Heartbeat with None — job_id field must be present and set to null.
+        let canonical_hb_none = serde_json::json!({
+            "type": "heartbeat",
+            "job_id": null,
+            "progress_pct": 0
+        });
+        let parsed_hb_none: EarnerMsg =
+            serde_json::from_value(canonical_hb_none.clone()).unwrap();
+        let reserialized_hb_none = serde_json::to_value(&parsed_hb_none).unwrap();
+        assert_eq!(
+            reserialized_hb_none, canonical_hb_none,
+            "EarnerMsg::Heartbeat(None) wire shape drifted — job_id must serialize as null, not be omitted"
+        );
+    }
+
+    #[test]
+    fn region_id_format_is_stable() {
+        // Pin the {:+05} sign+zero-pad format used by region_id().
+        assert_eq!(
+            RegionCoord { x: 42, y: -17, layer: 0 }.region_id(),
+            "r+0042_-0017_l0"
+        );
+        // Negative x, positive y, non-zero layer.
+        assert_eq!(
+            RegionCoord { x: -3, y: 100, layer: 2 }.region_id(),
+            "r-0003_+0100_l2"
+        );
+    }
 }
