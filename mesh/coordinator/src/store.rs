@@ -296,6 +296,20 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Bump an in-flight job's `started_at` to `now_secs` on an earner heartbeat,
+    /// so the deadline reaper measures the deadline window from the last sign of
+    /// life rather than from dispatch. A job that keeps heartbeating is making
+    /// progress and won't be reaped; a silent earner still hits the deadline.
+    /// No-op (returns `false`) for a job that is not currently `in_flight`
+    /// (a stale/late heartbeat for an already-completed or requeued job).
+    pub fn touch(&self, job_id: &uuid::Uuid, now_secs: i64) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE jobs SET started_at = ?1 WHERE id = ?2 AND status = ?3",
+            (now_secs, job_id.to_string(), STATUS_IN_FLIGHT),
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Current lifecycle status of a job, or `None` if the id is unknown.
     /// Lets the submit path gate results to jobs that are actually in_flight.
     pub fn job_status(&self, id: &uuid::Uuid) -> Result<Option<String>> {

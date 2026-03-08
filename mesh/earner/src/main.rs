@@ -80,6 +80,12 @@ struct Args {
     /// Shorthand for `--mode ws`. Overrides `--mode` when set.
     #[arg(long, default_value_t = false)]
     ws: bool,
+    /// Seconds between liveness heartbeats sent to the coordinator while a job
+    /// is in-flight (ws mode). The coordinator bumps the job's `started_at` on
+    /// each heartbeat so the deadline reaper measures the window from the last
+    /// sign of life rather than from dispatch time.
+    #[arg(long, env = "HEARTBEAT_SECS", default_value_t = 10)]
+    heartbeat_secs: u64,
 }
 
 impl Args {
@@ -279,7 +285,7 @@ where
         };
         match msg {
             CoordinatorMsg::JobOffer(job) => {
-                if let Err(e) = handle_offer(&mut ws, session, job).await {
+                if let Err(e) = handle_offer(&mut ws, session, job, args.heartbeat_secs).await {
                     tracing::warn!(error = %e, "job offer handling failed");
                 }
             }
@@ -315,7 +321,23 @@ fn backoff_delay(consecutive_failures: u32, max_secs: u64) -> Duration {
 }
 
 /// Render a single offered job, then `Accept` + `Submit` it over the socket.
-async fn handle_offer<S>(ws: &mut S, session: &Session, job: JobSpec) -> Result<()>
+///
+/// While the render is in progress, a periodic heartbeat is sent to the
+/// coordinator every `heartbeat_secs` seconds (`.max(1)` guards against a
+/// zero-second interval panicking `tokio::time::interval`). The coordinator
+/// bumps `started_at` on each heartbeat so the deadline reaper measures the
+/// window from the last sign of life rather than from dispatch. A job that
+/// keeps heartbeating is making progress and won't be reaped; a silent earner
+/// still hits the deadline.
+///
+/// The stub `runner::render` returns instantly, so for stub jobs no heartbeat
+/// fires mid-render — that is correct; this mechanism is for slow real renders.
+async fn handle_offer<S>(
+    ws: &mut S,
+    session: &Session,
+    job: JobSpec,
+    heartbeat_secs: u64,
+) -> Result<()>
 where
     S: SinkExt<WsMessage> + Unpin,
     <S as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
@@ -330,7 +352,28 @@ where
     .map_err(|e| anyhow!(e))
     .context("sending Accept")?;
 
-    let output = runner::render(&job).await.context("render failed")?;
+    // Run the render concurrently with a periodic heartbeat sender. The
+    // coordinator bumps `started_at` on each beat, so a job making progress
+    // is never reaped by the deadline reaper; a silent earner still hits the
+    // original window.
+    let render_fut = runner::render(&job);
+    tokio::pin!(render_fut);
+    let mut hb = tokio::time::interval(Duration::from_secs(heartbeat_secs.max(1)));
+    hb.tick().await; // consume the immediate first tick so the first beat is one interval in
+    let output = loop {
+        tokio::select! {
+            res = &mut render_fut => break res.context("render failed")?,
+            _ = hb.tick() => {
+                let beat = EarnerMsg::Heartbeat { job_id: Some(job.id), progress_pct: 0 };
+                ws.send(WsMessage::text(serde_json::to_string(&beat)?))
+                    .await
+                    .map_err(|e| anyhow!(e))
+                    .context("sending Heartbeat")?;
+                tracing::debug!(job_id = %job.id, "heartbeat sent");
+            }
+        }
+    };
+
     let mut hasher = Sha256::new();
     hasher.update(&output);
     let output_hash = hex::encode(hasher.finalize());

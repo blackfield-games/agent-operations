@@ -333,7 +333,12 @@ async fn submit(
 ///      verified. Valid → push to `completed` and reply
 ///      `CoordinatorMsg::Accepted { job_id, attestation_uid }`. Invalid →
 ///      `CoordinatorMsg::Rejected { job_id, reason }` and the job is requeued.
-///   5. earner → `EarnerMsg::Heartbeat { .. }` is logged and ignored.
+///   5. earner → `EarnerMsg::Heartbeat { job_id, progress_pct }`: when
+///      `job_id` matches the currently offered job, `store.touch` bumps
+///      `started_at` so the reaper deadline slides from the last heartbeat
+///      rather than from dispatch (liveness-aware reaping). A non-matching or
+///      absent job_id is logged and ignored; the session is never broken on a
+///      heartbeat.
 ///
 /// The earner registration and queue/completed state are shared with the HTTP
 /// endpoints, so `/stats` reflects ws activity identically.
@@ -451,7 +456,43 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                     EarnerMsg::Heartbeat { job_id, progress_pct } => {
-                        tracing::debug!(earner = %earner_address, ?job_id, progress_pct, "heartbeat");
+                        // When the heartbeat carries a job_id that matches the
+                        // currently offered job, bump `started_at` so the
+                        // reaper's deadline window resets from "last sign of
+                        // life" rather than from dispatch. A job that keeps
+                        // heartbeating is making progress and won't be reaped;
+                        // a silent earner still hits the original window.
+                        match (job_id, &offered) {
+                            (Some(jid), Some(job)) if jid == job.id => {
+                                let store = state.store.lock().await;
+                                match store.touch(&jid, now_secs()) {
+                                    Ok(true) => tracing::debug!(
+                                        earner = %earner_address,
+                                        %jid,
+                                        progress_pct,
+                                        "heartbeat: liveness bumped",
+                                    ),
+                                    Ok(false) => tracing::debug!(
+                                        earner = %earner_address,
+                                        %jid,
+                                        progress_pct,
+                                        "heartbeat for non-in-flight job ignored",
+                                    ),
+                                    Err(e) => tracing::error!(
+                                        earner = %earner_address,
+                                        %jid,
+                                        ?e,
+                                        "heartbeat: touch failed",
+                                    ),
+                                }
+                            }
+                            _ => tracing::debug!(
+                                earner = %earner_address,
+                                ?job_id,
+                                progress_pct,
+                                "heartbeat with no matching offer; ignoring",
+                            ),
+                        }
                     }
                 }
             }
@@ -1123,6 +1164,167 @@ mod tests {
             store.job_status(&id).unwrap().as_deref(),
             Some("failed")
         );
+    }
+
+    // ---- heartbeat / liveness-aware reaping ----
+
+    /// `touch` slides `started_at` forward and the reaper honours the new value.
+    ///
+    /// Procedure: enqueue a job with deadline=100; take it (`in_flight`); bump
+    /// `started_at` to t=5000 via `touch`; at t=5099 the job is not yet due
+    /// (99 < 100) — reaper returns empty; at t=5100 (100 >= 100) it fires.
+    #[test]
+    fn touch_bumps_started_at_and_reaper_respects_it() {
+        const BIG_MAX: u32 = 999;
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(100);
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap(); // → in_flight
+
+        assert!(store.touch(&id, 5000).unwrap(), "touch must return true for an in_flight job");
+
+        // 99 seconds after t=5000 → not yet expired.
+        let outcome = store.reap_expired(5099, BIG_MAX).unwrap();
+        assert!(outcome.requeued.is_empty(), "must not reap before deadline");
+        assert!(outcome.failed.is_empty(), "must not dead-letter before deadline");
+
+        // Exactly at deadline → reaped.
+        let outcome = store.reap_expired(5100, BIG_MAX).unwrap();
+        assert_eq!(outcome.requeued, vec![id], "must reap at deadline");
+        assert!(outcome.failed.is_empty());
+    }
+
+    /// Repeated heartbeats keep extending the liveness window.
+    ///
+    /// Sequence:
+    ///   take_next → in_flight;
+    ///   touch(5000) → reaper at 5090 sees only 90s elapsed → no reap;
+    ///   touch(5090) → reaper at 5180 sees only 90s elapsed → still no reap;
+    ///   reaper at 5190 sees 100s of silence since t=5090 → fires.
+    #[test]
+    fn heartbeats_keep_a_live_job_unreaped() {
+        const BIG: u32 = 999;
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(100);
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap();
+
+        store.touch(&id, 5000).unwrap();
+        let outcome = store.reap_expired(5090, BIG).unwrap();
+        assert!(outcome.requeued.is_empty(), "90s after first beat: should not reap");
+        assert!(outcome.failed.is_empty());
+
+        // Second heartbeat at t=5090.
+        store.touch(&id, 5090).unwrap();
+        let outcome = store.reap_expired(5180, BIG).unwrap();
+        assert!(
+            outcome.requeued.is_empty(),
+            "90s after second beat (180s total): should still not reap"
+        );
+        assert!(outcome.failed.is_empty());
+
+        // 100s of silence since the last beat (t=5090+100=5190) → reap.
+        let outcome = store.reap_expired(5190, BIG).unwrap();
+        assert_eq!(outcome.requeued, vec![id], "100s after last beat: must reap");
+        assert!(outcome.failed.is_empty());
+    }
+
+    /// `touch` is a no-op for a job that is not `in_flight`.
+    ///
+    /// A queued job returns `false`; so does a job whose id the store has never
+    /// seen (SQLite UPDATE affects 0 rows → `updated == 0`).
+    #[test]
+    fn touch_is_noop_for_non_in_flight() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        let id = job.id;
+        // Enqueue but do NOT take → status stays `queued`.
+        store.enqueue(&job).unwrap();
+
+        assert!(
+            !store.touch(&id, 5000).unwrap(),
+            "touch must return false for a queued (not in_flight) job"
+        );
+
+        // A completed job is likewise not in_flight → touch is a no-op. Uses a
+        // fresh store because `record_completed` needs `&mut Store`.
+        let mut store = Store::open_in_memory().unwrap();
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap();
+        store.record_completed(&signed_result(id, "cafebabe")).unwrap();
+        assert!(
+            !store.touch(&id, 5000).unwrap(),
+            "touch must return false for a done job"
+        );
+    }
+
+    /// An `EarnerMsg::Heartbeat` mid-session must not disturb the normal
+    /// offer → accept → submit → Accepted flow.
+    ///
+    /// Mirrors `ws_offer_accept_submit_flows_to_completed` but inserts a
+    /// heartbeat frame between `Accept` and `Submit`, then asserts the flow
+    /// still completes successfully.
+    #[tokio::test]
+    async fn ws_heartbeat_during_session_then_submit_completes() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        // 1. Hello
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+
+        // 2. Expect a JobOffer for the seeded job.
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+
+        // 3. Accept.
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // 4. Send a heartbeat (progress=50) between Accept and Submit; the
+        //    coordinator must handle it gracefully and keep the session alive.
+        let beat = EarnerMsg::Heartbeat { job_id: Some(job_id), progress_pct: 50 };
+        ws.send(WsMessage::text(serde_json::to_string(&beat).unwrap()))
+            .await
+            .unwrap();
+
+        // 5. Submit a validly-signed result.
+        let result = signed_result(job_id, "deadbeef");
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(result)).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // 6. Expect Accepted — heartbeat must not have broken the session.
+        let verdict = next_coordinator_msg(&mut ws).await;
+        match verdict {
+            CoordinatorMsg::Accepted { job_id: jid, attestation_uid } => {
+                assert_eq!(jid, job_id);
+                assert_eq!(attestation_uid, PLACEHOLDER_ATTESTATION_UID);
+            }
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+
+        // /stats reflects the completed job.
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 1, "completed count must be 1 after ws heartbeat test");
     }
 
     // ---- idempotent + gated submit ----
