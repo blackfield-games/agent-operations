@@ -131,8 +131,34 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     tracing::info!(bind = %args.bind, "coordinator up");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolve when the process receives a shutdown signal — `SIGINT` (Ctrl-C)
+/// on any platform, or `SIGTERM` on unix (Render sends SIGTERM on stop).
+/// Awaited by axum's graceful shutdown so in-flight requests and ws sessions
+/// drain before exit.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received; draining in-flight work");
 }
 
 /// Current time as epoch seconds. Saturates to 0 if the clock is before the
