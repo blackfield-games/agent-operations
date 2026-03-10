@@ -51,6 +51,12 @@ struct Args {
     /// the terminal `failed` state and removed from the active queue forever.
     #[arg(long, env = "COORDINATOR_MAX_ATTEMPTS", default_value = "5")]
     max_attempts: u32,
+    /// An earner is counted in `/stats` and kept in the in-memory registry only
+    /// while it has been seen within this many seconds. Refreshed on Hello, on
+    /// any websocket frame, on a periodic liveness tick while a ws earner is
+    /// idle, and on an authenticated HTTP submit. Past it, the reaper prunes it.
+    #[arg(long, env = "COORDINATOR_EARNER_TTL_SECS", default_value = "60")]
+    earner_ttl_secs: u64,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -61,6 +67,16 @@ struct EarnerInfo {
     gpu_model: String,
     vram_gb: u32,
     supported: Vec<JobKind>,
+    /// Unix epoch seconds of the last sign of life from this earner.
+    last_seen: i64,
+}
+
+impl EarnerInfo {
+    /// True if this earner has been seen within `ttl_secs` of `now` (both epoch
+    /// seconds). Saturating sub so a backward clock step can't underflow.
+    fn is_live(&self, now: i64, ttl_secs: i64) -> bool {
+        now.saturating_sub(self.last_seen) <= ttl_secs
+    }
 }
 
 struct AppState {
@@ -71,13 +87,16 @@ struct AppState {
     /// Maximum dispatch attempts before a job is dead-lettered to `failed`.
     /// Mirrors `--max-attempts` / `COORDINATOR_MAX_ATTEMPTS`.
     max_attempts: u32,
+    /// How long (seconds) an earner stays counted in `/stats` after its last
+    /// sign of life. Mirrors `--earner-ttl-secs` / `COORDINATOR_EARNER_TTL_SECS`.
+    earner_ttl_secs: i64,
 }
 
 impl AppState {
     /// Build state backed by `store`. Seeds one job only when the DB has no
     /// jobs yet, so a fresh DB gives earners something to do while a restart
     /// with existing jobs does NOT double-seed.
-    fn with_store(store: Store, max_attempts: u32) -> Result<Arc<Self>> {
+    fn with_store(store: Store, max_attempts: u32, earner_ttl_secs: i64) -> Result<Arc<Self>> {
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -91,6 +110,7 @@ impl AppState {
             store: Mutex::new(store),
             earners: Mutex::new(HashMap::new()),
             max_attempts,
+            earner_ttl_secs,
         }))
     }
 }
@@ -119,7 +139,7 @@ async fn main() -> Result<()> {
     let store = Store::open(&args.db)?;
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
     // `with_store` also reclaims jobs left in_flight by a previous crash.
-    let state = AppState::with_store(store, args.max_attempts)?;
+    let state = AppState::with_store(store, args.max_attempts, args.earner_ttl_secs as i64)?;
     tracing::info!(db = %args.db, "store ready");
 
     // Background reaper: periodically requeue in-flight jobs past their
@@ -170,6 +190,19 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Remove earners not seen within `ttl_secs` of `now` (epoch seconds), returning
+/// the number removed. Keeps the in-memory earner registry bounded as ws sessions
+/// end and HTTP earners go quiet.
+fn prune_stale_earners(
+    earners: &mut std::collections::HashMap<String, EarnerInfo>,
+    now: i64,
+    ttl_secs: i64,
+) -> usize {
+    let before = earners.len();
+    earners.retain(|_, info| info.is_live(now, ttl_secs));
+    before - earners.len()
+}
+
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
 /// attempts). Logs requeued and dead-lettered counts separately; store errors
@@ -180,23 +213,33 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
         loop {
             tick.tick().await;
             let max_attempts = state.max_attempts;
-            let store = state.store.lock().await;
-            match store.reap_expired(now_secs(), max_attempts) {
-                Ok(outcome) => {
-                    if !outcome.requeued.is_empty() {
-                        tracing::info!(
-                            count = outcome.requeued.len(),
-                            "requeued expired in-flight jobs"
-                        );
+            {
+                let store = state.store.lock().await;
+                match store.reap_expired(now_secs(), max_attempts) {
+                    Ok(outcome) => {
+                        if !outcome.requeued.is_empty() {
+                            tracing::info!(
+                                count = outcome.requeued.len(),
+                                "requeued expired in-flight jobs"
+                            );
+                        }
+                        if !outcome.failed.is_empty() {
+                            tracing::warn!(
+                                count = outcome.failed.len(),
+                                "dead-lettered jobs (max attempts exhausted)"
+                            );
+                        }
                     }
-                    if !outcome.failed.is_empty() {
-                        tracing::warn!(
-                            count = outcome.failed.len(),
-                            "dead-lettered jobs (max attempts exhausted)"
-                        );
-                    }
+                    Err(e) => tracing::error!(?e, "reaper: reap_expired failed"),
                 }
-                Err(e) => tracing::error!(?e, "reaper: reap_expired failed"),
+            } // store lock dropped here, before we touch earners
+
+            let removed = {
+                let mut earners = state.earners.lock().await;
+                prune_stale_earners(&mut earners, now_secs(), state.earner_ttl_secs)
+            };
+            if removed > 0 {
+                tracing::info!(removed, "pruned stale earners");
             }
         }
     });
@@ -248,16 +291,23 @@ async fn register(
     tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered");
     state.earners.lock().await.insert(
         earner_address,
-        EarnerInfo { gpu_model, vram_gb, supported },
+        EarnerInfo { gpu_model, vram_gb, supported, last_seen: now_secs() },
     );
     Ok("registered")
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, StatusCode> {
+    let now = now_secs();
+    let ttl = state.earner_ttl_secs;
     let earners = state.earners.lock().await;
+    let mut gpus_joined: usize = 0;
     let mut total_vram_gb: u64 = 0;
     let mut supported_breakdown: HashMap<JobKind, usize> = HashMap::new();
     for info in earners.values() {
+        if !info.is_live(now, ttl) {
+            continue;
+        }
+        gpus_joined += 1;
         total_vram_gb += info.vram_gb as u64;
         for kind in &info.supported {
             *supported_breakdown.entry(*kind).or_insert(0) += 1;
@@ -278,7 +328,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             }
         };
     Ok(Json(Stats {
-        gpus_joined: earners.len(),
+        gpus_joined,
         total_vram_gb,
         jobs_queued,
         jobs_in_flight,
@@ -317,6 +367,14 @@ async fn submit(
     ) {
         tracing::warn!(?id, earner = %result.earner_address, ?e, "rejected: bad attestation");
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    // Authenticated, live earner: refresh its liveness for /stats. Done before
+    // locking the store so we never hold the earners lock under the store lock.
+    {
+        let now = now_secs();
+        if let Some(info) = state.earners.lock().await.get_mut(&result.earner_address) {
+            info.last_seen = now;
+        }
     }
     // Gate on lifecycle: a result is only valid for a job the earner actually
     // took (which marked it in_flight). Checked after signature verification so
@@ -408,6 +466,7 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     let mut accepted = false;
     // Poll the queue on this cadence when we have nothing offered.
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut last_liveness_bump = now_secs();
 
     loop {
         // If we have no outstanding offer, try to grab a supported job.
@@ -425,7 +484,16 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
 
         tokio::select! {
             // Poll for new jobs while idle.
-            _ = tick.tick(), if offered.is_none() => { continue; }
+            _ = tick.tick(), if offered.is_none() => {
+                let now = now_secs();
+                if now - last_liveness_bump >= 1 {
+                    if let Some(info) = state.earners.lock().await.get_mut(&earner_address) {
+                        info.last_seen = now;
+                    }
+                    last_liveness_bump = now;
+                }
+                continue;
+            }
             incoming = socket.recv() => {
                 let Some(frame) = incoming else { break }; // socket closed
                 let frame = match frame {
@@ -448,6 +516,14 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                         continue;
                     }
                 };
+                // Any decoded frame is a sign of life — refresh liveness for /stats.
+                {
+                    let now = now_secs();
+                    if let Some(info) = state.earners.lock().await.get_mut(&earner_address) {
+                        info.last_seen = now;
+                    }
+                    last_liveness_bump = now;
+                }
                 match msg {
                     EarnerMsg::Hello { .. } => {
                         // Re-hello mid-session is unexpected; log and ignore.
@@ -557,7 +633,7 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
         tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered (ws)");
         state.earners.lock().await.insert(
             earner_address.clone(),
-            EarnerInfo { gpu_model, vram_gb, supported },
+            EarnerInfo { gpu_model, vram_gb, supported, last_seen: now_secs() },
         );
         return Some(earner_address);
     }
@@ -648,7 +724,7 @@ mod tests {
     /// because the in-memory DB starts empty; tests that need an empty queue
     /// drain it first via `/jobs/next` or use `test_state_empty`.
     fn test_state() -> Arc<AppState> {
-        AppState::with_store(Store::open_in_memory().unwrap(), 5).unwrap()
+        AppState::with_store(Store::open_in_memory().unwrap(), 5, 60).unwrap()
     }
 
     /// In-memory state with the auto-seeded job removed, so the queue starts
@@ -1007,7 +1083,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -1035,7 +1111,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -1087,7 +1163,7 @@ mod tests {
         // First "process": take the auto-seeded job in_flight, then drop state.
         let taken_id;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
             let store = state.store.lock().await;
             let job = store.take_next(|_| true).unwrap().expect("seeded job");
             taken_id = job.id;
@@ -1097,7 +1173,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight job on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -1433,6 +1509,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            earner_ttl_secs: 60,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -1466,6 +1543,61 @@ mod tests {
         assert_eq!(
             json["jobs_failed"], 0,
             "jobs_failed must be present and zero when no jobs are dead-lettered"
+        );
+    }
+
+    #[test]
+    fn earner_is_live_at_boundary_then_stale() {
+        let info = EarnerInfo {
+            gpu_model: "RTX 4090".into(),
+            vram_gb: 24,
+            supported: vec![JobKind::Terrain],
+            last_seen: 1000,
+        };
+        assert!(info.is_live(1000, 60), "0s elapsed is live");
+        assert!(info.is_live(1060, 60), "exactly ttl elapsed is still live");
+        assert!(!info.is_live(1061, 60), "ttl+1 elapsed is stale");
+    }
+
+    #[test]
+    fn prune_removes_only_stale_earners() {
+        let mut map: HashMap<String, EarnerInfo> = HashMap::new();
+        map.insert("fresh".into(), EarnerInfo {
+            gpu_model: "a".into(), vram_gb: 24, supported: vec![JobKind::Terrain], last_seen: 1000,
+        });
+        map.insert("stale".into(), EarnerInfo {
+            gpu_model: "b".into(), vram_gb: 16, supported: vec![JobKind::NpcTick], last_seen: 900,
+        });
+        // now=1000, ttl=60: fresh elapsed 0 (live); stale elapsed 100 (>60, dead).
+        let removed = prune_stale_earners(&mut map, 1000, 60);
+        assert_eq!(removed, 1);
+        assert!(map.contains_key("fresh"));
+        assert!(!map.contains_key("stale"));
+    }
+
+    #[tokio::test]
+    async fn stats_excludes_stale_earners() {
+        let state = test_state_empty().await;
+        // Register via HTTP — freshly seen, so it counts.
+        let msg = hello("0xabc", 24, vec![JobKind::Terrain]);
+        let resp = post_json(state.clone(), "/register", &serde_json::to_value(&msg).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 1);
+        assert_eq!(json["total_vram_gb"], 24);
+
+        // Force last_seen far into the past → stale (default ttl in test_state is 60).
+        {
+            let mut earners = state.earners.lock().await;
+            earners.get_mut("0xabc").unwrap().last_seen = 0;
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 0, "stale earner must drop out of gpus_joined");
+        assert_eq!(json["total_vram_gb"], 0, "stale earner's vram must not be counted");
+        let terrain = &json["supported_breakdown"]["terrain"];
+        assert!(
+            terrain.is_null() || terrain == &serde_json::json!(0),
+            "stale earner's supported kind must not be counted, got {terrain:?}"
         );
     }
 
