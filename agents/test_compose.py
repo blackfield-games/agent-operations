@@ -9,7 +9,7 @@ Run from the agents/ dir:
     .venv/bin/python -m pytest test_compose.py -v
 """
 
-from common.compose import compose_world
+from common.compose import compose_world, STRENGTH_ORDER
 from common.types import LayerSpec
 from runtime.supervisor import merge_layers
 
@@ -68,3 +68,59 @@ def test_compose_world_emits_one_sublayer_per_layer(tmp_path):
 
     assert text.count("@./terrain/a.usda@") == 1
     assert text.count("@./biome/a.usda@") == 1
+
+
+def test_strength_order_is_exactly_locked():
+    assert STRENGTH_ORDER == [
+        "validator",
+        "optimization",
+        "lighting",
+        "prop",
+        "npc",
+        "biome",
+        "terrain",
+        "director",
+    ]
+    assert STRENGTH_ORDER[0] == "validator", "validator must be strongest (last word)"
+    assert STRENGTH_ORDER[-1] == "director", "director must be weakest (base intent)"
+    assert len(STRENGTH_ORDER) == len(set(STRENGTH_ORDER))
+
+
+def test_compose_orders_sublayers_strongest_first_regardless_of_input_order(tmp_path):
+    # Build one LayerSpec per specialist, then pass them in REVERSED (weakest-first) order.
+    # compose_world must fix the order itself — the caller cannot be relied upon.
+    region = "r+0042_-0017_l0"
+    layers = [
+        LayerSpec(specialist=s, region_id=region, path=f"{s}/{s}.usda", summary=s, metrics={})
+        for s in reversed(STRENGTH_ORDER)
+    ]
+    root = compose_world(layers, tmp_path)
+    text = root.read_text()
+
+    positions = [text.index(f"@./{s}/{s}.usda@") for s in STRENGTH_ORDER]
+    assert positions == sorted(positions)
+    assert all(positions[i] < positions[i + 1] for i in range(len(positions) - 1))
+
+
+def test_stronger_specialist_wins_on_conflict(tmp_path):
+    """Earlier-listed subLayers are stronger in USD, so a stronger specialist's
+    opinion overrides a weaker one's on the same prim. For each (strong, weak)
+    pair, compose_world must list the stronger specialist's layer first regardless
+    of the order the layers are passed in.
+    """
+    pairs = [
+        ("validator", "director"),
+        ("optimization", "npc"),
+        ("lighting", "terrain"),
+        ("prop", "biome"),
+    ]
+    region = "r+0042_-0017_l0"
+    for strong, weak in pairs:
+        out_dir = tmp_path / f"{strong}_{weak}"
+        layers = [
+            LayerSpec(specialist=weak, region_id=region, path=f"{weak}/x.usda", summary=weak, metrics={}),
+            LayerSpec(specialist=strong, region_id=region, path=f"{strong}/x.usda", summary=strong, metrics={}),
+        ]
+        root = compose_world(layers, out_dir)
+        text = root.read_text()
+        assert text.index(f"@./{strong}/x.usda@") < text.index(f"@./{weak}/x.usda@")
