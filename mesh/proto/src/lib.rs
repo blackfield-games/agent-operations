@@ -45,6 +45,19 @@ impl JobKind {
             JobKind::Optimization => 4,
         }
     }
+
+    /// Inverse of [`JobKind::as_u16`]: map an on-chain numeric tag back to a
+    /// variant, or `None` if out of range. Keep in lockstep with `as_u16`.
+    pub fn from_u16(v: u16) -> Option<JobKind> {
+        match v {
+            0 => Some(JobKind::Terrain),
+            1 => Some(JobKind::Foliage),
+            2 => Some(JobKind::NpcTick),
+            3 => Some(JobKind::DiffusionTile),
+            4 => Some(JobKind::Optimization),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +205,23 @@ mod tests {
         assert_eq!(JobKind::NpcTick.as_u16(), 2);
         assert_eq!(JobKind::DiffusionTile.as_u16(), 3);
         assert_eq!(JobKind::Optimization.as_u16(), 4);
+    }
+
+    #[test]
+    fn jobkind_from_u16_is_inverse_of_as_u16() {
+        let all = [
+            JobKind::Terrain,
+            JobKind::Foliage,
+            JobKind::NpcTick,
+            JobKind::DiffusionTile,
+            JobKind::Optimization,
+        ];
+        for k in all {
+            assert_eq!(JobKind::from_u16(k.as_u16()), Some(k), "from_u16 must invert as_u16 for {k:?}");
+        }
+        // Out-of-range numeric tags map to no variant.
+        assert_eq!(JobKind::from_u16(5), None);
+        assert_eq!(JobKind::from_u16(u16::MAX), None);
     }
 
     #[test]
