@@ -115,6 +115,13 @@ impl AppState {
     }
 }
 
+/// Lifecycle status of a single job, for the HUD + observability.
+#[derive(Debug, Serialize)]
+struct JobStatusResponse {
+    id: Uuid,
+    status: String,
+}
+
 /// Aggregate mesh stats. Backs the wedge requirement
 /// "Mesh GPUs joined count exposed at /stats".
 #[derive(Debug, Serialize)]
@@ -263,6 +270,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/stats", get(stats))
         .route("/jobs/next", get(next_job))
         .route("/jobs/{id}/submit", post(submit))
+        .route("/jobs/{id}/status", get(job_status))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -344,6 +352,24 @@ async fn next_job(State(state): State<Arc<AppState>>) -> Result<Json<Option<JobS
         Ok(job) => Ok(Json(job)),
         Err(e) => {
             tracing::error!(?e, "next_job: take_next failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// `GET /jobs/{id}/status` — returns `{ "id": <uuid>, "status": ... }` for a
+/// known job (status is one of queued/in_flight/done/failed), 404 for an
+/// unknown id, 500 on a store error. Read-only; takes no write locks.
+async fn job_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JobStatusResponse>, StatusCode> {
+    let store = state.store.lock().await;
+    match store.job_status(&id) {
+        Ok(Some(status)) => Ok(Json(JobStatusResponse { id, status })),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!(?id, ?e, "job_status: lookup failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1599,6 +1625,42 @@ mod tests {
             terrain.is_null() || terrain == &serde_json::json!(0),
             "stale earner's supported kind must not be counted, got {terrain:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn job_status_endpoint_reports_lifecycle() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        // queued
+        let resp = get(state.clone(), &format!("/jobs/{job_id}/status")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "queued");
+        assert_eq!(json["id"], job_id.to_string());
+
+        // in_flight after a poll
+        state.store.lock().await.take_next(|_| true).unwrap();
+        let json = body_json(get(state.clone(), &format!("/jobs/{job_id}/status")).await).await;
+        assert_eq!(json["status"], "in_flight");
+
+        // done after a valid submit
+        let good = signed_result(job_id, "deadbeef");
+        let resp = post_json(state.clone(), &format!("/jobs/{job_id}/submit"),
+            &serde_json::to_value(&good).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(get(state.clone(), &format!("/jobs/{job_id}/status")).await).await;
+        assert_eq!(json["status"], "done");
+    }
+
+    #[tokio::test]
+    async fn job_status_endpoint_404_for_unknown_job() {
+        let state = test_state_empty().await;
+        let unknown = Uuid::new_v4();
+        let resp = get(state.clone(), &format!("/jobs/{unknown}/status")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
