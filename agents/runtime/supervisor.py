@@ -11,6 +11,7 @@ Temporal activity (see runtime/workflow.py) so individual steps survive crashes.
 """
 
 from __future__ import annotations
+import logging
 from typing import TypedDict, Annotated
 
 from langgraph.graph import StateGraph, END
@@ -24,6 +25,8 @@ from lighting import lighting
 from npc import npc
 from optimization import optimization
 from validator import validator
+
+logger = logging.getLogger(__name__)
 
 
 def merge_layers(existing: list[LayerSpec], new: list[LayerSpec]) -> list[LayerSpec]:
@@ -67,7 +70,14 @@ SPECIALISTS = {
 def _make_specialist_node(name: str):
     async def node(state: State) -> dict:
         fn = SPECIALISTS[name]
-        layer = await fn(state["brief"], state.get("layers", []))
+        try:
+            layer = await fn(state["brief"], state.get("layers", []))
+        except Exception:
+            # A specialist raising must not tank the whole region compose: log it
+            # and contribute no sublayer. The validator then sees the missing
+            # layer and can route back to this specialist on the next round.
+            logger.exception("specialist %r failed; isolating as an empty sublayer", name)
+            return {"layers": []}
         return {"layers": [layer] if layer else []}
     return node
 
