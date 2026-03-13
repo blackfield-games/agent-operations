@@ -293,7 +293,12 @@ where
                 tracing::info!(%job_id, %attestation_uid, "result accepted");
             }
             CoordinatorMsg::Rejected { job_id, reason } => {
-                tracing::warn!(%job_id, %reason, "result rejected");
+                // Dropped cleanly: we never recorded it as done, and the
+                // coordinator requeues the job for another earner (or
+                // dead-letters it after max attempts). There is nothing to
+                // retry here — we simply await the next offer, so a rejection
+                // can't busy-loop the earner.
+                tracing::warn!(%job_id, %reason, "result rejected; dropping job");
             }
         }
     }
@@ -409,6 +414,16 @@ async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> R
     Ok(())
 }
 
+/// Whether a finished poll cycle should poll again immediately. A successful
+/// submit (2xx) means there may be more work, so re-poll promptly (`true`). A
+/// coordinator-rejected submit (any non-2xx — 401 bad attestation, 404 unknown
+/// job, 409 not in-flight / already done) is dropped cleanly and the caller
+/// backs off (`false`), so a persistent rejection (e.g. a misconfigured session
+/// key) can't spin a tight render→submit→reject loop.
+fn keep_polling_after_submit(status: reqwest::StatusCode) -> bool {
+    status.is_success()
+}
+
 async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> Result<bool> {
     let url = format!("{}/jobs/next", args.coordinator);
     let job: Option<JobSpec> = client.get(&url).send().await?.json().await?;
@@ -434,8 +449,16 @@ async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> 
 
     let submit_url = format!("{}/jobs/{}/submit", args.coordinator, job.id);
     let resp = client.post(&submit_url).json(&result).send().await?;
-    tracing::info!(status = %resp.status(), "submitted");
-    Ok(true)
+    let status = resp.status();
+    if status.is_success() {
+        tracing::info!(%status, job_id = %job.id, "submitted");
+    } else {
+        // The coordinator gated the submit (401 bad attestation, 404 unknown
+        // job, 409 not in-flight / already done). Drop the job cleanly — it is
+        // NOT counted as done — and back off rather than re-polling at once.
+        tracing::warn!(%status, job_id = %job.id, "submit rejected; dropping job");
+    }
+    Ok(keep_polling_after_submit(status))
 }
 
 #[cfg(test)]
@@ -488,5 +511,18 @@ mod tests {
         // The shift would overflow a naive `1 << (n - 1)`; we must saturate.
         assert_eq!(backoff_delay(100, 30), Duration::from_secs(30));
         assert_eq!(backoff_delay(u32::MAX, 30), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn keep_polling_only_after_a_successful_submit() {
+        use reqwest::StatusCode;
+        // A successful submit may be followed by more work: re-poll promptly.
+        assert!(keep_polling_after_submit(StatusCode::OK));
+        assert!(keep_polling_after_submit(StatusCode::CREATED));
+        // Coordinator submit-gate rejections must back off, not re-poll, so a
+        // persistent rejection can't spin a tight render→submit→reject loop.
+        assert!(!keep_polling_after_submit(StatusCode::UNAUTHORIZED)); // 401 bad attestation
+        assert!(!keep_polling_after_submit(StatusCode::NOT_FOUND)); // 404 unknown job
+        assert!(!keep_polling_after_submit(StatusCode::CONFLICT)); // 409 not in-flight/done
     }
 }
