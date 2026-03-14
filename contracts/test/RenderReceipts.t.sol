@@ -80,6 +80,7 @@ contract RenderReceiptsTest is Test {
         assertEq(address(receipts.EAS()), address(eas));
         assertEq(receipts.owner(), owner);
         assertEq(receipts.schemaUid(), bytes32(0));
+        assertEq(receipts.receiptCount(), 0);
     }
 
     // --- registerSchema ---
@@ -210,6 +211,22 @@ contract RenderReceiptsTest is Test {
         assertEq(dJobKind, jobKind);
         assertEq(dOutputHash, outputHash);
         assertEq(dRegionId, regionId);
+    }
+
+    function test_issueReceipt_incrementsReceiptCount() public {
+        _arm();
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, keccak256("j1"), 10, 0, bytes32(0), bytes32(0));
+        assertEq(receipts.receiptCount(), 1);
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, keccak256("j2"), 10, 0, bytes32(0), bytes32(0));
+        assertEq(receipts.receiptCount(), 2);
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, keccak256("j3"), 10, 0, bytes32(0), bytes32(0));
+        assertEq(receipts.receiptCount(), 3);
     }
 
     function test_issueReceipt_deauthorizedCoordinatorReverts() public {

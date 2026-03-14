@@ -71,4 +71,22 @@ contract ComputeMeterTest is Test {
         vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
         meter.spend(buyer, 100 ether, bytes32(0));
     }
+
+    function test_totalBurned_accumulates() public {
+        assertEq(meter.totalBurned(), 0);
+
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        token.approve(address(meter), 50 ether);
+        meter.deposit(50 ether);
+        vm.stopPrank();
+
+        assertEq(meter.totalBurned(), 150 ether);
+
+        vm.prank(spender);
+        meter.spend(buyer, 40 ether, keccak256("j"));
+
+        assertEq(meter.totalBurned(), 150 ether);
+    }
 }

@@ -49,6 +49,9 @@ interface ISchemaRegistry {
 contract RenderReceipts is Ownable2Step {
     IEAS public immutable EAS;
     bytes32 public schemaUid;
+    /// @notice Running count of issued receipts (EAS render attestations).
+    ///         The HUD reads this for the total number of validated render jobs.
+    uint256 public receiptCount;
     mapping(address coordinator => bool authorized) public authorizedCoordinators;
 
     event ReceiptIssued(
@@ -106,6 +109,7 @@ contract RenderReceipts is Ownable2Step {
             })
         );
 
+        ++receiptCount;
         emit ReceiptIssued(uid, earner, jobId, jobKind, renderSeconds);
     }
 }

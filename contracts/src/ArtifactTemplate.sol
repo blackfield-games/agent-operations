@@ -22,6 +22,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
 
     event TemplateRegistered(uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest);
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
+    event MinterSet(address indexed minter);
 
     error NotMinter();
     error UnknownTemplate();
@@ -30,6 +31,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
 
     function setMinter(address minter_) external onlyOwner {
         minter = minter_;
+        emit MinterSet(minter_);
     }
 
     function setURI(string calldata newURI) external onlyOwner {

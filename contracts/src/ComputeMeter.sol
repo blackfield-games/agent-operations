@@ -18,6 +18,9 @@ contract ComputeMeter is Ownable2Step {
 
     mapping(address buyer => uint256 credit) public credit;
     mapping(address spender => bool authorized) public authorizedSpenders;
+    /// @notice Cumulative $BLCKFLD burned into compute credit across all buyers.
+    ///         A global HUD metric ("total compute purchased").
+    uint256 public totalBurned;
 
     event Deposited(address indexed buyer, uint256 amount, uint256 newCredit);
     event Spent(address indexed buyer, address indexed spender, uint256 amount, bytes32 jobId);
@@ -35,6 +38,7 @@ contract ComputeMeter is Ownable2Step {
         TOKEN.safeTransferFrom(msg.sender, BURN_ADDRESS, amount);
         unchecked {
             credit[msg.sender] += amount;
+            totalBurned += amount;
         }
         emit Deposited(msg.sender, amount, credit[msg.sender]);
     }

@@ -18,6 +18,7 @@ contract ArtifactTemplateTest is Test {
 
     event TemplateRegistered(uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest);
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
+    event MinterSet(address indexed minter);
 
     function setUp() public {
         art = new ArtifactTemplate(owner, BASE_URI);
@@ -46,6 +47,13 @@ contract ArtifactTemplateTest is Test {
         vm.prank(owner);
         art.setMinter(stranger);
         assertEq(art.minter(), stranger);
+    }
+
+    function test_setMinter_emits() public {
+        vm.expectEmit(true, false, false, true);
+        emit MinterSet(stranger);
+        vm.prank(owner);
+        art.setMinter(stranger);
     }
 
     // --- setURI ---
