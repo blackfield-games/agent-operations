@@ -10,7 +10,7 @@
 //! feature so no system SQLite is required.
 
 use anyhow::Result;
-use proto::{JobResult, JobSpec};
+use proto::{JobKind, JobResult, JobSpec};
 use rusqlite::Connection;
 
 /// Job lifecycle in the `jobs` table.
@@ -326,6 +326,26 @@ impl Store {
                 other => Err(other),
             })?;
         Ok(status)
+    }
+
+    /// Most-recent jobs (rowid DESC) capped at `limit`, as `(id, kind, status)`
+    /// triples for the `GET /jobs` listing. Empty when no jobs exist.
+    pub fn list_jobs(&self, limit: usize) -> Result<Vec<(uuid::Uuid, JobKind, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT spec_json, status FROM jobs ORDER BY rowid DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let spec_json: String = row.get(0)?;
+            let status: String = row.get(1)?;
+            Ok((spec_json, status))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (spec_json, status) = row?;
+            let job: JobSpec = serde_json::from_str(&spec_json)?;
+            out.push((job.id, job.kind, status));
+        }
+        Ok(out)
     }
 
     /// Count of jobs currently in the `queued` state (for `/stats`).

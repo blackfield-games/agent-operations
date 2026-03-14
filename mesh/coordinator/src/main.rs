@@ -122,6 +122,14 @@ struct JobStatusResponse {
     status: String,
 }
 
+/// One row of the `GET /jobs` listing: the HUD/ops recent-jobs view.
+#[derive(Debug, Serialize)]
+struct JobSummary {
+    id: Uuid,
+    kind: JobKind,
+    status: String,
+}
+
 /// Aggregate mesh stats. Backs the wedge requirement
 /// "Mesh GPUs joined count exposed at /stats".
 #[derive(Debug, Serialize)]
@@ -268,6 +276,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/stats", get(stats))
+        .route("/jobs", get(list_jobs))
         .route("/jobs/next", get(next_job))
         .route("/jobs/{id}/submit", post(submit))
         .route("/jobs/{id}/status", get(job_status))
@@ -370,6 +379,29 @@ async fn job_status(
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!(?id, ?e, "job_status: lookup failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Upper bound on rows returned by `GET /jobs`, to keep the payload bounded.
+const RECENT_JOBS_LIMIT: usize = 100;
+
+/// `GET /jobs` — most-recent jobs (capped at `RECENT_JOBS_LIMIT`) as a JSON
+/// array of `{ id, kind, status }`, newest first. Empty array if none; 500 on
+/// a store error. Read-only; takes a single store lock.
+async fn list_jobs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<JobSummary>>, StatusCode> {
+    let store = state.store.lock().await;
+    match store.list_jobs(RECENT_JOBS_LIMIT) {
+        Ok(rows) => Ok(Json(
+            rows.into_iter()
+                .map(|(id, kind, status)| JobSummary { id, kind, status })
+                .collect(),
+        )),
+        Err(e) => {
+            tracing::error!(?e, "list_jobs: store query failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
@@ -1661,6 +1693,96 @@ mod tests {
         let unknown = Uuid::new_v4();
         let resp = get(state.clone(), &format!("/jobs/{unknown}/status")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- GET /jobs listing ----
+
+    #[tokio::test]
+    async fn list_jobs_returns_enqueued_shape() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+
+        let terrain_job = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Terrain,
+            region: RegionCoord { x: 1, y: 2, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({"heightfield_seed": 1u64}),
+        };
+        let foliage_job = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Foliage,
+            region: RegionCoord { x: 3, y: 4, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({"density": 0.5}),
+        };
+
+        enqueue(&state, &terrain_job).await;
+        enqueue(&state, &foliage_job).await;
+
+        let resp = get(state.clone(), "/jobs").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // newest first: foliage was enqueued last
+        assert_eq!(arr[0]["kind"], "foliage");
+        assert_eq!(arr[1]["kind"], "terrain");
+        assert!(!arr[0]["id"].is_null());
+        assert!(!arr[1]["id"].is_null());
+        assert_eq!(arr[0]["status"], "queued");
+        assert_eq!(arr[1]["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn list_jobs_empty_is_empty_array() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        let resp = get(state.clone(), "/jobs").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_jobs_caps_at_limit() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+
+        let mut ids = Vec::new();
+        for i in 0..5u64 {
+            let job = JobSpec {
+                id: Uuid::new_v4(),
+                kind: JobKind::Terrain,
+                region: RegionCoord { x: i as i32, y: 0, layer: 0 },
+                deadline_secs: 60,
+                max_payout_wei: "1000000000000000000".into(),
+                inputs: serde_json::json!({"heightfield_seed": i}),
+            };
+            ids.push(job.id);
+            enqueue(&state, &job).await;
+        }
+
+        let rows = state.store.lock().await.list_jobs(3).unwrap();
+        assert_eq!(rows.len(), 3);
+        // newest first: last 3 ids enqueued are ids[4], ids[3], ids[2]
+        assert_eq!(rows[0].0, ids[4]);
+        assert_eq!(rows[1].0, ids[3]);
+        assert_eq!(rows[2].0, ids[2]);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
