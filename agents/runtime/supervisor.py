@@ -54,6 +54,7 @@ class State(TypedDict, total=False):
     verdict: ValidatorVerdict
     route_back: str  # specialist name if validator wants a re-run
     rounds: int
+    validator_errored: bool  # set when the validator node itself raised
 
 
 SPECIALISTS = {
@@ -110,13 +111,28 @@ def _failing_specialist(issues: list[str]) -> str:
 
 
 async def _validator_node(state: State) -> dict:
-    verdict = await validator.run(state["brief"], state.get("layers", []))
+    try:
+        verdict = await validator.run(state["brief"], state.get("layers", []))
+    except Exception:
+        # A crashing validator (e.g. the Dev C validation service is
+        # unavailable) must not propagate and tank the region compose —
+        # mirror the specialist isolation. Record a non-accepted verdict and
+        # flag the error so _after_validator ENDs gracefully: re-running the
+        # pipeline can't fix an unavailable validator, so we don't route back.
+        logger.exception("validator failed; ending compose with a non-accepted verdict")
+        return {
+            "verdict": ValidatorVerdict(accepted=False, issues=["validator errored"]),
+            "rounds": state.get("rounds", 0) + 1,
+            "validator_errored": True,
+        }
     return {"verdict": verdict, "rounds": state.get("rounds", 0) + 1}
 
 
 def _after_validator(state: State) -> str:
     verdict = state.get("verdict")
     if not verdict:
+        return END
+    if state.get("validator_errored"):  # validator itself raised — END, don't loop
         return END
     if verdict.accepted:
         return END

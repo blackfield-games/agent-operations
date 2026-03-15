@@ -7,7 +7,8 @@ Run from the agents/ dir:
 """
 
 import runtime.supervisor as sup
-from common.types import LayerSpec
+from common.types import LayerSpec, ValidatorVerdict
+from langgraph.graph import END
 
 
 async def test_failing_specialist_is_isolated_not_fatal(monkeypatch):
@@ -46,3 +47,30 @@ async def test_specialist_node_empty_when_specialist_returns_none(monkeypatch):
     node = sup._make_specialist_node("terrain")
     out = await node({"brief": object(), "layers": []})
     assert out == {"layers": []}
+
+
+async def test_validator_node_isolates_a_raising_validator(monkeypatch):
+    async def boom(brief, layers):
+        raise RuntimeError("validator exploded")
+    monkeypatch.setattr(sup.validator, "run", boom)
+    out = await sup._validator_node({"brief": object(), "layers": []})
+    assert out["validator_errored"] is True
+    assert out["verdict"].accepted is False
+    assert out["rounds"] == 1
+
+
+def test_after_validator_ends_on_validator_error():
+    state = {"verdict": ValidatorVerdict(accepted=False, issues=["x"]),
+             "validator_errored": True, "rounds": 1}
+    assert sup._after_validator(state) == END
+
+
+async def test_validator_node_passes_through_a_normal_verdict(monkeypatch):
+    verdict = ValidatorVerdict(accepted=True)
+    async def ok(brief, layers):
+        return verdict
+    monkeypatch.setattr(sup.validator, "run", ok)
+    out = await sup._validator_node({"brief": object(), "layers": []})
+    assert out["verdict"] is verdict
+    assert out.get("validator_errored") is None
+    assert out["rounds"] == 1
