@@ -143,6 +143,8 @@ struct Stats {
     jobs_failed: usize,
     /// How many registered earners advertise support for each job kind.
     supported_breakdown: HashMap<JobKind, usize>,
+    /// Backlog composition: how many QUEUED jobs of each kind are waiting.
+    queued_by_kind: HashMap<JobKind, usize>,
 }
 
 #[tokio::main]
@@ -344,6 +346,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
         };
+    let queued_by_kind = match store.queued_count_by_kind() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "stats: queued_count_by_kind failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -352,6 +361,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         jobs_completed,
         jobs_failed,
         supported_breakdown,
+        queued_by_kind,
     }))
 }
 
@@ -1783,6 +1793,46 @@ mod tests {
         assert_eq!(rows[0].0, ids[4]);
         assert_eq!(rows[1].0, ids[3]);
         assert_eq!(rows[2].0, ids[2]);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_queued_by_kind() {
+        let state = test_state_empty().await;
+        // enqueue 2 Terrain + 1 Foliage, all queued
+        let terrain1 = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Terrain,
+            region: RegionCoord { x: 1, y: 2, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({"heightfield_seed": 1u64}),
+        };
+        let terrain2 = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Terrain,
+            region: RegionCoord { x: 3, y: 4, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({"heightfield_seed": 2u64}),
+        };
+        let foliage1 = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Foliage,
+            region: RegionCoord { x: 5, y: 6, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({"density": 0.5}),
+        };
+        enqueue(&state, &terrain1).await;
+        enqueue(&state, &terrain2).await;
+        enqueue(&state, &foliage1).await;
+        let resp = get(state.clone(), "/stats").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["queued_by_kind"]["terrain"], 2);
+        assert_eq!(json["queued_by_kind"]["foliage"], 1);
+        // a kind with no queued jobs is absent from the map (serde_json: missing key -> null)
+        assert!(json["queued_by_kind"]["optimization"].is_null());
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
