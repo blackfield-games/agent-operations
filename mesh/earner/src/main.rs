@@ -34,13 +34,7 @@ enum Mode {
 
 /// All supported job kinds, advertised in `Hello` for both transports.
 fn all_supported() -> Vec<JobKind> {
-    vec![
-        JobKind::Terrain,
-        JobKind::Foliage,
-        JobKind::NpcTick,
-        JobKind::DiffusionTile,
-        JobKind::Optimization,
-    ]
+    JobKind::ALL.to_vec()
 }
 
 /// Dev-only default session key. This is a well-known test private key (not

@@ -58,6 +58,54 @@ impl JobKind {
             _ => None,
         }
     }
+
+    /// All variants in numeric (`as_u16`) order — the single source of truth for
+    /// the full set (earner capability lists, stats breakdowns, …).
+    pub const ALL: [JobKind; 5] = [
+        JobKind::Terrain,
+        JobKind::Foliage,
+        JobKind::NpcTick,
+        JobKind::DiffusionTile,
+        JobKind::Optimization,
+    ];
+
+    /// The canonical snake_case tag — identical to the serde representation.
+    /// Inverse of the `FromStr` impl below.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobKind::Terrain => "terrain",
+            JobKind::Foliage => "foliage",
+            JobKind::NpcTick => "npc_tick",
+            JobKind::DiffusionTile => "diffusion_tile",
+            JobKind::Optimization => "optimization",
+        }
+    }
+}
+
+/// Error returned by `<JobKind as std::str::FromStr>::from_str` for an unknown tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseJobKindError;
+
+impl std::fmt::Display for ParseJobKindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unknown JobKind tag")
+    }
+}
+
+impl std::error::Error for ParseJobKindError {}
+
+impl std::str::FromStr for JobKind {
+    type Err = ParseJobKindError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "terrain" => Ok(JobKind::Terrain),
+            "foliage" => Ok(JobKind::Foliage),
+            "npc_tick" => Ok(JobKind::NpcTick),
+            "diffusion_tile" => Ok(JobKind::DiffusionTile),
+            "optimization" => Ok(JobKind::Optimization),
+            _ => Err(ParseJobKindError),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +179,7 @@ pub enum EarnerMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 
     /// Derive an Ethereum-style address (0x-prefixed, lowercase) from a
@@ -395,5 +444,34 @@ mod tests {
             RegionCoord { x: -3, y: 100, layer: 2 }.region_id(),
             "r-0003_+0100_l2"
         );
+    }
+
+    #[test]
+    fn jobkind_as_str_matches_serde_tag() {
+        for k in JobKind::ALL {
+            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.as_str()),
+                "as_str disagrees with serde tag for {k:?}");
+        }
+    }
+
+    #[test]
+    fn jobkind_from_str_inverts_as_str() {
+        for k in JobKind::ALL {
+            assert_eq!(JobKind::from_str(k.as_str()), Ok(k), "from_str must invert as_str for {k:?}");
+        }
+        assert!(JobKind::from_str("nope").is_err());
+        assert!(JobKind::from_str("").is_err());
+    }
+
+    #[test]
+    fn jobkind_all_is_in_numeric_order() {
+        assert_eq!(
+            JobKind::ALL,
+            [JobKind::Terrain, JobKind::Foliage, JobKind::NpcTick, JobKind::DiffusionTile, JobKind::Optimization]
+        );
+        for (i, k) in JobKind::ALL.iter().enumerate() {
+            assert_eq!(k.as_u16() as usize, i, "ALL not in as_u16 order at {i}");
+        }
+        assert_eq!(JobKind::ALL.len(), 5);
     }
 }
