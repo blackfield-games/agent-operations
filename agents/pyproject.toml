@@ -30,6 +30,12 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Dev B owns common/, runtime/, and the test suite. The specialist packages are
+# Dev C stubs we wire around but never edit, so they sit outside our lint gate.
+extend-exclude = [
+    "director", "terrain", "biome", "prop",
+    "lighting", "npc", "optimization", "validator",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

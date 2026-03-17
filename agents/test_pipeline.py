@@ -7,7 +7,6 @@ Run from the agents/ dir:
 """
 
 import pytest
-from pathlib import Path
 
 from common.types import WorldBrief, RegionCoord
 from common.compose import compose_world

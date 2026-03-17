@@ -52,8 +52,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Minimal install: what the runtime + tests actually import. The heavy
-      # infra deps in pyproject (ray, usd-core, temporalio) aren't exercised by
-      # the test suite, so we skip them to keep CI fast.
-      - run: pip install langgraph pydantic anyio pytest pytest-asyncio
+          cache: pip
+          cache-dependency-path: agents/pyproject.toml
+      # Minimal install: what the runtime + tests actually import, plus ruff for
+      # the lint gate. The heavy infra deps in pyproject (ray, usd-core,
+      # temporalio) aren't exercised by the test suite, so we skip them to keep
+      # CI fast.
+      - run: pip install langgraph pydantic anyio pytest pytest-asyncio ruff
+      - run: ruff check .
       - run: python -m pytest -q

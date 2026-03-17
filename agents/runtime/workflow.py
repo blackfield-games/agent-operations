@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import timedelta
 from temporalio import workflow, activity
 
-from common.types import WorldBrief, LayerSpec, ValidatorVerdict
+from common.types import WorldBrief, LayerSpec
 from .supervisor import build_graph
 
 

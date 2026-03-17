@@ -4,8 +4,6 @@ Run from the agents/ dir:
     .venv/bin/python -m pytest test_cli.py -v
 """
 
-from pathlib import Path
-
 from runtime.cli import main
 
 
