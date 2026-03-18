@@ -34,7 +34,11 @@ contract MockEAS is IEAS {
         return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
     }
 
-    function multiAttest(IEAS.MultiAttestationRequest[] calldata) external payable returns (bytes32[] memory) {
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata)
+        external
+        payable
+        returns (bytes32[] memory)
+    {
         revert("not implemented");
     }
 }
@@ -98,7 +102,9 @@ contract RenderReceiptsHandler is Test {
         uint16 jobKind = uint16(jobKindSeed % 5);
 
         vm.prank(actor);
-        try receipts.issueReceipt(earner, jobId, renderSeconds, jobKind, outputHash, regionId) returns (bytes32) {
+        try receipts.issueReceipt(earner, jobId, renderSeconds, jobKind, outputHash, regionId) returns (
+            bytes32
+        ) {
             ghost_issued++;
             // If an unauthorized actor somehow succeeded, flag it.
             if (!isAuthorized[actor]) ghost_unauthorizedSuccess = true;
@@ -213,8 +219,11 @@ contract RenderReceiptsFuzzTest is Test {
         assertEq(eas.lastData(), abi.encode(earner, jobId, renderSeconds, jobKind, outputHash, regionId));
 
         // Returned uid must match the mock's deterministic formula.
-        bytes32 expectedUid =
-            keccak256(abi.encode(schemaUid, earner, abi.encode(earner, jobId, renderSeconds, jobKind, outputHash, regionId)));
+        bytes32 expectedUid = keccak256(
+            abi.encode(
+                schemaUid, earner, abi.encode(earner, jobId, renderSeconds, jobKind, outputHash, regionId)
+            )
+        );
         assertEq(uid, expectedUid);
     }
 

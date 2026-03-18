@@ -55,7 +55,11 @@ contract RenderReceipts is Ownable2Step {
     mapping(address coordinator => bool authorized) public authorizedCoordinators;
 
     event ReceiptIssued(
-        bytes32 indexed uid, address indexed earner, bytes32 indexed jobId, uint16 jobKind, uint64 renderSeconds
+        bytes32 indexed uid,
+        address indexed earner,
+        bytes32 indexed jobId,
+        uint16 jobKind,
+        uint64 renderSeconds
     );
     event CoordinatorSet(address indexed coordinator, bool authorized);
     event SchemaRegistered(bytes32 indexed uid);
@@ -68,11 +72,12 @@ contract RenderReceipts is Ownable2Step {
     }
 
     function registerSchema(address registry_) external onlyOwner returns (bytes32) {
-        bytes32 uid = ISchemaRegistry(registry_).register(
-            "address earner, bytes32 jobId, uint64 renderSeconds, uint16 jobKind, bytes32 outputHash, bytes32 regionId",
-            address(0),
-            true
-        );
+        bytes32 uid = ISchemaRegistry(registry_)
+            .register(
+                "address earner, bytes32 jobId, uint64 renderSeconds, uint16 jobKind, bytes32 outputHash, bytes32 regionId",
+                address(0),
+                true
+            );
         schemaUid = uid;
         emit SchemaRegistered(uid);
         return uid;

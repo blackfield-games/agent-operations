@@ -20,7 +20,9 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     mapping(uint256 templateId => Template) public templates;
     uint256 public nextTemplateId;
 
-    event TemplateRegistered(uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest);
+    event TemplateRegistered(
+        uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
+    );
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
 

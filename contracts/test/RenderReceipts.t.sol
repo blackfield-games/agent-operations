@@ -32,7 +32,11 @@ contract MockEAS is IEAS {
         return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
     }
 
-    function multiAttest(IEAS.MultiAttestationRequest[] calldata) external payable returns (bytes32[] memory) {
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata)
+        external
+        payable
+        returns (bytes32[] memory)
+    {
         revert("not implemented");
     }
 }
@@ -63,7 +67,11 @@ contract RenderReceiptsTest is Test {
     address stranger = address(0xBEEF);
 
     event ReceiptIssued(
-        bytes32 indexed uid, address indexed earner, bytes32 indexed jobId, uint16 jobKind, uint64 renderSeconds
+        bytes32 indexed uid,
+        address indexed earner,
+        bytes32 indexed jobId,
+        uint16 jobKind,
+        uint64 renderSeconds
     );
     event CoordinatorSet(address indexed coordinator, bool authorized);
     event SchemaRegistered(bytes32 indexed uid);

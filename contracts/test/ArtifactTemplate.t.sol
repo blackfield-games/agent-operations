@@ -16,7 +16,9 @@ contract ArtifactTemplateTest is Test {
 
     string constant BASE_URI = "ipfs://base/{id}.json";
 
-    event TemplateRegistered(uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest);
+    event TemplateRegistered(
+        uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
+    );
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
 
