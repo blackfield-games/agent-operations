@@ -9,7 +9,7 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::StatusCode,
     response::Response,
@@ -18,7 +18,7 @@ use axum::{
 };
 use clap::Parser;
 use proto::{CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec, RegionCoord};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -128,6 +128,13 @@ struct JobSummary {
     id: Uuid,
     kind: JobKind,
     status: String,
+}
+
+/// Query string for `GET /jobs`. `status`, when present, filters the listing to
+/// a single lifecycle status; absent returns all statuses.
+#[derive(Debug, Deserialize)]
+struct ListJobsQuery {
+    status: Option<String>,
 }
 
 /// Aggregate mesh stats. Backs the wedge requirement
@@ -398,13 +405,23 @@ async fn job_status(
 const RECENT_JOBS_LIMIT: usize = 100;
 
 /// `GET /jobs` — most-recent jobs (capped at `RECENT_JOBS_LIMIT`) as a JSON
-/// array of `{ id, kind, status }`, newest first. Empty array if none; 500 on
-/// a store error. Read-only; takes a single store lock.
+/// array of `{ id, kind, status }`, newest first. An optional `?status=` query
+/// param filters to one lifecycle status (`queued`/`in_flight`/`done`/`failed`);
+/// an unrecognized value is a 400. Empty array if none match; 500 on a store
+/// error. Read-only; takes a single store lock.
 async fn list_jobs(
     State(state): State<Arc<AppState>>,
+    Query(q): Query<ListJobsQuery>,
 ) -> Result<Json<Vec<JobSummary>>, StatusCode> {
+    // Validate the optional filter against the known statuses before querying,
+    // so a bad value is a 400 rather than a silently-empty 200.
+    if let Some(s) = &q.status {
+        if !store::JOB_STATUSES.contains(&s.as_str()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
     let store = state.store.lock().await;
-    match store.list_jobs(RECENT_JOBS_LIMIT) {
+    match store.list_jobs(RECENT_JOBS_LIMIT, q.status.as_deref()) {
         Ok(rows) => Ok(Json(
             rows.into_iter()
                 .map(|(id, kind, status)| JobSummary { id, kind, status })
@@ -1787,12 +1804,101 @@ mod tests {
             enqueue(&state, &job).await;
         }
 
-        let rows = state.store.lock().await.list_jobs(3).unwrap();
+        let rows = state.store.lock().await.list_jobs(3, None).unwrap();
         assert_eq!(rows.len(), 3);
         // newest first: last 3 ids enqueued are ids[4], ids[3], ids[2]
         assert_eq!(rows[0].0, ids[4]);
         assert_eq!(rows[1].0, ids[3]);
         assert_eq!(rows[2].0, ids[2]);
+    }
+
+    /// `list_jobs(.., Some(status))` returns exactly the jobs in that status,
+    /// across all four lifecycle states; `None` returns every job.
+    #[test]
+    fn list_jobs_status_filter_covers_all_statuses() {
+        let mut store = Store::open_in_memory().unwrap();
+
+        // queued: enqueued, never taken.
+        let queued = job_with_deadline(60);
+        store.enqueue(&queued).unwrap();
+
+        // in_flight: enqueued then taken (by id, so we pick exactly this one).
+        let in_flight = job_with_deadline(60);
+        store.enqueue(&in_flight).unwrap();
+        store.take_next(|j| j.id == in_flight.id).unwrap();
+
+        // done: enqueued, taken, completed.
+        let done = job_with_deadline(60);
+        store.enqueue(&done).unwrap();
+        store.take_next(|j| j.id == done.id).unwrap();
+        store.record_completed(&signed_result(done.id, "deadbeef")).unwrap();
+
+        // failed: enqueued, taken (attempts→1), requeued at max_attempts=1 →
+        // dead-lettered to `failed`.
+        let failed = job_with_deadline(60);
+        store.enqueue(&failed).unwrap();
+        store.take_next(|j| j.id == failed.id).unwrap();
+        assert!(store.requeue(&failed, 1).unwrap(), "attempts>=max must dead-letter");
+
+        // Each filter returns exactly its one job.
+        for (status, expected) in [
+            ("queued", queued.id),
+            ("in_flight", in_flight.id),
+            ("done", done.id),
+            ("failed", failed.id),
+        ] {
+            let rows = store.list_jobs(100, Some(status)).unwrap();
+            assert_eq!(rows.len(), 1, "exactly one job in status {status}");
+            assert_eq!(rows[0].0, expected, "wrong job for status {status}");
+            assert_eq!(rows[0].2, status, "status column must match the filter");
+        }
+
+        // No filter → all four.
+        assert_eq!(store.list_jobs(100, None).unwrap().len(), 4);
+    }
+
+    /// `GET /jobs?status=` filters by status, returns all jobs when absent, and
+    /// 400s on an unrecognized status value.
+    #[tokio::test]
+    async fn list_jobs_status_query_filters_and_400s() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+
+        let queued = job_with_deadline(60);
+        enqueue(&state, &queued).await;
+        let in_flight = job_with_deadline(60);
+        enqueue(&state, &in_flight).await;
+        state.store.lock().await.take_next(|j| j.id == in_flight.id).unwrap();
+
+        // ?status=queued → only the queued job.
+        let json = body_json(get(state.clone(), "/jobs?status=queued").await).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], queued.id.to_string());
+        assert_eq!(arr[0]["status"], "queued");
+
+        // ?status=in_flight → only the in_flight job.
+        let json = body_json(get(state.clone(), "/jobs?status=in_flight").await).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], in_flight.id.to_string());
+
+        // ?status=done → none match yet → empty array, still 200.
+        let resp = get(state.clone(), "/jobs?status=done").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_json(resp).await.as_array().unwrap().is_empty());
+
+        // No filter → both jobs.
+        let json = body_json(get(state.clone(), "/jobs").await).await;
+        assert_eq!(json.as_array().unwrap().len(), 2);
+
+        // Unrecognized status → 400.
+        let resp = get(state.clone(), "/jobs?status=bogus").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

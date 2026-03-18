@@ -22,6 +22,12 @@ const STATUS_DONE: &str = "done";
 /// without a successful result and will no longer be requeued.
 const STATUS_FAILED: &str = "failed";
 
+/// The full set of valid job lifecycle statuses, in lifecycle order. Single
+/// source of truth for callers that validate an incoming status string (e.g.
+/// the `GET /jobs?status=` filter validates against this before querying).
+pub const JOB_STATUSES: [&str; 4] =
+    [STATUS_QUEUED, STATUS_IN_FLIGHT, STATUS_DONE, STATUS_FAILED];
+
 /// Outcome returned by `reap_expired`, split into jobs that were requeued for
 /// another attempt and jobs that have been dead-lettered into `failed`.
 #[derive(Debug, Default, PartialEq)]
@@ -330,12 +336,25 @@ impl Store {
     }
 
     /// Most-recent jobs (rowid DESC) capped at `limit`, as `(id, kind, status)`
-    /// triples for the `GET /jobs` listing. Empty when no jobs exist.
-    pub fn list_jobs(&self, limit: usize) -> Result<Vec<(uuid::Uuid, JobKind, String)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT spec_json, status FROM jobs ORDER BY rowid DESC LIMIT ?1")?;
-        let rows = stmt.query_map([limit as i64], |row| {
+    /// triples for the `GET /jobs` listing. When `status` is `Some`, only jobs
+    /// in that lifecycle status are returned; `None` returns all statuses.
+    /// Empty when nothing matches.
+    ///
+    /// The `?1 IS NULL OR status = ?1` guard binds the optional filter as one
+    /// nullable parameter: a NULL filter matches every row, a concrete status
+    /// filters. Callers validate the status string (see `JOB_STATUSES`) before
+    /// calling; either way it is bound as a parameter, never interpolated.
+    pub fn list_jobs(
+        &self,
+        limit: usize,
+        status: Option<&str>,
+    ) -> Result<Vec<(uuid::Uuid, JobKind, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT spec_json, status FROM jobs
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![status, limit as i64], |row| {
             let spec_json: String = row.get(0)?;
             let status: String = row.get(1)?;
             Ok((spec_json, status))
