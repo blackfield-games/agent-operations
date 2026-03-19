@@ -52,6 +52,11 @@ contract RenderReceipts is Ownable2Step {
     /// @notice Running count of issued receipts (EAS render attestations).
     ///         The HUD reads this for the total number of validated render jobs.
     uint256 public receiptCount;
+    /// @notice Per-earner running count of issued receipts, for the HUD
+    ///         earner-leaderboard read path. Across all earners these sum to
+    ///         `receiptCount`. `earner` is also indexed in `ReceiptIssued`, so
+    ///         clients can cross-reference the event stream.
+    mapping(address earner => uint256 count) public receiptsByEarner;
     mapping(address coordinator => bool authorized) public authorizedCoordinators;
 
     event ReceiptIssued(
@@ -115,6 +120,7 @@ contract RenderReceipts is Ownable2Step {
         );
 
         ++receiptCount;
+        ++receiptsByEarner[earner];
         emit ReceiptIssued(uid, earner, jobId, jobKind, renderSeconds);
     }
 }

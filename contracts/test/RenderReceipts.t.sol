@@ -237,6 +237,29 @@ contract RenderReceiptsTest is Test {
         assertEq(receipts.receiptCount(), 3);
     }
 
+    function test_issueReceipt_tracksPerEarnerCountSummingToTotal() public {
+        _arm();
+        address earnerB = address(0xEA34);
+
+        // Two receipts for `earner`, one for `earnerB`.
+        vm.startPrank(coordinator);
+        receipts.issueReceipt(earner, keccak256("a1"), 10, 0, bytes32(0), bytes32(0));
+        receipts.issueReceipt(earnerB, keccak256("b1"), 10, 0, bytes32(0), bytes32(0));
+        receipts.issueReceipt(earner, keccak256("a2"), 10, 0, bytes32(0), bytes32(0));
+        vm.stopPrank();
+
+        // Per-earner getter reflects each earner's own count.
+        assertEq(receipts.receiptsByEarner(earner), 2);
+        assertEq(receipts.receiptsByEarner(earnerB), 1);
+        // An earner who never earned reads zero (mapping default).
+        assertEq(receipts.receiptsByEarner(stranger), 0);
+        // The per-earner counts sum to the global receiptCount.
+        assertEq(
+            receipts.receiptsByEarner(earner) + receipts.receiptsByEarner(earnerB), receipts.receiptCount()
+        );
+        assertEq(receipts.receiptCount(), 3);
+    }
+
     function test_issueReceipt_deauthorizedCoordinatorReverts() public {
         _arm();
         vm.prank(owner);
