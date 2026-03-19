@@ -38,6 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
+      # Lint gate (mirrors the agents ruff gate): fail fast on style drift
+      # before the slower build/test. Uses the [fmt] config in foundry.toml.
+      - run: forge fmt --check
       - run: forge build
       - run: forge test -vvv
 
