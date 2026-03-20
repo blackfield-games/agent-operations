@@ -11,7 +11,9 @@ Temporal activity (see runtime/workflow.py) so individual steps survive crashes.
 """
 
 from __future__ import annotations
+import asyncio
 import logging
+import os
 from typing import TypedDict, Annotated
 
 from langgraph.graph import StateGraph, END
@@ -27,6 +29,12 @@ from optimization import optimization
 from validator import validator
 
 logger = logging.getLogger(__name__)
+
+# A specialist or validator node that HANGS (not just one that raises) must not
+# stall the whole region compose. Each node await is bounded by this timeout
+# (seconds); on expiry the node is isolated exactly like a raising node. Tunable
+# via env for slow/fast backends; tests monkeypatch it to a tiny value.
+NODE_TIMEOUT_SECS = float(os.environ.get("AGENT_NODE_TIMEOUT_SECS", "120"))
 
 
 def merge_layers(existing: list[LayerSpec], new: list[LayerSpec]) -> list[LayerSpec]:
@@ -72,7 +80,18 @@ def _make_specialist_node(name: str):
     async def node(state: State) -> dict:
         fn = SPECIALISTS[name]
         try:
-            layer = await fn(state["brief"], state.get("layers", []))
+            layer = await asyncio.wait_for(
+                fn(state["brief"], state.get("layers", [])),
+                timeout=NODE_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError:
+            # A hung specialist is contained like a raising one: log and
+            # contribute no sublayer so the validator can route back to it.
+            logger.warning(
+                "specialist %r timed out after %ss; isolating as an empty sublayer",
+                name, NODE_TIMEOUT_SECS,
+            )
+            return {"layers": []}
         except Exception:
             # A specialist raising must not tank the whole region compose: log it
             # and contribute no sublayer. The validator then sees the missing
@@ -112,7 +131,23 @@ def _failing_specialist(issues: list[str]) -> str:
 
 async def _validator_node(state: State) -> dict:
     try:
-        verdict = await validator.run(state["brief"], state.get("layers", []))
+        verdict = await asyncio.wait_for(
+            validator.run(state["brief"], state.get("layers", [])),
+            timeout=NODE_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError:
+        # A hung validator is contained like a raising one: end the compose with
+        # a non-accepted verdict. Re-running can't fix an unresponsive validator,
+        # so validator_errored makes _after_validator END (no route-back).
+        logger.warning(
+            "validator timed out after %ss; ending compose with a non-accepted verdict",
+            NODE_TIMEOUT_SECS,
+        )
+        return {
+            "verdict": ValidatorVerdict(accepted=False, issues=["validator timed out"]),
+            "rounds": state.get("rounds", 0) + 1,
+            "validator_errored": True,
+        }
     except Exception:
         # A crashing validator (e.g. the Dev C validation service is
         # unavailable) must not propagate and tank the region compose —

@@ -6,6 +6,8 @@ Run from the agents/ dir:
     .venv/bin/python -m pytest test_supervisor.py -v
 """
 
+import asyncio
+
 import runtime.supervisor as sup
 from common.types import LayerSpec, ValidatorVerdict
 from langgraph.graph import END
@@ -73,4 +75,30 @@ async def test_validator_node_passes_through_a_normal_verdict(monkeypatch):
     out = await sup._validator_node({"brief": object(), "layers": []})
     assert out["verdict"] is verdict
     assert out.get("validator_errored") is None
+    assert out["rounds"] == 1
+
+
+async def test_specialist_node_times_out_to_empty_sublayer(monkeypatch):
+    async def hang(brief, layers):
+        await asyncio.sleep(10)
+
+    monkeypatch.setitem(sup.SPECIALISTS, "terrain", hang)
+    monkeypatch.setattr(sup, "NODE_TIMEOUT_SECS", 0.01)
+    node = sup._make_specialist_node("terrain")
+
+    # A hung specialist hits the same isolation path as a raising one.
+    out = await node({"brief": object(), "layers": []})
+    assert out == {"layers": []}
+
+
+async def test_validator_node_times_out_to_errored_verdict(monkeypatch):
+    async def hang(brief, layers):
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(sup.validator, "run", hang)
+    monkeypatch.setattr(sup, "NODE_TIMEOUT_SECS", 0.01)
+    out = await sup._validator_node({"brief": object(), "layers": []})
+    assert out["validator_errored"] is True
+    assert out["verdict"].accepted is False
+    assert out["verdict"].issues == ["validator timed out"]
     assert out["rounds"] == 1
