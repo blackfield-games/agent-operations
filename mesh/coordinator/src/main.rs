@@ -104,7 +104,9 @@ impl AppState {
             tracing::info!(recovered, "reclaimed in-flight jobs orphaned by a crash");
         }
         if store.jobs_empty()? {
-            store.enqueue(&seed_job())?;
+            for job in seed_jobs() {
+                store.enqueue(&job)?;
+            }
         }
         Ok(Arc::new(AppState {
             store: Mutex::new(store),
@@ -269,6 +271,30 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
     });
 }
 
+/// One synthetic queued job per `JobKind`, so a fresh coordinator presents the
+/// wedge HUD a representative backlog — every kind shows up in `queued_by_kind`
+/// — rather than a single Terrain job. Region/inputs are placeholders; only the
+/// spread of kinds matters here. Enqueued only when the DB is empty (see
+/// `with_store`), so a restart with existing jobs never double-seeds.
+fn seed_jobs() -> Vec<JobSpec> {
+    JobKind::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| JobSpec {
+            id: Uuid::new_v4(),
+            kind,
+            region: RegionCoord { x: 42 + i as i32, y: -17, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({ "seed": i as u64 }),
+        })
+        .collect()
+}
+
+/// A single Terrain job. Only used by tests (as a generic `JobSpec` fixture);
+/// the production seed path uses `seed_jobs`. `#[cfg(test)]` keeps it out of the
+/// release build so it isn't flagged as dead code.
+#[cfg(test)]
 fn seed_job() -> JobSpec {
     JobSpec {
         id: Uuid::new_v4(),
@@ -805,21 +831,22 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
 
-    /// In-memory store-backed state (no disk). `with_store` seeds one job
-    /// because the in-memory DB starts empty; tests that need an empty queue
-    /// drain it first via `/jobs/next` or use `test_state_empty`.
+    /// In-memory store-backed state (no disk). `with_store` seeds one job per
+    /// `JobKind` because the in-memory DB starts empty; tests that need an empty
+    /// queue drain it first via `/jobs/next` or use `test_state_empty`.
     fn test_state() -> Arc<AppState> {
         AppState::with_store(Store::open_in_memory().unwrap(), 5, 60).unwrap()
     }
 
-    /// In-memory state with the auto-seeded job removed, so the queue starts
+    /// In-memory state with every auto-seeded job removed, so the queue starts
     /// empty (matches the old `AppState::default()` behavior used by tests
     /// that assert `jobs_queued == 0`).
     async fn test_state_empty() -> Arc<AppState> {
         let state = test_state();
-        // Drain the seeded job so the queue is empty.
+        // Drain every seeded job so the queue is empty regardless of how many
+        // kinds `seed_jobs` enqueues.
         let store = state.store.lock().await;
-        let _ = store.take_next(|_| true).unwrap();
+        while store.take_next(|_| true).unwrap().is_some() {}
         drop(store);
         state
     }
@@ -912,19 +939,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_job_returns_seed_then_none() {
-        // `test_state` auto-seeds exactly one terrain job.
+    async fn next_job_drains_all_seeds_then_none() {
+        // `test_state` auto-seeds one job per JobKind; that many polls each
+        // return a job, then the queue is empty and the next poll is null.
         let state = test_state();
 
-        let resp = get(state.clone(), "/jobs/next").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let json = body_json(resp).await;
-        assert!(!json.is_null(), "first poll should return the seeded job");
-        assert_eq!(json["kind"], "terrain");
+        for _ in 0..JobKind::ALL.len() {
+            let json = body_json(get(state.clone(), "/jobs/next").await).await;
+            assert!(!json.is_null(), "each seeded job should poll non-null");
+        }
+        let json = body_json(get(state.clone(), "/jobs/next").await).await;
+        assert!(json.is_null(), "queue is empty after draining every seed");
+    }
 
-        let resp = get(state.clone(), "/jobs/next").await;
-        let json = body_json(resp).await;
-        assert!(json.is_null(), "second poll should return null");
+    /// A fresh coordinator seeds exactly one queued job per JobKind, so the
+    /// HUD's queued-by-kind backlog is representative from boot.
+    #[tokio::test]
+    async fn fresh_state_seeds_representative_backlog() {
+        let state = test_state();
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_queued"], JobKind::ALL.len() as u64);
+        for kind in JobKind::ALL {
+            assert_eq!(
+                json["queued_by_kind"][kind.as_str()],
+                1,
+                "expected exactly one queued {} job",
+                kind.as_str()
+            );
+        }
     }
 
     use k256::ecdsa::SigningKey;
@@ -1187,10 +1229,11 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
 
             let json = body_json(get(state.clone(), "/stats").await).await;
-            // One auto-seeded job still queued; the enqueued one is now done.
+            // The auto-seeded jobs (one per kind) stay queued; the extra job we
+            // enqueued and took is now done.
             queued_before = json["jobs_queued"].as_u64().unwrap();
             completed_before = json["jobs_completed"].as_u64().unwrap();
-            assert_eq!(queued_before, 1);
+            assert_eq!(queued_before, JobKind::ALL.len() as u64);
             assert_eq!(completed_before, 1);
         } // state (and its Store/Connection) dropped here → "process" ends.
 
@@ -1245,19 +1288,26 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let db_path = tmp.path().to_str().unwrap().to_string();
 
-        // First "process": take the auto-seeded job in_flight, then drop state.
+        // First "process": take every auto-seeded job in_flight, then drop
+        // state. We track one id across the restart.
         let taken_id;
+        let seeded;
         {
             let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
             let store = state.store.lock().await;
-            let job = store.take_next(|_| true).unwrap().expect("seeded job");
-            taken_id = job.id;
-            assert_eq!(store.in_flight_count().unwrap(), 1);
+            let mut ids = Vec::new();
+            while let Some(job) = store.take_next(|_| true).unwrap() {
+                ids.push(job.id);
+            }
+            seeded = ids.len();
+            assert_eq!(seeded, JobKind::ALL.len(), "fresh DB seeds one job per kind");
+            taken_id = ids[0];
+            assert_eq!(store.in_flight_count().unwrap(), seeded);
             assert_eq!(store.queued_count().unwrap(), 0);
-        } // state dropped → "crash" with a job stuck in_flight.
+        } // state dropped → "crash" with jobs stuck in_flight.
 
         // Second "process": reopen the SAME db. with_store must reclaim the
-        // orphaned in_flight job on startup.
+        // orphaned in_flight jobs on startup.
         let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
@@ -1266,6 +1316,7 @@ mod tests {
             "orphaned in_flight job must be queued again after restart"
         );
         assert_eq!(store.in_flight_count().unwrap(), 0);
+        assert_eq!(store.queued_count().unwrap(), seeded);
     }
 
     #[test]
