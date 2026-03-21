@@ -378,20 +378,32 @@ impl Store {
         Ok(count as usize)
     }
 
-    /// Count of queued jobs grouped by `JobKind` (for the `/stats` backlog
-    /// composition). Decodes each queued spec's kind in Rust, mirroring the
-    /// decode in `take_next`/`reap_expired`. Empty map when nothing is queued.
-    pub fn queued_count_by_kind(&self) -> Result<HashMap<JobKind, usize>> {
+    /// Count of jobs in `status` grouped by `JobKind` (for the `/stats`
+    /// composition fields). Decodes each matching spec's kind in Rust, mirroring
+    /// the decode in `take_next`/`reap_expired`. Empty map when nothing matches.
+    fn count_by_kind(&self, status: &str) -> Result<HashMap<JobKind, usize>> {
         let mut stmt = self
             .conn
             .prepare("SELECT spec_json FROM jobs WHERE status = ?1")?;
-        let rows = stmt.query_map([STATUS_QUEUED], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map([status], |row| row.get::<_, String>(0))?;
         let mut counts: HashMap<JobKind, usize> = HashMap::new();
         for row in rows {
             let job: JobSpec = serde_json::from_str(&row?)?;
             *counts.entry(job.kind).or_insert(0) += 1;
         }
         Ok(counts)
+    }
+
+    /// Count of QUEUED jobs grouped by `JobKind` (the `/stats` backlog
+    /// composition). Empty map when nothing is queued.
+    pub fn queued_count_by_kind(&self) -> Result<HashMap<JobKind, usize>> {
+        self.count_by_kind(STATUS_QUEUED)
+    }
+
+    /// Count of IN-FLIGHT jobs grouped by `JobKind` (the `/stats` in-flight
+    /// composition). Empty map when nothing is in flight.
+    pub fn in_flight_count_by_kind(&self) -> Result<HashMap<JobKind, usize>> {
+        self.count_by_kind(STATUS_IN_FLIGHT)
     }
 
     /// Count of jobs currently in the `in_flight` state (for `/stats`).

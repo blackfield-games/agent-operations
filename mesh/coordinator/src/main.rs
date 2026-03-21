@@ -154,6 +154,8 @@ struct Stats {
     supported_breakdown: HashMap<JobKind, usize>,
     /// Backlog composition: how many QUEUED jobs of each kind are waiting.
     queued_by_kind: HashMap<JobKind, usize>,
+    /// In-flight composition: how many IN-FLIGHT jobs of each kind are running.
+    in_flight_by_kind: HashMap<JobKind, usize>,
 }
 
 #[tokio::main]
@@ -386,6 +388,15 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    // Computed under the same store lock (earners still in scope) so the
+    // load-bearing `earners ⊃ store` lock order is preserved.
+    let in_flight_by_kind = match store.in_flight_count_by_kind() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "stats: in_flight_count_by_kind failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -395,6 +406,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         jobs_failed,
         supported_breakdown,
         queued_by_kind,
+        in_flight_by_kind,
     }))
 }
 
@@ -1990,6 +2002,47 @@ mod tests {
         assert_eq!(json["queued_by_kind"]["foliage"], 1);
         // a kind with no queued jobs is absent from the map (serde_json: missing key -> null)
         assert!(json["queued_by_kind"]["optimization"].is_null());
+    }
+
+    #[tokio::test]
+    async fn stats_reports_in_flight_by_kind() {
+        // Raw non-seeded store so only the jobs we take are in_flight
+        // (test_state_empty parks the auto-seeded jobs in_flight, which would
+        // skew the per-kind in_flight counts — same reason stats_reports_in_flight
+        // builds state directly).
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        let mk = |kind: JobKind, seed: u64| JobSpec {
+            id: Uuid::new_v4(),
+            kind,
+            region: RegionCoord { x: seed as i32, y: 0, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({ "seed": seed }),
+        };
+        // 2 Terrain + 1 Foliage, then move all three to in_flight.
+        enqueue(&state, &mk(JobKind::Terrain, 1)).await;
+        enqueue(&state, &mk(JobKind::Terrain, 2)).await;
+        enqueue(&state, &mk(JobKind::Foliage, 3)).await;
+        {
+            let store = state.store.lock().await;
+            while store.take_next(|_| true).unwrap().is_some() {}
+        }
+
+        let resp = get(state.clone(), "/stats").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["in_flight_by_kind"]["terrain"], 2);
+        assert_eq!(json["in_flight_by_kind"]["foliage"], 1);
+        // a kind with nothing in flight is absent (serde_json: missing key -> null)
+        assert!(json["in_flight_by_kind"]["optimization"].is_null());
+        // sanity: the three jobs are in_flight and none remain queued
+        assert_eq!(json["jobs_in_flight"], 3);
+        assert_eq!(json["jobs_queued"], 0);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
