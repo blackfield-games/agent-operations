@@ -406,6 +406,14 @@ impl Store {
         self.count_by_kind(STATUS_IN_FLIGHT)
     }
 
+    /// Count of DONE jobs grouped by `JobKind` (the `/stats` completed
+    /// composition). A job reaches `done` only via `record_completed`, which
+    /// also inserts its single result, so this sums to `completed_count`. Empty
+    /// map when nothing has completed.
+    pub fn done_count_by_kind(&self) -> Result<HashMap<JobKind, usize>> {
+        self.count_by_kind(STATUS_DONE)
+    }
+
     /// Count of jobs currently in the `in_flight` state (for `/stats`).
     pub fn in_flight_count(&self) -> Result<usize> {
         let count: i64 = self.conn.query_row(

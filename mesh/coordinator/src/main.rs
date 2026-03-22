@@ -156,6 +156,9 @@ struct Stats {
     queued_by_kind: HashMap<JobKind, usize>,
     /// In-flight composition: how many IN-FLIGHT jobs of each kind are running.
     in_flight_by_kind: HashMap<JobKind, usize>,
+    /// Completed composition: how many DONE jobs of each kind have finished.
+    /// Sums to `jobs_completed`.
+    completed_by_kind: HashMap<JobKind, usize>,
 }
 
 #[tokio::main]
@@ -397,6 +400,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let completed_by_kind = match store.done_count_by_kind() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "stats: done_count_by_kind failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -407,6 +417,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         supported_breakdown,
         queued_by_kind,
         in_flight_by_kind,
+        completed_by_kind,
     }))
 }
 
@@ -2043,6 +2054,49 @@ mod tests {
         // sanity: the three jobs are in_flight and none remain queued
         assert_eq!(json["jobs_in_flight"], 3);
         assert_eq!(json["jobs_queued"], 0);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_completed_by_kind() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        let mk = |kind: JobKind, seed: u64| JobSpec {
+            id: Uuid::new_v4(),
+            kind,
+            region: RegionCoord { x: seed as i32, y: 0, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({ "seed": seed }),
+        };
+        let terrain1 = mk(JobKind::Terrain, 1);
+        let terrain2 = mk(JobKind::Terrain, 2);
+        let foliage1 = mk(JobKind::Foliage, 3);
+        enqueue(&state, &terrain1).await;
+        enqueue(&state, &terrain2).await;
+        enqueue(&state, &foliage1).await;
+        {
+            // Take all three in_flight, then complete terrain1 + foliage1,
+            // leaving terrain2 in_flight.
+            let mut store = state.store.lock().await;
+            store.take_next(|j| j.id == terrain1.id).unwrap();
+            store.take_next(|j| j.id == terrain2.id).unwrap();
+            store.take_next(|j| j.id == foliage1.id).unwrap();
+            store.record_completed(&signed_result(terrain1.id, "a")).unwrap();
+            store.record_completed(&signed_result(foliage1.id, "b")).unwrap();
+        }
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["completed_by_kind"]["terrain"], 1);
+        assert_eq!(json["completed_by_kind"]["foliage"], 1);
+        // a kind with nothing completed is absent (serde_json: missing key -> null)
+        assert!(json["completed_by_kind"]["optimization"].is_null());
+        // cross-checks: 2 done total; terrain2 is still in_flight, not completed
+        assert_eq!(json["jobs_completed"], 2);
+        assert_eq!(json["in_flight_by_kind"]["terrain"], 1);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
