@@ -18,9 +18,17 @@ contract ComputeMeter is Ownable2Step {
 
     mapping(address buyer => uint256 credit) public credit;
     mapping(address spender => bool authorized) public authorizedSpenders;
+    /// @notice Cumulative $BLCKFLD debited (spent) per buyer across all jobs.
+    ///         Monotonic — unlike `credit`, which falls as it is spent — so it
+    ///         is the per-buyer "compute consumed" HUD read.
+    mapping(address buyer => uint256 spent) public spentByBuyer;
     /// @notice Cumulative $BLCKFLD burned into compute credit across all buyers.
     ///         A global HUD metric ("total compute purchased").
     uint256 public totalBurned;
+    /// @notice Cumulative $BLCKFLD debited (spent) across all buyers — the
+    ///         global "compute consumed" HUD metric, complementing
+    ///         `totalBurned` ("purchased"). Their gap is outstanding credit.
+    uint256 public totalSpent;
 
     event Deposited(address indexed buyer, uint256 amount, uint256 newCredit);
     event Spent(address indexed buyer, address indexed spender, uint256 amount, bytes32 jobId);
@@ -51,6 +59,8 @@ contract ComputeMeter is Ownable2Step {
         if (c < amount) revert InsufficientCredit();
         unchecked {
             credit[buyer] = c - amount;
+            totalSpent += amount;
+            spentByBuyer[buyer] += amount;
         }
         emit Spent(buyer, msg.sender, amount, jobId);
     }

@@ -89,4 +89,51 @@ contract ComputeMeterTest is Test {
 
         assertEq(meter.totalBurned(), 150 ether);
     }
+
+    function test_totalSpent_accumulates() public {
+        assertEq(meter.totalSpent(), 0);
+        assertEq(meter.spentByBuyer(buyer), 0);
+
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        vm.startPrank(spender);
+        meter.spend(buyer, 40 ether, keccak256("j1"));
+        meter.spend(buyer, 10 ether, keccak256("j2"));
+        vm.stopPrank();
+
+        // Cumulative spend is monotonic; credit falls by the same total.
+        assertEq(meter.totalSpent(), 50 ether);
+        assertEq(meter.spentByBuyer(buyer), 50 ether);
+        assertEq(meter.credit(buyer), 50 ether);
+    }
+
+    function test_spentByBuyer_sumsToTotalSpent() public {
+        address buyer2 = address(0xB0B2);
+        assertTrue(token.transfer(buyer2, 1000 ether));
+
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        vm.startPrank(buyer2);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        vm.startPrank(spender);
+        meter.spend(buyer, 30 ether, keccak256("a"));
+        meter.spend(buyer2, 70 ether, keccak256("b"));
+        meter.spend(buyer, 5 ether, keccak256("c"));
+        vm.stopPrank();
+
+        assertEq(meter.spentByBuyer(buyer), 35 ether);
+        assertEq(meter.spentByBuyer(buyer2), 70 ether);
+        // per-buyer attribution sums to the global total
+        assertEq(meter.spentByBuyer(buyer) + meter.spentByBuyer(buyer2), meter.totalSpent());
+        assertEq(meter.totalSpent(), 105 ether);
+    }
 }
