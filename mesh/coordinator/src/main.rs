@@ -132,6 +132,14 @@ struct JobSummary {
     status: String,
 }
 
+/// Full detail for `GET /jobs/{id}`: the job's `JobSpec` plus its recorded
+/// `JobResult` once the job has completed (`null` until then).
+#[derive(Debug, Serialize)]
+struct JobDetail {
+    spec: JobSpec,
+    result: Option<JobResult>,
+}
+
 /// Query string for `GET /jobs`. `status`, when present, filters the listing to
 /// a single lifecycle status; absent returns all statuses.
 #[derive(Debug, Deserialize)]
@@ -159,6 +167,12 @@ struct Stats {
     /// Completed composition: how many DONE jobs of each kind have finished.
     /// Sums to `jobs_completed`.
     completed_by_kind: HashMap<JobKind, usize>,
+    /// Failed composition: how many FAILED (dead-lettered) jobs of each kind.
+    /// Sums to `jobs_failed`.
+    failed_by_kind: HashMap<JobKind, usize>,
+    /// Total render-seconds produced across all completed jobs — the mesh
+    /// output metric for the HUD ("N render-seconds produced").
+    total_render_seconds: u64,
 }
 
 #[tokio::main]
@@ -317,6 +331,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/register", post(register))
         .route("/stats", get(stats))
         .route("/jobs", get(list_jobs))
+        .route("/jobs/{id}", get(job_detail))
         .route("/jobs/next", get(next_job))
         .route("/jobs/{id}/submit", post(submit))
         .route("/jobs/{id}/status", get(job_status))
@@ -407,6 +422,20 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let failed_by_kind = match store.failed_count_by_kind() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "stats: failed_count_by_kind failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let total_render_seconds = match store.total_render_seconds() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(?e, "stats: total_render_seconds failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -418,6 +447,8 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         queued_by_kind,
         in_flight_by_kind,
         completed_by_kind,
+        failed_by_kind,
+        total_render_seconds,
     }))
 }
 
@@ -448,6 +479,33 @@ async fn job_status(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// `GET /jobs/{id}` — full detail for a single job: its `JobSpec` plus the
+/// recorded `JobResult` once the job has completed (`result` is `null` until
+/// then). 404 for an unknown id, 500 on a store error. Read-only; takes a
+/// single store lock. Distinct from the status-only `GET /jobs/{id}/status`.
+async fn job_detail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<JobDetail>, StatusCode> {
+    let store = state.store.lock().await;
+    let spec = match store.get_job(&id) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!(?id, ?e, "job_detail: get_job failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let result = match store.get_result(&id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(?id, ?e, "job_detail: get_result failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    Ok(Json(JobDetail { spec, result }))
 }
 
 /// Upper bound on rows returned by `GET /jobs`, to keep the payload bounded.
@@ -1796,6 +1854,50 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ---- GET /jobs/{id} full detail ----
+
+    /// `GET /jobs/{id}` returns the full spec; `result` is null while the job is
+    /// queued and carries the recorded `JobResult` once it is done; an unknown
+    /// id is a 404.
+    #[tokio::test]
+    async fn job_detail_returns_spec_then_spec_and_result() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+
+        // A queued job: detail returns its spec, no result yet.
+        let queued = job_with_deadline(60);
+        enqueue(&state, &queued).await;
+        let resp = get(state.clone(), &format!("/jobs/{}", queued.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["spec"]["id"], queued.id.to_string());
+        assert_eq!(json["spec"]["kind"], "terrain");
+        assert!(json["result"].is_null(), "a queued job has no recorded result");
+
+        // A completed job: detail returns the spec plus the recorded result.
+        let done = job_with_deadline(60);
+        let done_id = done.id;
+        enqueue(&state, &done).await;
+        {
+            let mut store = state.store.lock().await;
+            store.take_next(|j| j.id == done_id).unwrap();
+            store.record_completed(&signed_result(done_id, "deadbeef")).unwrap();
+        }
+        let json = body_json(get(state.clone(), &format!("/jobs/{done_id}")).await).await;
+        assert_eq!(json["spec"]["id"], done_id.to_string());
+        assert_eq!(json["result"]["job_id"], done_id.to_string());
+        assert_eq!(json["result"]["output_hash"], "deadbeef");
+        assert_eq!(json["result"]["render_seconds"], 1);
+
+        // Unknown id → 404.
+        let resp = get(state.clone(), &format!("/jobs/{}", Uuid::new_v4())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     // ---- GET /jobs listing ----
 
     #[tokio::test]
@@ -2097,6 +2199,82 @@ mod tests {
         // cross-checks: 2 done total; terrain2 is still in_flight, not completed
         assert_eq!(json["jobs_completed"], 2);
         assert_eq!(json["in_flight_by_kind"]["terrain"], 1);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_failed_by_kind() {
+        // Raw non-seeded store so only the jobs we dead-letter are `failed`
+        // (test_state_empty parks the auto-seeded jobs in_flight, never failed,
+        // but a raw store keeps the failed composition unambiguous).
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        let mk = |kind: JobKind, seed: u64| JobSpec {
+            id: Uuid::new_v4(),
+            kind,
+            region: RegionCoord { x: seed as i32, y: 0, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({ "seed": seed }),
+        };
+        // 2 Terrain + 1 Foliage: take each once (attempts→1) then requeue at
+        // max_attempts=1 → dead-lettered to `failed`.
+        let jobs = [mk(JobKind::Terrain, 1), mk(JobKind::Terrain, 2), mk(JobKind::Foliage, 3)];
+        {
+            let store = state.store.lock().await;
+            for job in &jobs {
+                store.enqueue(job).unwrap();
+                store.take_next(|j| j.id == job.id).unwrap();
+                assert!(store.requeue(job, 1).unwrap(), "attempts>=max must dead-letter");
+            }
+        }
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["failed_by_kind"]["terrain"], 2);
+        assert_eq!(json["failed_by_kind"]["foliage"], 1);
+        // a kind with nothing failed is absent (serde_json: missing key -> null)
+        assert!(json["failed_by_kind"]["optimization"].is_null());
+        // cross-check the scalar total
+        assert_eq!(json["jobs_failed"], 3);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_total_render_seconds() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        // No completed jobs yet → 0.
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["total_render_seconds"], 0);
+
+        // Complete two jobs carrying distinct render_seconds (5 + 7); the field
+        // is not part of the signed digest, so setting it post-sign is valid and
+        // record_completed persists it verbatim.
+        let a = job_with_deadline(60);
+        let b = job_with_deadline(60);
+        {
+            let mut store = state.store.lock().await;
+            for job in [&a, &b] {
+                store.enqueue(job).unwrap();
+                store.take_next(|j| j.id == job.id).unwrap();
+            }
+            let mut ra = signed_result(a.id, "aa");
+            ra.render_seconds = 5;
+            let mut rb = signed_result(b.id, "bb");
+            rb.render_seconds = 7;
+            store.record_completed(&ra).unwrap();
+            store.record_completed(&rb).unwrap();
+        }
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["total_render_seconds"], 12, "sum of 5 + 7 render-seconds");
+        assert_eq!(json["jobs_completed"], 2);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping

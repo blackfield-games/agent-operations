@@ -335,6 +335,50 @@ impl Store {
         Ok(status)
     }
 
+    /// Full `JobSpec` for a job id, or `None` if the id is unknown. Decodes the
+    /// stored `spec_json`. Backs the `GET /jobs/{id}` full-detail endpoint
+    /// (vs the status-only `job_status`).
+    pub fn get_job(&self, id: &uuid::Uuid) -> Result<Option<JobSpec>> {
+        let spec_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_json FROM jobs WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match spec_json {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The recorded `JobResult` for a job id, or `None` when the job has no
+    /// result yet (it has not completed). Decodes the stored `result_json`.
+    /// Backs the `GET /jobs/{id}` full-detail endpoint.
+    pub fn get_result(&self, id: &uuid::Uuid) -> Result<Option<JobResult>> {
+        let result_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT result_json FROM results WHERE job_id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        match result_json {
+            Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Most-recent jobs (rowid DESC) capped at `limit`, as `(id, kind, status)`
     /// triples for the `GET /jobs` listing. When `status` is `Some`, only jobs
     /// in that lifecycle status are returned; `None` returns all statuses.
@@ -414,6 +458,14 @@ impl Store {
         self.count_by_kind(STATUS_DONE)
     }
 
+    /// Count of FAILED (dead-lettered) jobs grouped by `JobKind` (the `/stats`
+    /// failed composition). A job reaches `failed` only after exhausting
+    /// `max_attempts` dispatches, so this sums to `failed_count`. Empty map when
+    /// nothing has failed.
+    pub fn failed_count_by_kind(&self) -> Result<HashMap<JobKind, usize>> {
+        self.count_by_kind(STATUS_FAILED)
+    }
+
     /// Count of jobs currently in the `in_flight` state (for `/stats`).
     pub fn in_flight_count(&self) -> Result<usize> {
         let count: i64 = self.conn.query_row(
@@ -430,6 +482,23 @@ impl Store {
             self.conn
                 .query_row("SELECT COUNT(*) FROM results", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Sum of `render_seconds` across all recorded results — the mesh-output
+    /// metric surfaced at `/stats` ("N render-seconds produced"). Decodes each
+    /// stored `JobResult` in Rust and sums its `render_seconds`, mirroring the
+    /// per-kind decode pattern. Widened to `u64` so a large mesh-wide total
+    /// can't overflow the `u32` per-result field. Zero when nothing has
+    /// completed.
+    pub fn total_render_seconds(&self) -> Result<u64> {
+        let mut stmt = self.conn.prepare("SELECT result_json FROM results")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut total: u64 = 0;
+        for row in rows {
+            let result: JobResult = serde_json::from_str(&row?)?;
+            total += result.render_seconds as u64;
+        }
+        Ok(total)
     }
 
     /// Count of jobs in the terminal `failed` status (dead-lettered after
