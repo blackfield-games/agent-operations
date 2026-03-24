@@ -43,6 +43,15 @@ jobs:
       - run: forge fmt --check
       - run: forge build
       - run: forge test -vvv
+      # viem ABI drift gate (mirrors forge fmt --check): regenerate the
+      # committed ABIs and fail if they differ from what's checked in. `jq -S`
+      # canonicalizes key order so the gate tracks real ABI changes, not
+      # formatter cosmetics. jq is preinstalled on ubuntu-latest.
+      - run: |
+          for c in ComputeMeter RenderReceipts RegionAuthority ArtifactTemplate; do
+            forge inspect "$c" abi --json | jq -S . > "abi/$c.json"
+          done
+          git diff --exit-code abi/
 
   agents:
     name: agents (python)
