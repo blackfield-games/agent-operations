@@ -30,6 +30,16 @@ def compose_world(layers: list[LayerSpec], out_dir: Path) -> Path:
     """Write a world.usda root layer that sublayers each specialist's file in
     strength order. Does NOT open a UsdStage — that's the engine's job.
     """
+    # Guard against silent data loss: a specialist not in STRENGTH_ORDER would be
+    # silently dropped by the iteration below, omitting its layer from the world
+    # with no error or warning.  Fail fast before touching the filesystem.
+    known = set(STRENGTH_ORDER)
+    unknown = {layer.specialist for layer in layers} - known
+    if unknown:
+        raise ValueError(
+            f"unknown specialist(s) {sorted(unknown)}; valid: {STRENGTH_ORDER}"
+        )
+
     by_specialist: dict[str, list[LayerSpec]] = {}
     for layer in layers:
         by_specialist.setdefault(layer.specialist, []).append(layer)

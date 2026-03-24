@@ -9,6 +9,8 @@ Run from the agents/ dir:
     .venv/bin/python -m pytest test_compose.py -v
 """
 
+import pytest
+
 from common.compose import compose_world, STRENGTH_ORDER
 from common.types import LayerSpec
 from runtime.supervisor import merge_layers
@@ -124,3 +126,37 @@ def test_stronger_specialist_wins_on_conflict(tmp_path):
         root = compose_world(layers, out_dir)
         text = root.read_text()
         assert text.index(f"@./{strong}/x.usda@") < text.index(f"@./{weak}/x.usda@")
+
+
+def test_unknown_specialist_raises_value_error(tmp_path):
+    """A layer with an unrecognised specialist must raise ValueError immediately,
+    not be silently dropped from the composed world."""
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r+0000_+0000_l0", path="terrain/a.usda", summary="ok", metrics={}),
+        LayerSpec(specialist="biome", region_id="r+0000_+0000_l0", path="biome/a.usda", summary="ok", metrics={}),
+    ]
+    # Construct a LayerSpec with an invalid specialist by bypassing Pydantic validation.
+    bad = layers[0].model_copy(update={"specialist": "wizard"})
+    with pytest.raises(ValueError, match="wizard"):
+        compose_world([*layers, bad], tmp_path)
+
+
+def test_unknown_specialist_does_not_create_output_file(tmp_path):
+    """Fail-fast: the world.usda file must NOT be created when the input is invalid."""
+    bad = LayerSpec(specialist="terrain", region_id="r+0000_+0000_l0", path="terrain/a.usda", summary="ok", metrics={})
+    bad = bad.model_copy(update={"specialist": "gremlin"})
+    with pytest.raises(ValueError):
+        compose_world([bad], tmp_path)
+    assert not (tmp_path / "world.usda").exists()
+
+
+def test_compose_world_happy_path_all_known_specialists(tmp_path):
+    """Regression guard: all valid specialists compose without error and produce world.usda."""
+    region = "r+0042_-0017_l0"
+    layers = [
+        LayerSpec(specialist=s, region_id=region, path=f"{s}/{s}.usda", summary=s, metrics={})
+        for s in STRENGTH_ORDER
+    ]
+    root = compose_world(layers, tmp_path)
+    assert root.exists()
+    assert root.name == "world.usda"
