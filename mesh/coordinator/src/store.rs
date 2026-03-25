@@ -511,4 +511,67 @@ impl Store {
         )?;
         Ok(count as usize)
     }
+
+    /// Completed-result count grouped by earner address (`results.earner`), for
+    /// the `GET /earners` leaderboard. Counts recorded results per earner in SQL.
+    /// Empty map when nothing has completed.
+    pub fn completed_count_by_earner(&self) -> Result<HashMap<String, usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT earner, COUNT(*) FROM results GROUP BY earner")?;
+        let rows = stmt.query_map([], |row| {
+            let earner: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((earner, count as usize))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (earner, count) = row?;
+            counts.insert(earner, count);
+        }
+        Ok(counts)
+    }
+
+    /// Sum of `render_seconds` grouped by earner address, for the `GET /earners`
+    /// leaderboard. Decodes each recorded `JobResult` and accumulates its
+    /// `render_seconds` (widened to `u64`, mirroring `total_render_seconds`)
+    /// under its `results.earner` key. Empty map when nothing has completed.
+    pub fn render_seconds_by_earner(&self) -> Result<HashMap<String, u64>> {
+        let mut stmt = self.conn.prepare("SELECT earner, result_json FROM results")?;
+        let rows = stmt.query_map([], |row| {
+            let earner: String = row.get(0)?;
+            let result_json: String = row.get(1)?;
+            Ok((earner, result_json))
+        })?;
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for row in rows {
+            let (earner, result_json) = row?;
+            let result: JobResult = serde_json::from_str(&result_json)?;
+            *totals.entry(earner).or_insert(0) += result.render_seconds as u64;
+        }
+        Ok(totals)
+    }
+
+    /// Sum of `max_payout_wei` across all DONE jobs — the HUD "total $BLCKFLD
+    /// payable" metric. `max_payout_wei` is a 1e18-scale decimal string on the
+    /// `JobSpec`, so each done job's spec is decoded and its value parsed as
+    /// `u128` (wei; u128 max ≈ 3.4e38 ≈ 3.4e20 ether — ample headroom). Summed
+    /// with `checked_add` so an implausible overflow errors rather than wraps.
+    /// Zero when nothing has completed.
+    pub fn total_payout_wei(&self) -> Result<u128> {
+        let mut stmt = self.conn.prepare("SELECT spec_json FROM jobs WHERE status = ?1")?;
+        let rows = stmt.query_map([STATUS_DONE], |row| row.get::<_, String>(0))?;
+        let mut total: u128 = 0;
+        for row in rows {
+            let job: JobSpec = serde_json::from_str(&row?)?;
+            let wei: u128 = job
+                .max_payout_wei
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid max_payout_wei {:?}: {e}", job.max_payout_wei))?;
+            total = total
+                .checked_add(wei)
+                .ok_or_else(|| anyhow::anyhow!("total_payout_wei overflowed u128"))?;
+        }
+        Ok(total)
+    }
 }

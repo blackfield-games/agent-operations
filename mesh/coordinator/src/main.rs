@@ -62,8 +62,7 @@ struct Args {
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
 #[derive(Debug, Clone)]
 struct EarnerInfo {
-    /// Recorded for operator visibility / future scheduling; not yet surfaced.
-    #[allow(dead_code)]
+    /// GPU model the earner advertised at registration; surfaced in `/earners`.
     gpu_model: String,
     vram_gb: u32,
     supported: Vec<JobKind>,
@@ -173,6 +172,28 @@ struct Stats {
     /// Total render-seconds produced across all completed jobs — the mesh
     /// output metric for the HUD ("N render-seconds produced").
     total_render_seconds: u64,
+    /// Total $BLCKFLD payable across all completed jobs, as a decimal wei string
+    /// (1e18-scale). Sum of each done job's `max_payout_wei`. Serialized as a
+    /// STRING because a 1e18-scale total overflows JSON's safe integer range and
+    /// viem wants the decimal string anyway.
+    total_payout_wei: String,
+}
+
+/// One earner in the `GET /earners` live leaderboard: the capabilities it
+/// advertised at registration plus its lifetime `completed` job count and
+/// `render_seconds` total drawn from the `results` table.
+#[derive(Debug, Serialize)]
+struct EarnerEntry {
+    address: String,
+    gpu_model: String,
+    vram_gb: u32,
+    supported: Vec<JobKind>,
+    /// Unix epoch seconds of the last sign of life (same clock as `is_live`).
+    last_seen: i64,
+    /// Recorded results for this earner (sums to its share of `jobs_completed`).
+    completed: usize,
+    /// Total render-seconds this earner has produced across its results.
+    render_seconds: u64,
 }
 
 #[tokio::main]
@@ -330,6 +351,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/register", post(register))
         .route("/stats", get(stats))
+        .route("/earners", get(earners))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(job_detail))
         .route("/jobs/next", get(next_job))
@@ -436,6 +458,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let total_payout_wei = match store.total_payout_wei() {
+        Ok(w) => w.to_string(),
+        Err(e) => {
+            tracing::error!(?e, "stats: total_payout_wei failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -449,7 +478,60 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         completed_by_kind,
         failed_by_kind,
         total_render_seconds,
+        total_payout_wei,
     }))
+}
+
+/// `GET /earners` — live earner leaderboard for the HUD. Returns a JSON array of
+/// the currently-live earners (same `is_live(now, ttl)` filter as `/stats`), each
+/// with its advertised capabilities plus lifetime `completed` job count and
+/// `render_seconds` total drawn from the `results` table. Stale earners are
+/// excluded. Ordered by `completed` (then `render_seconds`, then `address`)
+/// descending so the busiest earner leads and the order is deterministic.
+///
+/// Holds `earners ⊃ store` (the store aggregates are computed while the earners
+/// guard is held), matching the `/stats` lock order to avoid a deadlock.
+async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEntry>>, StatusCode> {
+    let now = now_secs();
+    let ttl = state.earner_ttl_secs;
+    let earners = state.earners.lock().await;
+    let store = state.store.lock().await;
+    let completed = match store.completed_count_by_earner() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "earners: completed_count_by_earner failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let render_seconds = match store.render_seconds_by_earner() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "earners: render_seconds_by_earner failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let mut out: Vec<EarnerEntry> = earners
+        .iter()
+        .filter(|(_, info)| info.is_live(now, ttl))
+        .map(|(address, info)| EarnerEntry {
+            address: address.clone(),
+            gpu_model: info.gpu_model.clone(),
+            vram_gb: info.vram_gb,
+            supported: info.supported.clone(),
+            last_seen: info.last_seen,
+            completed: completed.get(address).copied().unwrap_or(0),
+            render_seconds: render_seconds.get(address).copied().unwrap_or(0),
+        })
+        .collect();
+    // Leaderboard order, with address as a final tiebreak so the array is stable
+    // across runs (HashMap iteration order is not).
+    out.sort_by(|a, b| {
+        b.completed
+            .cmp(&a.completed)
+            .then(b.render_seconds.cmp(&a.render_seconds))
+            .then(a.address.cmp(&b.address))
+    });
+    Ok(Json(out))
 }
 
 async fn next_job(State(state): State<Arc<AppState>>) -> Result<Json<Option<JobSpec>>, StatusCode> {
@@ -2275,6 +2357,146 @@ mod tests {
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["total_render_seconds"], 12, "sum of 5 + 7 render-seconds");
         assert_eq!(json["jobs_completed"], 2);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_total_payout_wei() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        // No completed jobs yet → "0" (serialized as a string).
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["total_payout_wei"], "0");
+
+        // Complete two jobs with known max_payout_wei; the stat sums them as a
+        // decimal wei string (1e18-scale, beyond JSON's safe-integer range).
+        let mut a = job_with_deadline(60);
+        a.max_payout_wei = "1500000000000000000".into(); // 1.5e18
+        let mut b = job_with_deadline(60);
+        b.max_payout_wei = "2500000000000000000".into(); // 2.5e18
+        {
+            let mut store = state.store.lock().await;
+            for job in [&a, &b] {
+                store.enqueue(job).unwrap();
+                store.take_next(|j| j.id == job.id).unwrap();
+                store.record_completed(&signed_result(job.id, "x")).unwrap();
+            }
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        // 1.5e18 + 2.5e18 = 4.0e18 wei, serialized as a decimal string.
+        assert_eq!(json["total_payout_wei"], "4000000000000000000");
+        assert_eq!(json["jobs_completed"], 2);
+    }
+
+    // ---- GET /earners live leaderboard ----
+
+    /// A `JobResult` attributed to `earner` with the given `render_seconds`.
+    /// `record_completed` stores `earner_address` verbatim and does not verify
+    /// the signature, so results can be credited to any address for the
+    /// leaderboard aggregates.
+    fn result_for(job_id: Uuid, earner: &str, render_seconds: u32) -> JobResult {
+        JobResult {
+            job_id,
+            earner_address: earner.into(),
+            output_hash: "h".into(),
+            output_url: "memory://x".into(),
+            render_seconds,
+            signature_hex: "00".into(),
+        }
+    }
+
+    /// `GET /earners` lists only live earners (stale ones excluded, like
+    /// `/stats`), each carrying its advertised capabilities plus its lifetime
+    /// completed-job and render-second totals from the `results` table.
+    #[tokio::test]
+    async fn earners_endpoint_lists_only_live_with_aggregates() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+
+        // Register two earners; then force one far into the past → stale (ttl=60).
+        for m in [
+            &hello("0xlive", 24, vec![JobKind::Terrain, JobKind::Foliage]),
+            &hello("0xstale", 16, vec![JobKind::NpcTick]),
+        ] {
+            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        {
+            let mut earners = state.earners.lock().await;
+            earners.get_mut("0xstale").unwrap().last_seen = 0;
+        }
+
+        // Complete two jobs credited to the live earner (render_seconds 5 + 7).
+        let a = job_with_deadline(60);
+        let b = job_with_deadline(60);
+        {
+            let mut store = state.store.lock().await;
+            store.enqueue(&a).unwrap();
+            store.enqueue(&b).unwrap();
+            store.take_next(|j| j.id == a.id).unwrap();
+            store.take_next(|j| j.id == b.id).unwrap();
+            store.record_completed(&result_for(a.id, "0xlive", 5)).unwrap();
+            store.record_completed(&result_for(b.id, "0xlive", 7)).unwrap();
+        }
+
+        let resp = get(state.clone(), "/earners").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only the live earner appears");
+        assert_eq!(arr[0]["address"], "0xlive");
+        assert_eq!(arr[0]["gpu_model"], "RTX 4090");
+        assert_eq!(arr[0]["vram_gb"], 24);
+        assert_eq!(arr[0]["completed"], 2);
+        assert_eq!(arr[0]["render_seconds"], 12, "sum of 5 + 7");
+        let supported = arr[0]["supported"].as_array().unwrap();
+        assert_eq!(supported.len(), 2, "advertised kinds preserved");
+    }
+
+    /// `GET /earners` orders the leaderboard by completed desc (then
+    /// render_seconds, then address), so the busiest live earner leads.
+    #[tokio::test]
+    async fn earners_endpoint_orders_by_completed_desc() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        for m in [
+            &hello("0xbusy", 24, vec![JobKind::Terrain]),
+            &hello("0xidle", 24, vec![JobKind::Terrain]),
+        ] {
+            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        // 0xbusy completes 2 jobs, 0xidle completes 1.
+        let jobs = [job_with_deadline(60), job_with_deadline(60), job_with_deadline(60)];
+        {
+            let mut store = state.store.lock().await;
+            for job in &jobs {
+                store.enqueue(job).unwrap();
+                store.take_next(|j| j.id == job.id).unwrap();
+            }
+            store.record_completed(&result_for(jobs[0].id, "0xbusy", 1)).unwrap();
+            store.record_completed(&result_for(jobs[1].id, "0xbusy", 1)).unwrap();
+            store.record_completed(&result_for(jobs[2].id, "0xidle", 1)).unwrap();
+        }
+
+        let json = body_json(get(state.clone(), "/earners").await).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["address"], "0xbusy", "busiest earner leads");
+        assert_eq!(arr[0]["completed"], 2);
+        assert_eq!(arr[1]["address"], "0xidle");
+        assert_eq!(arr[1]["completed"], 1);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
