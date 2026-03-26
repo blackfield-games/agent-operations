@@ -11,7 +11,7 @@ Run from the agents/ dir:
 
 import pytest
 
-from common.compose import compose_world, STRENGTH_ORDER
+from common.compose import compose_world, layer_summary, STRENGTH_ORDER
 from common.types import LayerSpec
 from runtime.supervisor import merge_layers
 
@@ -148,6 +148,32 @@ def test_unknown_specialist_does_not_create_output_file(tmp_path):
     with pytest.raises(ValueError):
         compose_world([bad], tmp_path)
     assert not (tmp_path / "world.usda").exists()
+
+
+def test_layer_summary_counts_per_specialist():
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r+0042_-0017_l0", path="terrain/a.usda", summary="a", metrics={}),
+        LayerSpec(specialist="biome", region_id="r+0042_-0017_l0", path="biome/a.usda", summary="b", metrics={}),
+        LayerSpec(specialist="biome", region_id="r+0042_-0018_l0", path="biome/b.usda", summary="c", metrics={}),
+    ]
+    # Two biome layers (distinct regions), one terrain.
+    assert layer_summary(layers) == {"biome": 2, "terrain": 1}
+
+
+def test_layer_summary_orders_by_strength_strongest_first():
+    region = "r+0042_-0017_l0"
+    # One layer per specialist, passed weakest-first; the summary must come back
+    # strongest-first (STRENGTH_ORDER), regardless of input order.
+    layers = [
+        LayerSpec(specialist=s, region_id=region, path=f"{s}/{s}.usda", summary=s, metrics={})
+        for s in reversed(STRENGTH_ORDER)
+    ]
+    assert list(layer_summary(layers).keys()) == STRENGTH_ORDER
+    assert all(count == 1 for count in layer_summary(layers).values())
+
+
+def test_layer_summary_empty_is_empty_dict():
+    assert layer_summary([]) == {}
 
 
 def test_compose_world_happy_path_all_known_specialists(tmp_path):

@@ -26,6 +26,25 @@ STRENGTH_ORDER = [
 ]
 
 
+def layer_summary(layers: list[LayerSpec]) -> dict[str, int]:
+    """Per-specialist layer counts, for observability in the runtime report and
+    the CLI ``--json`` output. Content-free: it counts layers, never reads their
+    data.
+
+    Keys follow STRENGTH_ORDER (strongest first) so the breakdown reads top-down;
+    a specialist with no emitted layer is omitted. Unlike `compose_world`, a count
+    is harmless for an unknown specialist, so any such specialist is appended in
+    sorted order after the known ones rather than rejected.
+    """
+    counts: dict[str, int] = {}
+    for layer in layers:
+        counts[layer.specialist] = counts.get(layer.specialist, 0) + 1
+    ordered = {s: counts[s] for s in STRENGTH_ORDER if s in counts}
+    for specialist in sorted(counts.keys() - set(STRENGTH_ORDER)):
+        ordered[specialist] = counts[specialist]
+    return ordered
+
+
 def compose_world(layers: list[LayerSpec], out_dir: Path) -> Path:
     """Write a world.usda root layer that sublayers each specialist's file in
     strength order. Does NOT open a UsdStage — that's the engine's job.
