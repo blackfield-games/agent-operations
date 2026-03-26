@@ -166,6 +166,66 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.balanceOf(player, id), 2);
     }
 
+    // --- HUD read-path counters (templatesByAuthor / totalMinted / mintedByTemplate) ---
+
+    function test_registerTemplate_tracksTemplatesByAuthor() public {
+        vm.startPrank(minter);
+        art.registerTemplate(author, 1, keccak256("a"));
+        art.registerTemplate(player, 2, keccak256("b"));
+        art.registerTemplate(author, 3, keccak256("c"));
+        vm.stopPrank();
+
+        assertEq(art.templatesByAuthor(author), 2);
+        assertEq(art.templatesByAuthor(player), 1);
+        assertEq(art.templatesByAuthor(stranger), 0);
+        // Across authors the per-author counts sum to nextTemplateId.
+        assertEq(art.templatesByAuthor(author) + art.templatesByAuthor(player), art.nextTemplateId());
+    }
+
+    function test_mint_tracksTotalMintedAndByTemplate() public {
+        vm.startPrank(minter);
+        uint256 id1 = art.registerTemplate(author, 1, keccak256("a"));
+        uint256 id2 = art.registerTemplate(author, 2, keccak256("b"));
+        art.mint(player, id1, 5, "");
+        art.mint(player, id1, 3, ""); // same template accumulates
+        art.mint(stranger, id2, 4, "");
+        vm.stopPrank();
+
+        assertEq(art.mintedByTemplate(id1), 8);
+        assertEq(art.mintedByTemplate(id2), 4);
+        assertEq(art.totalMinted(), 12);
+        // Across templates the per-template counts sum to totalMinted.
+        assertEq(art.mintedByTemplate(id1) + art.mintedByTemplate(id2), art.totalMinted());
+    }
+
+    /// @dev A reverting register/mint must record nothing (mirrors ComputeMeter's
+    ///      "a reverting spend records neither" property).
+    function test_revertingCallsRecordNothing() public {
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        assertEq(art.totalMinted(), 0);
+
+        // Non-minter register: templatesByAuthor must not move.
+        vm.expectRevert(ArtifactTemplate.NotMinter.selector);
+        vm.prank(stranger);
+        art.registerTemplate(stranger, 1, keccak256("x"));
+        assertEq(art.templatesByAuthor(stranger), 0);
+
+        // Unknown-template mint: mint counters must not move.
+        vm.expectRevert(ArtifactTemplate.UnknownTemplate.selector);
+        vm.prank(minter);
+        art.mint(player, 9999, 7, "");
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.mintedByTemplate(9999), 0);
+
+        // Non-minter mint of a known template: likewise records nothing.
+        vm.expectRevert(ArtifactTemplate.NotMinter.selector);
+        vm.prank(stranger);
+        art.mint(player, id, 7, "");
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.mintedByTemplate(id), 0);
+    }
+
     // --- minter rotation interplay ---
 
     function test_rotatedMinterCannotUseOldKey() public {

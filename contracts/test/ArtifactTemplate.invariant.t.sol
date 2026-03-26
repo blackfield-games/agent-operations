@@ -24,6 +24,7 @@ contract ArtifactTemplateHandler is Test {
     uint256[] public ids;
 
     uint256 public ghost_registered;
+    mapping(address => uint256) public ghost_registeredByAuthor;
     mapping(uint256 => uint256) public ghost_supply;
 
     constructor(ArtifactTemplate art_, address[] memory actors_) {
@@ -42,6 +43,7 @@ contract ArtifactTemplateHandler is Test {
         uint256 id = art.registerTemplate(author, rarity, manifest);
         ids.push(id);
         ghost_registered++;
+        ghost_registeredByAuthor[author]++;
     }
 
     function mint(uint256 idSeed, uint256 toSeed, uint256 amount) external {
@@ -117,6 +119,29 @@ contract ArtifactTemplateInvariantTest is Test {
             }
             assertEq(sum, handler.ghost_supply(id));
         }
+    }
+
+    /// @dev Per-author registered count tracked on-chain matches the ghost
+    ///      (creator-leaderboard read path).
+    function invariant_templatesByAuthorMatchesGhost() public view {
+        uint256 actorsLen = handler.actorsLength();
+        for (uint256 i = 0; i < actorsLen; i++) {
+            address actor = handler.actorAt(i);
+            assertEq(art.templatesByAuthor(actor), handler.ghost_registeredByAuthor(actor));
+        }
+    }
+
+    /// @dev Per-template minted units match the supply ghost, and across templates
+    ///      they sum to totalMinted (artifact-popularity read path).
+    function invariant_mintAccountingMatches() public view {
+        uint256 len = handler.idsLength();
+        uint256 summed = 0;
+        for (uint256 i = 0; i < len; i++) {
+            uint256 id = handler.ids(i);
+            assertEq(art.mintedByTemplate(id), handler.ghost_supply(id));
+            summed += art.mintedByTemplate(id);
+        }
+        assertEq(art.totalMinted(), summed);
     }
 }
 

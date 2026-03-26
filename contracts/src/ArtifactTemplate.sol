@@ -20,6 +20,20 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     mapping(uint256 templateId => Template) public templates;
     uint256 public nextTemplateId;
 
+    /// @notice Per-author count of registered templates, for the HUD creator
+    ///         leaderboard. Across all authors these sum to `nextTemplateId`.
+    ///         `author` is also indexed in `TemplateRegistered` for event cross-ref.
+    mapping(address author => uint256 count) public templatesByAuthor;
+
+    /// @notice Cumulative ERC-1155 units minted across all templates — the HUD
+    ///         "total artifacts minted" metric, the mint-side counterpart to the
+    ///         register side's `nextTemplateId`.
+    uint256 public totalMinted;
+
+    /// @notice Cumulative units minted per template, for the HUD artifact-
+    ///         popularity read. Across all templates these sum to `totalMinted`.
+    mapping(uint256 templateId => uint256 amount) public mintedByTemplate;
+
     event TemplateRegistered(
         uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
     );
@@ -47,6 +61,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         if (msg.sender != minter) revert NotMinter();
         templateId = ++nextTemplateId;
         templates[templateId] = Template({author: author, rarity: rarity, manifest: manifest});
+        ++templatesByAuthor[author];
         emit TemplateRegistered(templateId, author, rarity, manifest);
     }
 
@@ -54,6 +69,8 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         if (msg.sender != minter) revert NotMinter();
         if (templates[templateId].author == address(0)) revert UnknownTemplate();
         _mint(to, templateId, amount, data);
+        totalMinted += amount;
+        mintedByTemplate[templateId] += amount;
         emit Minted(to, templateId, amount);
     }
 }
