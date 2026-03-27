@@ -12,11 +12,12 @@ Run from the agents/ dir so package imports resolve like the tests do:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import anyio
 
-from common.compose import compose_world
+from common.compose import compose_world, layer_summary
 from common.types import LayerSpec, RegionCoord, ValidatorVerdict, WorldBrief
 from runtime.supervisor import build_graph
 
@@ -36,6 +37,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--aesthetic", default=None, help="override the default WorldBrief aesthetic"
     )
     p.add_argument("--out", default="out", help="output dir for world.usda")
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the region report as JSON instead of human-readable text",
+    )
     return p.parse_args(argv)
 
 
@@ -69,6 +75,28 @@ def _render_report(
     return "\n".join(lines)
 
 
+def _render_report_json(
+    region_id: str,
+    verdict: ValidatorVerdict,
+    layers: list[LayerSpec],
+    world_path: Path,
+) -> str:
+    """Machine-readable JSON form of the runtime report (see `_render_report` for
+    the human form). Stable keys for HUD/CI consumers; `layer_counts` is the
+    per-specialist breakdown from `layer_summary`."""
+    report = {
+        "region_id": region_id,
+        "accepted": verdict.accepted,
+        "issues": list(verdict.issues),
+        "layers": [
+            {"specialist": layer.specialist, "summary": layer.summary} for layer in layers
+        ],
+        "layer_counts": layer_summary(layers),
+        "world": str(world_path),
+    }
+    return json.dumps(report, indent=2)
+
+
 async def _run_graph(brief: WorldBrief) -> dict:
     graph = build_graph()
     return await graph.ainvoke({"brief": brief, "layers": [], "rounds": 0})
@@ -85,7 +113,10 @@ def main(argv: list[str] | None = None) -> int:
     layers: list[LayerSpec] = result["layers"]
 
     world_path = compose_world(layers, Path(args.out))
-    print(_render_report(brief.region.region_id, verdict, layers, world_path))
+    if args.json:
+        print(_render_report_json(brief.region.region_id, verdict, layers, world_path))
+    else:
+        print(_render_report(brief.region.region_id, verdict, layers, world_path))
 
     return 0 if verdict.accepted else 1
 
