@@ -58,12 +58,14 @@ def _render_report(
     verdict: ValidatorVerdict,
     layers: list[LayerSpec],
     world_path: Path,
+    rounds: int,
 ) -> str:
     """Concise human-readable summary of one runtime invocation."""
     status = "ACCEPTED" if verdict.accepted else "REJECTED"
     lines = [
         f"region:    {region_id}",
         f"validator: {status}",
+        f"rounds:    {rounds}",
     ]
     if verdict.issues:
         lines.append("issues:")
@@ -80,14 +82,17 @@ def _render_report_json(
     verdict: ValidatorVerdict,
     layers: list[LayerSpec],
     world_path: Path,
+    rounds: int,
 ) -> str:
     """Machine-readable JSON form of the runtime report (see `_render_report` for
     the human form). Stable keys for HUD/CI consumers; `layer_counts` is the
-    per-specialist breakdown from `layer_summary`."""
+    per-specialist breakdown from `layer_summary`; `rounds` is the number of
+    validator passes (1 when accepted on the first round, more after route-backs)."""
     report = {
         "region_id": region_id,
         "accepted": verdict.accepted,
         "issues": list(verdict.issues),
+        "rounds": rounds,
         "layers": [
             {"specialist": layer.specialist, "summary": layer.summary} for layer in layers
         ],
@@ -111,12 +116,13 @@ def main(argv: list[str] | None = None) -> int:
 
     verdict: ValidatorVerdict = result["verdict"]
     layers: list[LayerSpec] = result["layers"]
+    rounds: int = result.get("rounds", 0)
 
     world_path = compose_world(layers, Path(args.out))
     if args.json:
-        print(_render_report_json(brief.region.region_id, verdict, layers, world_path))
+        print(_render_report_json(brief.region.region_id, verdict, layers, world_path, rounds))
     else:
-        print(_render_report(brief.region.region_id, verdict, layers, world_path))
+        print(_render_report(brief.region.region_id, verdict, layers, world_path, rounds))
 
     return 0 if verdict.accepted else 1
 

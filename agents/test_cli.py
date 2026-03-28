@@ -31,6 +31,8 @@ def test_main_runs_end_to_end(tmp_path, monkeypatch, capsys):
     assert "r+0042_-0017_l0" in out
     assert "ACCEPTED" in out
     assert "7 emitted" in out
+    # one validation round on the happy path (accepted on the first pass)
+    assert "rounds:    1" in out
     # report lists every authoring specialist
     for specialist in ("director", "terrain", "biome", "prop", "lighting", "npc", "optimization"):
         assert specialist in out
@@ -59,6 +61,9 @@ def test_json_output(tmp_path, monkeypatch, capsys):
     assert report["region_id"] == "r+0001_+0002_l0"
     assert report["accepted"] is True
     assert isinstance(report["issues"], list)
+    # rounds: number of validator passes; 1 on the happy path (accepted first round).
+    assert isinstance(report["rounds"], int)
+    assert report["rounds"] == 1
 
     # One layer per authoring specialist, each carrying specialist + summary.
     assert len(report["layers"]) == len(AUTHORING)
