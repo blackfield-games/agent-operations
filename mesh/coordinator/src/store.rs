@@ -574,4 +574,37 @@ impl Store {
         }
         Ok(total)
     }
+
+    /// Sum of `max_payout_wei` grouped by earner address — the per-earner
+    /// counterpart to `total_payout_wei`, for the `GET /earners` leaderboard
+    /// economics column. Joins each recorded result to its job (every recorded
+    /// result's job is `done`, so the inner join is exact), decodes the
+    /// `JobSpec`, and accumulates `max_payout_wei.parse::<u128>()` under the
+    /// `results.earner` key with `checked_add` (an implausible overflow errors
+    /// rather than wraps, mirroring `total_payout_wei`). Empty map when nothing
+    /// has completed.
+    pub fn payout_wei_by_earner(&self) -> Result<HashMap<String, u128>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT r.earner, j.spec_json FROM results r JOIN jobs j ON r.job_id = j.id")?;
+        let rows = stmt.query_map([], |row| {
+            let earner: String = row.get(0)?;
+            let spec_json: String = row.get(1)?;
+            Ok((earner, spec_json))
+        })?;
+        let mut totals: HashMap<String, u128> = HashMap::new();
+        for row in rows {
+            let (earner, spec_json) = row?;
+            let job: JobSpec = serde_json::from_str(&spec_json)?;
+            let wei: u128 = job
+                .max_payout_wei
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid max_payout_wei {:?}: {e}", job.max_payout_wei))?;
+            let slot = totals.entry(earner).or_insert(0u128);
+            *slot = slot
+                .checked_add(wei)
+                .ok_or_else(|| anyhow::anyhow!("payout_wei_by_earner overflowed u128"))?;
+        }
+        Ok(totals)
+    }
 }

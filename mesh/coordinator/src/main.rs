@@ -194,6 +194,9 @@ struct EarnerEntry {
     completed: usize,
     /// Total render-seconds this earner has produced across its results.
     render_seconds: u64,
+    /// Total $BLCKFLD payable to this earner across its DONE jobs, as a decimal
+    /// wei string (the per-earner counterpart to `/stats` `total_payout_wei`).
+    payout_wei: String,
 }
 
 #[tokio::main]
@@ -510,6 +513,13 @@ async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEn
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let payout_wei = match store.payout_wei_by_earner() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "earners: payout_wei_by_earner failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let mut out: Vec<EarnerEntry> = earners
         .iter()
         .filter(|(_, info)| info.is_live(now, ttl))
@@ -521,6 +531,7 @@ async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEn
             last_seen: info.last_seen,
             completed: completed.get(address).copied().unwrap_or(0),
             render_seconds: render_seconds.get(address).copied().unwrap_or(0),
+            payout_wei: payout_wei.get(address).copied().unwrap_or(0).to_string(),
         })
         .collect();
     // Leaderboard order, with address as a final tiebreak so the array is stable
@@ -2497,6 +2508,49 @@ mod tests {
         assert_eq!(arr[0]["completed"], 2);
         assert_eq!(arr[1]["address"], "0xidle");
         assert_eq!(arr[1]["completed"], 1);
+    }
+
+    /// `GET /earners` carries each earner's `payout_wei`: the sum of
+    /// `max_payout_wei` across that earner's DONE jobs, as a decimal wei string
+    /// (the per-earner counterpart to `/stats` `total_payout_wei`).
+    #[tokio::test]
+    async fn earners_endpoint_reports_per_earner_payout_wei() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        let resp = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello("0xpay", 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Two DONE jobs credited to 0xpay with known payouts (1.5e18 + 2.5e18).
+        let mut a = job_with_deadline(60);
+        a.max_payout_wei = "1500000000000000000".into();
+        let mut b = job_with_deadline(60);
+        b.max_payout_wei = "2500000000000000000".into();
+        {
+            let mut store = state.store.lock().await;
+            for job in [&a, &b] {
+                store.enqueue(job).unwrap();
+                store.take_next(|j| j.id == job.id).unwrap();
+            }
+            store.record_completed(&result_for(a.id, "0xpay", 1)).unwrap();
+            store.record_completed(&result_for(b.id, "0xpay", 1)).unwrap();
+        }
+
+        let json = body_json(get(state.clone(), "/earners").await).await;
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["address"], "0xpay");
+        // 1.5e18 + 2.5e18 = 4.0e18 wei, serialized as a decimal string.
+        assert_eq!(arr[0]["payout_wei"], "4000000000000000000");
+        assert_eq!(arr[0]["completed"], 2);
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
