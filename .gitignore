@@ -1,0 +1,62 @@
+# --- internal / never-leak ---
+# Per "no internal doc leaks" rule: planning, scope, briefs, blockers
+# stay strictly local. Pre-commit hook should enforce this too.
+docs/internal/
+docs/**/BLOCKERS*.md
+docs/**/HANDOVER*.md
+docs/**/*-brief.*
+docs/**/*-scope.*
+docs/**/*-PRIVATE.*
+*.private.md
+.handover/
+BLOCKERS.md
+
+# --- secrets ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+keypairs/
+
+# --- build / generated ---
+target/
+node_modules/
+dist/
+build/
+out/
+.next/
+.turbo/
+.cache/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# --- foundry ---
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+
+# --- ue5 ---
+engine/Binaries/
+engine/DerivedDataCache/
+engine/Intermediate/
+engine/Saved/
+engine/.vs/
+engine/.vscode/
+
+# --- editor / os ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- assets: keep brand, ignore heavy captures ---
+assets/captures/
+assets/raw/
+assets/3dgs/
