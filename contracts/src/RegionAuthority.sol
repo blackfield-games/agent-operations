@@ -6,7 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
-/// @notice Stake $TOKEN to claim authority over a world region. Region holders
+/// @notice Stake $BLCKFLD to claim authority over a world region. Region holders
 ///         earn a share of compute fees + mint royalties inside their region.
 ///         tokenId == region coordinate hash (keccak256(region_x, region_y, layer)).
 contract RegionAuthority is ERC721, Ownable2Step {

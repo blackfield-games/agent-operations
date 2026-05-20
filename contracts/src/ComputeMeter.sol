@@ -5,8 +5,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
-/// @notice Burns $TOKEN to credit render-jobs against a buyer's compute budget.
-///         Buyers (players, region authorities, the game itself) deposit $TOKEN
+/// @notice Burns $BLCKFLD to credit render-jobs against a buyer's compute budget.
+///         Buyers (players, region authorities, the game itself) deposit $BLCKFLD
 ///         which is debited per validated render-second / NPC-tick / mint-permit.
 contract ComputeMeter is Ownable2Step {
     using SafeERC20 for IERC20;

@@ -47,7 +47,7 @@ pub struct JobSpec {
     pub kind: JobKind,
     pub region: RegionCoord,
     pub deadline_secs: u32,
-    /// Max $TOKEN payable on acceptance (in 1e18 wei).
+    /// Max $BLCKFLD payable on acceptance (in 1e18 wei).
     pub max_payout_wei: String,
     /// Inputs needed to run the job (CDN URLs, asset hashes).
     pub inputs: serde_json::Value,
