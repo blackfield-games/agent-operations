@@ -30,12 +30,19 @@ use uuid::Uuid;
 const PLACEHOLDER_ATTESTATION_UID: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+mod store;
 mod verify;
+
+use store::Store;
 
 #[derive(Parser)]
 struct Args {
     #[arg(long, env = "COORDINATOR_BIND", default_value = "127.0.0.1:8787")]
     bind: String,
+    /// Path to the SQLite database backing the job queue + results. Created on
+    /// first run; a restart reloads queue/completed state from it.
+    #[arg(long, env = "COORDINATOR_DB", default_value = "coordinator.db")]
+    db: String,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -48,11 +55,26 @@ struct EarnerInfo {
     supported: Vec<JobKind>,
 }
 
-#[derive(Default)]
 struct AppState {
-    queue: Mutex<Vec<JobSpec>>,
-    completed: Mutex<Vec<JobResult>>,
+    /// Job queue + completed results, persisted to SQLite so they survive a
+    /// restart. Earner registrations stay in-memory by design.
+    store: Mutex<Store>,
     earners: Mutex<HashMap<String, EarnerInfo>>,
+}
+
+impl AppState {
+    /// Build state backed by `store`. Seeds one job only when the DB has no
+    /// jobs yet, so a fresh DB gives earners something to do while a restart
+    /// with existing jobs does NOT double-seed.
+    fn with_store(store: Store) -> Result<Arc<Self>> {
+        if store.jobs_empty()? {
+            store.enqueue(&seed_job())?;
+        }
+        Ok(Arc::new(AppState {
+            store: Mutex::new(store),
+            earners: Mutex::new(HashMap::new()),
+        }))
+    }
 }
 
 /// Aggregate mesh stats. Backs the wedge requirement
@@ -73,10 +95,10 @@ async fn main() -> Result<()> {
         .with_env_filter("coordinator=info,tower_http=info")
         .init();
     let args = Args::parse();
-    let state = Arc::new(AppState::default());
-
-    // seed one job so the earner has something to take
-    state.queue.lock().await.push(seed_job());
+    let store = Store::open(&args.db)?;
+    // Seeds a fresh DB only; a restart reloads existing jobs from the file.
+    let state = AppState::with_store(store)?;
+    tracing::info!(db = %args.db, "store ready");
 
     let app = router(state);
 
@@ -137,7 +159,7 @@ async fn register(
     Ok("registered")
 }
 
-async fn stats(State(state): State<Arc<AppState>>) -> Json<Stats> {
+async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, StatusCode> {
     let earners = state.earners.lock().await;
     let mut total_vram_gb: u64 = 0;
     let mut supported_breakdown: HashMap<JobKind, usize> = HashMap::new();
@@ -147,18 +169,32 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<Stats> {
             *supported_breakdown.entry(*kind).or_insert(0) += 1;
         }
     }
-    Json(Stats {
+    let store = state.store.lock().await;
+    let (jobs_queued, jobs_completed) = match (store.queued_count(), store.completed_count()) {
+        (Ok(q), Ok(c)) => (q, c),
+        (q, c) => {
+            tracing::error!(?q, ?c, "stats: store count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    Ok(Json(Stats {
         gpus_joined: earners.len(),
         total_vram_gb,
-        jobs_queued: state.queue.lock().await.len(),
-        jobs_completed: state.completed.lock().await.len(),
+        jobs_queued,
+        jobs_completed,
         supported_breakdown,
-    })
+    }))
 }
 
 async fn next_job(State(state): State<Arc<AppState>>) -> Result<Json<Option<JobSpec>>, StatusCode> {
-    let mut q = state.queue.lock().await;
-    Ok(Json(q.pop()))
+    let store = state.store.lock().await;
+    match store.take_next(|_| true) {
+        Ok(job) => Ok(Json(job)),
+        Err(e) => {
+            tracing::error!(?e, "next_job: take_next failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn submit(
@@ -182,7 +218,11 @@ async fn submit(
     }
     tracing::info!(?id, earner = %result.earner_address, "result received");
     // TODO validator gate, EAS attestation relay
-    state.completed.lock().await.push(result);
+    let mut store = state.store.lock().await;
+    if let Err(e) = store.record_completed(&result) {
+        tracing::error!(?id, ?e, "submit: failed to persist result");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
     Ok("accepted")
 }
 
@@ -362,17 +402,25 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
     }
 }
 
-/// Pop the most recent queued job whose kind the earner supports. Leaves
-/// unsupported jobs in place for other earners.
+/// Take the most recent queued job whose kind the earner supports, marking it
+/// in-flight. Leaves unsupported jobs queued for other earners.
 async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Option<JobSpec> {
-    let mut q = state.queue.lock().await;
-    let idx = q.iter().rposition(|job| supported.contains(&job.kind))?;
-    Some(q.remove(idx))
+    let store = state.store.lock().await;
+    match store.take_next(|job| supported.contains(&job.kind)) {
+        Ok(job) => job,
+        Err(e) => {
+            tracing::error!(?e, "take_supported_job: take_next failed");
+            None
+        }
+    }
 }
 
 /// Put a job back on the queue (rejected submission or dropped connection).
 async fn requeue(state: &Arc<AppState>, job: JobSpec) {
-    state.queue.lock().await.push(job);
+    let store = state.store.lock().await;
+    if let Err(e) = store.requeue(&job) {
+        tracing::error!(job_id = %job.id, ?e, "requeue failed");
+    }
 }
 
 /// Verify a ws `Submit` against the outstanding offer and produce the verdict.
@@ -410,7 +458,13 @@ async fn handle_submit(
 
     tracing::info!(%job_id, earner = %result.earner_address, "ws result accepted");
     // TODO validator gate, real EAS attestation relay (placeholder uid for now).
-    state.completed.lock().await.push(result);
+    {
+        let mut store = state.store.lock().await;
+        if let Err(e) = store.record_completed(&result) {
+            tracing::error!(%job_id, ?e, "ws: failed to persist result");
+            return reject("failed to persist result");
+        }
+    }
     CoordinatorMsg::Accepted {
         job_id,
         attestation_uid: PLACEHOLDER_ATTESTATION_UID.to_string(),
@@ -424,8 +478,29 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
 
+    /// In-memory store-backed state (no disk). `with_store` seeds one job
+    /// because the in-memory DB starts empty; tests that need an empty queue
+    /// drain it first via `/jobs/next` or use `test_state_empty`.
     fn test_state() -> Arc<AppState> {
-        Arc::new(AppState::default())
+        AppState::with_store(Store::open_in_memory().unwrap()).unwrap()
+    }
+
+    /// In-memory state with the auto-seeded job removed, so the queue starts
+    /// empty (matches the old `AppState::default()` behavior used by tests
+    /// that assert `jobs_queued == 0`).
+    async fn test_state_empty() -> Arc<AppState> {
+        let state = test_state();
+        // Drain the seeded job so the queue is empty.
+        let store = state.store.lock().await;
+        let _ = store.take_next(|_| true).unwrap();
+        drop(store);
+        state
+    }
+
+    /// Enqueue a job directly via the store (test helper replacing the old
+    /// `state.queue.lock().await.push(job)`).
+    async fn enqueue(state: &Arc<AppState>, job: &JobSpec) {
+        state.store.lock().await.enqueue(job).unwrap();
     }
 
     fn hello(address: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
@@ -465,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_then_stats_reflects_earner() {
-        let state = test_state();
+        let state = test_state_empty().await;
         let msg = hello("0xabc", 24, vec![JobKind::Terrain, JobKind::Foliage]);
         let resp = post_json(state.clone(), "/register", &serde_json::to_value(&msg).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -511,8 +586,8 @@ mod tests {
 
     #[tokio::test]
     async fn next_job_returns_seed_then_none() {
+        // `test_state` auto-seeds exactly one terrain job.
         let state = test_state();
-        state.queue.lock().await.push(seed_job());
 
         let resp = get(state.clone(), "/jobs/next").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -559,10 +634,10 @@ mod tests {
 
     #[tokio::test]
     async fn submit_matching_id_accepted_mismatch_rejected() {
-        let state = test_state();
+        let state = test_state_empty().await;
         let job = seed_job();
         let job_id = job.id;
-        state.queue.lock().await.push(job);
+        enqueue(&state, &job).await;
 
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
@@ -648,10 +723,10 @@ mod tests {
 
     #[tokio::test]
     async fn ws_offer_accept_submit_flows_to_completed() {
-        let state = test_state();
+        let state = test_state_empty().await;
         let job = seed_job();
         let job_id = job.id;
-        state.queue.lock().await.push(job);
+        enqueue(&state, &job).await;
 
         let addr = serve_ephemeral(state.clone()).await;
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -703,10 +778,10 @@ mod tests {
 
     #[tokio::test]
     async fn ws_invalid_signature_yields_rejected() {
-        let state = test_state();
+        let state = test_state_empty().await;
         let job = seed_job();
         let job_id = job.id;
-        state.queue.lock().await.push(job);
+        enqueue(&state, &job).await;
 
         let addr = serve_ephemeral(state.clone()).await;
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -748,6 +823,56 @@ mod tests {
         // Nothing reached `completed`.
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_completed"], 0);
+    }
+
+    /// Simulated restart: enqueue a job and record a completed result against
+    /// one file-backed state, drop it, then reopen the SAME DB file into a
+    /// fresh `AppState` and assert the queued/completed counts survived.
+    #[tokio::test]
+    async fn queue_and_results_survive_restart() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        // --- first "process": fresh DB (auto-seeds one job), enqueue another,
+        //     and record a completed result. ---
+        let queued_before;
+        let completed_before;
+        {
+            let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+
+            // Enqueue a second job and submit a validly-signed result for it.
+            let job = seed_job();
+            let job_id = job.id;
+            enqueue(&state, &job).await;
+
+            let result = signed_result(job_id, "deadbeef");
+            let uri = format!("/jobs/{}/submit", job_id);
+            let resp =
+                post_json(state.clone(), &uri, &serde_json::to_value(&result).unwrap()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let json = body_json(get(state.clone(), "/stats").await).await;
+            // One auto-seeded job still queued; the enqueued one is now done.
+            queued_before = json["jobs_queued"].as_u64().unwrap();
+            completed_before = json["jobs_completed"].as_u64().unwrap();
+            assert_eq!(queued_before, 1);
+            assert_eq!(completed_before, 1);
+        } // state (and its Store/Connection) dropped here → "process" ends.
+
+        // --- second "process": reopen the same file. with_store must NOT
+        //     re-seed (jobs already exist), and counts must match. ---
+        let state = AppState::with_store(Store::open(&db_path).unwrap()).unwrap();
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(
+            json["jobs_queued"].as_u64().unwrap(),
+            queued_before,
+            "queued count must survive restart"
+        );
+        assert_eq!(
+            json["jobs_completed"].as_u64().unwrap(),
+            completed_before,
+            "completed count must survive restart"
+        );
     }
 
     /// Read text frames until one decodes to a `CoordinatorMsg` (skipping
