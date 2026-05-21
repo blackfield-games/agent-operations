@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use proto::{JobResult, JobSpec};
+use proto::{EarnerMsg, JobKind, JobResult, JobSpec};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -26,6 +26,10 @@ struct Args {
     address: String,
     #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 5)]
     poll_secs: u64,
+    #[arg(long, env = "GPU_MODEL", default_value = "unknown-gpu")]
+    gpu_model: String,
+    #[arg(long, env = "VRAM_GB", default_value_t = 24)]
+    vram_gb: u32,
 }
 
 #[tokio::main]
@@ -38,6 +42,12 @@ async fn main() -> Result<()> {
 
     tracing::info!(coordinator = %args.coordinator, address = %args.address, "earner online");
 
+    if let Err(e) = register(&client, &args).await {
+        // Non-fatal: the coordinator may not yet support /register, or be down.
+        // We still fall through to polling for jobs.
+        tracing::warn!(error = %e, "registration failed");
+    }
+
     loop {
         match poll_once(&client, &args).await {
             Ok(true) => {}
@@ -48,6 +58,25 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+async fn register(client: &reqwest::Client, args: &Args) -> Result<()> {
+    let hello = EarnerMsg::Hello {
+        earner_address: args.address.clone(),
+        gpu_model: args.gpu_model.clone(),
+        vram_gb: args.vram_gb,
+        supported: vec![
+            JobKind::Terrain,
+            JobKind::Foliage,
+            JobKind::NpcTick,
+            JobKind::DiffusionTile,
+            JobKind::Optimization,
+        ],
+    };
+    let url = format!("{}/register", args.coordinator);
+    let resp = client.post(&url).json(&hello).send().await?.error_for_status()?;
+    tracing::info!(status = %resp.status(), "registered with coordinator");
+    Ok(())
 }
 
 async fn poll_once(client: &reqwest::Client, args: &Args) -> Result<bool> {
