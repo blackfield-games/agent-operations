@@ -177,6 +177,11 @@ struct Stats {
     /// STRING because a 1e18-scale total overflows JSON's safe integer range and
     /// viem wants the decimal string anyway.
     total_payout_wei: String,
+    /// Age in seconds of the longest-running in-flight job (`now - started_at` of
+    /// the oldest `in_flight` dispatch), or `null` when nothing is in flight. A
+    /// queue-health signal for the HUD: it climbs when an earner is slow or stuck
+    /// and resets as jobs complete or get reaped. Needs no schema migration.
+    oldest_in_flight_secs: Option<u64>,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -468,6 +473,18 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    // Age of the longest-running in-flight dispatch (`now - oldest started_at`),
+    // or None when nothing is in flight. `max(0)` guards against clock skew where
+    // a heartbeat-bumped `started_at` briefly leads `now`. Still under the held
+    // store lock, so the load-bearing `earners ⊃ store` order is preserved.
+    let oldest_in_flight_secs = match store.oldest_in_flight_started_at() {
+        Ok(Some(ts)) => Some(now.saturating_sub(ts).max(0) as u64),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(?e, "stats: oldest_in_flight_started_at failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -482,6 +499,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         failed_by_kind,
         total_render_seconds,
         total_payout_wei,
+        oldest_in_flight_secs,
     }))
 }
 
@@ -1605,6 +1623,59 @@ mod tests {
         let outcome = store.reap_expired(5100, BIG_MAX).unwrap();
         assert_eq!(outcome.requeued, vec![id], "must reap at deadline");
         assert!(outcome.failed.is_empty());
+    }
+
+    #[test]
+    fn oldest_in_flight_started_at_is_min_over_in_flight_jobs() {
+        const BIG_MAX: u32 = 999;
+        let store = Store::open_in_memory().unwrap();
+        // Nothing in flight yet → None.
+        assert_eq!(store.oldest_in_flight_started_at().unwrap(), None);
+
+        // Two jobs in flight, touched to known (distinct) started_at timestamps.
+        let a = job_with_deadline(100);
+        let b = job_with_deadline(100);
+        let (id_a, id_b) = (a.id, b.id);
+        store.enqueue(&a).unwrap();
+        store.enqueue(&b).unwrap();
+        store.take_next(|_| true).unwrap();
+        store.take_next(|_| true).unwrap();
+        store.touch(&id_a, 5000).unwrap();
+        store.touch(&id_b, 4000).unwrap();
+
+        // The oldest is the MINIMUM started_at across the in-flight set.
+        assert_eq!(store.oldest_in_flight_started_at().unwrap(), Some(4000));
+
+        // Reaping past b's deadline requeues it (started_at cleared); only a is
+        // left in flight, so the oldest advances to a's timestamp.
+        let outcome = store.reap_expired(4100, BIG_MAX).unwrap();
+        assert_eq!(outcome.requeued, vec![id_b]);
+        assert_eq!(store.oldest_in_flight_started_at().unwrap(), Some(5000));
+    }
+
+    #[tokio::test]
+    async fn stats_reports_oldest_in_flight_secs() {
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            earner_ttl_secs: 60,
+        });
+        // No in-flight jobs → null (stable key, absent value).
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert!(json["oldest_in_flight_secs"].is_null(), "no in-flight jobs → null");
+
+        // Put one job in flight; the field becomes the age of its dispatch. Just
+        // taken, so it is ~0 and certainly a small NUMBER (proving None → Some).
+        let job = job_with_deadline(60);
+        {
+            let store = state.store.lock().await;
+            store.enqueue(&job).unwrap();
+            store.take_next(|_| true).unwrap();
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        let age = json["oldest_in_flight_secs"].as_u64().expect("in-flight → numeric age");
+        assert!(age < 5, "freshly dispatched job age should be ~0, got {age}");
     }
 
     /// Repeated heartbeats keep extending the liveness window.

@@ -476,6 +476,23 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Epoch-seconds `started_at` of the OLDEST in-flight job (the minimum over
+    /// every `in_flight` job), or `None` when nothing is in flight. The `/stats`
+    /// handler turns this into an `oldest_in_flight_secs` age (`now - this`) so
+    /// the HUD can surface the longest-running dispatch — a queue-health signal
+    /// that needs no schema migration: `started_at` is set on `take_next`,
+    /// bumped by heartbeats (`touch`), and cleared on completion/requeue/recover.
+    pub fn oldest_in_flight_started_at(&self) -> Result<Option<i64>> {
+        // SQL MIN over zero matching rows is NULL → None. (in_flight rows always
+        // have started_at set; the IS NOT NULL guard is belt-and-suspenders.)
+        let oldest: Option<i64> = self.conn.query_row(
+            "SELECT MIN(started_at) FROM jobs WHERE status = ?1 AND started_at IS NOT NULL",
+            [STATUS_IN_FLIGHT],
+            |row| row.get(0),
+        )?;
+        Ok(oldest)
+    }
+
     /// Count of recorded results (for `/stats`).
     pub fn completed_count(&self) -> Result<usize> {
         let count: i64 =
