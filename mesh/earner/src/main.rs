@@ -519,4 +519,58 @@ mod tests {
         assert!(!keep_polling_after_submit(StatusCode::NOT_FOUND)); // 404 unknown job
         assert!(!keep_polling_after_submit(StatusCode::CONFLICT)); // 409 not in-flight/done
     }
+
+    // ---- session key loading + attestation signing ----
+
+    /// The lowercase Ethereum-style address derived from `DEV_SESSION_KEY`
+    /// (no EIP-55 checksum — `address_from_verifying_key` hex-encodes lowercase).
+    /// This is the address the coordinator recovers from the earner's signature.
+    const DEV_ADDRESS: &str = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23";
+
+    #[test]
+    fn session_from_hex_derives_known_dev_address() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        assert_eq!(session.address, DEV_ADDRESS);
+    }
+
+    #[test]
+    fn session_from_hex_accepts_0x_prefix() {
+        // The 0x-prefixed and bare forms of the same key derive the same address.
+        let prefixed = Session::from_hex(&format!("0x{DEV_SESSION_KEY}")).unwrap();
+        let bare = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        assert_eq!(prefixed.address, bare.address);
+        assert_eq!(prefixed.address, DEV_ADDRESS);
+    }
+
+    #[test]
+    fn session_from_hex_rejects_invalid_hex() {
+        assert!(Session::from_hex("nothex!!").is_err());
+    }
+
+    #[test]
+    fn session_from_hex_rejects_wrong_length_key() {
+        // Valid hex but not a 32-byte secp256k1 scalar.
+        assert!(Session::from_hex("00").is_err());
+        assert!(Session::from_hex("").is_err());
+    }
+
+    #[test]
+    fn sign_result_is_recoverable_to_session_address() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let job_id = Uuid::new_v4();
+        let output_hash = "deadbeef";
+
+        let sig_hex = session.sign_result(&job_id, output_hash);
+        let raw = hex::decode(&sig_hex).unwrap();
+        assert_eq!(raw.len(), 65, "signature is 65 bytes r||s||v");
+
+        // Recover exactly as the coordinator does (coordinator verify.rs): the
+        // signer the coordinator recovers MUST be this earner's own address, or
+        // every submission this earner makes would be rejected as a mismatch.
+        let digest = signing_digest(&job_id, output_hash);
+        let sig = Signature::from_slice(&raw[..64]).unwrap();
+        let recid = RecoveryId::from_byte(raw[64]).unwrap();
+        let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
+        assert_eq!(address_from_verifying_key(&vk), session.address);
+    }
 }
