@@ -70,6 +70,7 @@ contract RenderReceiptsHandler is Test {
     MockEAS public eas;
 
     address[] public actors;
+    address[] public earners; // fixed earner-recipient pool; bounds receiptsByEarner's domain
     mapping(address => bool) public isAuthorized;
 
     uint256 public ghost_issued;
@@ -83,20 +84,29 @@ contract RenderReceiptsHandler is Test {
         for (uint256 i = 0; i < actors_.length; i++) {
             isAuthorized[actors_[i]] = authorized_[i];
         }
+
+        // Fixed earner-recipient pool (see issueReceipt / sumReceipts).
+        earners.push(address(0xEA0));
+        earners.push(address(0xEA1));
+        earners.push(address(0xEA2));
     }
 
     function issueReceipt(
         uint256 actorSeed,
-        address earner,
+        uint256 earnerSeed,
         bytes32 jobId,
         uint64 renderSeconds,
         uint256 jobKindSeed,
         bytes32 outputHash,
         bytes32 regionId
     ) external {
-        // skip the zero-address earner — would succeed on-chain but contaminates
-        // recipient assertions since address(0) is a valid but degenerate case
-        if (earner == address(0)) return;
+        // Draw the earner from a small fixed pool rather than fuzzing a fresh
+        // address each call. Bounding the earner domain keeps receiptsByEarner
+        // enumerable so sumReceipts() can partition-check it in O(pool) — the same
+        // reason the ComputeMeter handler routes every buy through a fixed actor
+        // set. Arbitrary-earner forwarding stays covered by the fuzz test, and
+        // pool members are all nonzero so no zero-address guard is needed here.
+        address earner = earners[earnerSeed % earners.length];
 
         address actor = actors[actorSeed % actors.length];
         uint16 jobKind = uint16(jobKindSeed % 5);
@@ -113,6 +123,15 @@ contract RenderReceiptsHandler is Test {
                 ghost_forwardMismatch = true;
             }
         } catch {}
+    }
+
+    /// @notice Sum of `receiptsByEarner` over every earner in the fixed pool. The
+    ///         handler only ever issues to pool members, so this is the full
+    ///         domain of the mapping — its sum must equal the global receiptCount.
+    function sumReceipts() external view returns (uint256 total) {
+        for (uint256 i = 0; i < earners.length; i++) {
+            total += receipts.receiptsByEarner(earners[i]);
+        }
     }
 }
 
@@ -172,6 +191,12 @@ contract RenderReceiptsInvariantTest is Test {
     /// @dev Every forward used the registered schema uid and the correct recipient.
     function invariant_forwardsCanonicalSchemaAndRecipient() public view {
         assertFalse(handler.ghost_forwardMismatch());
+    }
+
+    /// @dev Per-earner `receiptsByEarner` partitions the global `receiptCount`:
+    ///      summed over every earner it equals the contract's receiptCount.
+    function invariant_receiptsByEarnerSumsToCount() public view {
+        assertEq(handler.sumReceipts(), receipts.receiptCount());
     }
 }
 
