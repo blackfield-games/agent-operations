@@ -962,4 +962,62 @@ mod tests {
         let keep = poll_once(&client, &args, &session).await.unwrap();
         assert!(!keep, "a 409-rejected submit must back off, not keep polling");
     }
+
+    // ---- http register path: register over a wiremock coordinator ----
+
+    #[tokio::test]
+    async fn register_posts_hello_and_succeeds_on_2xx() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/register"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        register(&client, &args, &session).await.unwrap();
+
+        // The earner POSTed its Hello announcing address, GPU, and supported kinds.
+        let requests = server.received_requests().await.unwrap();
+        let reg = requests
+            .iter()
+            .find(|r| r.url.path() == "/register")
+            .expect("earner POSTed a Hello to /register");
+        match serde_json::from_slice::<EarnerMsg>(&reg.body).unwrap() {
+            EarnerMsg::Hello { earner_address, gpu_model, vram_gb, supported } => {
+                assert_eq!(earner_address, session.address);
+                assert_eq!(gpu_model, args.gpu_model);
+                assert_eq!(vram_gb, args.vram_gb);
+                assert_eq!(supported, all_supported());
+            }
+            other => panic!("register must POST a Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_errors_on_non_2xx() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+
+        // A 5xx from the coordinator surfaces as Err (error_for_status). run_http
+        // treats a failed register as non-fatal: it logs and falls through to
+        // polling, so this Err must not be silently swallowed at the source.
+        Mock::given(method("POST"))
+            .and(path("/register"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        assert!(
+            register(&client, &args, &session).await.is_err(),
+            "a non-2xx register response must surface as Err"
+        );
+    }
 }
