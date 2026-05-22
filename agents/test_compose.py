@@ -176,6 +176,32 @@ def test_layer_summary_empty_is_empty_dict():
     assert layer_summary([]) == {}
 
 
+def test_layer_summary_appends_unknown_specialists_sorted_after_known():
+    """Unlike compose_world (which REJECTS unknown specialists), layer_summary TOLERATES
+    them — a count is harmless. Known specialists come first in STRENGTH_ORDER, then any
+    unknown specialist is appended in sorted() order, never interleaved and never by input
+    order. Forge the unknowns via the Pydantic bypass (specialist is a Literal of the 8).
+    """
+    region = "r+0042_-0017_l0"
+    wizard1 = LayerSpec(specialist="terrain", region_id=region, path="x/w1.usda", summary="w1", metrics={}).model_copy(update={"specialist": "wizard"})
+    wizard2 = LayerSpec(specialist="biome", region_id=region, path="x/w2.usda", summary="w2", metrics={}).model_copy(update={"specialist": "wizard"})
+    alchemist = LayerSpec(specialist="terrain", region_id=region, path="x/a.usda", summary="a", metrics={}).model_copy(update={"specialist": "alchemist"})
+    # First-occurrence input order is wizard, terrain, biome, alchemist — deliberately NOT
+    # the expected output order, so the assertion proves the ordering logic, not insertion order.
+    layers = [
+        wizard1,
+        LayerSpec(specialist="terrain", region_id=region, path="terrain/t.usda", summary="t", metrics={}),
+        LayerSpec(specialist="biome", region_id=region, path="biome/b1.usda", summary="b1", metrics={}),
+        alchemist,
+        LayerSpec(specialist="biome", region_id="r+0042_-0018_l0", path="biome/b2.usda", summary="b2", metrics={}),
+        wizard2,
+    ]
+    result = layer_summary(layers)
+    # Known first in STRENGTH_ORDER (biome before terrain), then unknowns sorted (alchemist before wizard).
+    assert list(result.keys()) == ["biome", "terrain", "alchemist", "wizard"]
+    assert result == {"biome": 2, "terrain": 1, "alchemist": 1, "wizard": 2}
+
+
 def test_compose_world_happy_path_all_known_specialists(tmp_path):
     """Regression guard: all valid specialists compose without error and produce world.usda."""
     region = "r+0042_-0017_l0"
