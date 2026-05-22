@@ -6,6 +6,8 @@ Run from the agents/ dir:
 
 import json
 
+from common.types import LayerSpec, ValidatorVerdict
+from runtime import cli
 from runtime.cli import main
 
 # The 7 authoring specialists (validator emits no layer of its own).
@@ -78,3 +80,62 @@ def test_json_output(tmp_path, monkeypatch, capsys):
     assert all(count == 1 for count in report["layer_counts"].values())
 
     assert report["world"].endswith("out/world.usda")
+
+
+def _stub_run_graph(result: dict):
+    """Replacement for cli._run_graph that yields a fixed graph result, so main()'s
+    verdict -> exit-code + report logic is tested without running the real
+    LangGraph (covered end-to-end, including route-back, in test_supervisor.py)."""
+    async def _run(brief):
+        return result
+
+    return _run
+
+
+def test_main_exits_1_and_reports_rejected_on_validator_rejection(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r+0042_-0017_l0", path="terrain/a.usda", summary="scorched ridge", metrics={}),
+    ]
+    result = {
+        "verdict": ValidatorVerdict(accepted=False, issues=["style score 0.41 < 0.60 threshold"]),
+        "layers": layers,
+        "rounds": 3,
+    }
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(result))
+
+    code = main(["--x", "42", "--y", "-17", "--out", "out"])
+
+    # Rejection -> non-zero exit so the CLI is usable as a CI gate.
+    assert code == 1
+
+    out = capsys.readouterr().out
+    assert "REJECTED" in out
+    assert "rounds:    3" in out
+    # The issues block is only rendered when verdict.issues is non-empty.
+    assert "issues:" in out
+    assert "style score 0.41 < 0.60 threshold" in out
+    # world.usda is still composed from the emitted layers even on rejection.
+    assert (tmp_path / "out" / "world.usda").exists()
+
+
+def test_json_output_reflects_rejection(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r+0001_+0002_l0", path="terrain/a.usda", summary="t", metrics={}),
+    ]
+    result = {
+        "verdict": ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"]),
+        "layers": layers,
+        "rounds": 2,
+    }
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(result))
+
+    code = main(["--x", "1", "--y", "2", "--json", "--out", "out"])
+    assert code == 1  # --json does not change the rejection exit code
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["accepted"] is False
+    assert report["issues"] == ["missing specialist layers: ['biome']"]
+    assert report["rounds"] == 2
+    assert report["region_id"] == "r+0001_+0002_l0"
