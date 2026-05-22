@@ -18,7 +18,7 @@ jobs:
       run:
         working-directory: mesh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -36,7 +36,7 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: foundry-rs/foundry-toolchain@v1
       # Lint gate (mirrors the agents ruff gate): fail fast on style drift
       # before the slower build/test. Uses the [fmt] config in foundry.toml.
@@ -60,8 +60,8 @@ jobs:
       run:
         working-directory: agents
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
