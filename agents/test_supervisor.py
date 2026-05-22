@@ -9,7 +9,7 @@ Run from the agents/ dir:
 import asyncio
 
 import runtime.supervisor as sup
-from common.types import LayerSpec, ValidatorVerdict
+from common.types import LayerSpec, RegionCoord, ValidatorVerdict, WorldBrief
 from langgraph.graph import END
 
 
@@ -173,3 +173,38 @@ def test_after_validator_ends_on_recursion_guard():
         "rounds": 3,
     }
     assert sup._after_validator(state) == END
+
+
+# ---- end-to-end route-back loop (integrated build_graph run) ----
+
+
+async def test_route_back_loop_reruns_validator_then_accepts(tmp_path, monkeypatch):
+    # The tests above exercise merge_layers, _after_validator, and the validator
+    # node in ISOLATION. This drives the WHOLE compiled graph: a rejected first
+    # verdict must traverse the conditional edge back to the offending specialist,
+    # replay every downstream node, and run the validator a second time. The
+    # specialist stubs write USD layers under cwd, so isolate to tmp_path.
+    monkeypatch.chdir(tmp_path)
+
+    calls = {"n": 0}
+
+    async def reject_then_accept(brief, layers):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Attributable to biome → _failing_specialist routes back to "biome".
+            return ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"])
+        return ValidatorVerdict(accepted=True)
+
+    # Patch ONLY the validator; the 7 specialists stay the real Dev C stubs.
+    monkeypatch.setattr(sup.validator, "run", reject_then_accept)
+
+    brief = WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
+    result = await sup.build_graph().ainvoke({"brief": brief, "layers": [], "rounds": 0})
+
+    assert result["verdict"].accepted is True
+    assert result["rounds"] == 2  # reject → route-back → accept: validator ran twice
+    assert calls["n"] == 2
+    # The route-back re-ran biome→…→optimization; merge_layers de-duped the replays,
+    # so the layer set stays one-per-specialist (a plain operator.add would give 12).
+    assert len(result["layers"]) == 7
+    assert sorted(layer.specialist for layer in result["layers"]) == sorted(sup.SPECIALISTS)
