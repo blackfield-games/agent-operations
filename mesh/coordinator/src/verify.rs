@@ -135,4 +135,26 @@ mod tests {
         );
         assert_eq!(res, Err(VerifyError::AddressMismatch));
     }
+
+    #[test]
+    fn malformed_signature_encoding_rejected() {
+        // The two encoding-level reject branches, distinct from the recovery-byte
+        // path `tampered_signature_rejected` hits: no other test asserts the
+        // BadSignatureEncoding variant by name on this security gate.
+        let job_id = Uuid::new_v4();
+        let hash = "abc123";
+        let addr = dev_address();
+        // Non-hex input fails at hex::decode (the optional 0x prefix is stripped first).
+        assert_eq!(
+            verify_signature(&job_id, hash, &addr, "0xnothex"),
+            Err(VerifyError::BadSignatureEncoding)
+        );
+        // Valid hex but the wrong byte length (64, not the required 65) is rejected
+        // before any curve parsing.
+        let sixty_four_bytes = "00".repeat(64);
+        assert_eq!(
+            verify_signature(&job_id, hash, &addr, &sixty_four_bytes),
+            Err(VerifyError::BadSignatureEncoding)
+        );
+    }
 }
