@@ -458,6 +458,7 @@ async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::pin::Pin;
     use std::task::Poll;
 
@@ -661,5 +662,181 @@ mod tests {
             }
             other => panic!("second frame must be Submit, got {other:?}"),
         }
+    }
+
+    // ---- ws full session loop: ws_session over a dual Sink+Stream mock ----
+
+    /// A mock websocket that is BOTH a `Sink<WsMessage>` (records every frame the
+    /// earner sends, like [`RecordingSink`]) AND a `Stream` of pre-seeded incoming
+    /// frames (what the coordinator "sends"). `ws_session`'s `S: SinkExt + StreamExt`
+    /// bounds were designed for exactly this — drive the whole session loop with no
+    /// network. `poll_next` drains the seeded queue in order, then yields `None`,
+    /// which `ws_session` treats as a clean stream end → `Ok(())`.
+    struct MockSocket {
+        sent: Vec<WsMessage>,
+        incoming: VecDeque<Result<WsMessage, tokio_tungstenite::tungstenite::Error>>,
+    }
+
+    impl MockSocket {
+        fn new(incoming: VecDeque<Result<WsMessage, tokio_tungstenite::tungstenite::Error>>) -> Self {
+            Self { sent: Vec::new(), incoming }
+        }
+    }
+
+    impl futures_util::Sink<WsMessage> for MockSocket {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
+            self.get_mut().sent.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl futures_util::Stream for MockSocket {
+        type Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+            // Drain the seeded queue in order; an empty queue ends the stream.
+            Poll::Ready(self.get_mut().incoming.pop_front())
+        }
+    }
+
+    /// A `JobOffer` text frame for the canonical dev test job, plus its job id
+    /// (the offer moves the `JobSpec`, so the id is captured first).
+    fn job_offer_frame() -> (WsMessage, Uuid) {
+        let job = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Terrain,
+            region: proto::RegionCoord { x: 42, y: -17, layer: 0 },
+            deadline_secs: 120,
+            max_payout_wei: "1000000000000000000".to_string(),
+            inputs: serde_json::json!({}),
+        };
+        let job_id = job.id;
+        let offer = CoordinatorMsg::JobOffer(job);
+        (WsMessage::text(serde_json::to_string(&offer).unwrap()), job_id)
+    }
+
+    #[tokio::test]
+    async fn ws_session_runs_hello_then_accept_then_signed_submit() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let args = Args::parse_from(["earner"]);
+
+        // The coordinator offers exactly one job, then the stream ends.
+        let (offer, job_id) = job_offer_frame();
+        let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(offer));
+        let mut mock = MockSocket::new(incoming);
+
+        // `&mut mock` so we can read the recorded sends afterward; ws_session takes
+        // `S` by value, and `&mut MockSocket` is itself a Sink+Stream.
+        ws_session(&mut mock, &args, &session).await.unwrap();
+
+        // Hello on connect, then Accept + signed Submit for the one offer.
+        assert_eq!(mock.sent.len(), 3, "expected Hello, Accept, Submit, got {:?}", mock.sent);
+
+        match decode_frame(&mock.sent[0]) {
+            EarnerMsg::Hello { earner_address, supported, .. } => {
+                assert_eq!(earner_address, session.address);
+                assert_eq!(supported, all_supported());
+            }
+            other => panic!("first frame must be Hello, got {other:?}"),
+        }
+        match decode_frame(&mock.sent[1]) {
+            EarnerMsg::Accept { job_id: accepted } => assert_eq!(accepted, job_id),
+            other => panic!("second frame must be Accept, got {other:?}"),
+        }
+        // The Submit signature recovers to the earner's OWN address — the property
+        // the coordinator's verify.rs submit gate enforces (mirror of that recovery).
+        match decode_frame(&mock.sent[2]) {
+            EarnerMsg::Submit(result) => {
+                assert_eq!(result.job_id, job_id);
+                assert_eq!(result.earner_address, session.address);
+                let raw = hex::decode(&result.signature_hex).unwrap();
+                assert_eq!(raw.len(), 65, "signature is 65 bytes r||s||v");
+                let digest = signing_digest(&result.job_id, &result.output_hash);
+                let sig = Signature::from_slice(&raw[..64]).unwrap();
+                let recid = RecoveryId::from_byte(raw[64]).unwrap();
+                let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
+                assert_eq!(address_from_verifying_key(&vk), session.address);
+            }
+            other => panic!("third frame must be Submit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_session_skips_an_undecodable_frame_then_processes_the_offer() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let args = Args::parse_from(["earner"]);
+
+        // A malformed text frame precedes the real offer. ws_session must log and
+        // skip it (as the coordinator does for undecodable earner messages) and
+        // still process the following offer — one bad frame can't drop the session.
+        let (offer, job_id) = job_offer_frame();
+        let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(WsMessage::text("definitely not json {{{".to_string())));
+        incoming.push_back(Ok(offer));
+        let mut mock = MockSocket::new(incoming);
+
+        ws_session(&mut mock, &args, &session).await.unwrap();
+
+        // The garbage frame produced no send; the offer still yielded Accept+Submit.
+        assert_eq!(mock.sent.len(), 3, "garbage frame must be skipped, offer still handled: {:?}", mock.sent);
+        match decode_frame(&mock.sent[1]) {
+            EarnerMsg::Accept { job_id: accepted } => assert_eq!(accepted, job_id),
+            other => panic!("second frame must be Accept, got {other:?}"),
+        }
+        assert!(matches!(decode_frame(&mock.sent[2]), EarnerMsg::Submit(_)));
+    }
+
+    #[tokio::test]
+    async fn ws_session_stops_on_a_close_frame() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let args = Args::parse_from(["earner"]);
+
+        // A Close frame ends the session loop. An offer queued AFTER the Close must
+        // never be processed — ws_session breaks on Close and returns Ok(()).
+        let (offer, _job_id) = job_offer_frame();
+        let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(WsMessage::Close(None)));
+        incoming.push_back(Ok(offer));
+        let mut mock = MockSocket::new(incoming);
+
+        ws_session(&mut mock, &args, &session).await.unwrap();
+
+        // Only the connect-time Hello was sent; the post-Close offer was ignored.
+        assert_eq!(mock.sent.len(), 1, "Close must stop the loop before the queued offer: {:?}", mock.sent);
+        assert!(matches!(decode_frame(&mock.sent[0]), EarnerMsg::Hello { .. }));
+    }
+
+    #[tokio::test]
+    async fn ws_session_returns_err_on_a_recv_error() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let args = Args::parse_from(["earner"]);
+
+        // A transport recv error must surface as Err so run_ws logs it, backs off,
+        // and reconnects. Hello is already sent before the error is read.
+        let mut incoming = VecDeque::new();
+        incoming.push_back(Err(tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(
+            "simulated recv error",
+        ))));
+        let mut mock = MockSocket::new(incoming);
+
+        let result = ws_session(&mut mock, &args, &session).await;
+        assert!(result.is_err(), "a recv error must surface as Err for run_ws to reconnect");
+        assert_eq!(mock.sent.len(), 1, "Hello is sent before the recv error surfaces: {:?}", mock.sent);
+        assert!(matches!(decode_frame(&mock.sent[0]), EarnerMsg::Hello { .. }));
     }
 }
