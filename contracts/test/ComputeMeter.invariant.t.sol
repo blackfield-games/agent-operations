@@ -64,6 +64,14 @@ contract ComputeMeterHandler is Test {
         }
     }
 
+    /// @notice Sum of cumulative `spentByBuyer` over every tracked actor. Only
+    ///         actors ever buy, so this is the full domain of the mapping.
+    function sumSpent() external view returns (uint256 total) {
+        for (uint256 i = 0; i < actors.length; i++) {
+            total += meter.spentByBuyer(actors[i]);
+        }
+    }
+
     function actorAt(uint256 i) external view returns (address) {
         return actors[i];
     }
@@ -108,6 +116,24 @@ contract ComputeMeterInvariantTest is Test {
     /// @dev Every deposited token lands at BURN_ADDRESS, which started at zero.
     function invariant_allDepositsBurned() public view {
         assertEq(token.balanceOf(meter.BURN_ADDRESS()), handler.ghost_totalDeposited());
+    }
+
+    /// @dev The contract's own `totalBurned` HUD accumulator tracks deposits 1:1
+    ///      (independent of the ghost creditConservation uses).
+    function invariant_totalBurnedMatchesDeposited() public view {
+        assertEq(meter.totalBurned(), handler.ghost_totalDeposited());
+    }
+
+    /// @dev The contract's own `totalSpent` HUD accumulator matches the ghost sum
+    ///      of every debit driven through the handler.
+    function invariant_totalSpentMatchesGhost() public view {
+        assertEq(meter.totalSpent(), handler.ghost_totalSpent());
+    }
+
+    /// @dev Per-buyer `spentByBuyer` partitions the global `totalSpent`: summed
+    ///      over every actor it equals the contract's `totalSpent`.
+    function invariant_spentByBuyerSumsToTotalSpent() public view {
+        assertEq(handler.sumSpent(), meter.totalSpent());
     }
 }
 
