@@ -6,6 +6,8 @@ Run from the agents/ dir:
 
 import json
 
+import pytest
+
 from common.types import LayerSpec, ValidatorVerdict
 from runtime import cli
 from runtime.cli import main
@@ -139,3 +141,23 @@ def test_json_output_reflects_rejection(tmp_path, monkeypatch, capsys):
     assert report["issues"] == ["missing specialist layers: ['biome']"]
     assert report["rounds"] == 2
     assert report["region_id"] == "r+0001_+0002_l0"
+
+
+def test_missing_required_coord_exits_2():
+    # --x and --y are required ints: argparse must exit(2) when either is absent,
+    # never silently default the region coords. The CLI is a CI entrypoint, so a
+    # silent default would render the wrong region (0,0) without failing the run.
+    # _parse_args runs first in main(), so this exits before the graph is built.
+    for argv in (["--y", "1"], ["--x", "1"]):
+        with pytest.raises(SystemExit) as exc_info:
+            main(argv)
+        assert exc_info.value.code == 2
+
+
+def test_layer_arg_flows_into_region_id():
+    # A non-default --layer must reach the region_id (_lN), and --x/--y map to the
+    # grid coords. Every other test uses the default layer 0; this locks that the
+    # arg isn't dropped. Tests the arg->brief mapping directly, without the graph.
+    brief = cli._build_brief(cli._parse_args(["--x", "3", "--y", "-4", "--layer", "2"]))
+    assert brief.region.region_id == "r+0003_-0004_l2"
+    assert (brief.region.x, brief.region.y, brief.region.layer) == (3, -4, 2)
