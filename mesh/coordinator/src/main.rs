@@ -182,6 +182,10 @@ struct Stats {
     /// queue-health signal for the HUD: it climbs when an earner is slow or stuck
     /// and resets as jobs complete or get reaped. Needs no schema migration.
     oldest_in_flight_secs: Option<u64>,
+    /// Count of jobs dispatched more than once (`attempts > 1`): the reaper
+    /// requeued them on a missed deadline and they were handed out again. A
+    /// cumulative reaper-churn signal for the HUD; 0 on a healthy mesh.
+    jobs_redispatched: usize,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -485,6 +489,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let jobs_redispatched = match store.redispatched_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: redispatched_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -500,6 +511,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_render_seconds,
         total_payout_wei,
         oldest_in_flight_secs,
+        jobs_redispatched,
     }))
 }
 
@@ -1676,6 +1688,29 @@ mod tests {
         let json = body_json(get(state.clone(), "/stats").await).await;
         let age = json["oldest_in_flight_secs"].as_u64().expect("in-flight → numeric age");
         assert!(age < 5, "freshly dispatched job age should be ~0, got {age}");
+    }
+
+    #[test]
+    fn redispatched_count_counts_jobs_dispatched_more_than_once() {
+        const BIG_MAX: u32 = 999;
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.redispatched_count().unwrap(), 0);
+
+        let job = job_with_deadline(100);
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+
+        // First dispatch (attempts → 1): not yet redispatched.
+        store.take_next(|_| true).unwrap();
+        store.touch(&id, 1000).unwrap();
+        assert_eq!(store.redispatched_count().unwrap(), 0);
+
+        // Reaper requeues it past the deadline (attempts unchanged), then it is
+        // dispatched a second time (attempts → 2): now counted as redispatched.
+        let outcome = store.reap_expired(1100, BIG_MAX).unwrap();
+        assert_eq!(outcome.requeued, vec![id]);
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.redispatched_count().unwrap(), 1);
     }
 
     /// Repeated heartbeats keep extending the liveness window.

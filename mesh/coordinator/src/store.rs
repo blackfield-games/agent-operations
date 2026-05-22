@@ -493,6 +493,19 @@ impl Store {
         Ok(oldest)
     }
 
+    /// Count of jobs dispatched more than once (`attempts > 1`): `take_next`
+    /// handed them out, the reaper requeued them on a missed deadline, and they
+    /// were dispatched again. A cumulative reaper-churn signal for `/stats` —
+    /// counts each such job once regardless of current status, since `attempts`
+    /// is bumped on every dispatch and never reset. Zero on a healthy mesh where
+    /// every job lands on its first dispatch.
+    pub fn redispatched_count(&self) -> Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM jobs WHERE attempts > 1", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
     /// Count of recorded results (for `/stats`).
     pub fn completed_count(&self) -> Result<usize> {
         let count: i64 =
