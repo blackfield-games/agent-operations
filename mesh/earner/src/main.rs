@@ -458,6 +458,8 @@ async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::Poll;
 
     #[test]
     fn ws_url_maps_http_to_ws_and_https_to_wss() {
@@ -572,5 +574,92 @@ mod tests {
         let recid = RecoveryId::from_byte(raw[64]).unwrap();
         let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
         assert_eq!(address_from_verifying_key(&vk), session.address);
+    }
+
+    // ---- ws send path: handle_offer over a mock Sink ----
+
+    /// A `futures_util::Sink<WsMessage>` that records every sent frame instead of
+    /// writing to a socket. The `handle_offer`/`ws_session` generic bounds were
+    /// designed for exactly this — drive the earner's send path with no network.
+    /// `Infallible` as the error satisfies the `Error + Send + Sync + 'static`
+    /// bound and means a send never fails.
+    #[derive(Default)]
+    struct RecordingSink {
+        sent: Vec<WsMessage>,
+    }
+
+    impl futures_util::Sink<WsMessage> for RecordingSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
+            self.get_mut().sent.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn decode_frame(frame: &WsMessage) -> EarnerMsg {
+        match frame {
+            WsMessage::Text(t) => {
+                serde_json::from_str(t.as_str()).expect("sent frame is valid EarnerMsg JSON")
+            }
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_offer_emits_accept_then_signed_submit() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let job = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Terrain,
+            region: proto::RegionCoord { x: 42, y: -17, layer: 0 },
+            deadline_secs: 120,
+            max_payout_wei: "1000000000000000000".to_string(),
+            inputs: serde_json::json!({}),
+        };
+        let job_id = job.id;
+
+        // Large heartbeat interval: the stub render returns instantly, so the
+        // render completes before any beat fires — exactly two frames are sent.
+        let mut sink = RecordingSink::default();
+        handle_offer(&mut sink, &session, job, 3600).await.unwrap();
+
+        assert_eq!(sink.sent.len(), 2, "expected Accept then Submit, got {:?}", sink.sent);
+
+        // 1) Accept names this job so the coordinator marks it in-flight for us.
+        match decode_frame(&sink.sent[0]) {
+            EarnerMsg::Accept { job_id: accepted } => assert_eq!(accepted, job_id),
+            other => panic!("first frame must be Accept, got {other:?}"),
+        }
+
+        // 2) Submit whose signature recovers to the earner's OWN address — the
+        // property the whole payout model rests on (mirror of verify.rs recovery).
+        match decode_frame(&sink.sent[1]) {
+            EarnerMsg::Submit(result) => {
+                assert_eq!(result.job_id, job_id);
+                assert_eq!(result.earner_address, session.address);
+
+                let raw = hex::decode(&result.signature_hex).unwrap();
+                assert_eq!(raw.len(), 65, "signature is 65 bytes r||s||v");
+                let digest = signing_digest(&result.job_id, &result.output_hash);
+                let sig = Signature::from_slice(&raw[..64]).unwrap();
+                let recid = RecoveryId::from_byte(raw[64]).unwrap();
+                let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
+                assert_eq!(address_from_verifying_key(&vk), session.address);
+            }
+            other => panic!("second frame must be Submit, got {other:?}"),
+        }
     }
 }
