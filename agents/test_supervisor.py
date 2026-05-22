@@ -102,3 +102,74 @@ async def test_validator_node_times_out_to_errored_verdict(monkeypatch):
     assert out["verdict"].accepted is False
     assert out["verdict"].issues == ["validator timed out"]
     assert out["rounds"] == 1
+
+
+# ---- merge_layers reducer (route-back de-dup) ----
+
+
+def _layer(specialist, region_id, summary):
+    return LayerSpec(
+        specialist=specialist, region_id=region_id,
+        path=f"{specialist}/{region_id}.usda", summary=summary, metrics={},
+    )
+
+
+def test_merge_layers_keeps_latest_per_specialist_region():
+    # A route-back replays a downstream specialist, producing a second layer for
+    # the same (specialist, region_id). The reducer keeps the fresh one so
+    # compose_world never emits a duplicate sublayer.
+    region = "r+0000_+0000_l0"
+    old = _layer("terrain", region, "stale")
+    new = _layer("terrain", region, "fresh")
+    merged = sup.merge_layers([old], [new])
+    assert len(merged) == 1
+    assert merged[0].summary == "fresh"
+
+
+def test_merge_layers_keeps_distinct_specialists_and_regions():
+    a = _layer("terrain", "r+0000_+0000_l0", "t")
+    b = _layer("biome", "r+0000_+0000_l0", "b")  # same region, other specialist
+    c = _layer("terrain", "r+0001_+0000_l0", "t2")  # same specialist, other region
+    merged = sup.merge_layers([a], [b, c])
+    assert len(merged) == 3
+    assert {(m.specialist, m.region_id) for m in merged} == {
+        ("terrain", "r+0000_+0000_l0"),
+        ("biome", "r+0000_+0000_l0"),
+        ("terrain", "r+0001_+0000_l0"),
+    }
+
+
+def test_merge_layers_handles_empty_sides():
+    layer = _layer("terrain", "r+0000_+0000_l0", "x")
+    assert sup.merge_layers([], [layer]) == [layer]
+    assert sup.merge_layers([layer], []) == [layer]
+
+
+# ---- _after_validator routing (complements the validator_errored case above) ----
+
+
+def test_after_validator_ends_on_accepted():
+    state = {"verdict": ValidatorVerdict(accepted=True), "rounds": 1}
+    assert sup._after_validator(state) == END
+
+
+def test_after_validator_ends_when_no_verdict():
+    assert sup._after_validator({}) == END
+
+
+def test_after_validator_routes_back_to_failing_specialist():
+    state = {
+        "verdict": ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"]),
+        "rounds": 1,
+    }
+    assert sup._after_validator(state) == "biome"
+
+
+def test_after_validator_ends_on_recursion_guard():
+    # Even with an attributable, fixable issue, the round cap ends the loop so a
+    # persistently-failing region can't recurse forever.
+    state = {
+        "verdict": ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"]),
+        "rounds": 3,
+    }
+    assert sup._after_validator(state) == END
