@@ -4,6 +4,7 @@ pragma solidity ^0.8.27;
 import {Test} from "forge-std/Test.sol";
 import {ComputeMeter} from "../src/ComputeMeter.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 contract MockToken is ERC20 {
     constructor() ERC20("Mock", "MCK") {
@@ -17,6 +18,8 @@ contract ComputeMeterTest is Test {
     address owner = address(0xA11CE);
     address buyer = address(0xB0B);
     address spender = address(0xC0DE);
+
+    event SpenderSet(address indexed spender, bool authorized);
 
     function setUp() public {
         token = new MockToken();
@@ -135,5 +138,70 @@ contract ComputeMeterTest is Test {
         // per-buyer attribution sums to the global total
         assertEq(meter.spentByBuyer(buyer) + meter.spentByBuyer(buyer2), meter.totalSpent());
         assertEq(meter.totalSpent(), 105 ether);
+    }
+
+    // --- setSpender access control + toggle ---
+
+    function test_setSpender_onlyOwner() public {
+        // Only the owner gates spenders; a buyer cannot self-authorize to drain credit.
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, buyer));
+        vm.prank(buyer);
+        meter.setSpender(address(0xBEEF), true);
+    }
+
+    function test_setSpender_togglesAuthorizationAndEmits() public {
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        address temp = address(0xCAFE);
+
+        // Authorizing emits SpenderSet(true) and lets temp debit credit.
+        vm.expectEmit(true, false, false, true);
+        emit SpenderSet(temp, true);
+        vm.prank(owner);
+        meter.setSpender(temp, true);
+        assertTrue(meter.authorizedSpenders(temp));
+
+        vm.prank(temp);
+        meter.spend(buyer, 10 ether, keccak256("j"));
+        assertEq(meter.credit(buyer), 90 ether);
+
+        // De-authorizing emits SpenderSet(false); a further spend by temp reverts.
+        vm.expectEmit(true, false, false, true);
+        emit SpenderSet(temp, false);
+        vm.prank(owner);
+        meter.setSpender(temp, false);
+        assertFalse(meter.authorizedSpenders(temp));
+
+        vm.prank(temp);
+        vm.expectRevert(ComputeMeter.NotAuthorized.selector);
+        meter.spend(buyer, 10 ether, keccak256("j2"));
+    }
+
+    // --- two-step ownership ---
+
+    function test_ownership_twoStepTransfer() public {
+        address newOwner = address(0xBEEF);
+
+        vm.prank(owner);
+        meter.transferOwnership(newOwner);
+        // Transfer is pending until accepted: the current owner stays in control.
+        assertEq(meter.pendingOwner(), newOwner);
+        assertEq(meter.owner(), owner);
+
+        vm.prank(newOwner);
+        meter.acceptOwnership();
+        assertEq(meter.owner(), newOwner);
+
+        // The new owner can now gate spenders; the prior owner no longer can.
+        vm.prank(newOwner);
+        meter.setSpender(address(0xC0FFEE), true);
+        assertTrue(meter.authorizedSpenders(address(0xC0FFEE)));
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        vm.prank(owner);
+        meter.setSpender(address(0xC0FFEE), false);
     }
 }
