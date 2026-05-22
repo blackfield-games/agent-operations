@@ -35,8 +35,10 @@ contract Deploy is Script {
     function run() external returns (Deployed memory deployed) {
         DeployConfig memory cfg = _configFromEnv();
 
+        // Under broadcast, every CREATE and owner-gated call is sent from the EOA, so
+        // the EOA (msg.sender) — not the ephemeral script contract — is the deployer.
         vm.startBroadcast();
-        deployed = deploy(cfg);
+        deployed = deploy(cfg, msg.sender);
         vm.stopBroadcast();
 
         _log(cfg, deployed);
@@ -45,14 +47,14 @@ contract Deploy is Script {
     /// @notice Deploys all four contracts and performs post-deploy wiring.
     /// @dev Pure on-chain logic — no broadcast, no env. Callable from tests.
     ///
-    ///      The deployer (this execution context, `address(this)`) is set as the
-    ///      initial owner so it can perform owner-gated wiring, then ownership is
-    ///      transferred to `cfg.owner`. ComputeMeter / RenderReceipts / RegionAuthority
-    ///      are Ownable2Step, so `cfg.owner` must call `acceptOwnership()` on each to
-    ///      finalize. ArtifactTemplate transfer (also Ownable2Step) is identical.
-    function deploy(DeployConfig memory cfg) public returns (Deployed memory deployed) {
-        address deployer = address(this);
-
+    ///      `deployer` is whoever actually sends the CREATE + wiring calls: the
+    ///      broadcasting EOA (`msg.sender`) under `run()`, or the calling script
+    ///      contract in tests. It is set as the initial owner so it can perform the
+    ///      owner-gated wiring, then ownership is transferred to `cfg.owner`.
+    ///      ComputeMeter / RenderReceipts / RegionAuthority are Ownable2Step, so
+    ///      `cfg.owner` must call `acceptOwnership()` on each to finalize.
+    ///      ArtifactTemplate transfer (also Ownable2Step) is identical.
+    function deploy(DeployConfig memory cfg, address deployer) public returns (Deployed memory deployed) {
         // 1. Compute budget meter — burns $BLCKFLD, credits buyers.
         ComputeMeter computeMeter = new ComputeMeter(cfg.token, deployer);
 

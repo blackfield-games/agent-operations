@@ -64,7 +64,9 @@ contract DeployTest is Test {
             artifactBaseUri: "https://artifacts.test/{id}.json"
         });
 
-        deployed = script.deploy(cfg);
+        // In the test path the script contract itself sends the CREATE + wiring calls,
+        // so it is the deployer/initial owner (run() passes msg.sender instead).
+        deployed = script.deploy(cfg, address(script));
 
         // Ownership is handed off two-step; the configured owner accepts on each.
         // (The pending-then-accepted handoff is asserted in test_ownershipHandoffIsTwoStep.)
@@ -114,7 +116,7 @@ contract DeployTest is Test {
             stakeRequired: 1 ether,
             artifactBaseUri: "ipfs://{id}"
         });
-        Deploy.Deployed memory fresh = script.deploy(cfg);
+        Deploy.Deployed memory fresh = script.deploy(cfg, address(script));
 
         // Pending, not yet owner: the deployer (the script) still owns.
         assertEq(fresh.computeMeter.pendingOwner(), owner, "meter pending");
