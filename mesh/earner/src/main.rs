@@ -461,6 +461,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::task::Poll;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn ws_url_maps_http_to_ws_and_https_to_wss() {
@@ -838,5 +840,126 @@ mod tests {
         assert!(result.is_err(), "a recv error must surface as Err for run_ws to reconnect");
         assert_eq!(mock.sent.len(), 1, "Hello is sent before the recv error surfaces: {:?}", mock.sent);
         assert!(matches!(decode_frame(&mock.sent[0]), EarnerMsg::Hello { .. }));
+    }
+
+    // ---- http poll path: poll_once over a wiremock coordinator ----
+
+    /// The canonical dev test job used by the HTTP poll-path tests.
+    fn dev_job() -> JobSpec {
+        JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Terrain,
+            region: proto::RegionCoord { x: 1, y: -2, layer: 0 },
+            deadline_secs: 120,
+            max_payout_wei: "1000000000000000000".to_string(),
+            inputs: serde_json::json!({}),
+        }
+    }
+
+    /// `Args` whose coordinator base URL points at the mock server. The earner
+    /// derives both `/jobs/next` and `/jobs/{id}/submit` from this base.
+    fn args_for(server: &MockServer) -> Args {
+        let mut args = Args::parse_from(["earner"]);
+        args.coordinator = server.uri();
+        args
+    }
+
+    #[tokio::test]
+    async fn poll_once_renders_signs_submits_and_keeps_polling() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let job = dev_job();
+        let job_id = job.id;
+
+        // GET /jobs/next dispenses the one job; POST /jobs/{id}/submit accepts it.
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&job))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        // A submit accepted with 2xx means more work may be queued → keep polling.
+        let keep = poll_once(&client, &args, &session).await.unwrap();
+        assert!(keep, "a successful submit (2xx) should keep polling");
+
+        // The earner POSTed a JobResult to /jobs/{id}/submit whose signature
+        // recovers to its OWN address — the property the coordinator's submit gate
+        // enforces (mirror of verify.rs recovery), exercised here over real HTTP.
+        let requests = server.received_requests().await.unwrap();
+        let submit = requests
+            .iter()
+            .find(|r| r.url.path().ends_with("/submit"))
+            .expect("earner POSTed the result to the submit endpoint");
+        assert_eq!(submit.url.path(), format!("/jobs/{job_id}/submit").as_str());
+
+        let result: JobResult = serde_json::from_slice(&submit.body).unwrap();
+        assert_eq!(result.job_id, job_id);
+        assert_eq!(result.earner_address, session.address);
+        let raw = hex::decode(&result.signature_hex).unwrap();
+        assert_eq!(raw.len(), 65, "signature is 65 bytes r||s||v");
+        let digest = signing_digest(&result.job_id, &result.output_hash);
+        let sig = Signature::from_slice(&raw[..64]).unwrap();
+        let recid = RecoveryId::from_byte(raw[64]).unwrap();
+        let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
+        assert_eq!(address_from_verifying_key(&vk), session.address);
+    }
+
+    #[tokio::test]
+    async fn poll_once_returns_false_when_no_job_is_available() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+
+        // /jobs/next yields JSON null → no job; poll_once backs off (false) and
+        // never reaches the submit path.
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::Value::Null))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        let keep = poll_once(&client, &args, &session).await.unwrap();
+        assert!(!keep, "no job available → back off rather than re-poll immediately");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| !r.url.path().ends_with("/submit")),
+            "no submit must be attempted when there is no job: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_returns_false_when_the_submit_is_rejected() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let job = dev_job();
+
+        // The coordinator gates the submit with 409 (not in-flight / already done).
+        // poll_once must back off, NOT keep polling — so a persistent rejection
+        // can't spin a tight render→submit→reject loop (keep_polling_after_submit).
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&job))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        let keep = poll_once(&client, &args, &session).await.unwrap();
+        assert!(!keep, "a 409-rejected submit must back off, not keep polling");
     }
 }

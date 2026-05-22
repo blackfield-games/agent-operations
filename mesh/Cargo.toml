@@ -32,6 +32,7 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3.13"
+wiremock = "0.6"
 
 [profile.release]
 opt-level = 3
