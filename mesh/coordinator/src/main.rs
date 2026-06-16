@@ -737,9 +737,12 @@ async fn submit(
 ///   3. earner → `EarnerMsg::Accept { job_id }` marks the offer in-flight; an
 ///      `Accept` for a different/unknown job is ignored.
 ///   4. earner → `EarnerMsg::Submit(result)`: the signature + job_id are
-///      verified. Valid → push to `completed` and reply
-///      `CoordinatorMsg::Accepted { job_id, attestation_uid }`. Invalid →
-///      `CoordinatorMsg::Rejected { job_id, reason }` and the job is requeued.
+///      verified and the job is settled only while still in_flight. Valid +
+///      in_flight → push to `completed` and reply `CoordinatorMsg::Accepted
+///      { job_id, attestation_uid }`. Bad signature / wrong job → `Rejected`
+///      and the job is requeued for another earner. Stale offer (the job was
+///      reaped/reassigned out from under us) → `Rejected`, and the job is left
+///      untouched (not requeued). See [`SubmitOutcome`].
 ///   5. earner → `EarnerMsg::Heartbeat { job_id, progress_pct }`: when
 ///      `job_id` matches the currently offered job, `store.touch` bumps
 ///      `started_at` so the reaper deadline slides from the last heartbeat
