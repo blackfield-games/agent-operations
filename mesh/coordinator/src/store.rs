@@ -168,12 +168,18 @@ impl Store {
     /// but ONLY while it is still `in_flight`.
     ///
     /// This is an earner-driven action (its offer was rejected or its socket
-    /// dropped). If the job is no longer in_flight — the reaper already requeued
-    /// or dead-lettered it, or another earner now holds it — this is a no-op: a
-    /// late reject/disconnect must not clobber a reassigned job back to `queued`
-    /// or resurrect a terminal one. Reads `attempts` to decide: `>= max_attempts`
-    /// moves it to the terminal `failed` status, otherwise back to `queued`, and
-    /// clears `started_at`. Reaper-driven expiry lives in `reap_expired`.
+    /// dropped). If the reaper has already requeued or dead-lettered the job, the
+    /// late reject/disconnect is a no-op, so it can't resurrect a terminal job or
+    /// re-queue one the reaper just parked. Reads `attempts` to decide:
+    /// `>= max_attempts` → terminal `failed`, otherwise back to `queued`; clears
+    /// `started_at`. Reaper-driven expiry lives in `reap_expired`.
+    ///
+    /// Residual race (tracked as `mesh-dispatch-lease-fence`): the in_flight
+    /// check cannot distinguish "in_flight under me" from "in_flight under a
+    /// later earner". If a slow earner's job is reaped, reassigned to a new
+    /// earner, and only then the slow earner disconnects, this requeue still sees
+    /// `in_flight` and preempts the new holder. Closing it needs a per-dispatch
+    /// fence token, which the wire protocol does not yet carry.
     ///
     /// Returns `true` iff the job was dead-lettered (moved to `failed`); `false`
     /// if it was requeued OR if it was a no-op (not in_flight / unknown).
@@ -193,7 +199,7 @@ impl Store {
             })?;
         let Some((status, attempts)) = row else { return Ok(false) }; // unknown job
         if status != STATUS_IN_FLIGHT {
-            return Ok(false); // already reaped / reassigned / terminal — don't clobber
+            return Ok(false); // already reaped or terminal — don't clobber
         }
 
         let new_status = if attempts >= max_attempts { STATUS_FAILED } else { STATUS_QUEUED };
