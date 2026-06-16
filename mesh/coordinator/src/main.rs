@@ -1916,6 +1916,65 @@ mod tests {
         assert_eq!(store.completed_count().unwrap(), 1);
     }
 
+    /// `record_completed` settles ONLY an in_flight job. A result for an unknown,
+    /// queued, already-done, or dead-lettered job is refused (`false`) and leaves
+    /// the job untouched — the data-layer backstop against double-credit and the
+    /// "orphaned settle" of a stale/replayed submit.
+    #[test]
+    fn record_completed_refuses_non_in_flight() {
+        let mut store = Store::open_in_memory().unwrap();
+
+        // Unknown job (never enqueued) → refused, nothing recorded.
+        let ghost = job_with_deadline(60);
+        assert!(
+            !store.record_completed(&signed_result(ghost.id, "x")).unwrap(),
+            "a result for an unknown job must be refused"
+        );
+        assert_eq!(store.completed_count().unwrap(), 0);
+
+        // Queued (enqueued, never taken) → refused; stays queued.
+        let queued = job_with_deadline(60);
+        store.enqueue(&queued).unwrap();
+        assert!(
+            !store.record_completed(&signed_result(queued.id, "x")).unwrap(),
+            "a result for a queued job must be refused"
+        );
+        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(store.completed_count().unwrap(), 0);
+
+        // In_flight → settles once; a replayed result is then refused and neither
+        // double-counts nor changes the now-`done` job.
+        let live = job_with_deadline(60);
+        store.enqueue(&live).unwrap();
+        store.take_next(|j| j.id == live.id).unwrap();
+        assert!(
+            store.record_completed(&signed_result(live.id, "x")).unwrap(),
+            "first settle of an in_flight job succeeds"
+        );
+        assert_eq!(store.job_status(&live.id).unwrap().as_deref(), Some("done"));
+        assert!(
+            !store.record_completed(&signed_result(live.id, "x")).unwrap(),
+            "a replayed result for an already-done job must be refused"
+        );
+        assert_eq!(store.completed_count().unwrap(), 1);
+
+        // Dead-lettered (failed) → refused and must NOT be resurrected to done.
+        let failed = job_with_deadline(60);
+        store.enqueue(&failed).unwrap();
+        store.take_next(|j| j.id == failed.id).unwrap();
+        assert!(store.requeue(&failed, 1).unwrap(), "attempts>=max dead-letters");
+        assert_eq!(store.job_status(&failed.id).unwrap().as_deref(), Some("failed"));
+        assert!(
+            !store.record_completed(&signed_result(failed.id, "x")).unwrap(),
+            "a result for a dead-lettered job must be refused (no orphaned settle)"
+        );
+        assert_eq!(
+            store.job_status(&failed.id).unwrap().as_deref(),
+            Some("failed"),
+            "dead-lettered job must stay failed, not resurrect to done"
+        );
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight() {
         // Build state on a non-seeded in-memory store so the queue truly starts

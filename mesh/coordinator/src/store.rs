@@ -201,46 +201,56 @@ impl Store {
         Ok(new_status == STATUS_FAILED)
     }
 
-    /// Record a validated result: insert into `results` and mark the job
-    /// `done`. Both happen in one transaction.
+    /// Settle a job with its validated result: insert into `results` and mark
+    /// the job `done`, in one transaction — but ONLY while the job is currently
+    /// `in_flight`. Returns `true` if it settled, `false` if the job was not
+    /// in_flight and nothing was written.
     ///
-    /// Idempotent: a duplicate result for the same job (e.g. a retried submit)
-    /// is a no-op on the `results` table thanks to `ON CONFLICT DO NOTHING`, so
-    /// `completed_count` is not double-counted. The job is still ensured `done`
-    /// either way, so a re-record never errors.
-    pub fn record_completed(&mut self, result: &JobResult) -> Result<()> {
-        let result_json = serde_json::to_string(result)?;
+    /// The in_flight guard is the data-layer backstop against a stale or
+    /// replayed submit: a job that has been reaped, reassigned, already settled,
+    /// or never existed cannot be resurrected to `done` or credited twice — even
+    /// if a caller forgets to pre-check lifecycle. The `UNIQUE(job_id)` index on
+    /// `results` is a further guard so a result is recorded at most once.
+    pub fn record_completed(&mut self, result: &JobResult) -> Result<bool> {
         let job_id = result.job_id.to_string();
+        let tx = self.conn.transaction()?;
+
+        // Re-check lifecycle inside the transaction; only an in_flight job is
+        // settle-able. A non-in_flight (queued/done/failed) or unknown job is
+        // refused, leaving its state untouched.
+        let status: Option<String> = tx
+            .query_row("SELECT status FROM jobs WHERE id = ?1", [&job_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        if status.as_deref() != Some(STATUS_IN_FLIGHT) {
+            return Ok(false);
+        }
+
+        let result_json = serde_json::to_string(result)?;
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-
-        let tx = self.conn.transaction()?;
-        // ON CONFLICT(job_id): a second result for the same job is ignored so
-        // we never double count. `changed` is 0 when the row already existed.
-        let changed = tx.execute(
+        // ON CONFLICT(job_id) DO NOTHING is belt-and-suspenders: the in_flight
+        // guard already blocks a second settle, but the unique index keeps a
+        // duplicate insert a no-op rather than an error.
+        tx.execute(
             "INSERT INTO results (job_id, result_json, earner, created_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(job_id) DO NOTHING",
-            (
-                &job_id,
-                result_json,
-                &result.earner_address,
-                created_at,
-            ),
+            (&job_id, result_json, &result.earner_address, created_at),
         )?;
-        if changed == 0 {
-            tracing::warn!(%job_id, "duplicate result ignored (already recorded)");
-        }
-        // Mark done + clear started_at regardless, so a duplicate submit still
-        // leaves the job in a consistent terminal state.
         tx.execute(
             "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2",
             (STATUS_DONE, &job_id),
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Reclaim jobs orphaned `in_flight` by a crash: a job is marked in_flight
