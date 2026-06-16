@@ -1646,6 +1646,142 @@ mod tests {
         assert_eq!(store.queued_count().unwrap(), seeded);
     }
 
+    /// Recovery reclaims ONLY in_flight jobs: queued/done/failed are left exactly
+    /// as they were, so a restart can neither lose a finished job nor revive a
+    /// terminal one. Locks the `WHERE status = in_flight` boundary.
+    #[test]
+    fn recover_in_flight_only_touches_in_flight() {
+        let mut store = Store::open_in_memory().unwrap();
+
+        // queued — never taken.
+        let queued = job_with_deadline(60);
+        store.enqueue(&queued).unwrap();
+        // in_flight — taken, no result; the only job recovery should reclaim.
+        let in_flight = job_with_deadline(60);
+        store.enqueue(&in_flight).unwrap();
+        store.take_next(|j| j.id == in_flight.id).unwrap();
+        // done — taken + completed.
+        let done = job_with_deadline(60);
+        store.enqueue(&done).unwrap();
+        store.take_next(|j| j.id == done.id).unwrap();
+        store.record_completed(&signed_result(done.id, "d")).unwrap();
+        // failed — dead-lettered at max_attempts = 1.
+        let failed = job_with_deadline(60);
+        store.enqueue(&failed).unwrap();
+        store.take_next(|j| j.id == failed.id).unwrap();
+        assert!(store.requeue(&failed, 1).unwrap());
+
+        // Exactly one in_flight job → exactly one reclaimed.
+        assert_eq!(store.recover_in_flight().unwrap(), 1);
+        assert_eq!(
+            store.job_status(&in_flight.id).unwrap().as_deref(),
+            Some("queued"),
+            "the in_flight job must be reclaimed to queued"
+        );
+        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&done.id).unwrap().as_deref(),
+            Some("done"),
+            "a completed job must NOT be reclaimed"
+        );
+        assert_eq!(
+            store.job_status(&failed.id).unwrap().as_deref(),
+            Some("failed"),
+            "a dead-lettered job must NOT be revived"
+        );
+        assert_eq!(store.completed_count().unwrap(), 1, "the recorded result is untouched");
+
+        // Idempotent: nothing is in_flight now, so a second recovery is a no-op.
+        assert_eq!(store.recover_in_flight().unwrap(), 0);
+    }
+
+    /// A crash that left one job done (result committed) and one in_flight must,
+    /// on restart, keep the done job credited and redispatch the in_flight job
+    /// exactly once — the atomic boundary between "result recorded" and "still
+    /// dispatched" survives a real on-disk reopen.
+    #[tokio::test]
+    async fn restart_redispatches_in_flight_once_preserving_done() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        let done_id;
+        let in_flight_id;
+        {
+            // "Process 1": raw store (no auto-seed) with one done + one in_flight.
+            let mut store = Store::open(&db_path).unwrap();
+            let done = job_with_deadline(60);
+            done_id = done.id;
+            store.enqueue(&done).unwrap();
+            store.take_next(|j| j.id == done.id).unwrap();
+            store.record_completed(&signed_result(done.id, "d")).unwrap();
+
+            let in_flight = job_with_deadline(60);
+            in_flight_id = in_flight.id;
+            store.enqueue(&in_flight).unwrap();
+            store.take_next(|j| j.id == in_flight.id).unwrap();
+            assert_eq!(store.in_flight_count().unwrap(), 1);
+        } // drop → "crash"
+
+        // "Process 2": restart through with_store, which recovers on boot and must
+        // NOT re-seed (jobs already exist).
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
+        let store = state.store.lock().await;
+
+        // The done job survived and is still credited; it is not requeued.
+        assert_eq!(store.job_status(&done_id).unwrap().as_deref(), Some("done"));
+        assert_eq!(store.completed_count().unwrap(), 1, "pre-crash result must survive");
+
+        // The in_flight job was reclaimed to queued and redispatches exactly once.
+        assert_eq!(store.job_status(&in_flight_id).unwrap().as_deref(), Some("queued"));
+        let taken = store.take_next(|_| true).unwrap();
+        assert_eq!(taken.map(|j| j.id), Some(in_flight_id), "the reclaimed job redispatches");
+        assert!(
+            store.take_next(|_| true).unwrap().is_none(),
+            "and only once — nothing else is queued"
+        );
+    }
+
+    /// A DB created before the `started_at`/`attempts` columns existed migrates
+    /// cleanly on `Store::open` (idempotent `ALTER`s) and can still recover an
+    /// in_flight job — exercises the on-disk migration path, not just the
+    /// in-memory schema where every column is present from the start.
+    #[test]
+    fn open_migrates_pre_column_db_and_recovers() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        let job = job_with_deadline(60);
+        let spec_json = serde_json::to_string(&job).unwrap();
+        {
+            // Hand-build the OLD schema: a jobs table without started_at/attempts,
+            // holding a single in_flight row.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE jobs (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, status TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, spec_json, status) VALUES (?1, ?2, 'in_flight')",
+                (job.id.to_string(), &spec_json),
+            )
+            .unwrap();
+        } // close the raw connection before reopening through Store
+
+        // Store::open must run the ADD COLUMN migrations without erroring.
+        let store = Store::open(&db_path).unwrap();
+
+        // The migrated in_flight row is reclaimable and redispatchable.
+        assert_eq!(
+            store.recover_in_flight().unwrap(),
+            1,
+            "the pre-column in_flight job must be reclaimed after migration"
+        );
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        // attempts defaulted to 0 on migration → first dispatch makes it 1.
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.redispatched_count().unwrap(), 0, "migrated attempts default to 0");
+    }
+
     #[test]
     fn reap_expired_requeues_only_past_deadline() {
         let store = Store::open_in_memory().unwrap();
