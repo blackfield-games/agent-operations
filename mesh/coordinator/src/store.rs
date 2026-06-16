@@ -164,39 +164,43 @@ impl Store {
     }
 
     /// Put a job back on the queue (rejected submission / dropped connection),
-    /// or dead-letter it if it has already been dispatched `max_attempts` times.
+    /// or dead-letter it if it has already been dispatched `max_attempts` times —
+    /// but ONLY while it is still `in_flight`.
     ///
-    /// Reads the job's current `attempts` from the table (treats it as 0 if the
-    /// row does not exist yet, mirroring the `QueryReturnedNoRows` handling in
-    /// `job_status`). If `attempts >= max_attempts` the job is moved to the
-    /// terminal `failed` status; otherwise it is returned to `queued`. In both
-    /// cases `started_at` is cleared. The latest `spec` is always upserted so
-    /// this works even for jobs not yet in the table.
+    /// This is an earner-driven action (its offer was rejected or its socket
+    /// dropped). If the job is no longer in_flight — the reaper already requeued
+    /// or dead-lettered it, or another earner now holds it — this is a no-op: a
+    /// late reject/disconnect must not clobber a reassigned job back to `queued`
+    /// or resurrect a terminal one. Reads `attempts` to decide: `>= max_attempts`
+    /// moves it to the terminal `failed` status, otherwise back to `queued`, and
+    /// clears `started_at`. Reaper-driven expiry lives in `reap_expired`.
     ///
-    /// Returns `true` iff the job was dead-lettered (i.e. moved to `failed`).
+    /// Returns `true` iff the job was dead-lettered (moved to `failed`); `false`
+    /// if it was requeued OR if it was a no-op (not in_flight / unknown).
     pub fn requeue(&self, job: &JobSpec, max_attempts: u32) -> Result<bool> {
-        // Read the current attempt count for this job (0 if not yet inserted).
-        let attempts: u32 = self
+        // Act only on a still-in_flight job; read its status + attempts together.
+        let row: Option<(String, u32)> = self
             .conn
             .query_row(
-                "SELECT attempts FROM jobs WHERE id = ?1",
+                "SELECT status, attempts FROM jobs WHERE id = ?1",
                 [job.id.to_string()],
-                |row| row.get::<_, u32>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)),
             )
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
-            })?
-            .unwrap_or(0);
+            })?;
+        let Some((status, attempts)) = row else { return Ok(false) }; // unknown job
+        if status != STATUS_IN_FLIGHT {
+            return Ok(false); // already reaped / reassigned / terminal — don't clobber
+        }
 
         let new_status = if attempts >= max_attempts { STATUS_FAILED } else { STATUS_QUEUED };
-        let spec_json = serde_json::to_string(job)?;
+        // Guard the transition on in_flight too, so it stays atomic with the read.
         self.conn.execute(
-            "INSERT INTO jobs (id, spec_json, status, started_at)
-             VALUES (?1, ?2, ?3, NULL)
-             ON CONFLICT(id) DO UPDATE SET spec_json = ?2, status = ?3, started_at = NULL",
-            (job.id.to_string(), spec_json, new_status),
+            "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2 AND status = ?3",
+            (new_status, job.id.to_string(), STATUS_IN_FLIGHT),
         )?;
         Ok(new_status == STATUS_FAILED)
     }

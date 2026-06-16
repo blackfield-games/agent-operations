@@ -2095,6 +2095,46 @@ mod tests {
         );
     }
 
+    /// `requeue` (an earner's reject/disconnect) acts ONLY on an in_flight job.
+    /// A job that has been reaped/reassigned/settled out from under the earner is
+    /// left untouched, so a late reject can't clobber a reassigned job back to
+    /// queued or resurrect a terminal one.
+    #[test]
+    fn requeue_is_noop_for_non_in_flight() {
+        let store = Store::open_in_memory().unwrap();
+
+        // Unknown job → no-op; nothing created.
+        let ghost = job_with_deadline(60);
+        assert!(!store.requeue(&ghost, 5).unwrap());
+        assert!(store.job_status(&ghost.id).unwrap().is_none());
+
+        // Queued (not in_flight) → no-op; stays queued.
+        let queued = job_with_deadline(60);
+        store.enqueue(&queued).unwrap();
+        assert!(!store.requeue(&queued, 5).unwrap());
+        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+
+        // Done → no-op; must NOT be resurrected to queued.
+        let mut store = Store::open_in_memory().unwrap();
+        let done = job_with_deadline(60);
+        store.enqueue(&done).unwrap();
+        store.take_next(|j| j.id == done.id).unwrap();
+        store.record_completed(&signed_result(done.id, "x")).unwrap();
+        assert!(!store.requeue(&done, 5).unwrap());
+        assert_eq!(
+            store.job_status(&done.id).unwrap().as_deref(),
+            Some("done"),
+            "a stale requeue must not resurrect a completed job"
+        );
+
+        // In_flight → acts: attempts(1) < max(5) → back to queued.
+        let live = job_with_deadline(60);
+        store.enqueue(&live).unwrap();
+        store.take_next(|j| j.id == live.id).unwrap();
+        assert!(!store.requeue(&live, 5).unwrap(), "requeued (not dead-lettered) → false");
+        assert_eq!(store.job_status(&live.id).unwrap().as_deref(), Some("queued"));
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight() {
         // Build state on a non-seeded in-memory store so the queue truly starts
