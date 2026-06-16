@@ -712,11 +712,19 @@ async fn submit(
     }
     tracing::info!(?id, earner = %result.earner_address, "result received");
     // TODO validator gate, EAS attestation relay
-    if let Err(e) = store.record_completed(&result) {
-        tracing::error!(?id, ?e, "submit: failed to persist result");
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    match store.record_completed(&result) {
+        Ok(true) => Ok("accepted"),
+        // The in_flight gate above ran under this same lock, so a false here
+        // means the job changed underneath us — a conflict, not a success.
+        Ok(false) => {
+            tracing::warn!(?id, "submit: job no longer in_flight at settle");
+            Err(StatusCode::CONFLICT)
+        }
+        Err(e) => {
+            tracing::error!(?id, ?e, "submit: failed to persist result");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
-    Ok("accepted")
 }
 
 /// Websocket job dispatch (the v1 upgrade). Protocol, all JSON text frames:
@@ -854,22 +862,26 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                     EarnerMsg::Submit(result) => {
-                        let reply = handle_submit(&state, &offered, accepted, result).await;
-                        let ok = matches!(reply, CoordinatorMsg::Accepted { .. });
-                        if !send_msg(&mut socket, &reply).await {
-                            // Couldn't deliver the verdict; requeue any offer.
-                            if let (false, Some(job)) = (ok, offered.take()) {
-                                requeue(&state, job).await;
+                        let outcome = handle_submit(&state, &offered, accepted, result).await;
+                        let sent = send_msg(&mut socket, outcome.reply()).await;
+                        match outcome {
+                            // Settled or stale: clear the offer, requeue nothing.
+                            SubmitOutcome::Accepted(_) | SubmitOutcome::Drop(_) => {
+                                offered = None;
+                                accepted = false;
                             }
-                            return;
+                            // Rejected but still ours: requeue for another earner.
+                            SubmitOutcome::Requeue(_) => {
+                                if let Some(job) = offered.take() {
+                                    requeue(&state, job).await;
+                                }
+                                accepted = false;
+                            }
                         }
-                        if ok {
-                            offered = None;
-                            accepted = false;
-                        } else if let Some(job) = offered.take() {
-                            // Rejected → requeue so another earner can try.
-                            requeue(&state, job).await;
-                            accepted = false;
+                        // Verdict undeliverable (socket gone): disposition applied
+                        // above, so just end the session.
+                        if !sent {
+                            return;
                         }
                     }
                     EarnerMsg::Heartbeat { job_id, progress_pct } => {
@@ -980,27 +992,56 @@ async fn requeue(state: &Arc<AppState>, job: JobSpec) {
     }
 }
 
-/// Verify a ws `Submit` against the outstanding offer and produce the verdict.
-/// On `Accepted`, the result is pushed into `completed`.
+/// Disposition of a ws `Submit`: the verdict to send the earner, plus what
+/// `ws_session` should do with the outstanding offer.
+enum SubmitOutcome {
+    /// Verified + settled. Clear the offer; do not requeue.
+    Accepted(CoordinatorMsg),
+    /// Rejected, and the job is still this earner's in-flight work — put it back
+    /// on the queue so another earner can try.
+    Requeue(CoordinatorMsg),
+    /// Rejected, and the offer is stale: the job is no longer in_flight under us
+    /// (reaped, reassigned, or already terminal). Drop our in-memory offer but
+    /// leave the job's store state untouched — requeueing would clobber a job
+    /// another earner may now hold or resurrect a dead-lettered one.
+    Drop(CoordinatorMsg),
+}
+
+impl SubmitOutcome {
+    fn reply(&self) -> &CoordinatorMsg {
+        match self {
+            SubmitOutcome::Accepted(m) | SubmitOutcome::Requeue(m) | SubmitOutcome::Drop(m) => m,
+        }
+    }
+}
+
+/// Verify a ws `Submit` against the outstanding offer and settle it. Returns the
+/// verdict to relay plus the offer disposition (see [`SubmitOutcome`]). A result
+/// is settled only while its job is still in_flight under this connection, so a
+/// stale offer cannot double-credit or resurrect a terminal job.
 async fn handle_submit(
     state: &Arc<AppState>,
     offered: &Option<JobSpec>,
     accepted: bool,
     result: JobResult,
-) -> CoordinatorMsg {
+) -> SubmitOutcome {
     let job_id = result.job_id;
-    let reject = |reason: &str| CoordinatorMsg::Rejected {
+    let rejected = |reason: &str| CoordinatorMsg::Rejected {
         job_id,
         reason: reason.to_string(),
     };
 
     match offered {
         Some(job) if job.id == job_id => {}
-        Some(_) => return reject("submit job_id does not match the offered job"),
-        None => return reject("no job was offered on this connection"),
+        // The offered job is still validly ours; don't settle it on a mismatched
+        // submit, but free it for another earner rather than stranding it.
+        Some(_) => {
+            return SubmitOutcome::Requeue(rejected("submit job_id does not match the offered job"))
+        }
+        None => return SubmitOutcome::Drop(rejected("no job was offered on this connection")),
     }
     if !accepted {
-        return reject("submit before accept");
+        return SubmitOutcome::Requeue(rejected("submit before accept"));
     }
 
     if let Err(e) = verify::verify_signature(
@@ -1010,22 +1051,33 @@ async fn handle_submit(
         &result.signature_hex,
     ) {
         tracing::warn!(%job_id, earner = %result.earner_address, ?e, "ws rejected: bad attestation");
-        return reject("attestation signature verification failed");
+        return SubmitOutcome::Requeue(rejected("attestation signature verification failed"));
+    }
+
+    // Settle only if the job is still in_flight. record_completed is
+    // self-guarding: a stale offer returns false, which we Drop (not Requeue) so
+    // we never touch a job another earner may now hold or a dead-lettered one.
+    let settled = {
+        let mut store = state.store.lock().await;
+        match store.record_completed(&result) {
+            Ok(settled) => settled,
+            Err(e) => {
+                tracing::error!(%job_id, ?e, "ws: failed to persist result");
+                return SubmitOutcome::Requeue(rejected("failed to persist result"));
+            }
+        }
+    };
+    if !settled {
+        tracing::warn!(%job_id, earner = %result.earner_address, "ws rejected: job no longer in_flight");
+        return SubmitOutcome::Drop(rejected("job is no longer in flight"));
     }
 
     tracing::info!(%job_id, earner = %result.earner_address, "ws result accepted");
     // TODO validator gate, real EAS attestation relay (placeholder uid for now).
-    {
-        let mut store = state.store.lock().await;
-        if let Err(e) = store.record_completed(&result) {
-            tracing::error!(%job_id, ?e, "ws: failed to persist result");
-            return reject("failed to persist result");
-        }
-    }
-    CoordinatorMsg::Accepted {
+    SubmitOutcome::Accepted(CoordinatorMsg::Accepted {
         job_id,
         attestation_uid: PLACEHOLDER_ATTESTATION_UID.to_string(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1399,6 +1451,74 @@ mod tests {
         // Nothing reached `completed`.
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_completed"], 0);
+    }
+
+    /// A ws offer that goes stale before Submit — the job is dead-lettered out
+    /// from under the session — is rejected, and the earner's late, validly
+    /// signed result neither completes the job nor resurrects it from `failed`.
+    /// Guards the double-credit / orphaned-settle failure mode on the ws path.
+    #[tokio::test]
+    async fn ws_submit_for_stale_offer_rejected_without_resurrecting() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        // Hello → JobOffer → Accept: the job is now in_flight under us.
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Dead-letter the job out from under the session: at one attempt with
+        // max_attempts=1, requeue moves it to the terminal `failed` state (what
+        // the reaper would do once attempts are exhausted).
+        {
+            let store = state.store.lock().await;
+            assert!(
+                store.requeue(&offered, 1).unwrap(),
+                "attempts>=max must dead-letter the job"
+            );
+            assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("failed"));
+        }
+
+        // Submit a validly-signed result for the now-stale offer.
+        let result = signed_result(job_id, "deadbeef");
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(result)).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // The verdict is Rejected, not Accepted.
+        match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::Rejected { job_id: jid, .. } => assert_eq!(jid, job_id),
+            other => panic!("expected Rejected for a stale offer, got {other:?}"),
+        }
+
+        // The job stays failed (not resurrected to done); nothing was credited.
+        assert_eq!(
+            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            Some("failed"),
+            "stale submit must not resurrect a dead-lettered job"
+        );
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0, "stale submit must not be credited");
+        assert_eq!(json["jobs_failed"], 1);
     }
 
     /// Simulated restart: enqueue a job and record a completed result against
