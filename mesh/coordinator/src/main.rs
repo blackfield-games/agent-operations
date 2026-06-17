@@ -1371,14 +1371,26 @@ mod tests {
         format!("0x{}", hex::encode(&hash[12..]))
     }
 
-    /// A `JobResult` validly signed by the dev key for the given job/hash.
-    fn signed_result(job_id: Uuid, output_hash: &str) -> JobResult {
+    /// Expand a short, readable test label into a valid 256-bit lowercase-hex
+    /// digest — the shape an honest earner emits and the result-validation gate
+    /// requires. Distinct labels map to distinct hashes, so call sites keep
+    /// passing `"deadbeef"`/`"a"`/`"bbbb"` for legibility while every submitted
+    /// result is well-formed. Keccak (already a dep) keeps this dependency-free.
+    fn test_output_hash(label: &str) -> String {
+        hex::encode(Keccak256::digest(label.as_bytes()))
+    }
+
+    /// A `JobResult` validly signed by the dev key for the given job/label. The
+    /// label is expanded to a valid 256-bit-hex `output_hash` (see
+    /// [`test_output_hash`]) and the signature is taken over that hash.
+    fn signed_result(job_id: Uuid, label: &str) -> JobResult {
+        let output_hash = test_output_hash(label);
         let sk = dev_signing_key();
-        let sig = verify::sign_for_test(&sk, &job_id, output_hash);
+        let sig = verify::sign_for_test(&sk, &job_id, &output_hash);
         JobResult {
             job_id,
             earner_address: dev_address(),
-            output_hash: output_hash.into(),
+            output_hash,
             output_url: "memory://x".into(),
             render_seconds: 1,
             signature_hex: sig,
@@ -1652,17 +1664,18 @@ mod tests {
     /// A `JobResult` validly signed by an arbitrary key (distinct from the dev
     /// key `signed_result` uses), credited to that key's derived address — lets a
     /// test assert credit lands on a SPECIFIC earner, not just "someone".
-    fn signed_result_by(key_hex: &str, job_id: Uuid, output_hash: &str) -> JobResult {
+    fn signed_result_by(key_hex: &str, job_id: Uuid, label: &str) -> JobResult {
         let sk = SigningKey::from_slice(&hex::decode(key_hex).unwrap()).unwrap();
         let point = sk.verifying_key().to_encoded_point(false);
         let address = format!("0x{}", hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..]));
+        let output_hash = test_output_hash(label);
         JobResult {
             job_id,
             earner_address: address,
-            output_hash: output_hash.into(),
+            signature_hex: verify::sign_for_test(&sk, &job_id, &output_hash),
+            output_hash,
             output_url: "memory://x".into(),
             render_seconds: 1,
-            signature_hex: verify::sign_for_test(&sk, &job_id, output_hash),
         }
     }
 
@@ -2736,7 +2749,7 @@ mod tests {
         let json = body_json(get(state.clone(), &format!("/jobs/{done_id}")).await).await;
         assert_eq!(json["spec"]["id"], done_id.to_string());
         assert_eq!(json["result"]["job_id"], done_id.to_string());
-        assert_eq!(json["result"]["output_hash"], "deadbeef");
+        assert_eq!(json["result"]["output_hash"], test_output_hash("deadbeef"));
         assert_eq!(json["result"]["render_seconds"], 1);
 
         // Unknown id → 404.
