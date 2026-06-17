@@ -39,6 +39,10 @@ contract ArtifactTemplateHandler is Test {
     function register(uint16 rarity, bytes32 manifest, uint256 authorSeed) external {
         if (ids.length >= MAX_TEMPLATES) return;
         address author = actors[authorSeed % actors.length];
+        // Keep rarity in [0, MAX_RARITY] so every register lands (the guard would
+        // otherwise revert-discard the call and waste fuzz budget); actors are all
+        // non-zero, so the author guard never trips here.
+        rarity = rarity % (art.MAX_RARITY() + 1);
         // Handler IS the minter; no prank needed.
         uint256 id = art.registerTemplate(author, rarity, manifest);
         ids.push(id);
