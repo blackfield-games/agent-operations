@@ -11,8 +11,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::StatusCode,
-    response::Response,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -29,6 +29,15 @@ use uuid::Uuid;
 /// RenderReceipts.sol relay lands (later task). 32 zero bytes, 0x-prefixed.
 const PLACEHOLDER_ATTESTATION_UID: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// HTTP-poll fence header. `GET /jobs/next` returns the dispatched job's
+/// `dispatch_seq` here; the earner echoes it on `POST /jobs/{id}/submit` so the
+/// coordinator rejects a submit whose lease was reaped and reassigned. This is
+/// best-effort: a stateless submit can't be bound to a session, and the seq is a
+/// small integer an adversary could guess — it closes the *accidental* race for
+/// honest earners. The websocket path (coordinator-remembered seq) is the
+/// authoritative fence; HTTP poll is the legacy/dev transport.
+const DISPATCH_SEQ_HEADER: &str = "x-dispatch-seq";
 
 mod store;
 mod verify;
@@ -575,13 +584,18 @@ async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEn
     Ok(Json(out))
 }
 
-async fn next_job(State(state): State<Arc<AppState>>) -> Result<Json<Option<JobSpec>>, StatusCode> {
+async fn next_job(State(state): State<Arc<AppState>>) -> Response {
     let store = state.store.lock().await;
     match store.take_next(|_| true) {
-        Ok(job) => Ok(Json(job.map(|(j, _seq)| j))),
+        // Return the job and stamp its dispatch_seq in a header so the poller can
+        // echo it on submit (the HTTP fence).
+        Ok(Some((job, seq))) => {
+            ([(DISPATCH_SEQ_HEADER, seq.to_string())], Json(Some(job))).into_response()
+        }
+        Ok(None) => Json(None::<JobSpec>).into_response(),
         Err(e) => {
             tracing::error!(?e, "next_job: take_next failed");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
@@ -667,11 +681,25 @@ async fn list_jobs(
 async fn submit(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(result): Json<JobResult>,
 ) -> Result<&'static str, StatusCode> {
     if result.job_id != id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    // The poller must echo the dispatch_seq it got from /jobs/next (the fence).
+    // A submit without it can't be tied to a dispatch, so reject it outright.
+    let claimed_seq: i64 = match headers
+        .get(DISPATCH_SEQ_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+    {
+        Some(s) => s,
+        None => {
+            tracing::warn!(?id, "rejected: missing/invalid {DISPATCH_SEQ_HEADER} header");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
     // Verify the earner's recoverable secp256k1 attestation: the signer must be
     // the claimed earner_address. Rejected submissions never enter `completed`.
     if let Err(e) = verify::verify_signature(
@@ -707,6 +735,21 @@ async fn submit(
         }
         Err(e) => {
             tracing::error!(?id, ?e, "submit: job_status lookup failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    // Fence on the dispatch seq, under the same lock as the in_flight check and
+    // the settle: a job reaped and reassigned after this earner polled carries a
+    // higher seq than the one it echoed, so its stale submit is refused — no
+    // credit for a lease it no longer holds.
+    match store.current_dispatch_seq(&id) {
+        Ok(Some(seq)) if seq == claimed_seq => {}
+        Ok(_) => {
+            tracing::warn!(?id, earner = %result.earner_address, claimed_seq, "rejected: dispatch reassigned (stale lease)");
+            return Err(StatusCode::CONFLICT);
+        }
+        Err(e) => {
+            tracing::error!(?id, ?e, "submit: dispatch_seq lookup failed");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
@@ -1200,6 +1243,29 @@ mod tests {
             .unwrap()
     }
 
+    /// POST a result to a submit URI with the `x-dispatch-seq` fence header. Most
+    /// tests take a job once (dispatch seq 1) before submitting, so they pass
+    /// `seq = 1`; the fence test passes a stale/current seq to exercise rejection.
+    async fn post_submit(
+        state: Arc<AppState>,
+        uri: &str,
+        value: &serde_json::Value,
+        seq: i64,
+    ) -> axum::response::Response {
+        router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("x-dispatch-seq", seq.to_string())
+                    .body(Body::from(serde_json::to_vec(value).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn get(state: Arc<AppState>, uri: &str) -> axum::response::Response {
         router(state)
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -1328,13 +1394,13 @@ mod tests {
 
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // mismatched path id vs body job_id → rejected
         let other = Uuid::new_v4();
         let uri = format!("/jobs/{}/submit", other);
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // completed count reflects the one accepted submit
@@ -1352,7 +1418,7 @@ mod tests {
         bad.signature_hex.push('f');
 
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&bad).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&bad).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -1368,7 +1434,7 @@ mod tests {
         bad.earner_address = "0x000000000000000000000000000000000000dead".into();
 
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&bad).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&bad).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -1664,6 +1730,52 @@ mod tests {
         assert_eq!(credited.len(), 1, "and on no one else (A was never credited)");
     }
 
+    /// HTTP-poll fence (FM3): `/jobs/next` stamps `dispatch_seq` in a header, and
+    /// `/jobs/{id}/submit` must echo the CURRENT seq. A submit with no header is
+    /// refused (can't be tied to a dispatch); one echoing a seq from a since-
+    /// reassigned dispatch is refused; the current seq settles. Closes the race
+    /// on the stateless path so it isn't silently left open behind the ws fence.
+    #[tokio::test]
+    async fn http_submit_is_fenced_on_the_dispatch_seq_header() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        // /jobs/next dispatches the job (seq 1) and stamps it in the header.
+        let resp = get(state.clone(), "/jobs/next").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-dispatch-seq").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "next stamps the dispatch seq"
+        );
+
+        let good = signed_result(job_id, "deadbeef");
+        let uri = format!("/jobs/{job_id}/submit");
+
+        // No fence header → can't be tied to a dispatch → 400.
+        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "submit without a fence header is refused");
+
+        // Reassign: requeue and re-dispatch, so the current seq is now 2.
+        {
+            let store = state.store.lock().await;
+            assert!(!store.requeue(&job, state.max_attempts).unwrap(), "requeued, not dead-lettered");
+        }
+        state.store.lock().await.take_next(|_| true).unwrap(); // seq -> 2
+
+        // Echoing the stale seq 1 → 409 (lease reassigned); nothing credited.
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "stale dispatch seq is refused");
+        assert_eq!(state.store.lock().await.completed_count().unwrap(), 0);
+
+        // Echoing the current seq 2 → accepted + settled.
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 2).await;
+        assert_eq!(resp.status(), StatusCode::OK, "current dispatch seq settles");
+        assert_eq!(state.store.lock().await.completed_count().unwrap(), 1);
+    }
+
     /// Simulated restart: enqueue a job and record a completed result against
     /// one file-backed state, drop it, then reopen the SAME DB file into a
     /// fresh `AppState` and assert the queued/completed counts survived.
@@ -1692,7 +1804,7 @@ mod tests {
             let result = signed_result(job_id, "deadbeef");
             let uri = format!("/jobs/{}/submit", job_id);
             let resp =
-                post_json(state.clone(), &uri, &serde_json::to_value(&result).unwrap()).await;
+                post_submit(state.clone(), &uri, &serde_json::to_value(&result).unwrap(), 1).await;
             assert_eq!(resp.status(), StatusCode::OK);
 
             let json = body_json(get(state.clone(), "/stats").await).await;
@@ -2287,7 +2399,7 @@ mod tests {
         let job_id = Uuid::new_v4();
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2300,7 +2412,7 @@ mod tests {
 
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -2322,12 +2434,12 @@ mod tests {
         let uri = format!("/jobs/{}/submit", job_id);
 
         // First submit: accepted (in_flight → done).
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Second submit: job is now done, so the gate rejects with CONFLICT and
         // nothing is double-counted.
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -2474,7 +2586,7 @@ mod tests {
         // Submit → job done.
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -2570,8 +2682,8 @@ mod tests {
 
         // done after a valid submit
         let good = signed_result(job_id, "deadbeef");
-        let resp = post_json(state.clone(), &format!("/jobs/{job_id}/submit"),
-            &serde_json::to_value(&good).unwrap()).await;
+        let resp = post_submit(state.clone(), &format!("/jobs/{job_id}/submit"),
+            &serde_json::to_value(&good).unwrap(), 1).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(get(state.clone(), &format!("/jobs/{job_id}/status")).await).await;
         assert_eq!(json["status"], "done");

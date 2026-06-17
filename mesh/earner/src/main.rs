@@ -420,8 +420,21 @@ fn keep_polling_after_submit(status: reqwest::StatusCode) -> bool {
 
 async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> Result<bool> {
     let url = format!("{}/jobs/next", args.coordinator);
-    let job: Option<JobSpec> = client.get(&url).send().await?.json().await?;
+    let resp = client.get(&url).send().await?;
+    // The coordinator stamps the dispatch_seq for this hand-out in a header; we
+    // must echo it on submit so a job reaped+reassigned to another earner can't
+    // be settled by us (the fence). Read it before consuming the body.
+    let dispatch_seq = resp
+        .headers()
+        .get("x-dispatch-seq")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+    let job: Option<JobSpec> = resp.json().await?;
     let Some(job) = job else { return Ok(false) };
+    let Some(dispatch_seq) = dispatch_seq else {
+        tracing::warn!(job_id = %job.id, "offered job without a dispatch-seq header; skipping");
+        return Ok(false);
+    };
 
     tracing::info!(job_id = %job.id, kind = ?job.kind, region = %job.region.region_id(), "job accepted");
     let output = runner::render(&job).await.context("render failed")?;
@@ -442,7 +455,12 @@ async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> 
     };
 
     let submit_url = format!("{}/jobs/{}/submit", args.coordinator, job.id);
-    let resp = client.post(&submit_url).json(&result).send().await?;
+    let resp = client
+        .post(&submit_url)
+        .header("x-dispatch-seq", dispatch_seq.to_string())
+        .json(&result)
+        .send()
+        .await?;
     let status = resp.status();
     if status.is_success() {
         tracing::info!(%status, job_id = %job.id, "submitted");
@@ -871,10 +889,15 @@ mod tests {
         let job = dev_job();
         let job_id = job.id;
 
-        // GET /jobs/next dispenses the one job; POST /jobs/{id}/submit accepts it.
+        // GET /jobs/next dispenses the one job, stamping its dispatch_seq in the
+        // fence header; POST /jobs/{id}/submit accepts it.
         Mock::given(method("GET"))
             .and(path("/jobs/next"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&job))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-dispatch-seq", "7")
+                    .set_body_json(&job),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -898,6 +921,13 @@ mod tests {
             .find(|r| r.url.path().ends_with("/submit"))
             .expect("earner POSTed the result to the submit endpoint");
         assert_eq!(submit.url.path(), format!("/jobs/{job_id}/submit").as_str());
+        // The earner echoes the dispatch_seq it received from /jobs/next (the
+        // fence the coordinator checks before settling).
+        assert_eq!(
+            submit.headers.get("x-dispatch-seq").map(|v| v.to_str().unwrap()),
+            Some("7"),
+            "earner must echo the dispatch-seq header on submit"
+        );
 
         let result: JobResult = serde_json::from_slice(&submit.body).unwrap();
         assert_eq!(result.job_id, job_id);
