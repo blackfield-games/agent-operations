@@ -1,11 +1,13 @@
-"""Validator well-formedness gate: every emitted .usda layer is opened and
-checked (exists, non-empty, #usda cookie, declares a defaultPrim) before the
-run is accepted, and each issue names its specialist so the supervisor routes
-the fix back to the offending node.
+"""Validator acceptance gates: every emitted .usda layer is opened and checked
+(exists, non-empty, #usda cookie, declares a defaultPrim), and the layers are
+then checked for cross-layer composition conflicts — two specialists defining the
+same prim path with incompatible types, or an override dangling over a prim no one
+defines. Each issue names its specialist so the supervisor routes the fix back to
+the offending (pipeline-earliest) node.
 
 The gate venv ships without usd-core, so these exercise the structural path; the
-pxr strict parse is an additional production-only guard that degrades to None
-when pxr is absent (FM4).
+pxr strict parse / composed-stage resolution is an additional production-only
+guard that degrades to the structural checks when pxr is absent (FM4).
 
 Run from the agents/ dir:
     .venv/bin/python -m pytest test_validator.py -v
@@ -141,4 +143,129 @@ async def test_run_flags_a_dangling_layer_file(tmp_path):
 
     assert not verdict.accepted
     assert any("biome" in issue and "missing" in issue for issue in verdict.issues)
+    assert _failing_specialist(verdict.issues) == "biome"
+
+
+# ---- composition conflicts (cross-layer) ----
+
+# /World/Hub as a Mesh vs. as an Xform — the two bodies disagree only on Hub's
+# type, the discriminator for an incompatible-type conflict. The prim path carries
+# no specialist-name segment, so route-back keys on the named specialists alone.
+HUB_AS_MESH = """#usda 1.0
+(
+    defaultPrim = "World"
+)
+def Xform "World" {
+    def Mesh "Hub" {}
+}
+"""
+HUB_AS_XFORM = """#usda 1.0
+(
+    defaultPrim = "World"
+)
+def Xform "World" {
+    def Xform "Hub" {}
+}
+"""
+# Defines /World, overrides /World/Hub — legitimate over-on-def when paired with a
+# layer that defines Hub.
+OVERRIDES_HUB = """#usda 1.0
+(
+    defaultPrim = "World"
+)
+over "World" {
+    over "Hub" {}
+}
+"""
+# Defines /World, then dangles an override over /Ghost that nothing defines.
+DANGLES_GHOST = """#usda 1.0
+(
+    defaultPrim = "World"
+)
+def Xform "World" {}
+over "Ghost" {}
+"""
+
+
+def _set_with(root: Path, bodies: dict[str, str]) -> list[LayerSpec]:
+    return [_layer(root, s, body=bodies.get(s, VALID_BODY)) for s in SPECIALISTS]
+
+
+def test_prim_specs_skips_metadata_braces_and_nests_paths():
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n'
+        "    customLayerData = {\n        string note = \"{ not a prim }\"\n    }\n)\n"
+        'def Xform "World" (\n    kind = "group"\n)\n{\n'
+        '    over "Hub" {}\n    def Mesh "Rock" {}\n}\n'
+    )
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("over", "", "/World/Hub"),
+        ("def", "Mesh", "/World/Rock"),
+    ]
+
+
+def test_same_type_redefinition_is_not_a_conflict():
+    # Two specialists defining the same path with the same type is a legal USD
+    # opinion-merge, not a conflict (FM1: don't false-positive on layering).
+    tagged = [("terrain", "def", "Xform", "/X"), ("biome", "def", "Xform", "/X")]
+    assert validator._conflicts_from_specs(tagged) == []
+
+
+def test_typeless_def_carries_no_type_opinion():
+    tagged = [("terrain", "def", "", "/X"), ("biome", "def", "Mesh", "/X")]
+    assert validator._conflicts_from_specs(tagged) == []
+
+
+def test_incompatible_type_redefinition_is_flagged():
+    tagged = [("terrain", "def", "Mesh", "/World/Hub"), ("prop", "def", "Xform", "/World/Hub")]
+    issues = validator._conflicts_from_specs(tagged)
+    assert len(issues) == 1
+    assert "prop" in issues[0] and "terrain" in issues[0]
+    assert _failing_specialist(issues) == "terrain"
+
+
+def test_over_on_def_is_legal():
+    tagged = [("terrain", "def", "Mesh", "/World/Hub"), ("prop", "over", "", "/World/Hub")]
+    assert validator._conflicts_from_specs(tagged) == []
+
+
+def test_dangling_override_is_flagged():
+    tagged = [("biome", "over", "", "/World/Ghost")]
+    issues = validator._conflicts_from_specs(tagged)
+    assert len(issues) == 1
+    assert "biome" in issues[0] and "dangling" in issues[0]
+
+
+def test_composition_check_runs_without_pxr(tmp_path):
+    # The gate venv ships without usd-core, so the structural scan must catch a
+    # conflict on its own. _composition_conflicts reads the files and flags it.
+    layers = _set_with(tmp_path, {"terrain": HUB_AS_MESH, "prop": HUB_AS_XFORM})
+    issues = validator._composition_conflicts(layers, tmp_path)
+    assert any("incompatible types" in issue for issue in issues)
+
+
+async def test_run_accepts_a_legitimate_over_on_def(tmp_path):
+    # terrain defines /World/Hub, lighting only overrides it — legal layering, not
+    # a conflict; the world is accepted.
+    layers = _set_with(tmp_path, {"terrain": HUB_AS_MESH, "lighting": OVERRIDES_HUB})
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_rejects_incompatible_type_conflict_and_routes_to_earliest(tmp_path):
+    # terrain and prop both define /World/Hub but disagree on its type. Reject and
+    # route back to terrain (the pipeline-earliest of the two), which re-runs prop.
+    layers = _set_with(tmp_path, {"terrain": HUB_AS_MESH, "prop": HUB_AS_XFORM})
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("incompatible types" in issue for issue in verdict.issues)
+    assert _failing_specialist(verdict.issues) == "terrain"
+
+
+async def test_run_rejects_dangling_override_and_routes_to_offender(tmp_path):
+    layers = _set_with(tmp_path, {"biome": DANGLES_GHOST})
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("dangling override" in issue for issue in verdict.issues)
     assert _failing_specialist(verdict.issues) == "biome"
