@@ -456,6 +456,42 @@ contract RegionAuthorityTest is Test {
         assertEq(evil.balanceOf(address(r)), 2 * STAKE);
     }
 
+    /// @dev Reentrancy proof for withdraw(), the pull side of the transfer
+    ///      settlement. The attacker earns a `withdrawable` balance (claim region,
+    ///      fees deposited, then transfer the region away so the accrued settles to
+    ///      it), then reenters withdraw() from the payout hook. Only zeroing the
+    ///      balance before the transfer (CEI) stops a double-withdraw; two stakes sit
+    ///      in the pool so a double-pay would be fundable if CEI were broken.
+    function test_withdraw_reentrantHolderCannotDoubleWithdraw() public {
+        HookToken evil = new HookToken();
+        RegionAuthority r = new RegionAuthority(address(evil), STAKE, owner);
+        ReentrantWithdrawer attacker = new ReentrantWithdrawer(r, evil);
+
+        evil.transfer(alice, STAKE);
+        vm.prank(alice);
+        evil.approve(address(r), type(uint256).max);
+        vm.prank(alice);
+        r.claim(uint256(keccak256("region:9,9,0")), STAKE);
+
+        evil.transfer(address(attacker), STAKE);
+        attacker.claim(TILE, STAKE);
+        evil.approve(address(r), type(uint256).max);
+        r.depositFees(TILE, FEE);
+        attacker.transferTo(bob); // _update settles FEE -> withdrawable[attacker]
+        assertEq(r.withdrawable(address(attacker)), FEE);
+        assertEq(evil.balanceOf(address(r)), 2 * STAKE + FEE);
+
+        evil.arm();
+        attacker.withdraw();
+
+        assertTrue(attacker.reentered(), "reentry fired");
+        assertTrue(attacker.reentryReverted(), "reentry blocked by CEI");
+        assertEq(evil.balanceOf(address(attacker)), FEE, "got exactly one payout");
+        assertEq(r.withdrawable(address(attacker)), 0);
+        // Both stakes remain (attacker's region now bob's, plus the honest staker's).
+        assertEq(evil.balanceOf(address(r)), 2 * STAKE);
+    }
+
     // --- setStakeRequired ---
 
     function test_setStakeRequired_updatesAndEmits() public {
@@ -511,9 +547,14 @@ contract RegionAuthorityTest is Test {
     }
 }
 
+/// @dev Shared payout callback so HookToken can drive any reentrancy attacker.
+interface IPayoutReceiver {
+    function onPayout() external;
+}
+
 /// @notice ERC-20 staking token with an armed recipient hook (ERC777-style), used
-///         to hand control to the holder mid-payout so it can reenter unstake().
-///         Disarmed by default so funding/claim transfers are normal.
+///         to hand control to the recipient mid-payout so it can reenter the
+///         contract. Disarmed by default so funding/claim transfers are normal.
 contract HookToken is ERC20 {
     bool armed;
 
@@ -529,7 +570,7 @@ contract HookToken is ERC20 {
         super._update(from, to, value);
         if (armed && to != address(0) && to.code.length > 0) {
             armed = false; // one-shot, so the reentrant payout doesn't recurse
-            ReentrantHolder(to).onPayout();
+            IPayoutReceiver(to).onPayout();
         }
     }
 }
@@ -602,6 +643,49 @@ contract ReentrantClaimer {
     function onPayout() external {
         reentered = true;
         try region.claimFees(tokenId) {}
+        catch {
+            reentryReverted = true;
+        }
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}
+
+/// @notice Holder that earns a `withdrawable` balance (it transfers its region away
+///         after fees accrue, settling them to itself) then reenters withdraw() from
+///         the payout hook. Only withdraw zeroing the balance before the transfer
+///         (CEI) stops a second payout.
+contract ReentrantWithdrawer is IPayoutReceiver {
+    RegionAuthority region;
+    HookToken token;
+    uint256 public tokenId;
+    bool public reentered;
+    bool public reentryReverted;
+
+    constructor(RegionAuthority region_, HookToken token_) {
+        region = region_;
+        token = token_;
+    }
+
+    function claim(uint256 tokenId_, uint256 amount) external {
+        tokenId = tokenId_;
+        token.approve(address(region), type(uint256).max);
+        region.claim(tokenId_, amount);
+    }
+
+    function transferTo(address to) external {
+        region.transferFrom(address(this), to, tokenId);
+    }
+
+    function withdraw() external {
+        region.withdraw();
+    }
+
+    function onPayout() external {
+        reentered = true;
+        try region.withdraw() {}
         catch {
             reentryReverted = true;
         }
