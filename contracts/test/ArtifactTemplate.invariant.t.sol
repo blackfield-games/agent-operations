@@ -2,7 +2,17 @@
 pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
-import {ArtifactTemplate} from "../src/ArtifactTemplate.sol";
+import {ArtifactTemplate, IComputeMeter} from "../src/ArtifactTemplate.sol";
+
+/// @notice No-op ComputeMeter. These suites exercise supply accounting (balances,
+///         per-template/per-author counters), which is independent of the mint fee,
+///         over random amounts up to 1e24 that no finite credit could cover. A
+///         permissive meter keeps every mint landing so the property under test —
+///         not credit provisioning — is what's fuzzed; fee correctness is pinned in
+///         the unit suite against a real ComputeMeter.
+contract NoopMeter is IComputeMeter {
+    function spend(address, uint256, bytes32) external {}
+}
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -89,7 +99,7 @@ contract ArtifactTemplateInvariantTest is Test {
     string constant BASE_URI = "ipfs://base/{id}.json";
 
     function setUp() public {
-        art = new ArtifactTemplate(owner, BASE_URI);
+        art = new ArtifactTemplate(owner, BASE_URI, address(new NoopMeter()), 1);
 
         address[] memory actors = new address[](3);
         actors[0] = address(0xA1);
@@ -164,7 +174,7 @@ contract ArtifactTemplateFuzzTest is Test {
     string constant BASE_URI = "ipfs://base/{id}.json";
 
     function setUp() public {
-        art = new ArtifactTemplate(owner, BASE_URI);
+        art = new ArtifactTemplate(owner, BASE_URI, address(new NoopMeter()), 1);
         vm.prank(owner);
         art.setMinter(minter);
     }

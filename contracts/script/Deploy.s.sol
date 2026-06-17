@@ -22,6 +22,7 @@ contract Deploy is Script {
         address coordinator; // authorized render-job coordinator + minter
         uint256 stakeRequired; // $BLCKFLD required to claim a region
         string artifactBaseUri; // ERC-1155 base URI for artifact templates
+        uint256 artifactMintFeeRate; // ArtifactTemplate per-unit full-rarity mint fee
     }
 
     /// @dev Deployed contract handles, returned to callers (tests + run()).
@@ -64,8 +65,11 @@ contract Deploy is Script {
         // 3. Region authority — staked ERC-721 over world regions.
         RegionAuthority regionAuthority = new RegionAuthority(cfg.token, cfg.stakeRequired, deployer);
 
-        // 4. Artifact templates — ERC-1155 player-authored artifacts.
-        ArtifactTemplate artifactTemplate = new ArtifactTemplate(deployer, cfg.artifactBaseUri);
+        // 4. Artifact templates — ERC-1155 player-authored artifacts; mints debit the
+        //    rarity-scaled fee from the recipient's credit on this ComputeMeter.
+        ArtifactTemplate artifactTemplate = new ArtifactTemplate(
+            deployer, cfg.artifactBaseUri, address(computeMeter), cfg.artifactMintFeeRate
+        );
 
         // --- post-deploy wiring (deployer is owner) ---
 
@@ -76,6 +80,10 @@ contract Deploy is Script {
         // Coordinator is the authorized compute spender + artifact minter.
         computeMeter.setSpender(cfg.coordinator, true);
         artifactTemplate.setMinter(cfg.coordinator);
+
+        // ArtifactTemplate debits the mint fee directly via ComputeMeter.spend, so it
+        // must itself be an authorized spender or every fee-charging mint reverts.
+        computeMeter.setSpender(address(artifactTemplate), true);
 
         // --- hand ownership to the configured owner (two-step; owner must accept) ---
         if (cfg.owner != deployer) {
@@ -109,6 +117,7 @@ contract Deploy is Script {
         cfg.stakeRequired = vm.envOr("REGION_STAKE_REQUIRED", uint256(100_000 ether));
         cfg.artifactBaseUri =
             vm.envOr("ARTIFACT_BASE_URI", string("https://artifacts.blackfield.xyz/{id}.json"));
+        cfg.artifactMintFeeRate = vm.envOr("ARTIFACT_MINT_FEE_RATE", uint256(1 ether));
     }
 
     function _log(DeployConfig memory cfg, Deployed memory deployed) internal pure {

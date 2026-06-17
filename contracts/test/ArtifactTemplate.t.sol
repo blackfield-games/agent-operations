@@ -2,12 +2,22 @@
 pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
-import {ArtifactTemplate} from "../src/ArtifactTemplate.sol";
+import {ArtifactTemplate, IComputeMeter} from "../src/ArtifactTemplate.sol";
+import {ComputeMeter} from "../src/ComputeMeter.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC1155Receiver} from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+contract MockToken is ERC20 {
+    constructor() ERC20("Mock", "MCK") {
+        _mint(msg.sender, 1_000_000 ether);
+    }
+}
 
 contract ArtifactTemplateTest is Test {
     ArtifactTemplate art;
+    ComputeMeter meter;
+    MockToken token;
 
     address owner = address(0xA11CE);
     address minter = address(0x1117E2);
@@ -16,17 +26,40 @@ contract ArtifactTemplateTest is Test {
     address stranger = address(0xBEEF);
 
     string constant BASE_URI = "ipfs://base/{id}.json";
+    uint256 constant FEE_RATE = 1e12;
 
     event TemplateRegistered(
         uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
     );
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
+    event MintFeeRateSet(uint256 rate);
+    // ComputeMeter's debit event, re-declared for expectEmit against the meter.
+    event Spent(address indexed buyer, address indexed spender, uint256 amount, bytes32 jobId);
 
     function setUp() public {
-        art = new ArtifactTemplate(owner, BASE_URI);
-        vm.prank(owner);
+        token = new MockToken();
+        meter = new ComputeMeter(address(token), owner);
+        art = new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE);
+
+        vm.startPrank(owner);
         art.setMinter(minter);
+        meter.setSpender(address(art), true);
+        vm.stopPrank();
+
+        // Fund the recipients used across the mint tests; fees are tiny next to this.
+        _credit(player, 1_000 ether);
+        _credit(stranger, 1_000 ether);
+    }
+
+    /// @dev Burn `amount` $TOKEN into `who`'s ComputeMeter credit so a fee-charging
+    ///      mint to `who` has balance to debit.
+    function _credit(address who, uint256 amount) internal {
+        token.transfer(who, amount);
+        vm.startPrank(who);
+        token.approve(address(meter), amount);
+        meter.deposit(amount);
+        vm.stopPrank();
     }
 
     // --- construction ---
@@ -36,6 +69,8 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.uri(0), BASE_URI);
         assertEq(art.minter(), minter);
         assertEq(art.nextTemplateId(), 0);
+        assertEq(address(art.computeMeter()), address(meter));
+        assertEq(art.mintFeeRate(), FEE_RATE);
     }
 
     // --- setMinter ---
@@ -217,6 +252,9 @@ contract ArtifactTemplateTest is Test {
         ReentrantMinter rm = new ReentrantMinter(art);
         vm.prank(owner);
         art.setMinter(address(rm));
+        // rm is both minter and recipient, so it pays the fee on the outer and the
+        // reentrant mint — fund it for both.
+        _credit(address(rm), 1_000 ether);
 
         uint256 id = rm.register(author, 1000);
         rm.fire(5, 3); // outer mint 5; the receiver hook reenters and mints 3 more

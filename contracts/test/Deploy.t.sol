@@ -61,7 +61,8 @@ contract DeployTest is Test {
             owner: owner,
             coordinator: coordinator,
             stakeRequired: 50_000 ether,
-            artifactBaseUri: "https://artifacts.test/{id}.json"
+            artifactBaseUri: "https://artifacts.test/{id}.json",
+            artifactMintFeeRate: 1 ether
         });
 
         // In the test path the script contract itself sends the CREATE + wiring calls,
@@ -114,7 +115,8 @@ contract DeployTest is Test {
             owner: owner,
             coordinator: coordinator,
             stakeRequired: 1 ether,
-            artifactBaseUri: "ipfs://{id}"
+            artifactBaseUri: "ipfs://{id}",
+            artifactMintFeeRate: 1 ether
         });
         Deploy.Deployed memory fresh = script.deploy(cfg, address(script));
 

@@ -4,12 +4,32 @@ pragma solidity ^0.8.27;
 import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
+/// @notice The slice of ComputeMeter this contract depends on. Held as an interface
+///         so the mint-fee debit is one external call against a fixed ABI and tests
+///         can substitute a meter (real, reentrant, or no-op) at construction.
+interface IComputeMeter {
+    function spend(address buyer, uint256 amount, bytes32 jobId) external;
+}
+
 /// @notice Player-authored artifact templates (weapons, gear, structures).
-///         Minted as ERC-1155 once a $BLCKFLD burn pays the rarity-scaled mint fee
-///         via ComputeMeter. Each templateId points to an offchain USD artifact
-///         manifest committed in a Merkle root tied to the template URI.
+///         Each mint debits a rarity-scaled $BLCKFLD fee from the recipient's
+///         ComputeMeter credit before the ERC-1155 units are minted; an
+///         insufficient balance reverts the mint. Each templateId points to an
+///         offchain USD artifact manifest committed in a Merkle root tied to the
+///         template URI.
 contract ArtifactTemplate is ERC1155, Ownable2Step {
     address public minter;
+
+    /// @notice ComputeMeter that holds buyer compute credit. This contract must be
+    ///         in its `authorizedSpenders` set (wired at deploy) or every
+    ///         fee-charging mint reverts `NotAuthorized` at the meter.
+    IComputeMeter public immutable computeMeter;
+
+    /// @notice Mint fee at full rarity, per ERC-1155 unit, in $BLCKFLD compute
+    ///         credit. The charged fee scales linearly with `rarity` (see `_mintFee`).
+    ///         Owner-set and kept strictly positive so the global fee gate cannot be
+    ///         opened (mirrors RegionAuthority's non-zero stake floor).
+    uint256 public mintFeeRate;
 
     /// @notice Upper bound on `rarity`, in basis points (100%). The off-chain
     ///         rarity->fee calculation treats this as the full-scale value, so a
@@ -44,6 +64,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     );
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
+    event MintFeeRateSet(uint256 rate);
 
     error NotMinter();
     error UnknownTemplate();
@@ -51,12 +72,30 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     error InvalidRarity(uint16 rarity);
     error ZeroRecipient();
     error ZeroAmount();
+    error ZeroComputeMeter();
+    error ZeroFeeRate();
 
-    constructor(address owner_, string memory baseUri_) ERC1155(baseUri_) Ownable(owner_) {}
+    constructor(address owner_, string memory baseUri_, address computeMeter_, uint256 mintFeeRate_)
+        ERC1155(baseUri_)
+        Ownable(owner_)
+    {
+        if (computeMeter_ == address(0)) revert ZeroComputeMeter();
+        if (mintFeeRate_ == 0) revert ZeroFeeRate();
+        computeMeter = IComputeMeter(computeMeter_);
+        mintFeeRate = mintFeeRate_;
+    }
 
     function setMinter(address minter_) external onlyOwner {
         minter = minter_;
         emit MinterSet(minter_);
+    }
+
+    /// @notice Owner sets the per-unit full-rarity mint fee. Zero is rejected so the
+    ///         fee gate can never be globally disabled.
+    function setMintFeeRate(uint256 rate) external onlyOwner {
+        if (rate == 0) revert ZeroFeeRate();
+        mintFeeRate = rate;
+        emit MintFeeRateSet(rate);
     }
 
     function setURI(string calldata newURI) external onlyOwner {
@@ -82,16 +121,40 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         if (msg.sender != minter) revert NotMinter();
         if (to == address(0)) revert ZeroRecipient();
         if (amount == 0) revert ZeroAmount();
-        if (templates[templateId].author == address(0)) revert UnknownTemplate();
+        Template storage t = templates[templateId];
+        if (t.author == address(0)) revert UnknownTemplate();
 
-        // Write the supply counters before _mint, which fires the ERC-1155
-        // receiver hook on `to` — a minter that is also the recipient could
-        // reenter mint() during that hook. Effects-before-interaction (CEI)
-        // means the reentrant call sees counters that already include this mint.
+        uint256 fee = _mintFee(amount, t.rarity);
+
+        // CEI: write the supply counters (effects) before the two external
+        // interactions below — the meter `spend` and `_mint`, either of which can
+        // reenter (a misbehaving meter during spend; a minter that is also the
+        // recipient via the ERC-1155 receiver hook during _mint). A reentrant call
+        // therefore sees counters that already include this mint.
         totalMinted += amount;
         mintedByTemplate[templateId] += amount;
 
+        // Charge the recipient's compute credit before the units are minted, so an
+        // insufficient balance reverts the whole mint. The spend's jobId carries the
+        // templateId (these are artifact mints, not the render-job EAS UIDs the meter
+        // also serves). A rarity-0 template (the 0-bps common tier) yields a zero fee
+        // and skips the debit entirely.
+        if (fee != 0) computeMeter.spend(to, fee, bytes32(templateId));
+
         _mint(to, templateId, amount, data);
         emit Minted(to, templateId, amount);
+    }
+
+    /// @dev Rarity-scaled mint fee in $BLCKFLD compute credit:
+    ///      ceil(mintFeeRate * amount * rarity / MAX_RARITY). Rounds UP so any
+    ///      positive rarity costs at least one unit — a low rarity must never round
+    ///      down to a free mint. rarity == 0 (the 0-bps common tier) yields exactly
+    ///      zero. The multiply is checked arithmetic: it reverts only on the
+    ///      astronomical overflow of mintFeeRate * amount * rarity, reachable solely
+    ///      from absurd owner-set rate / coordinator-set amount values.
+    function _mintFee(uint256 amount, uint16 rarity) internal view returns (uint256) {
+        uint256 numerator = mintFeeRate * amount * rarity;
+        if (numerator == 0) return 0;
+        return (numerator - 1) / MAX_RARITY + 1;
     }
 }
