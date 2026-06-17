@@ -578,7 +578,7 @@ async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEn
 async fn next_job(State(state): State<Arc<AppState>>) -> Result<Json<Option<JobSpec>>, StatusCode> {
     let store = state.store.lock().await;
     match store.take_next(|_| true) {
-        Ok(job) => Ok(Json(job)),
+        Ok(job) => Ok(Json(job.map(|(j, _seq)| j))),
         Err(e) => {
             tracing::error!(?e, "next_job: take_next failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -787,8 +787,11 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
         .map(|info| info.supported.clone())
         .unwrap_or_default();
 
-    // The job we've currently offered (and whether the earner accepted it).
-    let mut offered: Option<JobSpec> = None;
+    // The job we've currently offered, paired with the `dispatch_seq` stamped
+    // when we took it. The seq is our fence: we only settle/requeue/touch this
+    // job while it still holds this seq, so a reaped+reassigned job can't be
+    // settled or preempted by us. Plus whether the earner accepted the offer.
+    let mut offered: Option<(JobSpec, i64)> = None;
     let mut accepted = false;
     // Poll the queue on this cadence when we have nothing offered.
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -797,13 +800,13 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     loop {
         // If we have no outstanding offer, try to grab a supported job.
         if offered.is_none() {
-            if let Some(job) = take_supported_job(&state, &supported).await {
+            if let Some((job, seq)) = take_supported_job(&state, &supported).await {
                 if !send_msg(&mut socket, &CoordinatorMsg::JobOffer(job.clone())).await {
-                    requeue(&state, job).await;
+                    requeue(&state, job, seq).await;
                     return;
                 }
                 tracing::info!(earner = %earner_address, job_id = %job.id, "job offered");
-                offered = Some(job);
+                offered = Some((job, seq));
                 accepted = false;
             }
         }
@@ -857,7 +860,7 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                     EarnerMsg::Accept { job_id } => {
                         match &offered {
-                            Some(job) if job.id == job_id => {
+                            Some((job, _)) if job.id == job_id => {
                                 accepted = true;
                                 tracing::info!(earner = %earner_address, %job_id, "offer accepted");
                             }
@@ -875,8 +878,8 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                             }
                             // Rejected but still ours: requeue for another earner.
                             SubmitOutcome::Requeue(_) => {
-                                if let Some(job) = offered.take() {
-                                    requeue(&state, job).await;
+                                if let Some((job, seq)) = offered.take() {
+                                    requeue(&state, job, seq).await;
                                 }
                                 accepted = false;
                             }
@@ -895,8 +898,25 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                         // heartbeating is making progress and won't be reaped;
                         // a silent earner still hits the original window.
                         match (job_id, &offered) {
-                            (Some(jid), Some(job)) if jid == job.id => {
+                            (Some(jid), Some((job, seq))) if jid == job.id => {
                                 let store = state.store.lock().await;
+                                // Fence: only the holder of the current dispatch
+                                // may slide the deadline. A stale heartbeat for a
+                                // job since reaped+reassigned (newer seq) must not
+                                // keep the new holder's lease alive.
+                                let holds_current = matches!(
+                                    store.current_dispatch_seq(&jid),
+                                    Ok(Some(cur)) if cur == *seq
+                                );
+                                if !holds_current {
+                                    tracing::debug!(
+                                        earner = %earner_address,
+                                        %jid,
+                                        progress_pct,
+                                        "heartbeat for a reassigned/stale dispatch ignored",
+                                    );
+                                    continue;
+                                }
                                 match store.touch(&jid, now_secs()) {
                                     Ok(true) => tracing::debug!(
                                         earner = %earner_address,
@@ -931,9 +951,10 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // Socket ended with an un-submitted offer in flight → requeue it.
-    if let Some(job) = offered.take() {
-        requeue(&state, job).await;
+    // Socket ended with an un-submitted offer in flight → requeue it (fenced on
+    // our dispatch seq, so a job already reaped+reassigned isn't yanked back).
+    if let Some((job, seq)) = offered.take() {
+        requeue(&state, job, seq).await;
     }
     tracing::info!(earner = %earner_address, "ws session ended");
 }
@@ -970,8 +991,10 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
 }
 
 /// Take the most recent queued job whose kind the earner supports, marking it
-/// in-flight. Leaves unsupported jobs queued for other earners.
-async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Option<JobSpec> {
+/// in-flight. Returns the job with the `dispatch_seq` stamped on this hand-out,
+/// which the session remembers to fence later settle/requeue/heartbeat actions.
+/// Leaves unsupported jobs queued for other earners.
+async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Option<(JobSpec, i64)> {
     let store = state.store.lock().await;
     match store.take_next(|job| supported.contains(&job.kind)) {
         Ok(job) => job,
@@ -983,9 +1006,27 @@ async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Opt
 }
 
 /// Put a job back on the queue (rejected submission or dropped connection), or
-/// dead-letter it if it has exhausted `state.max_attempts` dispatches.
-async fn requeue(state: &Arc<AppState>, job: JobSpec) {
+/// dead-letter it if it has exhausted `state.max_attempts` dispatches — but only
+/// while we still hold the dispatch identified by `seq`.
+///
+/// The fence read and the requeue run under the same store lock, so they are
+/// atomic against any other dispatch. If the job was reaped and reassigned to a
+/// new earner since we took it, its `dispatch_seq` has advanced past `seq` and we
+/// skip: requeueing would preempt the new holder mid-render. `store.requeue` then
+/// applies its own `in_flight` guard (a reaper-parked `queued` job is a no-op).
+async fn requeue(state: &Arc<AppState>, job: JobSpec, seq: i64) {
     let store = state.store.lock().await;
+    match store.current_dispatch_seq(&job.id) {
+        Ok(Some(cur)) if cur == seq => {}
+        Ok(_) => {
+            tracing::debug!(job_id = %job.id, seq, "requeue skipped: dispatch reassigned or job gone");
+            return;
+        }
+        Err(e) => {
+            tracing::error!(job_id = %job.id, ?e, "requeue: dispatch_seq read failed");
+            return;
+        }
+    }
     match store.requeue(&job, state.max_attempts) {
         Ok(true) => {
             tracing::warn!(job_id = %job.id, "job dead-lettered (max attempts exhausted)");
@@ -997,6 +1038,7 @@ async fn requeue(state: &Arc<AppState>, job: JobSpec) {
 
 /// Disposition of a ws `Submit`: the verdict to send the earner, plus what
 /// `ws_session` should do with the outstanding offer.
+#[derive(Debug)]
 enum SubmitOutcome {
     /// Verified + settled. Clear the offer; do not requeue.
     Accepted(CoordinatorMsg),
@@ -1024,7 +1066,7 @@ impl SubmitOutcome {
 /// stale offer cannot double-credit or resurrect a terminal job.
 async fn handle_submit(
     state: &Arc<AppState>,
-    offered: &Option<JobSpec>,
+    offered: &Option<(JobSpec, i64)>,
     accepted: bool,
     result: JobResult,
 ) -> SubmitOutcome {
@@ -1034,15 +1076,15 @@ async fn handle_submit(
         reason: reason.to_string(),
     };
 
-    match offered {
-        Some(job) if job.id == job_id => {}
+    let expected_seq = match offered {
+        Some((job, seq)) if job.id == job_id => *seq,
         // The offered job is still validly ours; don't settle it on a mismatched
         // submit, but free it for another earner rather than stranding it.
         Some(_) => {
             return SubmitOutcome::Requeue(rejected("submit job_id does not match the offered job"))
         }
         None => return SubmitOutcome::Drop(rejected("no job was offered on this connection")),
-    }
+    };
     if !accepted {
         return SubmitOutcome::Requeue(rejected("submit before accept"));
     }
@@ -1057,11 +1099,25 @@ async fn handle_submit(
         return SubmitOutcome::Requeue(rejected("attestation signature verification failed"));
     }
 
-    // Settle only if the job is still in_flight. record_completed is
-    // self-guarding: a stale offer returns false, which we Drop (not Requeue) so
-    // we never touch a job another earner may now hold or a dead-lettered one.
+    // Settle only if we still hold the current dispatch. The fence read and the
+    // settle run under one store lock, so they are atomic against any other
+    // dispatch: a job reaped and reassigned to a new earner carries a higher
+    // `dispatch_seq` than ours, so we Drop (never Requeue) — we must not settle
+    // (which would credit us for the new holder's lease) or touch the job.
+    // `record_completed` keeps its own `in_flight` guard as a backstop.
     let settled = {
         let mut store = state.store.lock().await;
+        match store.current_dispatch_seq(&job_id) {
+            Ok(Some(cur)) if cur == expected_seq => {}
+            Ok(_) => {
+                tracing::warn!(%job_id, earner = %result.earner_address, expected_seq, "ws rejected: dispatch reassigned (stale lease)");
+                return SubmitOutcome::Drop(rejected("job is no longer in flight"));
+            }
+            Err(e) => {
+                tracing::error!(%job_id, ?e, "ws: dispatch_seq read failed");
+                return SubmitOutcome::Requeue(rejected("failed to read dispatch state"));
+            }
+        }
         match store.record_completed(&result) {
             Ok(settled) => settled,
             Err(e) => {
@@ -1524,6 +1580,90 @@ mod tests {
         assert_eq!(json["jobs_failed"], 1);
     }
 
+    /// A `JobResult` validly signed by an arbitrary key (distinct from the dev
+    /// key `signed_result` uses), credited to that key's derived address — lets a
+    /// test assert credit lands on a SPECIFIC earner, not just "someone".
+    fn signed_result_by(key_hex: &str, job_id: Uuid, output_hash: &str) -> JobResult {
+        let sk = SigningKey::from_slice(&hex::decode(key_hex).unwrap()).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let address = format!("0x{}", hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..]));
+        JobResult {
+            job_id,
+            earner_address: address,
+            output_hash: output_hash.into(),
+            output_url: "memory://x".into(),
+            render_seconds: 1,
+            signature_hex: verify::sign_for_test(&sk, &job_id, output_hash),
+        }
+    }
+
+    /// The per-dispatch fence (FM1 + FM2). After a job is reaped and reassigned to
+    /// a new earner B, the previous holder A — submitting a perfectly valid,
+    /// signed result for the same job — can neither settle it (no misattributed
+    /// credit, FM2) nor requeue it on disconnect (no preemption of B, FM1). B,
+    /// holding the current dispatch, still settles and is credited. Drives
+    /// `handle_submit`/`requeue` directly with each holder's remembered seq.
+    #[tokio::test]
+    async fn stale_holder_cannot_settle_or_preempt_reassigned_job() {
+        // hardhat account #1 key — a valid secp256k1 scalar distinct from the dev key.
+        const KEY_B: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        // A takes the job: dispatch seq 1, in_flight under A.
+        let (job_a, seq_a) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        assert_eq!((job_a.id, seq_a), (job_id, 1));
+
+        // The deadline lapses and A's job returns to the queue (whether via the
+        // reaper or A's own disconnect — both are in_flight→queued, seq preserved).
+        {
+            let store = state.store.lock().await;
+            assert!(!store.requeue(&job_a, state.max_attempts).unwrap(), "requeued, not dead-lettered");
+            assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("queued"));
+        }
+        // B takes the now-queued job: seq 2.
+        let (job_b, seq_b) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        assert_eq!((job_b.id, seq_b), (job_id, 2), "B's dispatch carries a fresh, higher seq");
+
+        // FM2: A (seq 1) submits a valid result, but the lease is B's (seq 2).
+        // Must Drop, settle nothing, credit no one.
+        let result_a = signed_result(job_id, "aaaa"); // dev key == earner A
+        match handle_submit(&state, &Some((job_a.clone(), seq_a)), true, result_a).await {
+            SubmitOutcome::Drop(CoordinatorMsg::Rejected { job_id: jid, .. }) => assert_eq!(jid, job_id),
+            other => panic!("stale holder's submit must Drop, got {other:?}"),
+        }
+        {
+            let store = state.store.lock().await;
+            assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("in_flight"));
+            assert_eq!(store.completed_count().unwrap(), 0, "stale submit credited nothing");
+            assert_eq!(store.current_dispatch_seq(&job_id).unwrap(), Some(2));
+        }
+
+        // FM1: A's socket drops → requeue with A's stale seq. Must not preempt B.
+        requeue(&state, job_a, seq_a).await;
+        assert_eq!(
+            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            Some("in_flight"),
+            "stale holder's disconnect must not requeue B's in-flight job"
+        );
+
+        // B (seq 2) holds the current dispatch: it settles and is credited.
+        let result_b = signed_result_by(KEY_B, job_id, "bbbb");
+        let b_addr = result_b.earner_address.clone();
+        assert_ne!(b_addr, dev_address(), "B must be a different earner than A");
+        match handle_submit(&state, &Some((job_b, seq_b)), true, result_b).await {
+            SubmitOutcome::Accepted(CoordinatorMsg::Accepted { job_id: jid, .. }) => assert_eq!(jid, job_id),
+            other => panic!("current holder's submit must be Accepted, got {other:?}"),
+        }
+        let store = state.store.lock().await;
+        assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("done"));
+        let credited = store.completed_count_by_earner().unwrap();
+        assert_eq!(credited.get(&b_addr), Some(&1), "credit lands on B, the current holder");
+        assert_eq!(credited.len(), 1, "and on no one else (A was never credited)");
+    }
+
     /// Simulated restart: enqueue a job and record a completed result against
     /// one file-backed state, drop it, then reopen the SAME DB file into a
     /// fresh `AppState` and assert the queued/completed counts survived.
@@ -1547,7 +1687,7 @@ mod tests {
             // the most-recently inserted queued job — the one we just enqueued —
             // leaving the auto-seeded job queued.
             let taken = state.store.lock().await.take_next(|_| true).unwrap();
-            assert_eq!(taken.unwrap().id, job_id);
+            assert_eq!(taken.unwrap().0.id, job_id);
 
             let result = signed_result(job_id, "deadbeef");
             let uri = format!("/jobs/{}/submit", job_id);
@@ -1623,7 +1763,7 @@ mod tests {
             let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
-            while let Some(job) = store.take_next(|_| true).unwrap() {
+            while let Some((job, _)) = store.take_next(|_| true).unwrap() {
                 ids.push(job.id);
             }
             seeded = ids.len();
@@ -1734,7 +1874,7 @@ mod tests {
         // The in_flight job was reclaimed to queued and redispatches exactly once.
         assert_eq!(store.job_status(&in_flight_id).unwrap().as_deref(), Some("queued"));
         let taken = store.take_next(|_| true).unwrap();
-        assert_eq!(taken.map(|j| j.id), Some(in_flight_id), "the reclaimed job redispatches");
+        assert_eq!(taken.map(|(j, _)| j.id), Some(in_flight_id), "the reclaimed job redispatches");
         assert!(
             store.take_next(|_| true).unwrap().is_none(),
             "and only once — nothing else is queued"
@@ -1777,9 +1917,43 @@ mod tests {
             "the pre-column in_flight job must be reclaimed after migration"
         );
         assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        // dispatch_seq was also absent in the old schema; the migration defaults
+        // it to 0 (FM4), and the first dispatch bumps it to 1.
+        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(0), "migrated dispatch_seq defaults to 0");
         // attempts defaulted to 0 on migration → first dispatch makes it 1.
-        store.take_next(|_| true).unwrap();
+        let (_, seq) = store.take_next(|_| true).unwrap().unwrap();
+        assert_eq!(seq, 1, "first dispatch after migration stamps seq 1");
+        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(1));
         assert_eq!(store.redispatched_count().unwrap(), 0, "migrated attempts default to 0");
+    }
+
+    /// `dispatch_seq` is monotonic per job: every `take_next` bumps it, and it
+    /// survives a reap→requeue (the reaper does not reset it), so a reassigned
+    /// job always carries a strictly higher seq than the previous dispatch. This
+    /// is the invariant the fence relies on to tell "in_flight under me" from
+    /// "in_flight under a later earner".
+    #[test]
+    fn dispatch_seq_increments_on_each_take() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        store.enqueue(&job).unwrap();
+        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(0), "queued job starts at 0");
+
+        let (_, seq1) = store.take_next(|_| true).unwrap().unwrap();
+        assert_eq!(seq1, 1);
+
+        // Reap past the deadline → back to queued; the seq is preserved, not reset.
+        // take_next stamps started_at to the wall clock, so reap relative to it.
+        let out = store.reap_expired(now_secs() + 10_000, 5).unwrap();
+        assert_eq!(out.requeued, vec![job.id]);
+        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(1), "reap preserves the seq");
+
+        // Re-dispatch bumps strictly higher.
+        let (_, seq2) = store.take_next(|_| true).unwrap().unwrap();
+        assert_eq!(seq2, 2, "the reassigned dispatch carries a higher seq");
+        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(2));
+
+        assert_eq!(store.current_dispatch_seq(&Uuid::new_v4()).unwrap(), None, "unknown job → None");
     }
 
     #[test]

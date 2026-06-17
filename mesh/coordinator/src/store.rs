@@ -74,11 +74,12 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
-                 id         TEXT PRIMARY KEY,
-                 spec_json  TEXT NOT NULL,
-                 status     TEXT NOT NULL,
-                 started_at INTEGER,
-                 attempts   INTEGER NOT NULL DEFAULT 0
+                 id           TEXT PRIMARY KEY,
+                 spec_json    TEXT NOT NULL,
+                 status       TEXT NOT NULL,
+                 started_at   INTEGER,
+                 attempts     INTEGER NOT NULL DEFAULT 0,
+                 dispatch_seq INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS results (
                  job_id      TEXT NOT NULL,
@@ -101,6 +102,16 @@ impl Store {
         ignore_duplicate_column(
             conn.execute(
                 "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                [],
+            ),
+        )?;
+        // Migrate pre-existing DBs (created before `dispatch_seq` was added). The
+        // per-dispatch fence defaults to 0; the first `take_next` after a restart
+        // bumps it to 1, so a migrated in-flight job that is recovered and
+        // re-dispatched gets a fresh seq. Swallow only the duplicate-column error.
+        ignore_duplicate_column(
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN dispatch_seq INTEGER NOT NULL DEFAULT 0",
                 [],
             ),
         )?;
@@ -128,36 +139,46 @@ impl Store {
     }
 
     /// Pop the most recently inserted queued job whose kind passes `accept`,
-    /// marking it `in_flight`. Returns `None` if no queued job matches.
+    /// marking it `in_flight` and stamping a fresh per-dispatch fence. Returns
+    /// the job with its new `dispatch_seq`, or `None` if no queued job matches.
+    ///
+    /// `dispatch_seq` is a monotonic per-job counter bumped on every dispatch. It
+    /// identifies *this* hand-out: the coordinator remembers it for the session
+    /// and later requires it to match (`current_dispatch_seq`) before settling,
+    /// requeueing, or sliding the deadline — so a job reaped and reassigned to a
+    /// new earner can neither be settled nor preempted by the previous holder.
     ///
     /// "Most recent" mirrors the prior `Vec::pop` / `rposition` behavior:
     /// rowid is monotonic on insert, so highest rowid == most recent.
-    pub fn take_next<F>(&self, accept: F) -> Result<Option<JobSpec>>
+    pub fn take_next<F>(&self, accept: F) -> Result<Option<(JobSpec, i64)>>
     where
         F: Fn(&JobSpec) -> bool,
     {
         let mut stmt = self.conn.prepare(
-            "SELECT id, spec_json FROM jobs WHERE status = ?1 ORDER BY rowid DESC",
+            "SELECT id, spec_json, dispatch_seq FROM jobs WHERE status = ?1 ORDER BY rowid DESC",
         )?;
         let rows = stmt.query_map([STATUS_QUEUED], |row| {
             let id: String = row.get(0)?;
             let spec_json: String = row.get(1)?;
-            Ok((id, spec_json))
+            let dispatch_seq: i64 = row.get(2)?;
+            Ok((id, spec_json, dispatch_seq))
         })?;
 
         for row in rows {
-            let (id, spec_json) = row?;
+            let (id, spec_json, dispatch_seq) = row?;
             let job: JobSpec = serde_json::from_str(&spec_json)?;
             if accept(&job) {
+                let new_seq = dispatch_seq + 1;
                 self.conn.execute(
                     "UPDATE jobs
-                     SET status     = ?1,
-                         started_at = CAST(strftime('%s','now') AS INTEGER),
-                         attempts   = attempts + 1
-                     WHERE id = ?2",
-                    (STATUS_IN_FLIGHT, &id),
+                     SET status       = ?1,
+                         started_at   = CAST(strftime('%s','now') AS INTEGER),
+                         attempts     = attempts + 1,
+                         dispatch_seq = ?2
+                     WHERE id = ?3",
+                    (STATUS_IN_FLIGHT, new_seq, &id),
                 )?;
-                return Ok(Some(job));
+                return Ok(Some((job, new_seq)));
             }
         }
         Ok(None)
@@ -353,6 +374,28 @@ impl Store {
                 other => Err(other),
             })?;
         Ok(status)
+    }
+
+    /// Current `dispatch_seq` of a job, or `None` if the id is unknown. The
+    /// coordinator compares the seq it dispatched against this — under the same
+    /// store lock that guards the settle/requeue/touch mutation — so only the
+    /// holder of the *current* dispatch can act on the job. A job reaped and
+    /// reassigned to a new earner carries a higher seq, which fences out the
+    /// previous holder's late submit, disconnect-requeue, or stale heartbeat.
+    pub fn current_dispatch_seq(&self, id: &uuid::Uuid) -> Result<Option<i64>> {
+        let seq = self
+            .conn
+            .query_row(
+                "SELECT dispatch_seq FROM jobs WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(seq)
     }
 
     /// Full `JobSpec` for a job id, or `None` if the id is unknown. Decodes the
