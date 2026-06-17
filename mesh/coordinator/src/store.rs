@@ -657,6 +657,64 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// The oldest still-pending attestation (`uid IS NULL`), oldest-first by
+    /// insert order, as `(job_id, PendingAttestation)` — or `None` when the
+    /// backlog is empty. A pure read: it does NOT reserve or mutate the row, so
+    /// the drain loop drops the store lock before the slow on-chain submit and
+    /// only re-acquires it to `mark_submitted`. A single drain task is the only
+    /// caller and settles only ever INSERT new pending rows, so no reservation is
+    /// needed to avoid a double-claim.
+    pub fn claim_oldest_pending(
+        &self,
+    ) -> Result<Option<(uuid::Uuid, crate::eas::PendingAttestation)>> {
+        let row = self.conn.query_row(
+            "SELECT job_id, earner, job_id_b32, render_seconds, job_kind, output_hash, region_id_b32
+             FROM pending_attestations
+             WHERE uid IS NULL
+             ORDER BY created_at ASC, rowid ASC
+             LIMIT 1",
+            [],
+            |r| {
+                let job_id: String = r.get(0)?;
+                Ok((
+                    job_id,
+                    crate::eas::PendingAttestation {
+                        earner: r.get(1)?,
+                        job_id: r.get(2)?,
+                        render_seconds: r.get::<_, i64>(3)? as u64,
+                        job_kind: r.get::<_, i64>(4)? as u16,
+                        output_hash: r.get(5)?,
+                        region_id: r.get(6)?,
+                    },
+                ))
+            },
+        );
+        match row {
+            Ok((job_id, att)) => {
+                let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
+                    anyhow::anyhow!("pending_attestations.job_id not a uuid {job_id:?}: {e}")
+                })?;
+                Ok(Some((uuid, att)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Mark a pending attestation relayed by writing its on-chain `uid` +
+    /// `submitted_at`, but ONLY while it is still pending (`uid IS NULL`). Returns
+    /// whether a row was updated. The `uid IS NULL` guard makes a re-mark after a
+    /// crash-recovery re-submit a no-op, so a receipt is never marked (or counted
+    /// as drained) twice.
+    pub fn mark_submitted(&self, job_id: &uuid::Uuid, uid: &str, now_secs: i64) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET uid = ?1, submitted_at = ?2
+             WHERE job_id = ?3 AND uid IS NULL",
+            (uid, now_secs, job_id.to_string()),
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Test-only: read back the pending attestation recorded for a job, rebuilt
     /// as an `eas::PendingAttestation` so a test can assert the settle-time
     /// mapping round-trips. `None` when no pending row exists for the job.

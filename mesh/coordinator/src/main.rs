@@ -40,10 +40,12 @@ const PLACEHOLDER_ATTESTATION_UID: &str =
 const DISPATCH_SEQ_HEADER: &str = "x-dispatch-seq";
 
 mod eas;
+mod relay;
 mod store;
 mod validate;
 mod verify;
 
+use relay::{Relay, RelayError};
 use store::Store;
 
 #[derive(Parser)]
@@ -68,6 +70,18 @@ struct Args {
     /// idle, and on an authenticated HTTP submit. Past it, the reaper prunes it.
     #[arg(long, env = "COORDINATOR_EARNER_TTL_SECS", default_value = "60")]
     earner_ttl_secs: u64,
+    /// How often (seconds) the attestation relayer drains pending EAS receipts to
+    /// the chain. Only runs when a relay is configured (see `--relay-dev-mock`).
+    #[arg(long, env = "COORDINATOR_RELAY_INTERVAL_SECS", default_value = "10")]
+    relay_interval_secs: u64,
+    /// LOCAL DEV ONLY: drain pending attestations to an in-process mock relay
+    /// instead of the chain. Exercises the full drain path (claim → submit →
+    /// mark) without an RPC, a signer, or gas. The live Base relayer (an RPC
+    /// provider + an authorized coordinator EAS signer) is operator-gated; with
+    /// this flag off (the default) pending receipts accumulate, surfaced at
+    /// `/stats pending_attestations`.
+    #[arg(long, env = "COORDINATOR_RELAY_DEV_MOCK", default_value = "false")]
+    relay_dev_mock: bool,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -241,6 +255,22 @@ async fn main() -> Result<()> {
     // router-based tests don't spawn this; it only runs in the real binary.
     spawn_reaper(state.clone(), args.reap_interval_secs);
 
+    // Background attestation relayer. The live Base submitter (RPC + an
+    // authorized coordinator EAS signer with gas) is operator-gated, so it is not
+    // wired here; `--relay-dev-mock` drives the same drain loop against an
+    // in-process mock for local end-to-end testing. With neither configured the
+    // backlog accumulates (by design, pre-production) and is visible at `/stats`.
+    if args.relay_dev_mock {
+        tracing::warn!(
+            "DEV: draining attestations to an in-process MOCK relay — receipts are NOT submitted on-chain. Never enable in production."
+        );
+        spawn_relayer(state.clone(), relay::MockRelay::succeeding(), args.relay_interval_secs);
+    } else {
+        tracing::info!(
+            "on-chain attestation relayer disabled (operator-gated: needs a Base RPC + an authorized coordinator EAS signer). Pending receipts accumulate; see /stats pending_attestations."
+        );
+    }
+
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
@@ -337,6 +367,82 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
             }
         }
     });
+}
+
+/// Marker `uid` stored when the contract reports the receipt is already on-chain
+/// (`DuplicateReceipt`): the receipt exists but the relay didn't capture its real
+/// UID (a crash recovered between a prior `issueReceipt` and its local mark). The
+/// row is settled — it just carries this sentinel instead of the on-chain UID.
+const ALREADY_ISSUED_UID: &str = "already-issued";
+
+/// Spawn the attestation relayer: every `interval_secs`, drain the pending-receipt
+/// backlog through `relay`. Mirrors `spawn_reaper`; only the real binary spawns it.
+fn spawn_relayer<R: Relay + 'static>(state: Arc<AppState>, relay: R, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            tick.tick().await;
+            drain_attestations(&state, &relay).await;
+        }
+    });
+}
+
+/// Drain pending EAS receipts oldest-first through `relay`, settling each to its
+/// on-chain attestation UID. Stops the batch at the first transient/permanent
+/// error so a flaky or misconfigured RPC backs off to the next tick instead of
+/// hot-looping; successful receipts drain within the tick.
+///
+/// The store lock is NEVER held across the submit await: each receipt is claimed
+/// under the lock, the lock is dropped for the (slow) on-chain call, and only
+/// re-acquired to mark the result. So settles and `/stats` never stall behind
+/// network latency. `AlreadyIssued` is an idempotent success — the receipt is on
+/// chain (a recovered crash), so it is marked and the drain continues.
+async fn drain_attestations<R: Relay>(state: &Arc<AppState>, relay: &R) {
+    loop {
+        let claimed = {
+            let store = state.store.lock().await;
+            store.claim_oldest_pending()
+        }; // lock dropped before the on-chain submit below
+        let claimed = match claimed {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(?e, "relay: claim_oldest_pending failed");
+                return;
+            }
+        };
+        let Some((job_id, att)) = claimed else { return }; // backlog drained
+
+        let uid = match relay.submit(&att).await {
+            Ok(uid) => uid,
+            Err(RelayError::AlreadyIssued) => {
+                tracing::info!(%job_id, "relay: receipt already on-chain; marking submitted");
+                ALREADY_ISSUED_UID.to_string()
+            }
+            Err(RelayError::Transient(msg)) => {
+                tracing::warn!(%job_id, %msg, "relay: transient submit failure; retrying next tick");
+                return; // back off to the next tick
+            }
+            Err(RelayError::Permanent(msg)) => {
+                tracing::error!(%job_id, %msg, "relay: permanent submit failure; draining paused (check coordinator authorization)");
+                return;
+            }
+        };
+
+        let marked = {
+            let store = state.store.lock().await;
+            store.mark_submitted(&job_id, &uid, now_secs())
+        };
+        match marked {
+            Ok(true) => {}
+            // The row was already marked (a concurrent/duplicate drain) — not an
+            // error, just nothing to do; keep draining the rest of the backlog.
+            Ok(false) => tracing::warn!(%job_id, "relay: receipt already marked submitted"),
+            Err(e) => {
+                tracing::error!(%job_id, ?e, "relay: mark_submitted failed");
+                return;
+            }
+        }
+    }
 }
 
 /// One synthetic queued job per `JobKind`, so a fresh coordinator presents the
@@ -778,7 +884,9 @@ async fn submit(
         }
     }
     tracing::info!(?id, earner = %result.earner_address, "result received");
-    // Content gate already cleared above; TODO EAS attestation relay on settle.
+    // Content gate already cleared above. record_completed durably enqueues the
+    // pending EAS receipt in the settle tx; the background relayer drains it to
+    // RenderReceipts on-chain and stamps the real attestation uid.
     match store.record_completed(&result) {
         Ok(true) => Ok("accepted"),
         // The in_flight gate above ran under this same lock, so a false here
@@ -1212,8 +1320,10 @@ async fn handle_submit(
     }
 
     tracing::info!(%job_id, earner = %result.earner_address, "ws result accepted");
-    // Content gate already cleared above; TODO real EAS attestation relay on
-    // settle (placeholder uid until mesh-eas-attestation-relay lands).
+    // Content gate already cleared above. The settle (record_completed) durably
+    // enqueues the pending EAS receipt; the on-chain attestation is async (the
+    // background relayer assigns the real uid), so the accept reply still carries
+    // the placeholder uid — the receipt's real uid lands later in the relay.
     SubmitOutcome::Accepted(CoordinatorMsg::Accepted {
         job_id,
         attestation_uid: PLACEHOLDER_ATTESTATION_UID.to_string(),
