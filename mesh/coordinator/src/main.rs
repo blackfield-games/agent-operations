@@ -1765,7 +1765,7 @@ mod tests {
         assert_eq!(store.pending_attestation_count().unwrap(), 0);
     }
 
-    /// `/stats` exposes the attestation backlog: with no on-chain relayer yet,
+    /// `/stats` exposes the attestation backlog: until the relayer drains them,
     /// every settled job stays pending, so it tracks `jobs_completed`.
     #[tokio::test]
     async fn stats_reports_pending_attestation_backlog() {
@@ -1779,6 +1779,184 @@ mod tests {
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_completed"], 2);
         assert_eq!(json["pending_attestations"], 2);
+    }
+
+    // ---- attestation relayer (drain loop) ----
+
+    use relay::MockRelay;
+    use tokio::sync::Notify;
+
+    /// Enqueue, dispatch, and settle `job`, leaving it with one pending
+    /// attestation — the precondition for every drain test.
+    async fn settle_one(state: &Arc<AppState>, job: &JobSpec) {
+        enqueue(state, job).await;
+        state.store.lock().await.take_next(|j| j.id == job.id).unwrap();
+        assert!(state
+            .store
+            .lock()
+            .await
+            .record_completed(&signed_result(job.id, "r"))
+            .unwrap());
+    }
+
+    async fn pending(state: &Arc<AppState>) -> usize {
+        state.store.lock().await.pending_attestation_count().unwrap()
+    }
+
+    #[tokio::test]
+    async fn drain_submits_each_pending_once_and_marks_it() {
+        let state = test_state_empty().await;
+        let jobs = [seed_job(), seed_job()];
+        for job in &jobs {
+            settle_one(&state, job).await;
+        }
+        assert_eq!(pending(&state).await, 2);
+
+        let relay = MockRelay::succeeding();
+        drain_attestations(&state, &relay).await;
+
+        assert_eq!(pending(&state).await, 0, "both receipts drained");
+        assert_eq!(relay.calls(), 2);
+        let mut submitted = relay.submitted();
+        submitted.sort();
+        let mut expected: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
+        expected.sort();
+        assert_eq!(submitted, expected, "each pending job submitted exactly once");
+    }
+
+    #[tokio::test]
+    async fn drain_a_second_pass_with_an_empty_backlog_is_a_noop() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        settle_one(&state, &job).await;
+
+        let relay = MockRelay::succeeding();
+        drain_attestations(&state, &relay).await;
+        assert_eq!(pending(&state).await, 0);
+        assert_eq!(relay.calls(), 1);
+
+        // Nothing pending → the relay is not called again.
+        drain_attestations(&state, &relay).await;
+        assert_eq!(relay.calls(), 1, "an empty backlog submits nothing");
+    }
+
+    /// Crash recovery: a prior `issueReceipt` landed on-chain but the process died
+    /// before the local mark, so the row is still pending. The re-submit hits the
+    /// contract's `DuplicateReceipt` fence (`AlreadyIssued`) and the drain marks
+    /// the row rather than double-attesting.
+    #[tokio::test]
+    async fn drain_marks_already_issued_without_resubmitting() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        settle_one(&state, &job).await;
+
+        let relay = MockRelay::already_issued();
+        drain_attestations(&state, &relay).await;
+
+        assert_eq!(pending(&state).await, 0, "already-on-chain receipt is marked");
+        assert_eq!(relay.calls(), 1);
+        assert!(relay.submitted().is_empty(), "AlreadyIssued submits nothing new");
+    }
+
+    #[tokio::test]
+    async fn drain_retries_a_transient_failure_on_the_next_tick() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        settle_one(&state, &job).await;
+
+        let relay = MockRelay::transient_then_ok(1);
+        // First tick: the transient failure leaves the receipt pending, not dropped.
+        drain_attestations(&state, &relay).await;
+        assert_eq!(pending(&state).await, 1, "transient failure is not terminal");
+        assert_eq!(relay.calls(), 1);
+        assert!(relay.submitted().is_empty());
+
+        // Next tick: it succeeds and drains.
+        drain_attestations(&state, &relay).await;
+        assert_eq!(pending(&state).await, 0);
+        assert_eq!(relay.calls(), 2);
+        assert_eq!(relay.submitted(), vec![eas::job_id_hex(&job.id)]);
+    }
+
+    /// A transient error stops the batch (so a flaky RPC backs off to the next
+    /// tick) without dropping any receipt or hot-looping.
+    #[tokio::test]
+    async fn drain_stops_the_batch_at_a_transient_error() {
+        let state = test_state_empty().await;
+        for job in [seed_job(), seed_job()] {
+            settle_one(&state, &job).await;
+        }
+
+        let relay = MockRelay::transient_then_ok(usize::MAX); // never reaches the ok branch
+        drain_attestations(&state, &relay).await;
+
+        assert_eq!(pending(&state).await, 2, "nothing dropped");
+        assert_eq!(relay.calls(), 1, "batch stops at the first error — no hot loop");
+    }
+
+    /// A permanent error (e.g. an unauthorized signer) neither drops the receipt
+    /// nor hot-loops — the drain stops for the operator to fix authorization.
+    #[tokio::test]
+    async fn drain_does_not_drop_on_a_permanent_error() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        settle_one(&state, &job).await;
+
+        let relay = MockRelay::permanent();
+        drain_attestations(&state, &relay).await;
+
+        assert_eq!(pending(&state).await, 1, "permanent error does not drop the receipt");
+        assert_eq!(relay.calls(), 1, "no hot loop");
+        assert!(relay.submitted().is_empty());
+    }
+
+    /// FM: the drain must not hold the store mutex across the slow on-chain submit,
+    /// or every settle/stats stalls behind RPC latency. The gated relay holds the
+    /// submit in-flight while we prove the store lock is still acquirable.
+    #[tokio::test]
+    async fn drain_holds_no_store_lock_across_the_submit() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        settle_one(&state, &job).await;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let relay = MockRelay::gated(started.clone(), release.clone());
+
+        let drive = {
+            let state = state.clone();
+            tokio::spawn(async move { drain_attestations(&state, &relay).await })
+        };
+
+        // The submit is now in-flight (claimed, lock dropped, awaiting release).
+        started.notified().await;
+
+        // If the drain held the lock across the await this deadlocks; the timeout
+        // turns that regression into a failure instead of a hang.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert_eq!(pending(&state).await, 1, "claimed but not yet marked");
+        })
+        .await
+        .expect("store lock free during the in-flight submit");
+
+        release.notify_one();
+        drive.await.unwrap();
+        assert_eq!(pending(&state).await, 0, "receipt marked once the submit returns");
+    }
+
+    #[tokio::test]
+    async fn stats_pending_attestations_drains_after_relay() {
+        let state = test_state_empty().await;
+        for job in [seed_job(), seed_job()] {
+            settle_one(&state, &job).await;
+        }
+        let before = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(before["pending_attestations"], 2);
+
+        drain_attestations(&state, &MockRelay::succeeding()).await;
+
+        let after = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(after["pending_attestations"], 0, "the backlog drains as receipts land");
     }
 
     // ---- websocket dispatch integration tests ----

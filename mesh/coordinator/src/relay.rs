@@ -15,7 +15,8 @@
 
 use crate::eas::PendingAttestation;
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 /// Why a submission failed — the drain loop reacts differently to each.
 #[derive(Debug)]
@@ -52,6 +53,12 @@ pub trait Relay: Send + Sync {
 /// permanent, or already-issued — without RPC or funds.
 pub struct MockRelay {
     inner: Mutex<MockInner>,
+    /// Test-only gate: when set, `submit` signals `started` and then awaits
+    /// `release` before resolving, so a test can hold the submit in-flight and
+    /// assert the drain loop keeps the store lock free during it. `None` (always)
+    /// on the production dev path.
+    started: Option<Arc<Notify>>,
+    release: Option<Arc<Notify>>,
 }
 
 struct MockInner {
@@ -79,6 +86,8 @@ impl MockRelay {
                 calls: 0,
                 submitted: Vec::new(),
             }),
+            started: None,
+            release: None,
         }
     }
 
@@ -106,6 +115,17 @@ impl MockRelay {
         m
     }
 
+    /// A succeeding relay that signals `started` and then awaits `release` inside
+    /// `submit`, so a test can observe the in-flight submit window and assert the
+    /// store lock is free during it.
+    #[cfg(test)]
+    pub fn gated(started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        let mut m = Self::succeeding();
+        m.started = Some(started);
+        m.release = Some(release);
+        m
+    }
+
     /// Total `submit` calls so far.
     #[cfg(test)]
     pub fn calls(&self) -> usize {
@@ -127,24 +147,27 @@ fn mock_uid(att: &PendingAttestation) -> String {
 }
 
 impl Relay for MockRelay {
-    fn submit(
-        &self,
-        att: &PendingAttestation,
-    ) -> impl Future<Output = Result<String, RelayError>> + Send {
+    async fn submit(&self, att: &PendingAttestation) -> Result<String, RelayError> {
+        if let Some(s) = &self.started {
+            s.notify_one();
+        }
+        if let Some(r) = &self.release {
+            r.notified().await;
+        }
         let mut inner = self.inner.lock().unwrap();
         inner.calls += 1;
-        let outcome = if inner.permanent {
-            Err(RelayError::Permanent("mock permanent".into()))
-        } else if inner.already_issued {
-            Err(RelayError::AlreadyIssued)
-        } else if inner.transient_remaining > 0 {
+        if inner.permanent {
+            return Err(RelayError::Permanent("mock permanent".into()));
+        }
+        if inner.already_issued {
+            return Err(RelayError::AlreadyIssued);
+        }
+        if inner.transient_remaining > 0 {
             inner.transient_remaining -= 1;
-            Err(RelayError::Transient("mock transient".into()))
-        } else {
-            inner.submitted.push(att.job_id.clone());
-            Ok(mock_uid(att))
-        };
-        std::future::ready(outcome)
+            return Err(RelayError::Transient("mock transient".into()));
+        }
+        inner.submitted.push(att.job_id.clone());
+        Ok(mock_uid(att))
     }
 }
 
