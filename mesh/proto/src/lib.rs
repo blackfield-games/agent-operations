@@ -170,6 +170,13 @@ pub enum EarnerMsg {
     },
     /// Earner → coordinator: I accept this job offer.
     Accept { job_id: Uuid },
+    /// Earner → coordinator: I decline this job offer without rendering it —
+    /// typically because its `kind` is not in the `supported` set I advertised
+    /// in `Hello` (a capability self-guard against a coordinator that offered a
+    /// kind I can't render). Unlike a dropped result this is not a rendering
+    /// attempt: the coordinator requeues the job for a capable earner rather
+    /// than charging its dispatch budget.
+    Decline { job_id: Uuid, reason: String },
     /// Earner → coordinator: here's the result.
     Submit(JobResult),
     /// Earner → coordinator: heartbeat / progress.
@@ -383,6 +390,20 @@ mod tests {
         assert_eq!(
             reserialized_accept, canonical_accept,
             "EarnerMsg::Accept wire shape drifted"
+        );
+
+        // Decline — struct variant carrying the job id and a human-readable reason.
+        let canonical_decline = serde_json::json!({
+            "type": "decline",
+            "job_id": FIXED_UUID,
+            "reason": "unsupported job kind: diffusion_tile"
+        });
+        let parsed_decline: EarnerMsg =
+            serde_json::from_value(canonical_decline.clone()).unwrap();
+        let reserialized_decline = serde_json::to_value(&parsed_decline).unwrap();
+        assert_eq!(
+            reserialized_decline, canonical_decline,
+            "EarnerMsg::Decline wire shape drifted"
         );
 
         // Submit — newtype variant: inner JobResult fields are flattened next to "type".
