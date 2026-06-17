@@ -642,6 +642,36 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Test-only: read back the pending attestation recorded for a job, rebuilt
+    /// as an `eas::PendingAttestation` so a test can assert the settle-time
+    /// mapping round-trips. `None` when no pending row exists for the job.
+    #[cfg(test)]
+    pub fn pending_attestation(
+        &self,
+        job_id: &uuid::Uuid,
+    ) -> Result<Option<crate::eas::PendingAttestation>> {
+        let row = self.conn.query_row(
+            "SELECT earner, job_id_b32, render_seconds, job_kind, output_hash, region_id_b32
+             FROM pending_attestations WHERE job_id = ?1",
+            [&job_id.to_string()],
+            |r| {
+                Ok(crate::eas::PendingAttestation {
+                    earner: r.get::<_, String>(0)?,
+                    job_id: r.get::<_, String>(1)?,
+                    render_seconds: r.get::<_, i64>(2)? as u64,
+                    job_kind: r.get::<_, i64>(3)? as u16,
+                    output_hash: r.get::<_, String>(4)?,
+                    region_id: r.get::<_, String>(5)?,
+                })
+            },
+        );
+        match row {
+            Ok(a) => Ok(Some(a)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Sum of `render_seconds` across all recorded results — the mesh-output
     /// metric surfaced at `/stats` ("N render-seconds produced"). Decodes each
     /// stored `JobResult` in Rust and sums its `render_seconds`, mirroring the

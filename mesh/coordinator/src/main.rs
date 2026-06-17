@@ -1577,6 +1577,100 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    // ---- pending EAS attestations ----
+
+    /// Settling a job durably records a pending attestation in the same step,
+    /// with every field mapped from the job's spec + result per the contract's
+    /// schema (Terrain→0, the region packed, the UUID right-aligned in bytes32).
+    #[tokio::test]
+    async fn settle_records_a_pending_attestation_mapped_from_spec() {
+        let state = test_state_empty().await;
+        let job = seed_job(); // Terrain, region { x: 42, y: -17, layer: 0 }
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let result = signed_result(job_id, "render-1");
+        let mut store = state.store.lock().await;
+        assert!(store.record_completed(&result).unwrap());
+        assert_eq!(store.pending_attestation_count().unwrap(), 1);
+
+        let stored = store.pending_attestation(&job_id).unwrap().expect("pending row exists");
+        // Round-trips through the canonical builder...
+        assert_eq!(stored, eas::PendingAttestation::build(&job, &result).unwrap());
+        // ...and the mapping is exactly the contract's.
+        assert_eq!(stored.job_kind, 0); // Terrain
+        assert_eq!(stored.earner, result.earner_address);
+        assert_eq!(stored.output_hash, result.output_hash);
+        assert_eq!(stored.render_seconds, 1);
+        assert_eq!(stored.job_id, eas::job_id_hex(&job_id));
+        assert_eq!(stored.region_id, eas::region_id_hex(&job.region));
+    }
+
+    /// A second settle on an already-done job is refused by the in_flight guard,
+    /// so the attestation backlog never double-counts a job.
+    #[tokio::test]
+    async fn replayed_settle_keeps_one_pending_attestation() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let result = signed_result(job_id, "render-1");
+        let mut store = state.store.lock().await;
+        assert!(store.record_completed(&result).unwrap());
+        assert!(!store.record_completed(&result).unwrap(), "second settle refused (done)");
+        assert_eq!(store.pending_attestation_count().unwrap(), 1);
+    }
+
+    /// Settling is the only thing that records an attestation: a record_completed
+    /// against a job that is not in_flight settles nothing and enqueues nothing.
+    #[tokio::test]
+    async fn non_in_flight_settle_records_no_pending_attestation() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await; // queued, never taken → not in_flight
+
+        let mut store = state.store.lock().await;
+        assert!(!store.record_completed(&signed_result(job_id, "x")).unwrap());
+        assert_eq!(store.pending_attestation_count().unwrap(), 0);
+    }
+
+    /// Defensive degrade: a result whose output_hash is not a valid bytes32 digest
+    /// still settles (record_completed does not gate content — the accept paths do)
+    /// but records no attestation rather than persisting a malformed receipt.
+    #[tokio::test]
+    async fn settle_with_unmappable_result_settles_but_skips_attestation() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        // "deadbeef" is 8 chars — not a 256-bit digest, so the attestation can't build.
+        let mut store = state.store.lock().await;
+        assert!(store.record_completed(&signed_result_raw_hash(job_id, "deadbeef")).unwrap());
+        assert_eq!(store.pending_attestation_count().unwrap(), 0);
+    }
+
+    /// `/stats` exposes the attestation backlog: with no on-chain relayer yet,
+    /// every settled job stays pending, so it tracks `jobs_completed`.
+    #[tokio::test]
+    async fn stats_reports_pending_attestation_backlog() {
+        let state = test_state_empty().await;
+        let jobs = [seed_job(), seed_job()];
+        for job in &jobs {
+            enqueue(&state, job).await;
+            state.store.lock().await.take_next(|j| j.id == job.id).unwrap();
+            state.store.lock().await.record_completed(&signed_result(job.id, "r")).unwrap();
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 2);
+        assert_eq!(json["pending_attestations"], 2);
+    }
+
     // ---- websocket dispatch integration tests ----
 
     use futures_util::{SinkExt, StreamExt};
