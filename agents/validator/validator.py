@@ -27,6 +27,11 @@ USDA_MAGIC = "#usda"
 # A USD prim declaration: a specifier, an optional type name, a quoted prim name.
 # Drives the structural composition-conflict scan when usd-core isn't installed.
 _PRIM_DECL = re.compile(r'(def|over|class)\b[ \t]+(?:([A-Za-z_]\w*)[ \t]+)?"([^"]+)"')
+# A variantSet / variant block opener. Its `{ }` is a composition scope, not a
+# prim scope, so it must not contribute a path segment — but prims nested inside
+# (a variant can legally hold prim children) still attribute to the enclosing
+# prim. `variantSet` is matched before `variant` so the longer keyword wins.
+_VARIANT_DECL = re.compile(r"(?:variantSet|variant)\b")
 
 
 async def run(
@@ -146,10 +151,19 @@ def _prim_specs(text: str) -> list[tuple[str, str, str]]:
     are skipped whole, so a brace or keyword inside any of them is never read as
     structure. ``type_name`` is ``""`` for a typeless prim (``def "X"``), which
     carries no type opinion.
+
+    ``variantSet "x" = { "v" { ... } }`` braces are composition scopes, not prim
+    scopes: they are tracked (so brace accounting stays aligned) but contribute no
+    path segment, so a prim defined inside a variant attributes to the enclosing
+    prim — not a phantom ``/Prim//x`` path, and not dropped.
     """
     specs: list[tuple[str, str, str]] = []
-    stack: list[str] = []  # ancestor prim names → current path
+    # Each scope is (kind, name); only "prim" scopes contribute a path segment.
+    # "variant" scopes (a variantSet block and each variant inside it) are
+    # transparent — their braces are balanced but skipped when building a path.
+    stack: list[tuple[str, str]] = []
     pending: str | None = None  # a declared prim awaiting its opening brace
+    pending_variant = False  # a variantSet/variant keyword awaiting its brace
     paren = 0
     i, n = 0, len(text)
     while i < n:
@@ -179,8 +193,16 @@ def _prim_specs(text: str) -> list[tuple[str, str, str]]:
         elif paren:
             i += 1
         elif c == "{":
-            stack.append(pending or "")
-            pending = None
+            if pending is not None:
+                stack.append(("prim", pending))
+                pending = None
+            elif pending_variant:
+                stack.append(("variant", ""))  # a variantSet block
+                pending_variant = False
+            elif stack and stack[-1][0] == "variant":
+                stack.append(("variant", ""))  # a bare variant inside a variantSet
+            else:
+                stack.append(("prim", ""))  # an unrecognized brace, treated as a scope
             i += 1
         elif c == "}":
             if stack:
@@ -191,9 +213,14 @@ def _prim_specs(text: str) -> list[tuple[str, str, str]]:
             m = _PRIM_DECL.match(text, i) if left_ok else None
             if m:
                 specifier, type_name, name = m.group(1), m.group(2) or "", m.group(3)
-                specs.append((specifier, type_name, "/" + "/".join([*stack, name])))
+                prim_names = [nm for kind, nm in stack if kind == "prim"]
+                specs.append((specifier, type_name, "/" + "/".join([*prim_names, name])))
                 pending = name
+                pending_variant = False
                 i = m.end()
+            elif left_ok and (vm := _VARIANT_DECL.match(text, i)):
+                pending_variant = True
+                i = vm.end()
             else:
                 i += 1
     return specs
