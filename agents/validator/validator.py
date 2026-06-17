@@ -13,6 +13,7 @@ to commit the composed world or route back to a specialist.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from common.types import WorldBrief, LayerSpec, ValidatorVerdict
@@ -22,6 +23,10 @@ STYLE_SIM_THRESHOLD = 0.72
 # USD text layers must begin with this cookie; pxr refuses to open a file without
 # it and the engine silently skips a sublayer it cannot parse.
 USDA_MAGIC = "#usda"
+
+# A USD prim declaration: a specifier, an optional type name, a quoted prim name.
+# Drives the structural composition-conflict scan when usd-core isn't installed.
+_PRIM_DECL = re.compile(r'(def|over|class)\b[ \t]+(?:([A-Za-z_]\w*)[ \t]+)?"([^"]+)"')
 
 
 async def run(
@@ -45,10 +50,19 @@ async def run(
     # a missing defaultPrim, or a dangling file composes into a world.usda that
     # fails silently at load. Each issue leads with the specialist name so the
     # supervisor's _failing_specialist routes the fix back to the offending node.
+    wellformed: list[LayerSpec] = []
     for layer in layers:
         reason = _layer_wellformedness(layers_root / layer.path)
         if reason:
             issues.append(f"{layer.specialist} layer {layer.path} {reason}")
+        else:
+            wellformed.append(layer)
+
+    # Per-layer well-formedness isn't composability: two specialists can define the
+    # same prim path with incompatible types, or dangle an override over a prim no
+    # one defines, and the layers still open individually while the composed stage
+    # is silently broken. Check the layers that passed the per-layer gate.
+    issues.extend(_composition_conflicts(wellformed, layers_root))
 
     # style check: TODO call sidecar with brief.style_anchors + rendered preview
     # for now, accept if no other issues
@@ -99,3 +113,123 @@ def _pxr_parse_issue(path: Path) -> str | None:
     if not layer.defaultPrim:
         return "declares no defaultPrim"
     return None
+
+
+def _composition_conflicts(layers: list[LayerSpec], layers_root: Path) -> list[str]:
+    """Cross-layer composition conflicts across the well-formed specialist layers.
+
+    Structural scan of every layer's prim specs, fed to `_conflicts_from_specs`.
+    A missing/unreadable layer is skipped — the well-formedness gate already
+    flagged it, so it isn't re-reported here.
+    """
+    tagged: list[tuple[str, str, str, str]] = []
+    for layer in layers:
+        try:
+            text = (layers_root / layer.path).read_text()
+        except OSError:
+            continue
+        for specifier, type_name, path in _prim_specs(text):
+            tagged.append((layer.specialist, specifier, type_name, path))
+    return _conflicts_from_specs(tagged)
+
+
+def _prim_specs(text: str) -> list[tuple[str, str, str]]:
+    """Every prim spec in a USD text layer as ``(specifier, type_name, prim_path)``.
+
+    Structural heuristic, no pxr: prim scopes are the ``{ }`` blocks at paren-depth
+    zero. Dictionary braces in layer/prim metadata always sit inside ``( )``, so a
+    paren-aware counter tells the two apart; strings and ``#`` comments are skipped
+    so a brace or keyword inside them is never read as structure. ``type_name`` is
+    ``""`` for a typeless prim (``def "X"``), which carries no type opinion.
+    """
+    specs: list[tuple[str, str, str]] = []
+    stack: list[str] = []  # ancestor prim names → current path
+    pending: str | None = None  # a declared prim awaiting its opening brace
+    paren = 0
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+        elif c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "(":
+            paren += 1
+            i += 1
+        elif c == ")":
+            paren = max(paren - 1, 0)
+            i += 1
+        elif paren:
+            i += 1
+        elif c == "{":
+            stack.append(pending or "")
+            pending = None
+            i += 1
+        elif c == "}":
+            if stack:
+                stack.pop()
+            i += 1
+        else:
+            left_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            m = _PRIM_DECL.match(text, i) if left_ok else None
+            if m:
+                specifier, type_name, name = m.group(1), m.group(2) or "", m.group(3)
+                specs.append((specifier, type_name, "/" + "/".join([*stack, name])))
+                pending = name
+                i = m.end()
+            else:
+                i += 1
+    return specs
+
+
+def _conflicts_from_specs(tagged: list[tuple[str, str, str, str]]) -> list[str]:
+    """Composition conflicts from ``(specialist, specifier, type_name, prim_path)``.
+
+    Two classes — the ones provable without resolving full USD composition:
+      - a prim path *defined* (``def``/``class``, not ``over``) with two or more
+        incompatible non-empty type names across specialists; the composed prim's
+        type is ambiguous. Same-type redefinition is a legal opinion-merge and a
+        typeless def carries no type opinion, so neither is flagged;
+      - a *dangling override*: a path overridden by some specialist but defined by
+        none, so the opinion composes onto nothing.
+
+    Each issue names the conflicting specialists (sorted, for stable output) so the
+    supervisor's ``_failing_specialist`` routes back to the pipeline-earliest. The
+    prim path is included for diagnostics; a path segment equal to a specialist
+    name can over-trigger route-back to that node, which is conservative (it re-runs
+    the true culprits downstream) and bounded by the round cap.
+    """
+    types_by_path: dict[str, dict[str, set[str]]] = {}
+    overs_by_path: dict[str, set[str]] = {}
+    for specialist, specifier, type_name, path in tagged:
+        if specifier == "over":
+            overs_by_path.setdefault(path, set()).add(specialist)
+            continue
+        per_specialist = types_by_path.setdefault(path, {}).setdefault(specialist, set())
+        if type_name:
+            per_specialist.add(type_name)
+
+    issues: list[str] = []
+    for path in sorted(types_by_path):
+        by_specialist = types_by_path[path]
+        all_types = {t for types in by_specialist.values() for t in types}
+        if len(all_types) > 1:
+            who = ", ".join(sorted(by_specialist))
+            issues.append(
+                f"composition conflict: specialists {who} define the same prim "
+                f"<{path}> with incompatible types {sorted(all_types)}"
+            )
+
+    defined = set(types_by_path)
+    for path in sorted(overs_by_path):
+        if path not in defined:
+            who = ", ".join(sorted(overs_by_path[path]))
+            issues.append(
+                f"composition conflict: specialist {who} overrides prim <{path}> "
+                f"but no specialist defines it (dangling override)"
+            )
+    return issues
