@@ -29,16 +29,22 @@ contract RegionAuthority is ERC721, Ownable2Step {
     error StakeTooLow();
     error AlreadyClaimed();
     error NotHolder();
+    error ZeroStake();
 
     constructor(address token_, uint256 stakeRequired_, address owner_)
         ERC721("Blackfield Region", "BFLD-RGN")
         Ownable(owner_)
     {
+        if (stakeRequired_ == 0) revert ZeroStake();
         TOKEN = IERC20(token_);
         stakeRequired = stakeRequired_;
     }
 
     function claim(uint256 tokenId, uint256 amount) external {
+        // A region authority — which earns a fee share — must lock a positive
+        // stake. This holds independent of stakeRequired (which is also kept
+        // positive), so no tokenId is ever minted against a zero stake.
+        if (amount == 0) revert ZeroStake();
         if (amount < stakeRequired) revert StakeTooLow();
         if (_ownerOf(tokenId) != address(0)) revert AlreadyClaimed();
         TOKEN.safeTransferFrom(msg.sender, address(this), amount);
@@ -57,6 +63,7 @@ contract RegionAuthority is ERC721, Ownable2Step {
     }
 
     function setStakeRequired(uint256 amount) external onlyOwner {
+        if (amount == 0) revert ZeroStake();
         stakeRequired = amount;
         emit StakeRequiredSet(amount);
     }
