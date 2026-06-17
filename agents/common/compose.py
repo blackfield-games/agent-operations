@@ -10,8 +10,22 @@ weakest (the base "intent" layer). Order in SubLayerPaths: strongest first.
 
 from __future__ import annotations
 
+import logging
+import re
 from pathlib import Path
 from .types import LayerSpec
+
+logger = logging.getLogger(__name__)
+
+# A layer path is interpolated verbatim into a `@...@` USDA asset reference, so it
+# must contain only characters that can't break out of that reference or the
+# enclosing `subLayers = [ ]` block. This allowlist matches the real convention the
+# specialists emit — a relative path under layers/, e.g.
+# "terrain/r+0042_-0017_l0.usda": ASCII letters/digits and `. _ / + -` (the `+`/`-`
+# come from the region_id, `/` from the specialist subdir, `.` from the extension).
+# Anything else — empty, the `@` delimiter, a newline, whitespace, quotes — is
+# rejected rather than escaped, so behavior is unambiguous.
+_SAFE_LAYER_PATH = re.compile(r"[A-Za-z0-9._/+-]+")
 
 # strongest → weakest
 STRENGTH_ORDER = [
@@ -63,23 +77,41 @@ def compose_world(layers: list[LayerSpec], out_dir: Path) -> Path:
     for layer in layers:
         by_specialist.setdefault(layer.specialist, []).append(layer)
 
+    # Validate every path BEFORE touching the filesystem (fail-fast, like the
+    # unknown-specialist guard): a path that breaks the `@...@` asset reference
+    # would silently corrupt world.usda, which no downstream gate re-parses.
     ordered: list[str] = []
     for specialist in STRENGTH_ORDER:
         for layer in by_specialist.get(specialist, []):
+            if not _SAFE_LAYER_PATH.fullmatch(layer.path):
+                raise ValueError(
+                    f"{specialist} emitted an invalid layer path {layer.path!r}: "
+                    f"paths must be non-empty and match {_SAFE_LAYER_PATH.pattern} "
+                    f"(no '@', newline, whitespace, or quotes that would break the "
+                    f"USDA asset reference)"
+                )
             ordered.append(layer.path)
+
+    # An all-None / empty specialist set is not an error — the supervisor isolates
+    # a failed specialist by contributing no layer — but it yields a world with no
+    # content, so warn rather than silently writing an empty stage.
+    if not ordered:
+        logger.warning(
+            "compose_world: no layers to compose; writing an empty world.usda "
+            "(subLayers = []) — the run produced no specialist output"
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
     root = out_dir / "world.usda"
-    sublayers = ",\n        ".join(f'@./{p}@' for p in ordered)
+    items = ",\n        ".join(f'@./{p}@' for p in ordered)
+    sublayers_block = f"[\n        {items}\n    ]" if ordered else "[]"
     root.write_text(
         f"""#usda 1.0
 (
     defaultPrim = "World"
     upAxis = "Z"
     metersPerUnit = 1.0
-    subLayers = [
-        {sublayers}
-    ]
+    subLayers = {sublayers_block}
 )
 
 def Xform "World" (
