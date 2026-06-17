@@ -92,7 +92,9 @@ impl Store {
              -- Pending EAS render receipts: written atomically with the settle
              -- (see record_completed) so a crash before the on-chain
              -- RenderReceipts.issueReceipt cannot lose a validated job's receipt.
-             -- Fields mirror the contract's registered schema (see eas.rs).
+             -- Fields mirror the contract's registered schema (see eas.rs). A row
+             -- is PENDING while `uid IS NULL`; the relayer flips it by writing the
+             -- returned attestation `uid` + `submitted_at` once issueReceipt lands.
              CREATE TABLE IF NOT EXISTS pending_attestations (
                  job_id         TEXT PRIMARY KEY,
                  earner         TEXT NOT NULL,
@@ -101,9 +103,22 @@ impl Store {
                  job_kind       INTEGER NOT NULL,
                  output_hash    TEXT NOT NULL,
                  region_id_b32  TEXT NOT NULL,
-                 created_at     INTEGER NOT NULL
+                 created_at     INTEGER NOT NULL,
+                 uid            TEXT,
+                 submitted_at   INTEGER
              );",
         )?;
+        // Migrate pre-existing DBs (created before the relayer's `uid` /
+        // `submitted_at` columns). NULL on every existing row means "still
+        // pending", which is correct: nothing had been relayed yet. Swallow only
+        // the duplicate-column error.
+        ignore_duplicate_column(
+            conn.execute("ALTER TABLE pending_attestations ADD COLUMN uid TEXT", []),
+        )?;
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_attestations ADD COLUMN submitted_at INTEGER",
+            [],
+        ))?;
         // Migrate pre-existing DBs (created before `started_at` was added). The
         // column already exists on a later boot, so we swallow only that one
         // error and let any other failure propagate.
@@ -630,12 +645,12 @@ impl Store {
     }
 
     /// Number of settled jobs whose EAS render receipt has not yet been relayed
-    /// on-chain — the attestation backlog depth, surfaced at `/stats`. Currently
-    /// every settled job stays pending (no on-chain submitter yet), so this
-    /// tracks `completed_count`; it will drain once the relayer lands.
+    /// on-chain — the attestation backlog depth, surfaced at `/stats`. A row is
+    /// pending while its `uid` is NULL; the relayer drains the backlog by writing
+    /// the on-chain attestation `uid`, so this count falls as receipts land.
     pub fn pending_attestation_count(&self) -> Result<usize> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM pending_attestations",
+            "SELECT COUNT(*) FROM pending_attestations WHERE uid IS NULL",
             [],
             |row| row.get(0),
         )?;
