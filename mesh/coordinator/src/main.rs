@@ -1134,7 +1134,10 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                         // and it can't re-decline — the same job in a hot loop.
                         // Only act on the job we currently have offered (fenced by
                         // the remembered dispatch seq inside `requeue`); a decline
-                        // for any other id is stale/unknown and ignored.
+                        // for any other id is stale/unknown and ignored. A decline
+                        // after the earner already Accepted is unusual but handled
+                        // identically (fault-requeue + `accepted` reset) — still
+                        // fenced and capped at one fault per session.
                         match &offered {
                             Some((job, _)) if job.id == job_id => {
                                 tracing::info!(earner = %earner_address, %job_id, %reason, "offer declined; requeueing for a capable earner");
@@ -2505,6 +2508,67 @@ mod tests {
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_failed"], 0, "nothing dead-lettered");
         assert_eq!(json["jobs_completed"], 0, "nothing credited");
+    }
+
+    /// A Decline for a job id we are NOT currently offering is ignored (the
+    /// `_ => warn` arm) and must not disturb the offer we DO hold. Pins the
+    /// `job.id == job_id` guard: a regression that requeued the offered job on
+    /// any decline would clear the offer, and the follow-up Accept+Submit (sent
+    /// after the stale decline, so processed after it in FIFO order) would no
+    /// longer settle — so receiving `Accepted` proves the stale decline was a
+    /// no-op and the held offer survived intact.
+    #[tokio::test]
+    async fn ws_decline_for_unoffered_job_leaves_the_held_offer_settleable() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+
+        // Decline a DIFFERENT (random) job id — not the one we hold.
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Decline {
+                job_id: Uuid::new_v4(),
+                reason: "stale".into(),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Then accept + submit the real offer. FIFO ordering means this is
+        // processed after the stale decline; an Accepted verdict proves the
+        // offer was untouched.
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(signed_result(job_id, "deadbeef"))).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::Accepted { job_id: jid, .. } => assert_eq!(jid, job_id),
+            other => panic!("a stale decline must leave the offer settleable, got {other:?}"),
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 1, "the held offer must still settle");
     }
 
     /// A `JobResult` validly signed by an arbitrary key (distinct from the dev
