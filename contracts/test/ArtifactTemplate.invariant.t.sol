@@ -70,15 +70,13 @@ contract ArtifactTemplateHandler is Test {
         uint256 id = ids[idSeed % ids.length];
         address to = actors[toSeed % actors.length];
         amount = bound(amount, 1, 1e24);
-        uint256 cap = ghost_maxSupply[id];
-        // Handler IS the minter; no prank needed. A mint that would breach a non-zero
-        // cap must revert SupplyExceeded and leave supply untouched; one within the
-        // cap (or any mint to an uncapped template) lands and bumps the ghost.
-        if (cap != 0 && ghost_supply[id] + amount > cap) {
-            vm.expectRevert(ArtifactTemplate.SupplyExceeded.selector);
-            art.mint(to, id, amount, "");
-            return;
-        }
+        // Handler IS the minter; no prank needed. An over-cap mint reverts INSIDE the
+        // contract and the fuzzer discards the whole call (fail_on_revert is unset =
+        // false), so neither the chain nor the ghost advances. We deliberately do NOT
+        // pre-check + vm.expectRevert here: that would mask a regression — if the cap
+        // check were deleted, the over-cap mint would commit (minted > cap), the ghost
+        // would advance with it, and invariant_mintedNeverExceedsCap would catch it.
+        // The ghost only advances when the contract actually commits the mint.
         art.mint(to, id, amount, "");
         ghost_supply[id] += amount;
     }

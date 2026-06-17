@@ -472,15 +472,15 @@ contract ArtifactTemplateTest is Test {
     }
 
     function test_mint_capHoldsUnderReentrancy() public {
-        // The security-critical property: the cap holds under reentrancy ONLY
-        // because the counter commits BEFORE _mint. The reentrant mint (from the
-        // ERC-1155 receiver hook) sees the outer mint already counted, so its own
-        // cap check uses the committed total. cap=8, outer=5, reentry=5: the
-        // reentry's check is 5+5=10 > 8 → SupplyExceeded, which propagates through
-        // the receiver hook and reverts the whole mint (nothing committed). Were the
-        // counter written AFTER _mint, the reentry would see 0, slip past (0+5≤8),
-        // and the two mints would total 10 > cap — so this expectRevert is the CEI
-        // discriminator, not a generic revert check.
+        // A reentrant mint cannot breach the cap. cap=8, outer=5, reentry=5: the
+        // outer commits 5, then _mint's receiver hook reenters mint(5); the reentry's
+        // check is 5+5=10 > 8 → SupplyExceeded, which propagates through the hook and
+        // reverts the whole tx, so nothing is committed and the cap stays intact.
+        // (This is an all-or-nothing safety check, not the CEI-ordering discriminator:
+        // the cap holds under either counter-ordering because the outermost over-cap
+        // check unwinds the whole tx. The "counters commit before _mint" ordering
+        // itself is pinned by test_mint_reentrantMinterKeepsCounterIntegrity, which
+        // asserts the reentrant hook observes the outer mint already counted.)
         ReentrantMinter rm = new ReentrantMinter(art);
         vm.prank(owner);
         art.setMinter(address(rm));
