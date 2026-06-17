@@ -108,6 +108,52 @@ contract ReentrantEAS is IEAS {
     }
 }
 
+/// @dev Hostile EAS that reenters revokeReceipt with the same jobId mid-revoke, to
+///      prove receiptRevoked is flipped and the counters decremented BEFORE the external
+///      EAS.revoke (checks-effects-interactions): the reentrant revoke is rejected by
+///      AlreadyRevoked and cannot double-decrement or double-revoke.
+contract ReentrantRevokeEAS is IEAS {
+    RenderReceipts public target;
+    bytes32 public reJobId;
+    uint256 public attestCalls;
+    uint256 public revokeCalls;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    function arm(RenderReceipts target_, bytes32 jobId_) external {
+        target = target_;
+        reJobId = jobId_;
+    }
+
+    function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
+        attestCalls++;
+        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {
+        revokeCalls++;
+        if (!reentered) {
+            reentered = true;
+            try target.revokeReceipt(reJobId) {
+            // reentry unexpectedly succeeded — reentryReverted stays false
+            }
+            catch (bytes memory err) {
+                reentryReverted = true;
+                reentryRevertSelector = bytes4(err);
+            }
+        }
+    }
+
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata)
+        external
+        payable
+        returns (bytes32[] memory)
+    {
+        revert("not implemented");
+    }
+}
+
 contract MockSchemaRegistry is ISchemaRegistry {
     bytes32 public constant FIXED_UID = keccak256("blackfield.render.schema.v1");
 
@@ -140,6 +186,7 @@ contract RenderReceiptsTest is Test {
         uint16 jobKind,
         uint64 renderSeconds
     );
+    event ReceiptRevoked(bytes32 indexed uid, address indexed earner, bytes32 indexed jobId);
     event CoordinatorSet(address indexed coordinator, bool authorized);
     event SchemaRegistered(bytes32 indexed uid);
 
@@ -501,6 +548,214 @@ contract RenderReceiptsTest is Test {
         vm.expectRevert(RenderReceipts.NotAuthorized.selector);
         vm.prank(owner);
         receipts.issueReceipt(earner, keccak256("j"), 10, 0, bytes32(0), bytes32(0));
+    }
+
+    // --- revokeReceipt ---
+
+    function test_revokeReceipt_happyPath_flipsStateDecrementsAndRevokesUid() public {
+        _arm();
+        bytes32 jobId = keccak256("revoke-me");
+        vm.prank(coordinator);
+        bytes32 uid = receipts.issueReceipt(earner, jobId, 10, 1, bytes32(0), bytes32(0));
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.receiptsByEarner(earner), 1);
+        assertEq(receipts.receiptUid(jobId), uid);
+        assertFalse(receipts.receiptRevoked(jobId));
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceiptRevoked(uid, earner, jobId);
+        vm.prank(coordinator);
+        receipts.revokeReceipt(jobId);
+
+        // Fence flipped to revoked; receipt no longer live; revoked tally up.
+        assertTrue(receipts.receiptRevoked(jobId));
+        assertTrue(receipts.receiptIssued(jobId)); // stays set — cannot be re-issued
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.receiptsByEarner(earner), 0);
+        assertEq(receipts.revokedCount(), 1);
+
+        // EAS.revoke was called once on the stored uid with the canonical schema, and
+        // the faithful mock marked that attestation revoked.
+        assertEq(eas.revokeCalls(), 1);
+        assertEq(eas.lastRevokedUid(), uid);
+        assertEq(eas.lastRevokeSchema(), receipts.schemaUid());
+        assertTrue(eas.isRevoked(uid));
+    }
+
+    function test_revokeReceipt_revertsNotAuthorized() public {
+        _arm();
+        bytes32 jobId = keccak256("j");
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        vm.prank(stranger);
+        receipts.revokeReceipt(jobId);
+
+        // The rejected revoke changed nothing.
+        assertFalse(receipts.receiptRevoked(jobId));
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.revokedCount(), 0);
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    /// @dev The owner administers coordinators but is not itself one; revoking, like
+    ///      issuing, requires explicit self-authorization.
+    function test_revokeReceipt_ownerIsNotImplicitlyAuthorized() public {
+        _arm();
+        bytes32 jobId = keccak256("j");
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        vm.prank(owner);
+        receipts.revokeReceipt(jobId);
+    }
+
+    /// @dev Auth is checked before the issued/revoked guards, so an unauthorized caller
+    ///      gets NotAuthorized even for a never-issued job — no state oracle leak.
+    function test_revokeReceipt_unauthorizedRevertsBeforeNotIssued() public {
+        _arm();
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        vm.prank(stranger);
+        receipts.revokeReceipt(keccak256("never"));
+    }
+
+    function test_revokeReceipt_revertsNotIssued() public {
+        _arm();
+        bytes32 jobId = keccak256("never-issued");
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.NotIssued.selector, jobId));
+        vm.prank(coordinator);
+        receipts.revokeReceipt(jobId);
+    }
+
+    function test_revokeReceipt_doubleRevokeReverts() public {
+        _arm();
+        bytes32 jobId = keccak256("once");
+        vm.startPrank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+        receipts.revokeReceipt(jobId);
+
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.AlreadyRevoked.selector, jobId));
+        receipts.revokeReceipt(jobId);
+        vm.stopPrank();
+
+        // The rejected second revoke left the post-first-revoke values untouched.
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.revokedCount(), 1);
+        assertEq(eas.revokeCalls(), 1);
+    }
+
+    /// @dev A revoked job's fence stays set, so it can never be re-issued (no
+    ///      resurrection of a withdrawn attestation).
+    function test_revokeReceipt_revokedJobCannotBeReissued() public {
+        _arm();
+        bytes32 jobId = keccak256("revoked-then-reissue");
+        vm.startPrank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+        receipts.revokeReceipt(jobId);
+
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.DuplicateReceipt.selector, jobId));
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+        vm.stopPrank();
+
+        assertEq(receipts.receiptCount(), 0); // not resurrected
+        assertEq(receipts.revokedCount(), 1);
+        assertEq(eas.attestCalls(), 1); // the blocked re-issue never re-attested
+    }
+
+    function test_revokeReceipt_deauthorizedCoordinatorReverts() public {
+        _arm();
+        bytes32 jobId = keccak256("j");
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+        vm.prank(owner);
+        receipts.setCoordinator(coordinator, false);
+
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        vm.prank(coordinator);
+        receipts.revokeReceipt(jobId);
+    }
+
+    /// @dev Revocation is gated to the coordinator SET, not the issuing address: a
+    ///      different authorized coordinator can revoke (the chosen design — issuer-only
+    ///      would strand receipts when a coordinator key rotates).
+    function test_revokeReceipt_anyAuthorizedCoordinatorCanRevoke() public {
+        _arm();
+        address coordinatorB = address(0xC0DE2);
+        vm.prank(owner);
+        receipts.setCoordinator(coordinatorB, true);
+
+        bytes32 jobId = keccak256("cross-coordinator");
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.prank(coordinatorB);
+        receipts.revokeReceipt(jobId);
+
+        assertTrue(receipts.receiptRevoked(jobId));
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.revokedCount(), 1);
+    }
+
+    /// @dev Revoke decrements only the STORED earner's slot (from issue time), never a
+    ///      caller-supplied one: a second earner's count is untouched and the per-earner
+    ///      partition of receiptCount is preserved.
+    function test_revokeReceipt_decrementsOnlyTheStoredEarner() public {
+        _arm();
+        address earnerB = address(0xEA34);
+        bytes32 jobA = keccak256("a");
+        bytes32 jobB = keccak256("b");
+        vm.startPrank(coordinator);
+        receipts.issueReceipt(earner, jobA, 10, 0, bytes32(0), bytes32(0));
+        receipts.issueReceipt(earnerB, jobB, 10, 0, bytes32(0), bytes32(0));
+        receipts.revokeReceipt(jobA);
+        vm.stopPrank();
+
+        assertEq(receipts.receiptsByEarner(earner), 0);
+        assertEq(receipts.receiptsByEarner(earnerB), 1);
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.revokedCount(), 1);
+        assertEq(
+            receipts.receiptsByEarner(earner) + receipts.receiptsByEarner(earnerB), receipts.receiptCount()
+        );
+    }
+
+    /// @dev receiptRevoked is set (and counters decremented) before the external
+    ///      EAS.revoke, so a hostile EAS reentering revokeReceipt with the same jobId
+    ///      mid-revoke is rejected by AlreadyRevoked: exactly one EAS.revoke, one
+    ///      decrement, counters consistent. (Fails if the flag moved after the call.)
+    function test_revokeReceipt_reentrantRevokeCannotDoubleDecrement() public {
+        ReentrantRevokeEAS reentrantEas = new ReentrantRevokeEAS();
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner);
+
+        bytes32 jobId = keccak256("reentrant-revoke-job");
+        reentrantEas.arm(r, jobId);
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(reentrantEas), true); // reentry's msg.sender is the EAS
+        vm.stopPrank();
+
+        vm.prank(coordinator);
+        r.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+        assertEq(r.receiptCount(), 1);
+
+        vm.prank(coordinator);
+        r.revokeReceipt(jobId);
+
+        // The reentrant revoke hit the AlreadyRevoked guard (state flipped before the call).
+        assertTrue(reentrantEas.reentered());
+        assertTrue(reentrantEas.reentryReverted());
+        assertEq(reentrantEas.reentryRevertSelector(), RenderReceipts.AlreadyRevoked.selector);
+
+        // Exactly one outer revoke reached EAS; counters decremented exactly once.
+        assertEq(reentrantEas.revokeCalls(), 1);
+        assertTrue(r.receiptRevoked(jobId));
+        assertEq(r.receiptCount(), 0);
+        assertEq(r.receiptsByEarner(earner), 0);
+        assertEq(r.revokedCount(), 1);
     }
 
     // --- Ownable2Step ---
