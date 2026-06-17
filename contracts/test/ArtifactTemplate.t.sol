@@ -118,7 +118,7 @@ contract ArtifactTemplateTest is Test {
         emit TemplateRegistered(1, author, rarity, manifest);
 
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, rarity, manifest);
+        uint256 id = art.registerTemplate(author, rarity, manifest, 0);
 
         assertEq(id, 1);
         assertEq(art.nextTemplateId(), 1);
@@ -131,9 +131,9 @@ contract ArtifactTemplateTest is Test {
 
     function test_registerTemplate_incrementsIds() public {
         vm.startPrank(minter);
-        uint256 id1 = art.registerTemplate(author, 1, keccak256("a"));
-        uint256 id2 = art.registerTemplate(player, 2, keccak256("b"));
-        uint256 id3 = art.registerTemplate(author, 3, keccak256("c"));
+        uint256 id1 = art.registerTemplate(author, 1, keccak256("a"), 0);
+        uint256 id2 = art.registerTemplate(player, 2, keccak256("b"), 0);
+        uint256 id3 = art.registerTemplate(author, 3, keccak256("c"), 0);
         vm.stopPrank();
 
         assertEq(id1, 1);
@@ -148,7 +148,7 @@ contract ArtifactTemplateTest is Test {
     function test_registerTemplate_revertsNotMinter() public {
         vm.expectRevert(ArtifactTemplate.NotMinter.selector);
         vm.prank(stranger);
-        art.registerTemplate(author, 1, bytes32(0));
+        art.registerTemplate(author, 1, bytes32(0), 0);
     }
 
     function test_registerTemplate_revertsZeroAuthor() public {
@@ -156,7 +156,7 @@ contract ArtifactTemplateTest is Test {
         // an id + a leaderboard slot for a template no one can ever mint.
         vm.expectRevert(ArtifactTemplate.ZeroAuthor.selector);
         vm.prank(minter);
-        art.registerTemplate(address(0), 1, keccak256("m"));
+        art.registerTemplate(address(0), 1, keccak256("m"), 0);
 
         assertEq(art.nextTemplateId(), 0);
         assertEq(art.templatesByAuthor(address(0)), 0);
@@ -165,7 +165,7 @@ contract ArtifactTemplateTest is Test {
     function test_registerTemplate_revertsRarityAboveMax() public {
         vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.InvalidRarity.selector, uint16(10001)));
         vm.prank(minter);
-        art.registerTemplate(author, 10001, keccak256("m"));
+        art.registerTemplate(author, 10001, keccak256("m"), 0);
 
         assertEq(art.nextTemplateId(), 0);
     }
@@ -176,7 +176,7 @@ contract ArtifactTemplateTest is Test {
         // otherwise consume the prank and registerTemplate would revert NotMinter.
         uint16 maxRarity = art.MAX_RARITY();
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, maxRarity, keccak256("m"));
+        uint256 id = art.registerTemplate(author, maxRarity, keccak256("m"), 0);
 
         (, uint16 r,) = art.templates(id);
         assertEq(r, 10_000);
@@ -186,7 +186,7 @@ contract ArtifactTemplateTest is Test {
 
     function test_mint_happyPath() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1000, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1000, keccak256("m"), 0);
 
         vm.expectEmit(true, true, false, true);
         emit Minted(player, id, 5);
@@ -199,7 +199,7 @@ contract ArtifactTemplateTest is Test {
 
     function test_mint_revertsNotMinter() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
 
         vm.expectRevert(ArtifactTemplate.NotMinter.selector);
         vm.prank(stranger);
@@ -214,7 +214,7 @@ contract ArtifactTemplateTest is Test {
 
     function test_mint_revertsZeroRecipient() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
 
         vm.expectRevert(ArtifactTemplate.ZeroRecipient.selector);
         vm.prank(minter);
@@ -226,7 +226,7 @@ contract ArtifactTemplateTest is Test {
 
     function test_mint_revertsZeroAmount() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
 
         // A zero-amount mint would emit a spurious Minted/TransferSingle and fire
         // the receiver hook for nothing; reject it instead.
@@ -269,7 +269,7 @@ contract ArtifactTemplateTest is Test {
 
     function test_mint_multipleAccumulatesBalance() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
 
         vm.startPrank(minter);
         art.mint(player, id, 3, "");
@@ -281,7 +281,7 @@ contract ArtifactTemplateTest is Test {
 
     function test_mint_passesDataThrough() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
         // Non-empty data must not revert for an EOA recipient.
         vm.prank(minter);
         art.mint(player, id, 2, hex"deadbeef");
@@ -294,7 +294,7 @@ contract ArtifactTemplateTest is Test {
         vm.prank(owner);
         art.setMintFeeRate(2e15);
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 5000, keccak256("m")); // 50% rarity
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0); // 50% rarity
 
         // ceil(2e15 * 4 * 5000 / 10000) = 4e15, exact (no rounding).
         uint256 expectedFee = 4e15;
@@ -319,7 +319,7 @@ contract ArtifactTemplateTest is Test {
         vm.prank(owner);
         art.setMintFeeRate(1);
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
 
         uint256 creditBefore = meter.credit(player);
         vm.prank(minter);
@@ -335,7 +335,7 @@ contract ArtifactTemplateTest is Test {
         vm.prank(owner);
         art.setMintFeeRate(1e15);
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 10_000, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 10_000, keccak256("m"), 0);
 
         vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
         vm.prank(minter);
@@ -355,7 +355,7 @@ contract ArtifactTemplateTest is Test {
         vm.prank(owner);
         meter.setSpender(address(art), false);
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 5000, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0);
 
         vm.expectRevert(ComputeMeter.NotAuthorized.selector);
         vm.prank(minter);
@@ -371,7 +371,7 @@ contract ArtifactTemplateTest is Test {
         // it. The global fee gate stays closed by the non-zero mintFeeRate guard.
         address poor = address(0xF00D);
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 0, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 0, keccak256("m"), 0);
 
         vm.prank(minter);
         art.mint(poor, id, 7, "");
@@ -439,9 +439,9 @@ contract ArtifactTemplateTest is Test {
 
     function test_registerTemplate_tracksTemplatesByAuthor() public {
         vm.startPrank(minter);
-        art.registerTemplate(author, 1, keccak256("a"));
-        art.registerTemplate(player, 2, keccak256("b"));
-        art.registerTemplate(author, 3, keccak256("c"));
+        art.registerTemplate(author, 1, keccak256("a"), 0);
+        art.registerTemplate(player, 2, keccak256("b"), 0);
+        art.registerTemplate(author, 3, keccak256("c"), 0);
         vm.stopPrank();
 
         assertEq(art.templatesByAuthor(author), 2);
@@ -453,8 +453,8 @@ contract ArtifactTemplateTest is Test {
 
     function test_mint_tracksTotalMintedAndByTemplate() public {
         vm.startPrank(minter);
-        uint256 id1 = art.registerTemplate(author, 1, keccak256("a"));
-        uint256 id2 = art.registerTemplate(author, 2, keccak256("b"));
+        uint256 id1 = art.registerTemplate(author, 1, keccak256("a"), 0);
+        uint256 id2 = art.registerTemplate(author, 2, keccak256("b"), 0);
         art.mint(player, id1, 5, "");
         art.mint(player, id1, 3, ""); // same template accumulates
         art.mint(stranger, id2, 4, "");
@@ -471,13 +471,13 @@ contract ArtifactTemplateTest is Test {
     ///      "a reverting spend records neither" property).
     function test_revertingCallsRecordNothing() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
         assertEq(art.totalMinted(), 0);
 
         // Non-minter register: templatesByAuthor must not move.
         vm.expectRevert(ArtifactTemplate.NotMinter.selector);
         vm.prank(stranger);
-        art.registerTemplate(stranger, 1, keccak256("x"));
+        art.registerTemplate(stranger, 1, keccak256("x"), 0);
         assertEq(art.templatesByAuthor(stranger), 0);
 
         // Unknown-template mint: mint counters must not move.
@@ -499,7 +499,7 @@ contract ArtifactTemplateTest is Test {
 
     function test_rotatedMinterCannotUseOldKey() public {
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
 
         vm.prank(owner);
         art.setMinter(stranger);
@@ -557,7 +557,7 @@ contract ReentrantMinter is IERC1155Receiver {
     }
 
     function register(address author, uint16 rarity) external returns (uint256) {
-        templateId = art.registerTemplate(author, rarity, keccak256("r"));
+        templateId = art.registerTemplate(author, rarity, keccak256("r"), 0);
         return templateId;
     }
 
@@ -605,7 +605,7 @@ contract ReentrantSpender is IComputeMeter {
     }
 
     function register(address author, uint16 rarity) external returns (uint256) {
-        templateId = art.registerTemplate(author, rarity, keccak256("rs"));
+        templateId = art.registerTemplate(author, rarity, keccak256("rs"), 0);
         return templateId;
     }
 

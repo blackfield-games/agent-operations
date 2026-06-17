@@ -59,6 +59,12 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     ///         popularity read. Across all templates these sum to `totalMinted`.
     mapping(uint256 templateId => uint256 amount) public mintedByTemplate;
 
+    /// @notice Optional hard cap on `mintedByTemplate[id]`, set at register time.
+    ///         0 = uncapped — the default for every template (an unset slot reads
+    ///         0), preserving pre-cap behavior; a non-zero value caps cumulative
+    ///         mints for that template, enforcing scarcity for high-rarity tiers.
+    mapping(uint256 templateId => uint256) public templateMaxSupply;
+
     event TemplateRegistered(
         uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
     );
@@ -74,6 +80,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     error ZeroAmount();
     error ZeroComputeMeter();
     error ZeroFeeRate();
+    error SupplyExceeded(uint256 templateId, uint256 wouldMint, uint256 maxSupply);
 
     constructor(address owner_, string memory baseUri_, address computeMeter_, uint256 mintFeeRate_)
         ERC1155(baseUri_)
@@ -102,7 +109,11 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         _setURI(newURI);
     }
 
-    function registerTemplate(address author, uint16 rarity, bytes32 manifest)
+    /// @param maxSupply Hard cap on cumulative units mintable for this template;
+    ///        0 leaves it uncapped. The id is always freshly minted
+    ///        (`++nextTemplateId`), so a template's cap is fixed at registration and
+    ///        can never be retroactively lowered below an already-minted count.
+    function registerTemplate(address author, uint16 rarity, bytes32 manifest, uint256 maxSupply)
         external
         returns (uint256 templateId)
     {
@@ -113,6 +124,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         if (rarity > MAX_RARITY) revert InvalidRarity(rarity);
         templateId = ++nextTemplateId;
         templates[templateId] = Template({author: author, rarity: rarity, manifest: manifest});
+        templateMaxSupply[templateId] = maxSupply;
         ++templatesByAuthor[author];
         emit TemplateRegistered(templateId, author, rarity, manifest);
     }
@@ -124,6 +136,15 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         Template storage t = templates[templateId];
         if (t.author == address(0)) revert UnknownTemplate();
 
+        // Supply cap (effects-before-interaction): reject BEFORE any counter write or
+        // external call, so a reentrant minter sees the cap enforced and a batched
+        // `amount` can't slip past. `cap == 0` is uncapped (the default). Exact-fill
+        // (wouldMint == cap) succeeds; one unit over reverts. `amount == 0` already
+        // reverted above, so wouldMint strictly increases here.
+        uint256 cap = templateMaxSupply[templateId];
+        uint256 wouldMint = mintedByTemplate[templateId] + amount;
+        if (cap != 0 && wouldMint > cap) revert SupplyExceeded(templateId, wouldMint, cap);
+
         uint256 fee = _mintFee(amount, t.rarity);
 
         // CEI: write the supply counters (effects) before the two external
@@ -132,7 +153,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         // recipient via the ERC-1155 receiver hook during _mint). A reentrant call
         // therefore sees counters that already include this mint.
         totalMinted += amount;
-        mintedByTemplate[templateId] += amount;
+        mintedByTemplate[templateId] = wouldMint;
 
         // Charge the recipient's compute credit before the units are minted, so an
         // insufficient balance reverts the whole mint. The spend's jobId carries the

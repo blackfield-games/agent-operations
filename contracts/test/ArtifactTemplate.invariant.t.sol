@@ -54,7 +54,7 @@ contract ArtifactTemplateHandler is Test {
         // non-zero, so the author guard never trips here.
         rarity = rarity % (art.MAX_RARITY() + 1);
         // Handler IS the minter; no prank needed.
-        uint256 id = art.registerTemplate(author, rarity, manifest);
+        uint256 id = art.registerTemplate(author, rarity, manifest, 0);
         ids.push(id);
         ghost_registered++;
         ghost_registeredByAuthor[author]++;
@@ -185,7 +185,7 @@ contract ArtifactTemplateFuzzTest is Test {
         b = bound(b, 1, 1e24);
 
         vm.prank(minter);
-        uint256 id = art.registerTemplate(author, 1000, keccak256("manifest"));
+        uint256 id = art.registerTemplate(author, 1000, keccak256("manifest"), 0);
 
         vm.startPrank(minter);
         art.mint(player, id, a, "");
@@ -202,7 +202,7 @@ contract ArtifactTemplateFuzzTest is Test {
 
         vm.startPrank(minter);
         for (uint256 i = 0; i < n; i++) {
-            uint256 id = art.registerTemplate(author, uint16(i % 10001), keccak256(abi.encode(i)));
+            uint256 id = art.registerTemplate(author, uint16(i % 10001), keccak256(abi.encode(i)), 0);
             assertEq(id, i + 1);
         }
         vm.stopPrank();
