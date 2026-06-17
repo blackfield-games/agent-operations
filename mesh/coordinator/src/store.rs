@@ -282,9 +282,13 @@ impl Store {
     /// dispatch attempt that `take_next` provisionally charged is refunded
     /// (`attempts -= 1`) and a separate `faults` counter is charged instead. The
     /// job is dead-lettered only once it has accumulated `max_faults` earner
-    /// faults, so a poison job (a spec no connected earner can satisfy) still
-    /// terminates rather than looping forever — while a renderable job can no
-    /// longer be burned to `failed` by an earner that keeps submitting garbage.
+    /// faults — the backstop that still terminates a poison job (a spec no earner
+    /// can satisfy) while a renderable job can no longer be burned to `failed` by
+    /// an earner that keeps submitting garbage. Termination is at the fault-count
+    /// level: the ws layer caps each session's contribution to one fault per job
+    /// (the per-session skip set), so reaching `max_faults` takes faults from
+    /// `max_faults` distinct sessions/earners — a single connected earner parks
+    /// the job at one fault rather than dead-lettering it, by design.
     ///
     /// Like [`requeue`](Self::requeue) this acts ONLY on a still-`in_flight` job
     /// and is a no-op otherwise (a reaper-parked or terminal job is left

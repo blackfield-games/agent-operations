@@ -1107,8 +1107,12 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                                 if let Some((job, seq)) = offered.take() {
                                     // Don't re-offer a job this earner just faulted
                                     // on (anti hot-loop): another earner can still
-                                    // take it, and the persistent fault counter
-                                    // still dead-letters a poison job.
+                                    // take it. This intentionally caps THIS session's
+                                    // contribution to the job's persistent fault
+                                    // count at one, so a single connected earner
+                                    // can't unilaterally drive a renderable job to
+                                    // max_faults — dead-lettering needs faults from
+                                    // multiple sessions/earners (see requeue_earner_fault).
                                     if kind == RequeueKind::EarnerFault {
                                         faulted.insert(job.id);
                                     }
