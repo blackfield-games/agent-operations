@@ -40,6 +40,7 @@ const PLACEHOLDER_ATTESTATION_UID: &str =
 const DISPATCH_SEQ_HEADER: &str = "x-dispatch-seq";
 
 mod store;
+mod validate;
 mod verify;
 
 use store::Store;
@@ -711,6 +712,15 @@ async fn submit(
         tracing::warn!(?id, earner = %result.earner_address, ?e, "rejected: bad attestation");
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // Content gate: the signature proves who produced the result; this proves the
+    // result is well-formed enough to meter and attest. A malformed output hash,
+    // unfetchable url, or zero render-seconds is unprocessable — reject it before
+    // any state mutation. The job is left in_flight for the reaper, mirroring the
+    // bad-attestation path above (which also leaves it for the reaper).
+    if let Err(e) = validate::validate_result(&result) {
+        tracing::warn!(?id, earner = %result.earner_address, reason = e.reason(), "rejected: result failed content gate");
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
     // Authenticated, live earner: refresh its liveness for /stats. Done before
     // locking the store so we never hold the earners lock under the store lock.
     {
@@ -754,7 +764,7 @@ async fn submit(
         }
     }
     tracing::info!(?id, earner = %result.earner_address, "result received");
-    // TODO validator gate, EAS attestation relay
+    // Content gate already cleared above; TODO EAS attestation relay on settle.
     match store.record_completed(&result) {
         Ok(true) => Ok("accepted"),
         // The in_flight gate above ran under this same lock, so a false here
@@ -1145,6 +1155,16 @@ async fn handle_submit(
         return SubmitOutcome::Requeue(rejected("attestation signature verification failed"));
     }
 
+    // Content gate: reject a result that is not well-formed enough to meter or
+    // attest before touching the store. Requeue (not Drop) so the job — which may
+    // be perfectly renderable — gets another earner; the requeue helper is itself
+    // dispatch_seq-fenced, so a content-reject for a since-reassigned lease can't
+    // clobber the new holder. Mirrors the bad-attestation Requeue above.
+    if let Err(e) = validate::validate_result(&result) {
+        tracing::warn!(%job_id, earner = %result.earner_address, reason = e.reason(), "ws rejected: result failed content gate");
+        return SubmitOutcome::Requeue(rejected(e.reason()));
+    }
+
     // Settle only if we still hold the current dispatch. The fence read and the
     // settle run under one store lock, so they are atomic against any other
     // dispatch: a job reaped and reassigned to a new earner carries a higher
@@ -1178,7 +1198,8 @@ async fn handle_submit(
     }
 
     tracing::info!(%job_id, earner = %result.earner_address, "ws result accepted");
-    // TODO validator gate, real EAS attestation relay (placeholder uid for now).
+    // Content gate already cleared above; TODO real EAS attestation relay on
+    // settle (placeholder uid until mesh-eas-attestation-relay lands).
     SubmitOutcome::Accepted(CoordinatorMsg::Accepted {
         job_id,
         attestation_uid: PLACEHOLDER_ATTESTATION_UID.to_string(),
