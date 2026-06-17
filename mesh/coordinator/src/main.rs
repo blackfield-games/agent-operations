@@ -19,7 +19,7 @@ use axum::{
 use clap::Parser;
 use proto::{CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec, RegionCoord};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -64,6 +64,14 @@ struct Args {
     /// the terminal `failed` state and removed from the active queue forever.
     #[arg(long, env = "COORDINATOR_MAX_ATTEMPTS", default_value = "5")]
     max_attempts: u32,
+    /// Maximum number of EARNER-fault result rejects (bad signature, malformed or
+    /// implausible content, submit-protocol violation) a single job tolerates
+    /// before it is dead-lettered. Earner faults do NOT consume the `max_attempts`
+    /// renderability budget (a faulty earner shouldn't burn a renderable job), so
+    /// this separate, more generous cap is the backstop that still terminates a
+    /// poison job (a spec no connected earner can satisfy).
+    #[arg(long, env = "COORDINATOR_MAX_FAULTS", default_value = "10")]
+    max_faults: u32,
     /// An earner is counted in `/stats` and kept in the in-memory registry only
     /// while it has been seen within this many seconds. Refreshed on Hello, on
     /// any websocket frame, on a periodic liveness tick while a ws earner is
@@ -111,6 +119,10 @@ struct AppState {
     /// Maximum dispatch attempts before a job is dead-lettered to `failed`.
     /// Mirrors `--max-attempts` / `COORDINATOR_MAX_ATTEMPTS`.
     max_attempts: u32,
+    /// Maximum earner-fault rejects a job tolerates before dead-lettering, on a
+    /// budget separate from `max_attempts` (earner faults don't burn the
+    /// renderability budget). Mirrors `--max-faults` / `COORDINATOR_MAX_FAULTS`.
+    max_faults: u32,
     /// How long (seconds) an earner stays counted in `/stats` after its last
     /// sign of life. Mirrors `--earner-ttl-secs` / `COORDINATOR_EARNER_TTL_SECS`.
     earner_ttl_secs: i64,
@@ -120,7 +132,12 @@ impl AppState {
     /// Build state backed by `store`. Seeds one job only when the DB has no
     /// jobs yet, so a fresh DB gives earners something to do while a restart
     /// with existing jobs does NOT double-seed.
-    fn with_store(store: Store, max_attempts: u32, earner_ttl_secs: i64) -> Result<Arc<Self>> {
+    fn with_store(
+        store: Store,
+        max_attempts: u32,
+        max_faults: u32,
+        earner_ttl_secs: i64,
+    ) -> Result<Arc<Self>> {
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -136,6 +153,7 @@ impl AppState {
             store: Mutex::new(store),
             earners: Mutex::new(HashMap::new()),
             max_attempts,
+            max_faults,
             earner_ttl_secs,
         }))
     }
@@ -247,7 +265,8 @@ async fn main() -> Result<()> {
     let store = Store::open(&args.db)?;
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
     // `with_store` also reclaims jobs left in_flight by a previous crash.
-    let state = AppState::with_store(store, args.max_attempts, args.earner_ttl_secs as i64)?;
+    let state =
+        AppState::with_store(store, args.max_attempts, args.max_faults, args.earner_ttl_secs as i64)?;
     tracing::info!(db = %args.db, "store ready");
 
     // Background reaper: periodically requeue in-flight jobs past their
@@ -996,6 +1015,9 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     // settled or preempted by us. Plus whether the earner accepted the offer.
     let mut offered: Option<(JobSpec, i64)> = None;
     let mut accepted = false;
+    // Jobs this earner has faulted on in this session. We won't re-offer them to
+    // the same earner (anti hot-loop, FM4); they stay queued for other earners.
+    let mut faulted: HashSet<Uuid> = HashSet::new();
     // Poll the queue on this cadence when we have nothing offered.
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_liveness_bump = now_secs();
@@ -1003,9 +1025,10 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     loop {
         // If we have no outstanding offer, try to grab a supported job.
         if offered.is_none() {
-            if let Some((job, seq)) = take_supported_job(&state, &supported).await {
+            if let Some((job, seq)) = take_supported_job(&state, &supported, &faulted).await {
                 if !send_msg(&mut socket, &CoordinatorMsg::JobOffer(job.clone())).await {
-                    requeue(&state, job, seq).await;
+                    // Socket died delivering the offer — a disconnect, so charge.
+                    requeue(&state, job, seq, RequeueKind::Charge).await;
                     return;
                 }
                 tracing::info!(earner = %earner_address, job_id = %job.id, "job offered");
@@ -1080,9 +1103,16 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                                 accepted = false;
                             }
                             // Rejected but still ours: requeue for another earner.
-                            SubmitOutcome::Requeue(_) => {
+                            SubmitOutcome::Requeue(_, kind) => {
                                 if let Some((job, seq)) = offered.take() {
-                                    requeue(&state, job, seq).await;
+                                    // Don't re-offer a job this earner just faulted
+                                    // on (anti hot-loop): another earner can still
+                                    // take it, and the persistent fault counter
+                                    // still dead-letters a poison job.
+                                    if kind == RequeueKind::EarnerFault {
+                                        faulted.insert(job.id);
+                                    }
+                                    requeue(&state, job, seq, kind).await;
                                 }
                                 accepted = false;
                             }
@@ -1155,9 +1185,10 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     // Socket ended with an un-submitted offer in flight → requeue it (fenced on
-    // our dispatch seq, so a job already reaped+reassigned isn't yanked back).
+    // our dispatch seq, so a job already reaped+reassigned isn't yanked back). A
+    // dropped socket is a disconnect, not an earner fault, so it charges.
     if let Some((job, seq)) = offered.take() {
-        requeue(&state, job, seq).await;
+        requeue(&state, job, seq, RequeueKind::Charge).await;
     }
     tracing::info!(earner = %earner_address, "ws session ended");
 }
@@ -1193,13 +1224,19 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
     }
 }
 
-/// Take the most recent queued job whose kind the earner supports, marking it
-/// in-flight. Returns the job with the `dispatch_seq` stamped on this hand-out,
-/// which the session remembers to fence later settle/requeue/heartbeat actions.
-/// Leaves unsupported jobs queued for other earners.
-async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Option<(JobSpec, i64)> {
+/// Take the most recent queued job whose kind the earner supports and that it
+/// has not already faulted on this session, marking it in-flight. Returns the job
+/// with the `dispatch_seq` stamped on this hand-out, which the session remembers
+/// to fence later settle/requeue/heartbeat actions. Leaves unsupported jobs — and
+/// jobs in `skip` — queued for other earners. `skip` is what stops a faulting
+/// earner from being re-offered the same job in a reject/re-offer hot loop.
+async fn take_supported_job(
+    state: &Arc<AppState>,
+    supported: &[JobKind],
+    skip: &HashSet<Uuid>,
+) -> Option<(JobSpec, i64)> {
     let store = state.store.lock().await;
-    match store.take_next(|job| supported.contains(&job.kind)) {
+    match store.take_next(|job| supported.contains(&job.kind) && !skip.contains(&job.id)) {
         Ok(job) => job,
         Err(e) => {
             tracing::error!(?e, "take_supported_job: take_next failed");
@@ -1208,16 +1245,36 @@ async fn take_supported_job(state: &Arc<AppState>, supported: &[JobKind]) -> Opt
     }
 }
 
-/// Put a job back on the queue (rejected submission or dropped connection), or
-/// dead-letter it if it has exhausted `state.max_attempts` dispatches — but only
-/// while we still hold the dispatch identified by `seq`.
+/// Why a rejected/returned job is going back on the queue, which decides whether
+/// this dispatch counts against the job's renderability budget (`max_attempts`)
+/// or the separate earner-fault budget (`max_faults`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequeueKind {
+    /// The earner failed to deliver (missed deadline, dropped socket) or the
+    /// requeue is a coordinator-internal transient. The dispatch was a genuine
+    /// rendering attempt, so it charges `max_attempts` (the existing behavior).
+    Charge,
+    /// The earner returned a faulty result (bad signature, malformed/implausible
+    /// content) or violated the submit protocol. The job is still renderable, so
+    /// the dispatch attempt is refunded and a `max_faults` fault is charged
+    /// instead — the faulting earner is penalized, never the job.
+    EarnerFault,
+}
+
+/// Put a job back on the queue, or dead-letter it once it has exhausted the
+/// relevant budget — but only while we still hold the dispatch identified by
+/// `seq`. `kind` selects the budget: a `Charge` requeue (deadline/disconnect)
+/// consumes `state.max_attempts`; an `EarnerFault` requeue refunds the dispatch
+/// attempt and consumes `state.max_faults` instead (see
+/// [`Store::requeue_earner_fault`]).
 ///
 /// The fence read and the requeue run under the same store lock, so they are
 /// atomic against any other dispatch. If the job was reaped and reassigned to a
 /// new earner since we took it, its `dispatch_seq` has advanced past `seq` and we
-/// skip: requeueing would preempt the new holder mid-render. `store.requeue` then
-/// applies its own `in_flight` guard (a reaper-parked `queued` job is a no-op).
-async fn requeue(state: &Arc<AppState>, job: JobSpec, seq: i64) {
+/// skip: requeueing would preempt the new holder mid-render. The store method
+/// then applies its own `in_flight` guard (a reaper-parked `queued` job is a
+/// no-op). The fence lives here, in one place, for both kinds.
+async fn requeue(state: &Arc<AppState>, job: JobSpec, seq: i64, kind: RequeueKind) {
     let store = state.store.lock().await;
     match store.current_dispatch_seq(&job.id) {
         Ok(Some(cur)) if cur == seq => {}
@@ -1230,12 +1287,16 @@ async fn requeue(state: &Arc<AppState>, job: JobSpec, seq: i64) {
             return;
         }
     }
-    match store.requeue(&job, state.max_attempts) {
-        Ok(true) => {
-            tracing::warn!(job_id = %job.id, "job dead-lettered (max attempts exhausted)");
+    let (dead_lettered, why) = match kind {
+        RequeueKind::Charge => (store.requeue(&job, state.max_attempts), "max attempts exhausted"),
+        RequeueKind::EarnerFault => {
+            (store.requeue_earner_fault(&job, state.max_faults), "max earner faults exhausted")
         }
+    };
+    match dead_lettered {
+        Ok(true) => tracing::warn!(job_id = %job.id, ?kind, "job dead-lettered ({why})"),
         Ok(false) => {}
-        Err(e) => tracing::error!(job_id = %job.id, ?e, "requeue failed"),
+        Err(e) => tracing::error!(job_id = %job.id, ?kind, ?e, "requeue failed"),
     }
 }
 
@@ -1246,8 +1307,10 @@ enum SubmitOutcome {
     /// Verified + settled. Clear the offer; do not requeue.
     Accepted(CoordinatorMsg),
     /// Rejected, and the job is still this earner's in-flight work — put it back
-    /// on the queue so another earner can try.
-    Requeue(CoordinatorMsg),
+    /// on the queue so another earner can try. The `RequeueKind` says whether the
+    /// reject was an earner fault (refund the attempt, charge a fault) or a
+    /// charging requeue (coordinator-internal transient).
+    Requeue(CoordinatorMsg, RequeueKind),
     /// Rejected, and the offer is stale: the job is no longer in_flight under us
     /// (reaped, reassigned, or already terminal). Drop our in-memory offer but
     /// leave the job's store state untouched — requeueing would clobber a job
@@ -1258,7 +1321,7 @@ enum SubmitOutcome {
 impl SubmitOutcome {
     fn reply(&self) -> &CoordinatorMsg {
         match self {
-            SubmitOutcome::Accepted(m) | SubmitOutcome::Requeue(m) | SubmitOutcome::Drop(m) => m,
+            SubmitOutcome::Accepted(m) | SubmitOutcome::Requeue(m, _) | SubmitOutcome::Drop(m) => m,
         }
     }
 }
@@ -1282,14 +1345,20 @@ async fn handle_submit(
     let (deadline_secs, expected_seq) = match offered {
         Some((job, seq)) if job.id == job_id => (job.deadline_secs, *seq),
         // The offered job is still validly ours; don't settle it on a mismatched
-        // submit, but free it for another earner rather than stranding it.
+        // submit, but free it for another earner rather than stranding it. A
+        // submit for the wrong job_id is an earner protocol fault — the offered
+        // job is untouched and renderable, so don't charge its attempt budget.
         Some(_) => {
-            return SubmitOutcome::Requeue(rejected("submit job_id does not match the offered job"))
+            return SubmitOutcome::Requeue(
+                rejected("submit job_id does not match the offered job"),
+                RequeueKind::EarnerFault,
+            )
         }
         None => return SubmitOutcome::Drop(rejected("no job was offered on this connection")),
     };
     if !accepted {
-        return SubmitOutcome::Requeue(rejected("submit before accept"));
+        // Submit before Accept is another earner protocol fault on a renderable job.
+        return SubmitOutcome::Requeue(rejected("submit before accept"), RequeueKind::EarnerFault);
     }
 
     if let Err(e) = verify::verify_signature(
@@ -1299,7 +1368,10 @@ async fn handle_submit(
         &result.signature_hex,
     ) {
         tracing::warn!(%job_id, earner = %result.earner_address, ?e, "ws rejected: bad attestation");
-        return SubmitOutcome::Requeue(rejected("attestation signature verification failed"));
+        return SubmitOutcome::Requeue(
+            rejected("attestation signature verification failed"),
+            RequeueKind::EarnerFault,
+        );
     }
 
     // Content gate: reject a result that is not well-formed enough to meter or
@@ -1309,7 +1381,7 @@ async fn handle_submit(
     // clobber the new holder. Mirrors the bad-attestation Requeue above.
     if let Err(e) = validate::validate_result(&result) {
         tracing::warn!(%job_id, earner = %result.earner_address, reason = e.reason(), "ws rejected: result failed content gate");
-        return SubmitOutcome::Requeue(rejected(e.reason()));
+        return SubmitOutcome::Requeue(rejected(e.reason()), RequeueKind::EarnerFault);
     }
     // Bound render_seconds against this dispatch's deadline (the reaper's lease
     // budget, already in hand via `offered`). A result claiming far more compute
@@ -1317,7 +1389,7 @@ async fn handle_submit(
     // fault. Requeue: the job may be renderable by an honest earner.
     if let Err(e) = validate::validate_render_seconds(result.render_seconds, deadline_secs) {
         tracing::warn!(%job_id, earner = %result.earner_address, reason = e.reason(), "ws rejected: result failed content gate");
-        return SubmitOutcome::Requeue(rejected(e.reason()));
+        return SubmitOutcome::Requeue(rejected(e.reason()), RequeueKind::EarnerFault);
     }
 
     // Settle only if we still hold the current dispatch. The fence read and the
@@ -1335,15 +1407,25 @@ async fn handle_submit(
                 return SubmitOutcome::Drop(rejected("job is no longer in flight"));
             }
             Err(e) => {
+                // Coordinator-internal transient (DB read), not an earner fault:
+                // keep the conservative charging requeue (existing behavior).
                 tracing::error!(%job_id, ?e, "ws: dispatch_seq read failed");
-                return SubmitOutcome::Requeue(rejected("failed to read dispatch state"));
+                return SubmitOutcome::Requeue(
+                    rejected("failed to read dispatch state"),
+                    RequeueKind::Charge,
+                );
             }
         }
         match store.record_completed(&result) {
             Ok(settled) => settled,
             Err(e) => {
+                // Coordinator-internal transient (DB write), not an earner fault:
+                // keep the conservative charging requeue (existing behavior).
                 tracing::error!(%job_id, ?e, "ws: failed to persist result");
-                return SubmitOutcome::Requeue(rejected("failed to persist result"));
+                return SubmitOutcome::Requeue(
+                    rejected("failed to persist result"),
+                    RequeueKind::Charge,
+                );
             }
         }
     };
@@ -1374,7 +1456,7 @@ mod tests {
     /// `JobKind` because the in-memory DB starts empty; tests that need an empty
     /// queue drain it first via `/jobs/next` or use `test_state_empty`.
     fn test_state() -> Arc<AppState> {
-        AppState::with_store(Store::open_in_memory().unwrap(), 5, 60).unwrap()
+        AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60).unwrap()
     }
 
     /// In-memory state with every auto-seeded job removed, so the queue starts
@@ -2305,7 +2387,7 @@ mod tests {
         }
 
         // FM1: A's socket drops → requeue with A's stale seq. Must not preempt B.
-        requeue(&state, job_a, seq_a).await;
+        requeue(&state, job_a, seq_a, RequeueKind::Charge).await;
         assert_eq!(
             state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
             Some("in_flight"),
@@ -2345,9 +2427,11 @@ mod tests {
 
         let bad = signed_result_raw_hash(job_id, "deadbeef"); // valid sig, malformed hash
         match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
-            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }) => {
+            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }, kind) => {
                 assert_eq!(jid, job_id);
                 assert_eq!(reason, validate::ValidationError::MalformedOutputHash.reason());
+                // A content fault is an earner fault: don't charge the attempt.
+                assert_eq!(kind, RequeueKind::EarnerFault);
             }
             other => panic!("expected Requeue with the content-gate reason, got {other:?}"),
         }
@@ -2358,8 +2442,8 @@ mod tests {
             Some("in_flight")
         );
 
-        // The caller's seq-fenced requeue then returns the job to the queue.
-        requeue(&state, offered, seq).await;
+        // The caller's seq-fenced earner-fault requeue then returns it to queued.
+        requeue(&state, offered, seq, RequeueKind::EarnerFault).await;
         assert_eq!(state.store.lock().await.job_status(&job_id).unwrap().as_deref(), Some("queued"));
     }
 
@@ -2380,9 +2464,10 @@ mod tests {
         let mut bad = signed_result(job_id, "deadbeef"); // valid sig + hash
         bad.render_seconds = u32::MAX; // the only defect
         match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
-            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }) => {
+            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }, kind) => {
                 assert_eq!(jid, job_id);
                 assert_eq!(reason, validate::ValidationError::ImplausibleRenderSeconds.reason());
+                assert_eq!(kind, RequeueKind::EarnerFault);
             }
             other => panic!("expected Requeue with the content-gate reason, got {other:?}"),
         }
@@ -2453,7 +2538,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -2482,7 +2567,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -2536,7 +2621,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -2551,7 +2636,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -2640,7 +2725,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 60).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -2880,6 +2965,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         // No in-flight jobs → null (stable key, absent value).
@@ -3233,6 +3319,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         let job = seed_job();
@@ -3372,6 +3459,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
 
@@ -3413,6 +3501,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
 
@@ -3456,6 +3545,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         let resp = get(state.clone(), "/jobs").await;
@@ -3470,6 +3560,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
 
@@ -3548,6 +3639,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
 
@@ -3634,6 +3726,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
@@ -3671,6 +3764,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
@@ -3717,6 +3811,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
@@ -3754,6 +3849,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         // No completed jobs yet → 0.
@@ -3790,6 +3886,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         // No completed jobs yet → "0" (serialized as a string).
@@ -3842,6 +3939,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
 
@@ -3893,6 +3991,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         for m in [
@@ -3933,6 +4032,7 @@ mod tests {
             store: Mutex::new(Store::open_in_memory().unwrap()),
             earners: Mutex::new(HashMap::new()),
             max_attempts: 5,
+            max_faults: 10,
             earner_ttl_secs: 60,
         });
         let resp = post_json(
