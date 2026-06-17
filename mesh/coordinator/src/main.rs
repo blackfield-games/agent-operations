@@ -3762,6 +3762,22 @@ mod tests {
         assert_eq!(store.failed_count().unwrap(), 0);
     }
 
+    /// An extreme deadline_secs × multiple must saturate, not panic: the sweep
+    /// runs in the background reaper, where an arithmetic overflow would unwind
+    /// and kill the loop. `u32::MAX * u32::MAX ≈ 1.8e19` overflows `i64::MAX`, so
+    /// without the saturating multiply this panics in debug. Saturated to
+    /// i64::MAX the TTL effectively never expires, and the call returns cleanly.
+    #[test]
+    fn ttl_saturates_on_extreme_inputs_instead_of_panicking() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(u32::MAX);
+        store.enqueue(&job).unwrap();
+
+        let expired = store.reap_ttl_expired(i64::MAX, u32::MAX).unwrap();
+        assert!(expired.is_empty(), "a saturated TTL effectively never expires");
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight() {
         // Build state on a non-seeded in-memory store so the queue truly starts

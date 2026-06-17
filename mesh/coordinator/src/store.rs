@@ -548,7 +548,11 @@ impl Store {
             if job.deadline_secs == 0 {
                 continue; // operator-unbounded job: no wall-clock TTL
             }
-            let ttl = job.deadline_secs as i64 * ttl_multiple as i64;
+            // saturating, not checked: an extreme deadline_secs/multiple must not
+            // panic — this runs inside the background reaper, where an unwind would
+            // silently kill the whole reap loop (the caller's match only catches Err,
+            // not a panic). A saturated TTL just means "effectively never expires".
+            let ttl = (job.deadline_secs as i64).saturating_mul(ttl_multiple as i64);
             if now_secs - created_at >= ttl {
                 // Guard on a still-non-terminal status so a settle/dead-letter
                 // that landed since the scan above is left untouched.
