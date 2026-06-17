@@ -195,12 +195,13 @@ impl Store {
     /// `>= max_attempts` → terminal `failed`, otherwise back to `queued`; clears
     /// `started_at`. Reaper-driven expiry lives in `reap_expired`.
     ///
-    /// Residual race (tracked as `mesh-dispatch-lease-fence`): the in_flight
-    /// check cannot distinguish "in_flight under me" from "in_flight under a
-    /// later earner". If a slow earner's job is reaped, reassigned to a new
-    /// earner, and only then the slow earner disconnects, this requeue still sees
-    /// `in_flight` and preempts the new holder. Closing it needs a per-dispatch
-    /// fence token, which the wire protocol does not yet carry.
+    /// The `in_flight` check alone cannot distinguish "in_flight under me" from
+    /// "in_flight under a later earner" (a job reaped then reassigned). That fence
+    /// lives one layer up: the coordinator's `requeue` helper compares
+    /// `current_dispatch_seq` against the seq it dispatched — under this same store
+    /// lock — before calling here, so a stale holder's late disconnect can no
+    /// longer preempt the new holder. This method is the `in_flight`/`attempts`
+    /// backstop beneath that dispatch-seq fence.
     ///
     /// Returns `true` iff the job was dead-lettered (moved to `failed`); `false`
     /// if it was requeued OR if it was a no-op (not in_flight / unknown).

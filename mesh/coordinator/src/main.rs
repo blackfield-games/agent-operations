@@ -775,17 +775,20 @@ async fn submit(
 ///   1. earner → `EarnerMsg::Hello` (required first message; registers like
 ///      `/register`). Any other first message closes the socket.
 ///   2. coordinator polls the queue; when a job whose `kind` the earner
-///      advertised in `supported` is available, it pops it and sends
+///      advertised in `supported` is available, it pops it (stamping a fresh
+///      `dispatch_seq`, which the session remembers) and sends
 ///      `CoordinatorMsg::JobOffer(job)`. Only one job is offered at a time.
 ///   3. earner → `EarnerMsg::Accept { job_id }` marks the offer in-flight; an
 ///      `Accept` for a different/unknown job is ignored.
 ///   4. earner → `EarnerMsg::Submit(result)`: the signature + job_id are
-///      verified and the job is settled only while still in_flight. Valid +
-///      in_flight → push to `completed` and reply `CoordinatorMsg::Accepted
-///      { job_id, attestation_uid }`. Bad signature / wrong job → `Rejected`
-///      and the job is requeued for another earner. Stale offer (the job was
-///      reaped/reassigned out from under us) → `Rejected`, and the job is left
-///      untouched (not requeued). See [`SubmitOutcome`].
+///      verified and the job is settled only while it still holds the
+///      `dispatch_seq` we remembered (the fence). Valid + current dispatch →
+///      push to `completed` and reply `CoordinatorMsg::Accepted { job_id,
+///      attestation_uid }`. Bad signature / wrong job → `Rejected` and the job
+///      is requeued for another earner. Stale offer (the job was reaped and
+///      reassigned out from under us, so its seq has advanced) → `Rejected`, and
+///      the job is left untouched (not requeued, not settled). See
+///      [`SubmitOutcome`].
 ///   5. earner → `EarnerMsg::Heartbeat { job_id, progress_pct }`: when
 ///      `job_id` matches the currently offered job, `store.touch` bumps
 ///      `started_at` so the reaper deadline slides from the last heartbeat
