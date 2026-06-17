@@ -381,6 +381,40 @@ contract ArtifactTemplateTest is Test {
         assertEq(rs.observedTotalMintedAtSpend(), 5, "CEI: outer effects precede the spend");
     }
 
+    // --- fee-rate config ---
+
+    function test_constructor_revertsZeroComputeMeter() public {
+        vm.expectRevert(ArtifactTemplate.ZeroComputeMeter.selector);
+        new ArtifactTemplate(owner, BASE_URI, address(0), FEE_RATE);
+    }
+
+    function test_constructor_revertsZeroFeeRate() public {
+        // A zero rate would re-open free mints for every template (mirrors the
+        // RegionAuthority zero-stake hole); reject it at construction.
+        vm.expectRevert(ArtifactTemplate.ZeroFeeRate.selector);
+        new ArtifactTemplate(owner, BASE_URI, address(meter), 0);
+    }
+
+    function test_setMintFeeRate_updatesAndEmits() public {
+        vm.expectEmit(false, false, false, true);
+        emit MintFeeRateSet(99e12);
+        vm.prank(owner);
+        art.setMintFeeRate(99e12);
+        assertEq(art.mintFeeRate(), 99e12);
+    }
+
+    function test_setMintFeeRate_revertsZero() public {
+        vm.expectRevert(ArtifactTemplate.ZeroFeeRate.selector);
+        vm.prank(owner);
+        art.setMintFeeRate(0);
+    }
+
+    function test_setMintFeeRate_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        vm.prank(stranger);
+        art.setMintFeeRate(123);
+    }
+
     // --- HUD read-path counters (templatesByAuthor / totalMinted / mintedByTemplate) ---
 
     function test_registerTemplate_tracksTemplatesByAuthor() public {
