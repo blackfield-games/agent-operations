@@ -17,6 +17,19 @@
   },
   {
     "inputs": [],
+    "name": "MAX_RARITY",
+    "outputs": [
+      {
+        "internalType": "uint16",
+        "name": "",
+        "type": "uint16"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "acceptOwnership",
     "outputs": [],
     "stateMutability": "nonpayable",
@@ -779,6 +792,17 @@
     "type": "error"
   },
   {
+    "inputs": [
+      {
+        "internalType": "uint16",
+        "name": "rarity",
+        "type": "uint16"
+      }
+    ],
+    "name": "InvalidRarity",
+    "type": "error"
+  },
+  {
     "inputs": [],
     "name": "NotMinter",
     "type": "error"
@@ -808,6 +832,21 @@
   {
     "inputs": [],
     "name": "UnknownTemplate",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroAmount",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroAuthor",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroRecipient",
     "type": "error"
   }
 ]
