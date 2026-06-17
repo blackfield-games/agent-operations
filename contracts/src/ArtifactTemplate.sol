@@ -11,6 +11,11 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 contract ArtifactTemplate is ERC1155, Ownable2Step {
     address public minter;
 
+    /// @notice Upper bound on `rarity`, in basis points (100%). The off-chain
+    ///         rarity->fee calculation treats this as the full-scale value, so a
+    ///         template above it would over/under-charge the $BLCKFLD mint fee.
+    uint16 public constant MAX_RARITY = 10_000;
+
     struct Template {
         address author;
         uint16 rarity; // 0-10000 basis points, drives mint cost
@@ -42,6 +47,10 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
 
     error NotMinter();
     error UnknownTemplate();
+    error ZeroAuthor();
+    error InvalidRarity(uint16 rarity);
+    error ZeroRecipient();
+    error ZeroAmount();
 
     constructor(address owner_, string memory baseUri_) ERC1155(baseUri_) Ownable(owner_) {}
 
@@ -59,6 +68,10 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         returns (uint256 templateId)
     {
         if (msg.sender != minter) revert NotMinter();
+        // author==0 is the UnknownTemplate sentinel; registering it would brick
+        // every future mint of this id. rarity>MAX_RARITY breaks the fee scale.
+        if (author == address(0)) revert ZeroAuthor();
+        if (rarity > MAX_RARITY) revert InvalidRarity(rarity);
         templateId = ++nextTemplateId;
         templates[templateId] = Template({author: author, rarity: rarity, manifest: manifest});
         ++templatesByAuthor[author];
@@ -67,10 +80,18 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
 
     function mint(address to, uint256 templateId, uint256 amount, bytes calldata data) external {
         if (msg.sender != minter) revert NotMinter();
+        if (to == address(0)) revert ZeroRecipient();
+        if (amount == 0) revert ZeroAmount();
         if (templates[templateId].author == address(0)) revert UnknownTemplate();
-        _mint(to, templateId, amount, data);
+
+        // Write the supply counters before _mint, which fires the ERC-1155
+        // receiver hook on `to` — a minter that is also the recipient could
+        // reenter mint() during that hook. Effects-before-interaction (CEI)
+        // means the reentrant call sees counters that already include this mint.
         totalMinted += amount;
         mintedByTemplate[templateId] += amount;
+
+        _mint(to, templateId, amount, data);
         emit Minted(to, templateId, amount);
     }
 }
