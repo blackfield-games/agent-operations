@@ -980,7 +980,14 @@ async fn submit(
 ///      `CoordinatorMsg::JobOffer(job)`. Only one job is offered at a time.
 ///   3. earner → `EarnerMsg::Accept { job_id }` marks the offer in-flight; an
 ///      `Accept` for a different/unknown job is ignored.
-///   4. earner → `EarnerMsg::Submit(result)`: the signature + job_id are
+///   4. earner → `EarnerMsg::Decline { job_id, reason }` (instead of Accept):
+///      the earner refuses the offer without rendering it (its capability
+///      self-guard caught a kind it can't serve). For the currently offered job
+///      we requeue it for a capable earner with the dispatch attempt refunded
+///      (`RequeueKind::EarnerFault`) and add it to this session's skip set, so it
+///      is neither re-offered nor re-declined in a loop; a decline for any other
+///      job id is ignored.
+///   5. earner → `EarnerMsg::Submit(result)`: the signature + job_id are
 ///      verified and the job is settled only while it still holds the
 ///      `dispatch_seq` we remembered (the fence). Valid + current dispatch →
 ///      push to `completed` and reply `CoordinatorMsg::Accepted { job_id,
@@ -989,7 +996,7 @@ async fn submit(
 ///      reassigned out from under us, so its seq has advanced) → `Rejected`, and
 ///      the job is left untouched (not requeued, not settled). See
 ///      [`SubmitOutcome`].
-///   5. earner → `EarnerMsg::Heartbeat { job_id, progress_pct }`: when
+///   6. earner → `EarnerMsg::Heartbeat { job_id, progress_pct }`: when
 ///      `job_id` matches the currently offered job, `store.touch` bumps
 ///      `started_at` so the reaper deadline slides from the last heartbeat
 ///      rather than from dispatch (liveness-aware reaping). A non-matching or
@@ -1115,6 +1122,29 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                                 tracing::info!(earner = %earner_address, %job_id, "offer accepted");
                             }
                             _ => tracing::warn!(earner = %earner_address, %job_id, "accept for unknown/stale job"),
+                        }
+                    }
+                    EarnerMsg::Decline { job_id, reason } => {
+                        // The earner refuses this offer without rendering it (its
+                        // capability self-guard caught a kind it can't serve).
+                        // Mirror the earner-fault disposition: the job is still
+                        // renderable, so requeue it for a capable earner with the
+                        // dispatch attempt refunded (RequeueKind::EarnerFault), and
+                        // add it to this session's skip set so we don't re-offer —
+                        // and it can't re-decline — the same job in a hot loop.
+                        // Only act on the job we currently have offered (fenced by
+                        // the remembered dispatch seq inside `requeue`); a decline
+                        // for any other id is stale/unknown and ignored.
+                        match &offered {
+                            Some((job, _)) if job.id == job_id => {
+                                tracing::info!(earner = %earner_address, %job_id, %reason, "offer declined; requeueing for a capable earner");
+                                if let Some((job, seq)) = offered.take() {
+                                    faulted.insert(job.id);
+                                    requeue(&state, job, seq, RequeueKind::EarnerFault).await;
+                                }
+                                accepted = false;
+                            }
+                            _ => tracing::warn!(earner = %earner_address, %job_id, "decline for unknown/stale job"),
                         }
                     }
                     EarnerMsg::Submit(result) => {
@@ -2414,6 +2444,63 @@ mod tests {
             state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
             Some("queued"),
             "an earner fault must not dead-letter a renderable job"
+        );
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_failed"], 0, "nothing dead-lettered");
+        assert_eq!(json["jobs_completed"], 0, "nothing credited");
+    }
+
+    /// A ws earner that DECLINES an offered job (its capability self-guard fired)
+    /// is not re-offered the same job, and the job returns to the queue
+    /// renderable for another earner — never dead-lettered by the decline.
+    /// Mirrors the earner-fault disposition but driven by an `EarnerMsg::Decline`
+    /// instead of a faulty Submit, and proves the coordinator acts on Decline (a
+    /// dropped/undecoded decline would leave the job stuck `in_flight`).
+    #[tokio::test]
+    async fn ws_decline_requeues_job_and_does_not_reoffer_to_same_earner() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+
+        // Decline instead of Accept — never rendered, never accepted.
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Decline {
+                job_id,
+                reason: "unsupported job kind: terrain".into(),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // The same earner must NOT be re-offered the declined job (the skip set).
+        // A re-offer would arrive within a poll tick (~100ms); wait well past it
+        // and assert nothing comes — a regressed skip set would land a JobOffer.
+        let reoffer =
+            tokio::time::timeout(Duration::from_millis(500), next_coordinator_msg(&mut ws)).await;
+        assert!(reoffer.is_err(), "declined job re-offered to the same earner: {reoffer:?}");
+
+        // The job is back on the queue, renderable for another earner — not left
+        // in_flight (which a dropped decline would do) and not dead-lettered.
+        assert_eq!(
+            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            Some("queued"),
+            "a decline must requeue the job, not strand it in_flight or dead-letter it"
         );
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_failed"], 0, "nothing dead-lettered");
