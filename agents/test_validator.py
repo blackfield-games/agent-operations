@@ -35,15 +35,30 @@ def _brief() -> WorldBrief:
     return WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
 
 
-def _layer(root: Path, specialist: str, body: str | None = VALID_BODY) -> LayerSpec:
+# Metrics each role is contracted to emit (mirrors the real terrain/optimization
+# stubs); other specialists emit none. _full_set applies these so a fully-formed
+# world satisfies the validator's per-role metrics schema.
+_ROLE_METRICS = {"terrain": {"triangles": 262144.0}, "optimization": {"over_budget": 0.0}}
+
+
+def _layer(
+    root: Path,
+    specialist: str,
+    body: str | None = VALID_BODY,
+    metrics: dict | None = None,
+) -> LayerSpec:
     """Write a layer file for `specialist` under `root` (skipped when body is
-    None, to model a LayerSpec pointing at a missing file) and return its spec."""
+    None, to model a LayerSpec pointing at a missing file) and return its spec.
+    `metrics` defaults to the role's contracted metrics so a layer satisfies the
+    schema unless a test deliberately overrides it."""
     rel = f"{specialist}/{REGION}.usda"
     if body is not None:
         full = root / rel
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(body)
-    return LayerSpec(specialist=specialist, region_id=REGION, path=rel, summary="t")
+    if metrics is None:
+        metrics = dict(_ROLE_METRICS.get(specialist, {}))
+    return LayerSpec(specialist=specialist, region_id=REGION, path=rel, summary="t", metrics=metrics)
 
 
 def _full_set(root: Path) -> list[LayerSpec]:
@@ -144,6 +159,73 @@ async def test_run_flags_a_dangling_layer_file(tmp_path):
     assert not verdict.accepted
     assert any("biome" in issue and "missing" in issue for issue in verdict.issues)
     assert _failing_specialist(verdict.issues) == "biome"
+
+
+# ---- per-role metrics schema ----
+
+
+def _with_override(root: Path, specialist: str, layer: LayerSpec) -> list[LayerSpec]:
+    """A full well-formed set with one specialist's spec replaced by `layer`."""
+    return [layer if s == specialist else _layer(root, s) for s in SPECIALISTS]
+
+
+async def test_run_rejects_missing_required_metric_and_routes_to_optimization(tmp_path):
+    # The optimizer emits NO over_budget — the budget gate would silently pass via
+    # its .get(..., 0.0) default. The schema must catch the missing metric.
+    opt = _layer(tmp_path, "optimization", metrics={})
+    verdict = await validator.run(_brief(), _with_override(tmp_path, "optimization", opt), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("optimization" in i and "over_budget" in i and "missing" in i for i in verdict.issues)
+    assert _failing_specialist(verdict.issues) == "optimization"
+
+
+async def test_run_rejects_misspelled_metric_key_and_routes_to_terrain(tmp_path):
+    # terrain emits `tri` instead of `triangles`; the optimizer's sum silently reads
+    # 0 for it. The schema catches the missing `triangles` and routes back to terrain.
+    terr = _layer(tmp_path, "terrain", metrics={"tri": 262144.0})
+    verdict = await validator.run(_brief(), _with_override(tmp_path, "terrain", terr), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("terrain" in i and "triangles" in i for i in verdict.issues)
+    assert _failing_specialist(verdict.issues) == "terrain"
+
+
+async def test_run_rejects_a_nan_metric_value(tmp_path):
+    # Pydantic accepts NaN for a float field, so a NaN over_budget reaches the gate
+    # where `nan > 0` is False (silently passing). The schema rejects non-finite.
+    opt = _layer(tmp_path, "optimization", metrics={"over_budget": float("nan")})
+    verdict = await validator.run(_brief(), _with_override(tmp_path, "optimization", opt), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("optimization" in i and "over_budget" in i and "finite" in i for i in verdict.issues)
+    assert _failing_specialist(verdict.issues) == "optimization"
+
+
+async def test_run_rejects_a_wrong_typed_metric_value(tmp_path):
+    # A string where a float is expected — bypass Pydantic (which would reject it at
+    # construction) to model a metric that slipped through wrong-typed.
+    bad = _layer(tmp_path, "optimization").model_copy(update={"metrics": {"over_budget": "lots"}})
+    verdict = await validator.run(_brief(), _with_override(tmp_path, "optimization", bad), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("optimization" in i and "over_budget" in i and "finite" in i for i in verdict.issues)
+    assert _failing_specialist(verdict.issues) == "optimization"
+
+
+async def test_run_accepts_int_valued_metrics(tmp_path):
+    # FM3 discriminator: int metrics must NOT be flagged against the float contract.
+    # Bypass Pydantic (which coerces int->float) so the values are genuinely int.
+    terr = _layer(tmp_path, "terrain").model_copy(update={"metrics": {"triangles": 262144}})
+    opt = _layer(tmp_path, "optimization").model_copy(update={"metrics": {"over_budget": 0}})
+    layers = []
+    for s in SPECIALISTS:
+        layers.append(terr if s == "terrain" else opt if s == "optimization" else _layer(tmp_path, s))
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+def test_metrics_no_schema_role_imposes_no_requirement(tmp_path):
+    # FM4: a role with no ROLE_METRICS entry (biome) and no metrics must return no
+    # issues and must not KeyError.
+    biome = _layer(tmp_path, "biome", metrics={})
+    assert validator._metrics_issues(biome) == []
 
 
 # ---- composition conflicts (cross-layer) ----
