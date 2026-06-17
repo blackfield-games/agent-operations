@@ -154,6 +154,51 @@ contract ReentrantRevokeEAS is IEAS {
     }
 }
 
+/// @dev Hostile EAS that reenters revokeReceipt with the same jobId mid-ATTEST (during
+///      issueReceipt), when receiptIssued is already set but receiptUid is still zero.
+///      Proves revokeReceipt's uid==0 guard rejects it (NotIssued) without relying on EAS
+///      to reject a zero uid, and the outer issue still completes cleanly.
+contract ReentrantIssueRevokeEAS is IEAS {
+    RenderReceipts public target;
+    bytes32 public reJobId;
+    uint256 public attestCalls;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    function arm(RenderReceipts target_, bytes32 jobId_) external {
+        target = target_;
+        reJobId = jobId_;
+    }
+
+    function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
+        attestCalls++;
+        if (!reentered) {
+            reentered = true;
+            try target.revokeReceipt(reJobId) {
+            // reentry unexpectedly succeeded — reentryReverted stays false
+            }
+            catch (bytes memory err) {
+                reentryReverted = true;
+                reentryRevertSelector = bytes4(err);
+            }
+        }
+        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {
+        revert("not implemented");
+    }
+
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata)
+        external
+        payable
+        returns (bytes32[] memory)
+    {
+        revert("not implemented");
+    }
+}
+
 contract MockSchemaRegistry is ISchemaRegistry {
     bytes32 public constant FIXED_UID = keccak256("blackfield.render.schema.v1");
 
@@ -756,6 +801,42 @@ contract RenderReceiptsTest is Test {
         assertEq(r.receiptCount(), 0);
         assertEq(r.receiptsByEarner(earner), 0);
         assertEq(r.revokedCount(), 1);
+    }
+
+    /// @dev Cross-function reentrancy: issueReceipt sets receiptIssued before its attest
+    ///      but receiptUid only after, so a hostile EAS reentering revokeReceipt during
+    ///      attest finds the receipt issued with a still-zero uid. revokeReceipt's uid==0
+    ///      guard rejects it with NotIssued (self-contained, not relying on EAS), and the
+    ///      outer issue completes with clean, consistent state. (Without the guard the
+    ///      reentry would revert in EAS instead, with a different selector.)
+    function test_issueReceipt_reentrantRevokeDuringAttestIsRejected() public {
+        ReentrantIssueRevokeEAS reentrantEas = new ReentrantIssueRevokeEAS();
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner);
+
+        bytes32 jobId = keccak256("reentrant-revoke-during-attest");
+        reentrantEas.arm(r, jobId);
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(reentrantEas), true); // reentry's msg.sender is the EAS
+        vm.stopPrank();
+
+        vm.prank(coordinator);
+        bytes32 uid = r.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        // The reentrant revoke hit revokeReceipt's uid==0 guard (NotIssued), not EAS.
+        assertTrue(reentrantEas.reentered());
+        assertTrue(reentrantEas.reentryReverted());
+        assertEq(reentrantEas.reentryRevertSelector(), RenderReceipts.NotIssued.selector);
+
+        // The outer issue completed cleanly: one live receipt, not revoked, uid persisted.
+        assertEq(r.receiptCount(), 1);
+        assertEq(r.receiptsByEarner(earner), 1);
+        assertEq(r.revokedCount(), 0);
+        assertFalse(r.receiptRevoked(jobId));
+        assertTrue(r.receiptIssued(jobId));
+        assertEq(r.receiptUid(jobId), uid);
     }
 
     // --- Ownable2Step ---
