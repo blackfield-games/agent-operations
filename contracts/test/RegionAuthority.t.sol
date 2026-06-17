@@ -217,39 +217,42 @@ contract RegionAuthorityTest is Test {
         assertEq(token.balanceOf(bob), bobBefore + STAKE);
     }
 
-    /// @dev A malicious ERC-20 staking token reenters unstake() from its transfer
-    ///      hook during the payout. unstake deletes the stake and burns the NFT
-    ///      before the transfer (effects-before-interaction), so the reentrant
-    ///      call reverts on the burned token's ownerOf() and no second withdrawal
-    ///      is possible — alice recovers exactly one stake.
-    function test_unstake_reentrantTokenCannotDoubleWithdraw() public {
-        ReentrantUnstakeToken evil = new ReentrantUnstakeToken();
+    /// @dev Reentrancy proof. A region holder reenters unstake() from the staking
+    ///      token's payout hook. Because the attacker IS the holder, the reentry
+    ///      passes the `ownerOf == msg.sender` gate — so the only thing stopping a
+    ///      second withdrawal is that unstake deletes the stake and burns the NFT
+    ///      *before* the payout transfer (CEI). A second honest staker's funds sit
+    ///      in the pool, making a double-withdraw genuinely fundable, so this test
+    ///      fails (reentry would succeed and drain the pool) if delete/burn were
+    ///      moved after the transfer.
+    function test_unstake_reentrantHolderCannotDrainPool() public {
+        HookToken evil = new HookToken();
         RegionAuthority r = new RegionAuthority(address(evil), STAKE, owner);
-        evil.setRegion(r);
+        ReentrantHolder attacker = new ReentrantHolder(r, evil);
 
-        evil.transfer(alice, 1_000 ether);
-        uint256 aliceBefore = evil.balanceOf(alice);
+        // Honest staker funds a distinct region, so the pool holds 2*STAKE when the
+        // attacker unstakes — enough to pay a reentrant double-withdraw if it lands.
+        uint256 aliceTile = uint256(keccak256("region:9,9,0"));
+        evil.transfer(alice, STAKE);
         vm.prank(alice);
         evil.approve(address(r), type(uint256).max);
-
         vm.prank(alice);
-        r.claim(TILE, STAKE);
+        r.claim(aliceTile, STAKE);
+
+        evil.transfer(address(attacker), STAKE);
+        attacker.claim(TILE, STAKE);
+        assertEq(evil.balanceOf(address(r)), 2 * STAKE);
+
+        evil.arm(); // fire the holder's reentry on the next payout to it
+        attacker.unstake();
+
+        // The reentry fired and reverted (NFT already burned), so the attacker
+        // recovered exactly its own stake and the honest staker's funds are intact.
+        assertTrue(attacker.reentered());
+        assertTrue(attacker.reentryReverted());
+        assertEq(evil.balanceOf(address(attacker)), STAKE);
         assertEq(evil.balanceOf(address(r)), STAKE);
-
-        evil.arm(TILE); // reenter unstake(TILE) once during the payout transfer
-
-        vm.prank(alice);
-        r.unstake(TILE);
-
-        // The reentry fired and was rejected: the NFT was burned before the payout.
-        assertTrue(evil.reentryAttempted());
-        assertTrue(evil.reentryReverted());
-
-        // Exactly one payout — alice whole, region drained, NFT gone.
-        assertEq(evil.balanceOf(alice), aliceBefore);
-        assertEq(evil.balanceOf(address(r)), 0);
-        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, TILE));
-        r.ownerOf(TILE);
+        assertEq(r.balanceOf(address(attacker)), 0);
     }
 
     // --- setStakeRequired ---
@@ -307,38 +310,64 @@ contract RegionAuthorityTest is Test {
     }
 }
 
-/// @notice ERC-20 that reenters RegionAuthority.unstake() once from its transfer
-///         hook (the payout path) to probe unstake's effects-before-interaction
-///         ordering. Disarmed by default so funding/claim transfers are normal.
-contract ReentrantUnstakeToken is ERC20 {
-    RegionAuthority region;
-    uint256 armedTokenId;
+/// @notice ERC-20 staking token with an armed recipient hook (ERC777-style), used
+///         to hand control to the holder mid-payout so it can reenter unstake().
+///         Disarmed by default so funding/claim transfers are normal.
+contract HookToken is ERC20 {
     bool armed;
-    bool public reentryAttempted;
-    bool public reentryReverted;
 
-    constructor() ERC20("Reentrant", "RNT") {
+    constructor() ERC20("Hook", "HOOK") {
         _mint(msg.sender, 1_000_000 ether);
     }
 
-    function setRegion(RegionAuthority region_) external {
-        region = region_;
-    }
-
-    function arm(uint256 tokenId) external {
-        armedTokenId = tokenId;
+    function arm() external {
         armed = true;
     }
 
-    function transfer(address to, uint256 value) public override returns (bool) {
-        if (armed) {
+    function _update(address from, address to, uint256 value) internal override {
+        super._update(from, to, value);
+        if (armed && to != address(0) && to.code.length > 0) {
             armed = false; // one-shot, so the reentrant payout doesn't recurse
-            reentryAttempted = true;
-            try region.unstake(armedTokenId) {}
-            catch {
-                reentryReverted = true;
-            }
+            ReentrantHolder(to).onPayout();
         }
-        return super.transfer(to, value);
+    }
+}
+
+/// @notice Region holder that reenters unstake() once when it receives the staking
+///         token payout. It IS the NFT holder, so the reentry clears the NotHolder
+///         gate — only unstake's delete+burn (before the payout) stops a second
+///         withdrawal from the pool.
+contract ReentrantHolder {
+    RegionAuthority region;
+    HookToken token;
+    uint256 public tokenId;
+    bool public reentered;
+    bool public reentryReverted;
+
+    constructor(RegionAuthority region_, HookToken token_) {
+        region = region_;
+        token = token_;
+    }
+
+    function claim(uint256 tokenId_, uint256 amount) external {
+        tokenId = tokenId_;
+        token.approve(address(region), type(uint256).max);
+        region.claim(tokenId_, amount);
+    }
+
+    function unstake() external {
+        region.unstake(tokenId);
+    }
+
+    function onPayout() external {
+        reentered = true;
+        try region.unstake(tokenId) {}
+        catch {
+            reentryReverted = true;
+        }
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
     }
 }
