@@ -159,7 +159,9 @@ contract RegionAuthorityFuzzTest is Test {
     }
 
     function testFuzz_claim_belowRequired_reverts(uint256 amount) public {
-        amount = bound(amount, 0, STAKE - 1);
+        // Non-zero but below the floor reverts StakeTooLow; amount==0 reverts
+        // ZeroStake (checked first), covered separately in the unit suite.
+        amount = bound(amount, 1, STAKE - 1);
 
         vm.expectRevert(RegionAuthority.StakeTooLow.selector);
         vm.prank(alice);

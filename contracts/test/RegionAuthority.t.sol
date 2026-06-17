@@ -58,6 +58,12 @@ contract RegionAuthorityTest is Test {
         assertEq(region.symbol(), "BFLD-RGN");
     }
 
+    function test_constructor_revertsZeroStake() public {
+        // A zero floor would let a region be claimed for free; reject it at construction.
+        vm.expectRevert(RegionAuthority.ZeroStake.selector);
+        new RegionAuthority(address(token), 0, owner);
+    }
+
     // --- claim happy path ---
 
     function test_claim_mintsAndStakes() public {
@@ -100,6 +106,18 @@ contract RegionAuthorityTest is Test {
         vm.expectRevert(RegionAuthority.StakeTooLow.selector);
         vm.prank(alice);
         region.claim(TILE, STAKE - 1);
+    }
+
+    function test_claim_revertsZeroAmount() public {
+        // Zero amount is rejected before the StakeTooLow check, so no region is
+        // ever minted against a zero stake even if the floor were somehow lowered.
+        vm.expectRevert(RegionAuthority.ZeroStake.selector);
+        vm.prank(alice);
+        region.claim(TILE, 0);
+
+        assertEq(region.balanceOf(alice), 0);
+        (uint256 amount,) = region.stakes(TILE);
+        assertEq(amount, 0);
     }
 
     function test_claim_revertsAlreadyClaimed() public {
@@ -213,6 +231,14 @@ contract RegionAuthorityTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         vm.prank(alice);
         region.setStakeRequired(1);
+    }
+
+    function test_setStakeRequired_revertsZero() public {
+        vm.expectRevert(RegionAuthority.ZeroStake.selector);
+        vm.prank(owner);
+        region.setStakeRequired(0);
+        // Floor unchanged after the rejected call.
+        assertEq(region.stakeRequired(), STAKE);
     }
 
     function test_setStakeRequired_affectsSubsequentClaims() public {
