@@ -34,6 +34,11 @@ contract RegionAuthorityTest is Test {
     event Staked(address indexed holder, uint256 indexed tokenId, uint256 amount);
     event Unstaked(address indexed holder, uint256 indexed tokenId, uint256 amount);
     event StakeRequiredSet(uint256 amount);
+    event FeesDeposited(uint256 indexed tokenId, address indexed from, uint256 amount);
+    event FeesClaimed(uint256 indexed tokenId, address indexed holder, uint256 amount);
+    event Withdrawn(address indexed holder, uint256 amount);
+
+    uint256 constant FEE = 30 ether;
 
     function setUp() public {
         token = new MockToken();
@@ -255,6 +260,202 @@ contract RegionAuthorityTest is Test {
         assertEq(r.balanceOf(address(attacker)), 0);
     }
 
+    // --- fee distribution ---
+
+    function test_depositFees_accruesToRegion() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+
+        vm.expectEmit(true, true, false, true);
+        emit FeesDeposited(TILE, bob, FEE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        assertEq(region.accruedFees(TILE), FEE);
+        assertEq(token.balanceOf(address(region)), STAKE + FEE);
+    }
+
+    function test_depositFees_revertsZeroAmount() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+
+        vm.expectRevert(RegionAuthority.ZeroAmount.selector);
+        vm.prank(bob);
+        region.depositFees(TILE, 0);
+    }
+
+    function test_depositFees_revertsUnknownRegion() public {
+        // No one has claimed TILE, so fees have no holder to accrue to.
+        vm.expectRevert(RegionAuthority.UnknownRegion.selector);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+    }
+
+    function test_claimFees_holderWithdrawsExact() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+
+        vm.expectEmit(true, true, false, true);
+        emit FeesClaimed(TILE, alice, FEE);
+        vm.prank(alice);
+        region.claimFees(TILE);
+
+        assertEq(token.balanceOf(alice), aliceBefore + FEE);
+        assertEq(region.accruedFees(TILE), 0);
+        // Stake stays locked; only the fees left the contract.
+        assertEq(token.balanceOf(address(region)), STAKE);
+    }
+
+    function test_claimFees_revertsNotHolder() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        vm.expectRevert(RegionAuthority.NotHolder.selector);
+        vm.prank(bob);
+        region.claimFees(TILE);
+    }
+
+    function test_claimFees_revertsNothingToClaim() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+
+        vm.expectRevert(RegionAuthority.NothingToClaim.selector);
+        vm.prank(alice);
+        region.claimFees(TILE);
+    }
+
+    /// @dev The fairness property: a region sale must not hand the buyer the fees the
+    ///      seller earned. On transfer the accrued balance settles to the OUTGOING
+    ///      holder's pull ledger; the new holder inherits nothing.
+    function test_transfer_settlesAccruedToOutgoingHolder() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        vm.prank(alice);
+        region.transferFrom(alice, bob, TILE);
+
+        assertEq(region.accruedFees(TILE), 0, "accrued cleared on transfer");
+        assertEq(region.withdrawable(alice), FEE, "settled to the seller");
+        assertEq(region.withdrawable(bob), 0, "buyer inherits nothing");
+
+        // The new holder has no region fees to claim.
+        vm.expectRevert(RegionAuthority.NothingToClaim.selector);
+        vm.prank(bob);
+        region.claimFees(TILE);
+    }
+
+    function test_withdraw_paysSettledFees() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+        vm.prank(alice);
+        region.transferFrom(alice, bob, TILE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+
+        vm.expectEmit(true, false, false, true);
+        emit Withdrawn(alice, FEE);
+        vm.prank(alice);
+        region.withdraw();
+
+        assertEq(token.balanceOf(alice), aliceBefore + FEE);
+        assertEq(region.withdrawable(alice), 0);
+    }
+
+    function test_withdraw_revertsNothingToClaim() public {
+        vm.expectRevert(RegionAuthority.NothingToClaim.selector);
+        vm.prank(alice);
+        region.withdraw();
+    }
+
+    /// @dev Unstaking burns the NFT, whose _update hook settles accrued fees into the
+    ///      holder's withdrawable ledger — so the fees are recoverable, not stranded.
+    function test_unstake_settlesAccruedNotStranded() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.prank(alice);
+        region.unstake(TILE);
+
+        // Stake returned immediately; fees parked in withdrawable.
+        assertEq(token.balanceOf(alice), aliceBefore + STAKE);
+        assertEq(region.accruedFees(TILE), 0);
+        assertEq(region.withdrawable(alice), FEE);
+
+        vm.prank(alice);
+        region.withdraw();
+        assertEq(token.balanceOf(alice), aliceBefore + STAKE + FEE);
+        assertEq(token.balanceOf(address(region)), 0, "nothing stranded");
+    }
+
+    function test_depositFees_newHolderAccruesIndependentlyAfterTransfer() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+        vm.prank(alice);
+        region.transferFrom(alice, bob, TILE);
+
+        // Fresh fees after the sale accrue to bob, the new holder.
+        vm.prank(alice);
+        region.depositFees(TILE, FEE);
+        assertEq(region.accruedFees(TILE), FEE);
+
+        vm.prank(bob);
+        region.claimFees(TILE);
+        assertEq(region.accruedFees(TILE), 0);
+        // alice still holds her pre-sale settlement, untouched.
+        assertEq(region.withdrawable(alice), FEE);
+    }
+
+    /// @dev Reentrancy proof for claimFees. A holder reenters claimFees() from the
+    ///      token payout hook; it IS the holder, so the NotHolder gate is cleared and
+    ///      only CEI (accrued zeroed before the transfer) stops a double-withdraw. A
+    ///      second region's stake sits in the pool so a double-pay would be fundable;
+    ///      the test fails (reentry drains the extra fee) if the zero moved after the
+    ///      transfer.
+    function test_claimFees_reentrantHolderCannotDoubleWithdraw() public {
+        HookToken evil = new HookToken();
+        RegionAuthority r = new RegionAuthority(address(evil), STAKE, owner);
+        ReentrantClaimer attacker = new ReentrantClaimer(r, evil);
+
+        // Fund the attacker's stake + fees, and an honest staker's stake, so the pool
+        // (STAKE + FEE + STAKE) could cover a double FEE payout if CEI were broken.
+        evil.transfer(alice, STAKE);
+        vm.prank(alice);
+        evil.approve(address(r), type(uint256).max);
+        vm.prank(alice);
+        r.claim(uint256(keccak256("region:9,9,0")), STAKE);
+
+        evil.transfer(address(attacker), STAKE);
+        attacker.claim(TILE, STAKE);
+        evil.approve(address(r), type(uint256).max);
+        r.depositFees(TILE, FEE);
+        assertEq(evil.balanceOf(address(r)), 2 * STAKE + FEE);
+
+        evil.arm(); // fire the holder's reentry on the next payout to it
+        attacker.claimFees();
+
+        assertTrue(attacker.reentered(), "reentry fired");
+        assertTrue(attacker.reentryReverted(), "reentry blocked by CEI");
+        assertEq(evil.balanceOf(address(attacker)), FEE, "got exactly one fee");
+        assertEq(r.accruedFees(TILE), 0);
+        // Honest staker's stake + the attacker's own stake remain in the pool.
+        assertEq(evil.balanceOf(address(r)), 2 * STAKE);
+    }
+
     // --- setStakeRequired ---
 
     function test_setStakeRequired_updatesAndEmits() public {
@@ -362,6 +563,45 @@ contract ReentrantHolder {
     function onPayout() external {
         reentered = true;
         try region.unstake(tokenId) {}
+        catch {
+            reentryReverted = true;
+        }
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}
+
+/// @notice Region holder that reenters claimFees() once when it receives a fee
+///         payout. It IS the NFT holder, so the reentry clears the NotHolder gate —
+///         only claimFees zeroing the accrued balance before the payout (CEI) stops
+///         a second withdrawal from the pool.
+contract ReentrantClaimer {
+    RegionAuthority region;
+    HookToken token;
+    uint256 public tokenId;
+    bool public reentered;
+    bool public reentryReverted;
+
+    constructor(RegionAuthority region_, HookToken token_) {
+        region = region_;
+        token = token_;
+    }
+
+    function claim(uint256 tokenId_, uint256 amount) external {
+        tokenId = tokenId_;
+        token.approve(address(region), type(uint256).max);
+        region.claim(tokenId_, amount);
+    }
+
+    function claimFees() external {
+        region.claimFees(tokenId);
+    }
+
+    function onPayout() external {
+        reentered = true;
+        try region.claimFees(tokenId) {}
         catch {
             reentryReverted = true;
         }
