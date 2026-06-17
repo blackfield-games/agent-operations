@@ -360,6 +360,27 @@ contract ArtifactTemplateTest is Test {
         assertEq(meter.spentByBuyer(poor), 0, "no fee debited for rarity-0");
     }
 
+    function test_mint_reentrantSpenderKeepsCEI() public {
+        // The fee debit is a second external call inside mint (alongside _mint). A
+        // misbehaving meter reenters mint() from spend(); CEI orders the supply
+        // counters before that interaction, so the reentrant mint observes the outer
+        // mint already counted and the quiescent totals stay exact.
+        ReentrantSpender rs = new ReentrantSpender();
+        ArtifactTemplate art2 = new ArtifactTemplate(owner, BASE_URI, address(rs), FEE_RATE);
+        vm.prank(owner);
+        art2.setMinter(address(rs));
+        rs.setArt(art2);
+
+        uint256 id = rs.register(author, 1000);
+        rs.fire(player, 5, 3); // outer mint 5; spend reenters and mints 3 more
+
+        assertEq(art2.totalMinted(), 8, "totals exact under reentrancy");
+        assertEq(art2.mintedByTemplate(id), 8);
+        assertEq(art2.balanceOf(player, id), 8);
+        // The discriminator: the outer counter write landed before spend reentered.
+        assertEq(rs.observedTotalMintedAtSpend(), 5, "CEI: outer effects precede the spend");
+    }
+
     // --- HUD read-path counters (templatesByAuthor / totalMinted / mintedByTemplate) ---
 
     function test_registerTemplate_tracksTemplatesByAuthor() public {
@@ -510,5 +531,40 @@ contract ReentrantMinter is IERC1155Receiver {
 
     function supportsInterface(bytes4) external pure returns (bool) {
         return true;
+    }
+}
+
+/// @notice A ComputeMeter stand-in that is also the minter, reentering mint() once
+///         from spend() to prove the supply counters (effects) land before the
+///         external spend interaction (CEI). Recipient is an EOA, so the only
+///         reentrancy path is the spend, not the ERC-1155 receiver hook.
+contract ReentrantSpender is IComputeMeter {
+    ArtifactTemplate art;
+    uint256 public templateId;
+    uint256 reentryAmount;
+    address recipient;
+    bool entered;
+    uint256 public observedTotalMintedAtSpend;
+
+    function setArt(ArtifactTemplate art_) external {
+        art = art_;
+    }
+
+    function register(address author, uint16 rarity) external returns (uint256) {
+        templateId = art.registerTemplate(author, rarity, keccak256("rs"));
+        return templateId;
+    }
+
+    function fire(address recipient_, uint256 outerAmount, uint256 reentryAmount_) external {
+        recipient = recipient_;
+        reentryAmount = reentryAmount_;
+        art.mint(recipient_, templateId, outerAmount, "");
+    }
+
+    function spend(address, uint256, bytes32) external {
+        if (entered) return;
+        entered = true;
+        observedTotalMintedAtSpend = art.totalMinted();
+        art.mint(recipient, templateId, reentryAmount, "");
     }
 }
