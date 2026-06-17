@@ -124,11 +124,14 @@ def _composition_conflicts(layers: list[LayerSpec], layers_root: Path) -> list[s
     """
     tagged: list[tuple[str, str, str, str]] = []
     for layer in layers:
-        try:
-            text = (layers_root / layer.path).read_text()
-        except OSError:
-            continue
-        for specifier, type_name, path in _prim_specs(text):
+        full = layers_root / layer.path
+        specs = _pxr_layer_specs(full)
+        if specs is None:
+            try:
+                specs = _prim_specs(full.read_text())
+            except OSError:
+                continue
+        for specifier, type_name, path in specs:
             tagged.append((layer.specialist, specifier, type_name, path))
     return _conflicts_from_specs(tagged)
 
@@ -233,3 +236,37 @@ def _conflicts_from_specs(tagged: list[tuple[str, str, str, str]]) -> list[str]:
                 f"but no specialist defines it (dangling override)"
             )
     return issues
+
+
+def _pxr_layer_specs(path: Path) -> list[tuple[str, str, str]] | None:
+    """A layer's prim specs as ``(specifier, type_name, prim_path)`` via pxr, or
+    None when usd-core isn't importable / the layer won't open.
+
+    Guarded like `_pxr_parse_issue`: returns None on any failure so
+    `_composition_conflicts` falls back to the structural `_prim_specs` scan
+    instead of raising through the gate (FM4). When pxr is present, USD's own
+    parser supersedes the regex heuristic — exact specifier, type, and namespaced
+    path for every prim spec in the layer. This resolves each layer authoritatively
+    but not the full composed stage: reference/variant/instance-mediated conflicts
+    still need the Pcp resolution that remains a TODO here.
+    """
+    try:
+        from pxr import Sdf
+    except ImportError:
+        return None
+    try:
+        layer = Sdf.Layer.OpenAsAnonymous(str(path))
+    except Exception:
+        return None
+    if not layer:
+        return None
+    specifier = {Sdf.SpecifierDef: "def", Sdf.SpecifierClass: "class", Sdf.SpecifierOver: "over"}
+    specs: list[tuple[str, str, str]] = []
+    stack = [layer.pseudoRoot]
+    while stack:
+        for child in stack.pop().nameChildren:
+            specs.append(
+                (specifier.get(child.specifier, "over"), child.typeName or "", child.path.pathString)
+            )
+            stack.append(child)
+    return specs
