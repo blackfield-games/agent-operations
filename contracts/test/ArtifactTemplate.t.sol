@@ -401,6 +401,76 @@ contract ArtifactTemplateTest is Test {
         assertEq(rs.observedTotalMintedAtSpend(), 5, "CEI: outer effects precede the spend");
     }
 
+    // --- supply cap ---
+
+    function test_registerTemplate_storesMaxSupply() public {
+        vm.startPrank(minter);
+        uint256 capped = art.registerTemplate(author, 0, keccak256("c"), 100);
+        uint256 uncapped = art.registerTemplate(author, 0, keccak256("u"), 0);
+        vm.stopPrank();
+        assertEq(art.templateMaxSupply(capped), 100);
+        assertEq(art.templateMaxSupply(uncapped), 0, "0 means uncapped");
+    }
+
+    function test_mint_cappedExactFillSucceedsThenOverUnitReverts() public {
+        // rarity 0 => free mint, so the cap is exercised in isolation from the fee.
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 0, keccak256("m"), 10);
+
+        // The boundary mint that exactly fills the cap succeeds.
+        vm.prank(minter);
+        art.mint(player, id, 10, "");
+        assertEq(art.balanceOf(player, id), 10);
+        assertEq(art.mintedByTemplate(id), 10);
+
+        // One unit over reverts with the exact SupplyExceeded args and leaves the
+        // counters untouched (the check is effects-before-interaction).
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 11, 10));
+        vm.prank(minter);
+        art.mint(player, id, 1, "");
+        assertEq(art.mintedByTemplate(id), 10, "a rejected mint must not bump the counter");
+        assertEq(art.totalMinted(), 10);
+    }
+
+    function test_mint_cappedAccumulatesAcrossMintsUpToCap() public {
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 0, keccak256("m"), 10);
+
+        vm.startPrank(minter);
+        art.mint(player, id, 4, "");
+        art.mint(player, id, 4, "");
+        art.mint(player, id, 2, ""); // exact fill at the cap
+        vm.stopPrank();
+        assertEq(art.mintedByTemplate(id), 10);
+
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 11, 10));
+        vm.prank(minter);
+        art.mint(player, id, 1, "");
+    }
+
+    function test_mint_cappedRejectsBatchExceedingCapInOneCall() public {
+        // FM1: a single batched amount over the cap must revert, not slip past.
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 0, keccak256("m"), 5);
+
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 6, 5));
+        vm.prank(minter);
+        art.mint(player, id, 6, "");
+        assertEq(art.mintedByTemplate(id), 0, "nothing minted past the cap");
+        assertEq(art.totalMinted(), 0);
+    }
+
+    function test_mint_uncappedAllowsArbitrarilyLargeMint() public {
+        // FM2: maxSupply == 0 is UNCAPPED, never a cap of zero — a huge mint lands.
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 0, keccak256("m"), 0);
+
+        vm.prank(minter);
+        art.mint(player, id, 1e30, "");
+        assertEq(art.balanceOf(player, id), 1e30);
+        assertEq(art.mintedByTemplate(id), 1e30);
+    }
+
     // --- fee-rate config ---
 
     function test_constructor_revertsZeroComputeMeter() public {

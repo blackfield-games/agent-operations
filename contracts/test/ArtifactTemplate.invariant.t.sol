@@ -36,6 +36,7 @@ contract ArtifactTemplateHandler is Test {
     uint256 public ghost_registered;
     mapping(address => uint256) public ghost_registeredByAuthor;
     mapping(uint256 => uint256) public ghost_supply;
+    mapping(uint256 => uint256) public ghost_maxSupply;
 
     constructor(ArtifactTemplate art_, address[] memory actors_) {
         art = art_;
@@ -46,16 +47,20 @@ contract ArtifactTemplateHandler is Test {
     // Handler functions
     // -----------------------------------------------------------------------
 
-    function register(uint16 rarity, bytes32 manifest, uint256 authorSeed) external {
+    function register(uint16 rarity, bytes32 manifest, uint256 authorSeed, uint256 capSeed) external {
         if (ids.length >= MAX_TEMPLATES) return;
         address author = actors[authorSeed % actors.length];
         // Keep rarity in [0, MAX_RARITY] so every register lands (the guard would
         // otherwise revert-discard the call and waste fuzz budget); actors are all
         // non-zero, so the author guard never trips here.
         rarity = rarity % (art.MAX_RARITY() + 1);
+        // Mix both regimes: ~half the templates uncapped (0), half with a bounded
+        // cap, so the supply-cap invariant is exercised alongside the uncapped path.
+        uint256 maxSupply = capSeed % 2 == 0 ? 0 : bound(capSeed, 1, 1e24);
         // Handler IS the minter; no prank needed.
-        uint256 id = art.registerTemplate(author, rarity, manifest, 0);
+        uint256 id = art.registerTemplate(author, rarity, manifest, maxSupply);
         ids.push(id);
+        ghost_maxSupply[id] = maxSupply;
         ghost_registered++;
         ghost_registeredByAuthor[author]++;
     }
@@ -65,7 +70,15 @@ contract ArtifactTemplateHandler is Test {
         uint256 id = ids[idSeed % ids.length];
         address to = actors[toSeed % actors.length];
         amount = bound(amount, 1, 1e24);
-        // Handler IS the minter; no prank needed.
+        uint256 cap = ghost_maxSupply[id];
+        // Handler IS the minter; no prank needed. A mint that would breach a non-zero
+        // cap must revert SupplyExceeded and leave supply untouched; one within the
+        // cap (or any mint to an uncapped template) lands and bumps the ghost.
+        if (cap != 0 && ghost_supply[id] + amount > cap) {
+            vm.expectRevert(ArtifactTemplate.SupplyExceeded.selector);
+            art.mint(to, id, amount, "");
+            return;
+        }
         art.mint(to, id, amount, "");
         ghost_supply[id] += amount;
     }
@@ -156,6 +169,21 @@ contract ArtifactTemplateInvariantTest is Test {
             summed += art.mintedByTemplate(id);
         }
         assertEq(art.totalMinted(), summed);
+    }
+
+    /// @dev A capped template's minted supply NEVER exceeds its cap (the scarcity
+    ///      guarantee), and the on-chain cap matches what was registered. Uncapped
+    ///      templates (cap == 0) are unconstrained and skipped.
+    function invariant_mintedNeverExceedsCap() public view {
+        uint256 len = handler.idsLength();
+        for (uint256 i = 0; i < len; i++) {
+            uint256 id = handler.ids(i);
+            uint256 cap = handler.ghost_maxSupply(id);
+            assertEq(art.templateMaxSupply(id), cap, "on-chain cap drifted from registered");
+            if (cap != 0) {
+                assertLe(art.mintedByTemplate(id), cap);
+            }
+        }
     }
 }
 
