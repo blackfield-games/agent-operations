@@ -233,6 +233,88 @@ def test_prim_specs_skips_asset_paths():
     assert validator._prim_specs(body) == [("def", "Xform", "/World"), ("def", "Mesh", "/World/Hub")]
 
 
+# A variantSet's `{ }` is a composition scope, not a prim scope: a prim defined
+# inside a variant attributes to the enclosing prim (no phantom /World//Mat), and
+# the variant braces still balance so a following sibling sits at the right depth.
+def test_prim_specs_variant_block_attributes_to_enclosing_prim():
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\n'
+        'def Xform "World" {\n'
+        '    variantSet "look" = {\n'
+        '        "red" {\n'
+        '            def Material "Mat" {}\n'
+        "        }\n"
+        "    }\n"
+        '    def Mesh "Rock" {}\n'
+        "}\n"
+    )
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("def", "Material", "/World/Mat"),
+        ("def", "Mesh", "/World/Rock"),
+    ]
+
+
+# Nested variantSets (a variantSet inside a variant inside a variantSet): the deep
+# Light still resolves under its enclosing PRIM, and the trailing Tail is back at
+# /World — proving every transparent scope popped cleanly (FM3 brace accounting).
+def test_prim_specs_nested_variant_blocks_stay_aligned():
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\n'
+        'def Xform "World" {\n'
+        '    def Scope "Rig" {\n'
+        '        variantSet "fx" = {\n'
+        '            "on" {\n'
+        '                variantSet "level" = {\n'
+        '                    "hi" { def Light "Key" {} }\n'
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        '    def Mesh "Tail" {}\n'
+        "}\n"
+    )
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("def", "Scope", "/World/Rig"),
+        ("def", "Light", "/World/Rig/Key"),
+        ("def", "Mesh", "/World/Tail"),
+    ]
+
+
+# The keyword only counts as USD syntax: a literal "variantSet" in a string value
+# and a `# variant` comment must not open a transparent scope (FM2 — the same
+# string/comment/asset skip that shields a fake `def` shields these too).
+def test_prim_specs_quoted_or_commented_variant_keyword_is_inert():
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\n'
+        'def Xform "World" {\n'
+        '    string note = "a variantSet { here is only text"\n'
+        '    # variant "x" = { also ignored\n'
+        '    def Mesh "Hub" {}\n'
+        "}\n"
+    )
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("def", "Mesh", "/World/Hub"),
+    ]
+
+
+# End-to-end through the conflict detector: two specialists define <World/Mat>
+# (incompatible types) inside variants. The conflict must surface at the REAL path
+# /World/Mat — which only holds when variant scopes inject no phantom segment;
+# pre-fix both sat at /World///Mat and this assertion fails.
+def test_variant_nested_prims_conflict_at_their_real_path():
+    a = '#usda 1.0\ndef Xform "World" {\n  variantSet "look" = { "red" { def Material "Mat" {} } }\n}\n'
+    b = '#usda 1.0\ndef Xform "World" {\n  variantSet "look" = { "red" { def Scope "Mat" {} } }\n}\n'
+    tagged = [("biome", *s) for s in validator._prim_specs(a)]
+    tagged += [("prop", *s) for s in validator._prim_specs(b)]
+    issues = validator._conflicts_from_specs(tagged)
+    assert len(issues) == 1
+    assert "</World/Mat>" in issues[0]
+    assert "Material" in issues[0] and "Scope" in issues[0]
+
+
 def test_same_type_redefinition_is_not_a_conflict():
     # Two specialists defining the same path with the same type is a legal USD
     # opinion-merge, not a conflict (FM1: don't false-positive on layering).
