@@ -1,0 +1,4 @@
+# Generated OpenUSD output: specialists write layers/<specialist>/*.usda and
+# compose_world writes world.usda. Both are build products, never source.
+/layers/
+world.usda
