@@ -88,7 +88,21 @@ impl Store {
                  created_at  INTEGER NOT NULL
              );
              -- Idempotency: at most one recorded result per job.
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_results_job_id ON results(job_id);",
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_results_job_id ON results(job_id);
+             -- Pending EAS render receipts: written atomically with the settle
+             -- (see record_completed) so a crash before the on-chain
+             -- RenderReceipts.issueReceipt cannot lose a validated job's receipt.
+             -- Fields mirror the contract's registered schema (see eas.rs).
+             CREATE TABLE IF NOT EXISTS pending_attestations (
+                 job_id         TEXT PRIMARY KEY,
+                 earner         TEXT NOT NULL,
+                 job_id_b32     TEXT NOT NULL,
+                 render_seconds INTEGER NOT NULL,
+                 job_kind       INTEGER NOT NULL,
+                 output_hash    TEXT NOT NULL,
+                 region_id_b32  TEXT NOT NULL,
+                 created_at     INTEGER NOT NULL
+             );",
         )?;
         // Migrate pre-existing DBs (created before `started_at` was added). The
         // column already exists on a later boot, so we swallow only that one
@@ -249,17 +263,21 @@ impl Store {
 
         // Re-check lifecycle inside the transaction; only an in_flight job is
         // settle-able. A non-in_flight (queued/done/failed) or unknown job is
-        // refused, leaving its state untouched.
-        let status: Option<String> = tx
-            .query_row("SELECT status FROM jobs WHERE id = ?1", [&job_id], |row| {
-                row.get::<_, String>(0)
+        // refused, leaving its state untouched. The spec is read alongside the
+        // status (same row) to build the pending attestation below.
+        let row: Option<(String, String)> = tx
+            .query_row("SELECT status, spec_json FROM jobs WHERE id = ?1", [&job_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        if status.as_deref() != Some(STATUS_IN_FLIGHT) {
+        let Some((status, spec_json)) = row else {
+            return Ok(false);
+        };
+        if status != STATUS_IN_FLIGHT {
             return Ok(false);
         }
 
@@ -281,6 +299,39 @@ impl Store {
             "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2",
             (STATUS_DONE, &job_id),
         )?;
+        // Record the pending EAS render receipt in the SAME transaction as the
+        // settle, so a crash before the on-chain relay cannot leave a settled job
+        // un-attested. Built from the stored spec (kind + region) + the result;
+        // the ON CONFLICT keeps a replay a no-op (the in_flight guard already
+        // blocks a second settle). Skipped only if the result's output_hash is
+        // malformed — unreachable on the content-gated path, but record_completed
+        // is also reachable directly (tests), so we degrade rather than fail.
+        match serde_json::from_str::<JobSpec>(&spec_json)
+            .ok()
+            .and_then(|spec| crate::eas::PendingAttestation::build(&spec, result))
+        {
+            Some(att) => {
+                tx.execute(
+                    "INSERT INTO pending_attestations
+                         (job_id, earner, job_id_b32, render_seconds, job_kind, output_hash, region_id_b32, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(job_id) DO NOTHING",
+                    (
+                        &job_id,
+                        &att.earner,
+                        &att.job_id,
+                        att.render_seconds as i64,
+                        att.job_kind,
+                        &att.output_hash,
+                        &att.region_id,
+                        created_at,
+                    ),
+                )?;
+            }
+            None => {
+                tracing::warn!(%job_id, "settle: spec unreadable or output_hash malformed; pending attestation skipped");
+            }
+        }
         tx.commit()?;
         Ok(true)
     }

@@ -39,6 +39,7 @@ const PLACEHOLDER_ATTESTATION_UID: &str =
 /// authoritative fence; HTTP poll is the legacy/dev transport.
 const DISPATCH_SEQ_HEADER: &str = "x-dispatch-seq";
 
+mod eas;
 mod store;
 mod validate;
 mod verify;
