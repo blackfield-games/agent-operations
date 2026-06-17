@@ -20,6 +20,8 @@ contract ComputeMeterTest is Test {
     address spender = address(0xC0DE);
 
     event SpenderSet(address indexed spender, bool authorized);
+    event Spent(address indexed buyer, address indexed spender, uint256 amount, bytes32 jobId);
+    event Deposited(address indexed buyer, uint256 amount, uint256 newCredit);
 
     function setUp() public {
         token = new MockToken();
@@ -73,6 +75,77 @@ contract ComputeMeterTest is Test {
         vm.prank(spender);
         vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
         meter.spend(buyer, 100 ether, bytes32(0));
+    }
+
+    function test_spend_zeroAmount_isNoOpButEmits() public {
+        // The credit guard is `c < amount`, so amount == 0 always passes (even at
+        // zero credit) and debits nothing. This pins that boundary: a zero-amount
+        // spend changes no accounting but still emits a Spent event with the jobId.
+        // If a future ZeroAmount guard is added, this test flips intentionally.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        bytes32 jobId = keccak256("zero-job");
+        vm.expectEmit(true, true, false, true);
+        emit Spent(buyer, spender, 0, jobId);
+        vm.prank(spender);
+        meter.spend(buyer, 0, jobId);
+
+        assertEq(meter.credit(buyer), 100 ether, "credit untouched");
+        assertEq(meter.totalSpent(), 0, "global spend untouched");
+        assertEq(meter.spentByBuyer(buyer), 0, "per-buyer spend untouched");
+    }
+
+    function test_spend_ownerIsNotImplicitlyAuthorized() public {
+        // Authority separation: the owner gates spenders via setSpender but is not
+        // itself a spender. It must self-authorize to debit, so a stray owner key
+        // can't drain credit without first emitting an on-chain SpenderSet(owner).
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        assertFalse(meter.authorizedSpenders(owner));
+        vm.prank(owner);
+        vm.expectRevert(ComputeMeter.NotAuthorized.selector);
+        meter.spend(buyer, 10 ether, keccak256("j"));
+    }
+
+    function test_spend_exactDrainToZero() public {
+        // The c == amount boundary: `c < amount` is false, so an exact-balance
+        // debit succeeds, lands credit at exactly zero, and a further non-zero
+        // spend then reverts InsufficientCredit (FM2 boundary, explicit vs fuzz).
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        vm.prank(spender);
+        meter.spend(buyer, 100 ether, keccak256("drain"));
+
+        assertEq(meter.credit(buyer), 0);
+        assertEq(meter.spentByBuyer(buyer), 100 ether);
+        assertEq(meter.totalSpent(), 100 ether);
+
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
+        meter.spend(buyer, 1, keccak256("over"));
+    }
+
+    function test_deposit_zeroAmount_isNoOp() public {
+        // deposit(0) transfers nothing, credits nothing, but still emits the event.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 1 ether);
+        vm.expectEmit(true, false, false, true);
+        emit Deposited(buyer, 0, 0);
+        meter.deposit(0);
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 0);
+        assertEq(meter.totalBurned(), 0);
+        assertEq(token.balanceOf(buyer), 1000 ether, "no tokens moved");
     }
 
     function test_totalBurned_accumulates() public {
