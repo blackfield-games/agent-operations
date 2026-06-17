@@ -212,3 +212,69 @@ def test_compose_world_happy_path_all_known_specialists(tmp_path):
     root = compose_world(layers, tmp_path)
     assert root.exists()
     assert root.name == "world.usda"
+
+
+def test_compose_rejects_empty_layer_path_naming_specialist(tmp_path):
+    """An empty path would emit `@.//@` and reference nothing; reject it, fail-fast
+    (no file written), and name the offending specialist."""
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r+0000_+0000_l0", path="", summary="x", metrics={}),
+    ]
+    with pytest.raises(ValueError, match="terrain"):
+        compose_world(layers, tmp_path)
+    assert not (tmp_path / "world.usda").exists()
+
+
+def test_compose_rejects_at_delimiter_in_path_naming_specialist(tmp_path):
+    """An `@` closes the USDA asset reference early and injects arbitrary syntax —
+    the actual world.usda corruption the guard exists to stop (FM2)."""
+    layers = [
+        LayerSpec(specialist="biome", region_id="r+0000_+0000_l0", path="biome/a@evil.usda", summary="x", metrics={}),
+    ]
+    with pytest.raises(ValueError, match="biome"):
+        compose_world(layers, tmp_path)
+    assert not (tmp_path / "world.usda").exists()
+
+
+def test_compose_rejects_newline_in_path_naming_specialist(tmp_path):
+    """A newline breaks out of the `subLayers = [ ]` block (FM2)."""
+    layers = [
+        LayerSpec(specialist="prop", region_id="r+0000_+0000_l0", path="prop/a\n].usda", summary="x", metrics={}),
+    ]
+    with pytest.raises(ValueError, match="prop"):
+        compose_world(layers, tmp_path)
+    assert not (tmp_path / "world.usda").exists()
+
+
+def test_compose_accepts_legitimate_relative_paths(tmp_path):
+    """FM1 discriminator: the allowlist must NOT reject the real convention —
+    nested subdirs, the `+`/`-`/`_` region-id chars, and dots all compose
+    unchanged and in strength order. A too-aggressive guard would raise here."""
+    region = "r+0042_-0017_l0"
+    layers = [
+        LayerSpec(specialist="terrain", region_id=region, path="terrain/sub/r+0042_-0017_l0.usda", summary="t", metrics={}),
+        LayerSpec(specialist="biome", region_id=region, path="biome/a.b.usda", summary="b", metrics={}),
+    ]
+    root = compose_world(layers, tmp_path)
+    text = root.read_text()
+    assert "@./terrain/sub/r+0042_-0017_l0.usda@" in text
+    assert "@./biome/a.b.usda@" in text
+    # Stronger specialist (biome) is listed before the weaker (terrain).
+    assert text.index("@./biome/a.b.usda@") < text.index("@./terrain/sub/r+0042_-0017_l0.usda@")
+
+
+def test_compose_empty_set_warns_and_writes_parseable_empty_world(tmp_path, caplog):
+    """An all-None / empty specialist set must DEGRADE (warn), not raise (FM3),
+    and write a still-parseable, explicitly-empty world.usda."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        root = compose_world([], tmp_path)
+
+    assert any("no layers to compose" in r.message for r in caplog.records), \
+        f"expected an empty-set warning, got {[r.message for r in caplog.records]}"
+    assert root.exists(), "an empty set must still produce world.usda, not crash"
+    text = root.read_text()
+    assert text.startswith("#usda 1.0")
+    assert 'defaultPrim = "World"' in text
+    assert "subLayers = []" in text, f"empty set must write an explicitly-empty array: {text!r}"
