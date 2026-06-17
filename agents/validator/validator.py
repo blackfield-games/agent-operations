@@ -141,9 +141,11 @@ def _prim_specs(text: str) -> list[tuple[str, str, str]]:
 
     Structural heuristic, no pxr: prim scopes are the ``{ }`` blocks at paren-depth
     zero. Dictionary braces in layer/prim metadata always sit inside ``( )``, so a
-    paren-aware counter tells the two apart; strings and ``#`` comments are skipped
-    so a brace or keyword inside them is never read as structure. ``type_name`` is
-    ``""`` for a typeless prim (``def "X"``), which carries no type opinion.
+    paren-aware counter tells the two apart. Quoted strings (single ``'`` / double
+    ``"`` / triple ``'''`` / ``\"\"\"``), ``@...@`` asset paths, and ``#`` comments
+    are skipped whole, so a brace or keyword inside any of them is never read as
+    structure. ``type_name`` is ``""`` for a typeless prim (``def "X"``), which
+    carries no type opinion.
     """
     specs: list[tuple[str, str, str]] = []
     stack: list[str] = []  # ancestor prim names → current path
@@ -152,11 +154,19 @@ def _prim_specs(text: str) -> list[tuple[str, str, str]]:
     i, n = 0, len(text)
     while i < n:
         c = text[i]
-        if c == '"':
-            i += 1
-            while i < n and text[i] != '"':
-                i += 2 if text[i] == "\\" else 1
-            i += 1
+        if c == '"' or c == "'":
+            if text[i : i + 3] == c * 3:  # triple-quoted: runs to the next triple
+                end = text.find(c * 3, i + 3)
+                i = n if end < 0 else end + 3
+            else:
+                i += 1
+                while i < n and text[i] != c:
+                    i += 2 if text[i] == "\\" else 1
+                i += 1
+        elif c == "@":  # asset path @...@ / @@@...@@@ — may hold braces, #, quotes
+            marker = "@@@" if text[i : i + 3] == "@@@" else "@"
+            end = text.find(marker, i + len(marker))
+            i = n if end < 0 else end + len(marker)
         elif c == "#":
             while i < n and text[i] != "\n":
                 i += 1
@@ -202,9 +212,13 @@ def _conflicts_from_specs(tagged: list[tuple[str, str, str, str]]) -> list[str]:
 
     Each issue names the conflicting specialists (sorted, for stable output) so the
     supervisor's ``_failing_specialist`` routes back to the pipeline-earliest. The
-    prim path is included for diagnostics; a path segment equal to a specialist
-    name can over-trigger route-back to that node, which is conservative (it re-runs
-    the true culprits downstream) and bounded by the round cap.
+    prim path is included for diagnostics; because ``_failing_specialist`` substring-
+    matches the whole issue, a path segment containing a pipeline-earlier specialist
+    name (e.g. ``terrain_lod`` → terrain) can over-trigger route-back to that
+    innocent node. That wastes its re-run but still replays the true culprits
+    downstream (so a non-deterministic specialist can converge), and is bounded by
+    the round cap. The clean fix — word-boundary matching in ``_failing_specialist``
+    — lives in the supervisor, outside this gate.
     """
     types_by_path: dict[str, dict[str, set[str]]] = {}
     overs_by_path: dict[str, set[str]] = {}
