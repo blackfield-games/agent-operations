@@ -71,7 +71,10 @@ contract RenderReceiptsHandler is Test {
 
     address[] public actors;
     address[] public earners; // fixed earner-recipient pool; bounds receiptsByEarner's domain
+    bytes32[] public jobs; // fixed jobId pool; collisions exercise the dedup guard
     mapping(address => bool) public isAuthorized;
+    mapping(bytes32 => uint256) public ghost_successesByJob;
+    uint256 public ghost_duplicateRejections;
 
     uint256 public ghost_issued;
     bool public ghost_unauthorizedSuccess;
@@ -89,12 +92,20 @@ contract RenderReceiptsHandler is Test {
         earners.push(address(0xEA0));
         earners.push(address(0xEA1));
         earners.push(address(0xEA2));
+
+        // Fixed jobId pool. Small enough that the fuzzer keeps re-drawing the same
+        // jobId across a run, so the dedup guard's revert path is actually hit
+        // (a freshly-fuzzed bytes32 would collide ~never) — letting the invariants
+        // prove duplicates corrupt none of the accounting.
+        for (uint256 i = 0; i < 64; i++) {
+            jobs.push(keccak256(abi.encode("job", i)));
+        }
     }
 
     function issueReceipt(
         uint256 actorSeed,
         uint256 earnerSeed,
-        bytes32 jobId,
+        uint256 jobSeed,
         uint64 renderSeconds,
         uint256 jobKindSeed,
         bytes32 outputHash,
@@ -104,9 +115,10 @@ contract RenderReceiptsHandler is Test {
         // address each call. Bounding the earner domain keeps receiptsByEarner
         // enumerable so sumReceipts() can partition-check it in O(pool) — the same
         // reason the ComputeMeter handler routes every buy through a fixed actor
-        // set. Arbitrary-earner forwarding stays covered by the fuzz test, and
+        // set. Arbitrary earner/jobId forwarding stays covered by the fuzz test;
         // pool members are all nonzero so no zero-address guard is needed here.
         address earner = earners[earnerSeed % earners.length];
+        bytes32 jobId = jobs[jobSeed % jobs.length];
 
         address actor = actors[actorSeed % actors.length];
         uint16 jobKind = uint16(jobKindSeed % 5);
@@ -116,13 +128,25 @@ contract RenderReceiptsHandler is Test {
             bytes32
         ) {
             ghost_issued++;
+            ghost_successesByJob[jobId]++;
             // If an unauthorized actor somehow succeeded, flag it.
             if (!isAuthorized[actor]) ghost_unauthorizedSuccess = true;
             // Every successful forward must use the canonical schema and correct recipient.
             if (eas.lastSchema() != receipts.schemaUid() || eas.lastRecipient() != earner) {
                 ghost_forwardMismatch = true;
             }
-        } catch {}
+        } catch (bytes memory err) {
+            if (bytes4(err) == RenderReceipts.DuplicateReceipt.selector) ghost_duplicateRejections++;
+        }
+    }
+
+    /// @notice Largest number of successful issues observed for any single job in
+    ///         the pool. The dedup guard caps this at 1.
+    function maxSuccessesPerJob() external view returns (uint256 mx) {
+        for (uint256 i = 0; i < jobs.length; i++) {
+            uint256 s = ghost_successesByJob[jobs[i]];
+            if (s > mx) mx = s;
+        }
     }
 
     /// @notice Sum of `receiptsByEarner` over every earner in the fixed pool. The
@@ -197,6 +221,25 @@ contract RenderReceiptsInvariantTest is Test {
     ///      summed over every earner it equals the contract's receiptCount.
     function invariant_receiptsByEarnerSumsToCount() public view {
         assertEq(handler.sumReceipts(), receipts.receiptCount());
+    }
+
+    /// @dev Guards against `invariant_noJobIssuedTwice` passing vacuously: by the end
+    ///      of the campaign the fuzzer must have actually replayed a jobId and been
+    ///      rejected, so the dedup path was genuinely exercised (≈189 in practice).
+    function afterInvariant() external view {
+        assertGt(handler.ghost_duplicateRejections(), 0);
+    }
+
+    /// @dev No jobId is ever issued more than once: the dedup guard holds under
+    ///      fuzzing even though the handler keeps replaying the same small job pool.
+    function invariant_noJobIssuedTwice() public view {
+        assertLe(handler.maxSuccessesPerJob(), 1);
+    }
+
+    /// @dev Every successful issue increments receiptCount exactly once — rejected
+    ///      duplicates leave it untouched.
+    function invariant_receiptCountEqualsIssued() public view {
+        assertEq(receipts.receiptCount(), handler.ghost_issued());
     }
 }
 
