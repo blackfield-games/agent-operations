@@ -883,6 +883,31 @@ async fn submit(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
+    // Bound render_seconds against the job's own deadline. The spec is read here,
+    // under the same store lock as the lifecycle/fence checks above, so there is
+    // no extra pre-lock read and no TOCTOU. An implausible value is a content
+    // fault → 422, job left in_flight for the reaper (mirroring the pre-lock
+    // content gate, which can't see the deadline before locking).
+    match store.get_job(&id) {
+        Ok(Some(spec)) => {
+            if let Err(e) =
+                validate::validate_render_seconds(result.render_seconds, spec.deadline_secs)
+            {
+                tracing::warn!(?id, earner = %result.earner_address, reason = e.reason(), "rejected: result failed content gate");
+                return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            }
+        }
+        // job_status already confirmed an in_flight job under this same lock, so a
+        // missing spec here is an internal inconsistency, not a client error.
+        Ok(None) => {
+            tracing::error!(?id, "submit: spec missing for an in_flight job");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Err(e) => {
+            tracing::error!(?id, ?e, "submit: get_job lookup failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     tracing::info!(?id, earner = %result.earner_address, "result received");
     // Content gate already cleared above. record_completed durably enqueues the
     // pending EAS receipt in the settle tx; the background relayer drains it to
@@ -1254,8 +1279,8 @@ async fn handle_submit(
         reason: reason.to_string(),
     };
 
-    let expected_seq = match offered {
-        Some((job, seq)) if job.id == job_id => *seq,
+    let (deadline_secs, expected_seq) = match offered {
+        Some((job, seq)) if job.id == job_id => (job.deadline_secs, *seq),
         // The offered job is still validly ours; don't settle it on a mismatched
         // submit, but free it for another earner rather than stranding it.
         Some(_) => {
@@ -1283,6 +1308,14 @@ async fn handle_submit(
     // dispatch_seq-fenced, so a content-reject for a since-reassigned lease can't
     // clobber the new holder. Mirrors the bad-attestation Requeue above.
     if let Err(e) = validate::validate_result(&result) {
+        tracing::warn!(%job_id, earner = %result.earner_address, reason = e.reason(), "ws rejected: result failed content gate");
+        return SubmitOutcome::Requeue(rejected(e.reason()));
+    }
+    // Bound render_seconds against this dispatch's deadline (the reaper's lease
+    // budget, already in hand via `offered`). A result claiming far more compute
+    // than the job allowed is fabricated — refuse it like any other content
+    // fault. Requeue: the job may be renderable by an honest earner.
+    if let Err(e) = validate::validate_render_seconds(result.render_seconds, deadline_secs) {
         tracing::warn!(%job_id, earner = %result.earner_address, reason = e.reason(), "ws rejected: result failed content gate");
         return SubmitOutcome::Requeue(rejected(e.reason()));
     }

@@ -28,6 +28,12 @@ pub enum ValidationError {
     /// `render_seconds` is zero — a job that consumed no compute did no work and
     /// must not be metered or paid.
     ZeroRenderSeconds,
+    /// `render_seconds` claims more compute than the job's deadline plausibly
+    /// allowed. An unbounded value (e.g. `u32::MAX`) would poison
+    /// `/stats total_render_seconds` and over-credit any render-second-weighted
+    /// payout, so a result claiming far more time than the job was budgeted is
+    /// refused. See [`validate_render_seconds`].
+    ImplausibleRenderSeconds,
 }
 
 impl ValidationError {
@@ -37,12 +43,23 @@ impl ValidationError {
             ValidationError::MalformedOutputHash => "output_hash is not a 256-bit lowercase-hex digest",
             ValidationError::MalformedOutputUrl => "output_url is not a fetchable scheme://… url",
             ValidationError::ZeroRenderSeconds => "render_seconds is zero",
+            ValidationError::ImplausibleRenderSeconds => {
+                "render_seconds exceeds the job's deadline budget"
+            }
         }
     }
 }
 
 /// 32-byte digest rendered as lowercase hex.
 const OUTPUT_HASH_LEN: usize = 64;
+
+/// Slack multiplier on `deadline_secs` for the render-seconds plausibility
+/// bound. A result may claim up to this many times the job's own deadline of
+/// compute before it is refused. Deliberately generous: the bound exists to
+/// reject self-evidently fabricated values (e.g. `u32::MAX`), not to enforce a
+/// tight SLA, so an honest earner that finished slightly past the soft deadline
+/// (before the reaper reclaimed the lease) still settles.
+const RENDER_SECONDS_DEADLINE_SLACK: u64 = 2;
 
 /// Validate the *content* of an authenticated result. Pure function of the
 /// result — no store, no network — so it is cheap to run before taking any lock.
@@ -55,6 +72,32 @@ pub fn validate_result(result: &JobResult) -> Result<(), ValidationError> {
     }
     if result.render_seconds == 0 {
         return Err(ValidationError::ZeroRenderSeconds);
+    }
+    Ok(())
+}
+
+/// Bound `render_seconds` against the job's own `deadline_secs` — the lease
+/// window the reaper enforces (`reap_expired`). A result claiming more than
+/// `deadline_secs * RENDER_SECONDS_DEADLINE_SLACK` of compute is implausible: the
+/// job would have been reclaimed long before the earner spent that much time, so
+/// the value is fabricated and would poison metering and payout.
+///
+/// Needs the job's deadline, so — unlike [`validate_result`] — it runs where the
+/// `JobSpec` is in hand: the ws path passes the offered job's deadline, the http
+/// path looks it up under the store lock. `deadline_secs == 0` carries no compute
+/// budget to bound against, so the upper bound is skipped (the zero-render-seconds
+/// check in [`validate_result`] still applies); job creation is expected to set a
+/// positive deadline, and the reaper treats a zero deadline as already expired.
+pub fn validate_render_seconds(
+    render_seconds: u32,
+    deadline_secs: u32,
+) -> Result<(), ValidationError> {
+    if deadline_secs == 0 {
+        return Ok(());
+    }
+    let max = (deadline_secs as u64).saturating_mul(RENDER_SECONDS_DEADLINE_SLACK);
+    if render_seconds as u64 > max {
+        return Err(ValidationError::ImplausibleRenderSeconds);
     }
     Ok(())
 }
@@ -212,5 +255,57 @@ mod tests {
         r.output_hash = "bad".into();
         r.render_seconds = 0;
         assert_eq!(validate_result(&r), Err(ValidationError::MalformedOutputHash));
+    }
+
+    #[test]
+    fn render_seconds_at_the_deadline_is_plausible() {
+        // The common honest case: a render that used about its whole budget.
+        assert_eq!(validate_render_seconds(60, 60), Ok(()));
+    }
+
+    #[test]
+    fn render_seconds_under_the_deadline_is_plausible() {
+        assert_eq!(validate_render_seconds(5, 60), Ok(()));
+    }
+
+    #[test]
+    fn render_seconds_at_the_slack_bound_is_plausible() {
+        // deadline * SLACK (2) is the inclusive ceiling — an earner that finished
+        // past the soft deadline but within the slack still settles.
+        assert_eq!(validate_render_seconds(120, 60), Ok(()));
+    }
+
+    #[test]
+    fn render_seconds_just_over_the_slack_bound_is_rejected() {
+        // One second past deadline * SLACK is implausible.
+        assert_eq!(
+            validate_render_seconds(121, 60),
+            Err(ValidationError::ImplausibleRenderSeconds)
+        );
+    }
+
+    #[test]
+    fn render_seconds_u32_max_is_rejected() {
+        // The attack the bound exists for: a fabricated value that would poison
+        // /stats and over-credit a render-second-weighted payout.
+        assert_eq!(
+            validate_render_seconds(u32::MAX, 60),
+            Err(ValidationError::ImplausibleRenderSeconds)
+        );
+    }
+
+    #[test]
+    fn zero_deadline_skips_the_upper_bound() {
+        // No compute budget to bound against → the upper bound is skipped; even a
+        // huge value passes here (the zero-render-seconds check lives in
+        // validate_result, and the reaper reclaims a zero-deadline job at once).
+        assert_eq!(validate_render_seconds(u32::MAX, 0), Ok(()));
+    }
+
+    #[test]
+    fn large_deadline_does_not_overflow_the_bound() {
+        // deadline * SLACK is computed in u64, so a large deadline can't wrap and
+        // spuriously reject a plausible render.
+        assert_eq!(validate_render_seconds(u32::MAX, u32::MAX), Ok(()));
     }
 }
