@@ -18,8 +18,9 @@ use std::collections::HashMap;
 const STATUS_QUEUED: &str = "queued";
 const STATUS_IN_FLIGHT: &str = "in_flight";
 const STATUS_DONE: &str = "done";
-/// Terminal failure state: the job has been dispatched `max_attempts` times
-/// without a successful result and will no longer be requeued.
+/// Terminal failure state: the job exhausted its dispatch `attempts` /
+/// earner-`faults` budget, or outlived its absolute wall-clock TTL
+/// (`reap_ttl_expired`), and will no longer be requeued.
 const STATUS_FAILED: &str = "failed";
 
 /// The full set of valid job lifecycle statuses, in lifecycle order. Single
@@ -501,6 +502,67 @@ impl Store {
             }
         }
         Ok(outcome)
+    }
+
+    /// Dead-letter any non-terminal job alive past its absolute wall-clock TTL.
+    ///
+    /// This is the poison-job backstop that neither the per-dispatch deadline
+    /// reaper nor the attempt/fault budgets can reach: a job a single connected
+    /// earner keeps faulting on parks back in `queued` with one fault (the
+    /// per-session skip set caps each earner at one), so `reap_expired`
+    /// (in_flight only) never sees it and `max_faults` — which needs faults from
+    /// `max_faults` *distinct* earners — is never reached. Anchored to the
+    /// immutable `created_at`, a job's TTL is `deadline_secs * ttl_multiple`; any
+    /// `queued` OR `in_flight` job whose age exceeds it is moved to the terminal
+    /// `failed` state regardless of attempts, faults, or earner count.
+    ///
+    /// * `deadline_secs == 0` (operator-unbounded) is exempt — never reaped here,
+    ///   mirroring how the deadline reaper treats it as "no deadline".
+    /// * `ttl_multiple` makes the TTL dominate the per-dispatch deadline, so a
+    ///   long-but-healthy render — even one that heartbeats across many redispatch
+    ///   cycles — never trips it; only a genuinely stuck job does. The caller sets
+    ///   it well above `max_attempts + max_faults` so the existing budgets always
+    ///   terminate a churning job first.
+    /// * The UPDATE is guarded `WHERE status IN (queued, in_flight)` so a job that
+    ///   raced to `done`/`failed` between the scan and the write is a no-op; only
+    ///   rows actually transitioned are reported.
+    ///
+    /// `now_secs` is passed in (epoch seconds) so callers — and tests — control
+    /// the clock. Returns the ids dead-lettered this sweep.
+    pub fn reap_ttl_expired(&self, now_secs: i64, ttl_multiple: u32) -> Result<Vec<uuid::Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, spec_json, created_at FROM jobs
+             WHERE status IN (?1, ?2) AND created_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([STATUS_QUEUED, STATUS_IN_FLIGHT], |row| {
+            let id: String = row.get(0)?;
+            let spec_json: String = row.get(1)?;
+            let created_at: i64 = row.get(2)?;
+            Ok((id, spec_json, created_at))
+        })?;
+
+        let mut expired = Vec::new();
+        for row in rows {
+            let (id, spec_json, created_at) = row?;
+            let job: JobSpec = serde_json::from_str(&spec_json)?;
+            if job.deadline_secs == 0 {
+                continue; // operator-unbounded job: no wall-clock TTL
+            }
+            let ttl = job.deadline_secs as i64 * ttl_multiple as i64;
+            if now_secs - created_at >= ttl {
+                // Guard on a still-non-terminal status so a settle/dead-letter
+                // that landed since the scan above is left untouched.
+                let changed = self.conn.execute(
+                    "UPDATE jobs SET status = ?1, started_at = NULL
+                     WHERE id = ?2 AND status IN (?3, ?4)",
+                    (STATUS_FAILED, &id, STATUS_QUEUED, STATUS_IN_FLIGHT),
+                )?;
+                if changed > 0 {
+                    expired.push(job.id);
+                }
+            }
+        }
+        Ok(expired)
     }
 
     /// Bump an in-flight job's `started_at` to `now_secs` on an earner heartbeat,

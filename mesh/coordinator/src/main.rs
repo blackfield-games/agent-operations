@@ -346,10 +346,23 @@ fn prune_stale_earners(
     before - earners.len()
 }
 
+/// Per-job absolute wall-clock TTL, as a multiple of the job's own
+/// `deadline_secs`: a job alive (queued or in_flight) past
+/// `created_at + deadline_secs * JOB_TTL_DEADLINE_MULTIPLE` is dead-lettered by
+/// the reaper regardless of attempts/faults/earner count. ~24h at the 60s
+/// default deadline, scaling up with longer-budget jobs. Chosen to dominate the
+/// `max_attempts (5) + max_faults (10)` ≈ 15 retry-churn windows by ~100×, so
+/// the existing budgets always terminate a churning job first and this backstop
+/// only catches a job that is genuinely stuck — a queued poison job a single
+/// connected earner keeps faulting on (which never accrues the *distinct*-earner
+/// faults `max_faults` needs), or a silently wedged in-flight dispatch.
+const JOB_TTL_DEADLINE_MULTIPLE: u32 = 1440;
+
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
-/// attempts). Logs requeued and dead-lettered counts separately; store errors
-/// are logged and the loop continues.
+/// attempts), then dead-letter any job — queued or in-flight — past its absolute
+/// wall-clock TTL. Logs requeued, deadline-failed, and TTL-expired counts
+/// separately; store errors are logged and the loop continues.
 fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -374,6 +387,17 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
                         }
                     }
                     Err(e) => tracing::error!(?e, "reaper: reap_expired failed"),
+                }
+                // Absolute-TTL backstop, on the same lock + clock as the deadline
+                // sweep. Catches the poison job the deadline reaper and the
+                // attempt/fault budgets cannot: one parked in `queued` by a single
+                // faulting earner, never re-dispatched, never reaching max_faults.
+                match store.reap_ttl_expired(now_secs(), JOB_TTL_DEADLINE_MULTIPLE) {
+                    Ok(expired) if !expired.is_empty() => {
+                        tracing::warn!(count = expired.len(), "dead-lettered jobs (wall-clock TTL exceeded)");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(?e, "reaper: reap_ttl_expired failed"),
                 }
             } // store lock dropped here, before we touch earners
 
