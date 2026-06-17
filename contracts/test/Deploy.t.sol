@@ -106,6 +106,22 @@ contract DeployTest is Test {
         assertEq(deployed.artifactTemplate.minter(), coordinator, "coordinator not minter");
     }
 
+    function test_artifactTemplateWiredForMintFee() public view {
+        // The mint-fee debit (ArtifactTemplate.spend -> ComputeMeter) only clears if
+        // ArtifactTemplate is itself an authorized spender; without this wiring every
+        // fee-charging mint would revert NotAuthorized.
+        assertTrue(
+            deployed.computeMeter.authorizedSpenders(address(deployed.artifactTemplate)),
+            "artifact template not an authorized spender"
+        );
+        assertEq(
+            address(deployed.artifactTemplate.computeMeter()),
+            address(deployed.computeMeter),
+            "artifact template meter not wired"
+        );
+        assertEq(deployed.artifactTemplate.mintFeeRate(), 1 ether, "artifact mint fee rate not wired");
+    }
+
     function test_ownershipHandoffIsTwoStep() public {
         // Fresh deploy so we observe the pre-acceptance pending state.
         Deploy.DeployConfig memory cfg = Deploy.DeployConfig({
