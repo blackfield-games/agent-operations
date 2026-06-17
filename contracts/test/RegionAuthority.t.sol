@@ -217,6 +217,41 @@ contract RegionAuthorityTest is Test {
         assertEq(token.balanceOf(bob), bobBefore + STAKE);
     }
 
+    /// @dev A malicious ERC-20 staking token reenters unstake() from its transfer
+    ///      hook during the payout. unstake deletes the stake and burns the NFT
+    ///      before the transfer (effects-before-interaction), so the reentrant
+    ///      call reverts on the burned token's ownerOf() and no second withdrawal
+    ///      is possible — alice recovers exactly one stake.
+    function test_unstake_reentrantTokenCannotDoubleWithdraw() public {
+        ReentrantUnstakeToken evil = new ReentrantUnstakeToken();
+        RegionAuthority r = new RegionAuthority(address(evil), STAKE, owner);
+        evil.setRegion(r);
+
+        evil.transfer(alice, 1_000 ether);
+        uint256 aliceBefore = evil.balanceOf(alice);
+        vm.prank(alice);
+        evil.approve(address(r), type(uint256).max);
+
+        vm.prank(alice);
+        r.claim(TILE, STAKE);
+        assertEq(evil.balanceOf(address(r)), STAKE);
+
+        evil.arm(TILE); // reenter unstake(TILE) once during the payout transfer
+
+        vm.prank(alice);
+        r.unstake(TILE);
+
+        // The reentry fired and was rejected: the NFT was burned before the payout.
+        assertTrue(evil.reentryAttempted());
+        assertTrue(evil.reentryReverted());
+
+        // Exactly one payout — alice whole, region drained, NFT gone.
+        assertEq(evil.balanceOf(alice), aliceBefore);
+        assertEq(evil.balanceOf(address(r)), 0);
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, TILE));
+        r.ownerOf(TILE);
+    }
+
     // --- setStakeRequired ---
 
     function test_setStakeRequired_updatesAndEmits() public {
@@ -269,5 +304,41 @@ contract RegionAuthorityTest is Test {
         vm.prank(bob);
         region.setStakeRequired(5);
         assertEq(region.stakeRequired(), 5);
+    }
+}
+
+/// @notice ERC-20 that reenters RegionAuthority.unstake() once from its transfer
+///         hook (the payout path) to probe unstake's effects-before-interaction
+///         ordering. Disarmed by default so funding/claim transfers are normal.
+contract ReentrantUnstakeToken is ERC20 {
+    RegionAuthority region;
+    uint256 armedTokenId;
+    bool armed;
+    bool public reentryAttempted;
+    bool public reentryReverted;
+
+    constructor() ERC20("Reentrant", "RNT") {
+        _mint(msg.sender, 1_000_000 ether);
+    }
+
+    function setRegion(RegionAuthority region_) external {
+        region = region_;
+    }
+
+    function arm(uint256 tokenId) external {
+        armedTokenId = tokenId;
+        armed = true;
+    }
+
+    function transfer(address to, uint256 value) public override returns (bool) {
+        if (armed) {
+            armed = false; // one-shot, so the reentrant payout doesn't recurse
+            reentryAttempted = true;
+            try region.unstake(armedTokenId) {}
+            catch {
+                reentryReverted = true;
+            }
+        }
+        return super.transfer(to, value);
     }
 }
