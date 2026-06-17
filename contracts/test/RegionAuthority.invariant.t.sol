@@ -126,6 +126,17 @@ contract RegionAuthorityHandler is Test {
         holderOf[tokenId] = to; // accrued settles to from's withdrawable; aggregate unchanged
     }
 
+    /// @dev Self-transfer runs _update's settlement with from == to: accrued moves to
+    ///      the holder's own withdrawable, the NFT stays put. Conservation must hold.
+    function selfTransfer(uint256 idxSeed) external {
+        if (activeTokenIds.length == 0) return;
+        uint256 tokenId = activeTokenIds[idxSeed % activeTokenIds.length];
+        address holder = holderOf[tokenId];
+
+        vm.prank(holder);
+        region.transferFrom(holder, holder, tokenId);
+    }
+
     function activeCount() external view returns (uint256) {
         return activeTokenIds.length;
     }
@@ -180,7 +191,9 @@ contract RegionAuthorityInvariantTest is Test {
     ///      (deposit args in, claimFees/withdraw payouts out) — transfers and burns
     ///      only shuffle fees between accrued and withdrawable, never the total.
     function invariant_balanceEqualsStakesPlusUnclaimedFees() public view {
-        assertEq(token.balanceOf(address(region)), handler.ghost_activeStakeSum() + handler.ghost_unclaimedFees());
+        assertEq(
+            token.balanceOf(address(region)), handler.ghost_activeStakeSum() + handler.ghost_unclaimedFees()
+        );
     }
 
     /// @dev The contract's internal books reconcile to its balance: balance ==
