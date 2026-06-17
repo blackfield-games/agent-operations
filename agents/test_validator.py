@@ -205,6 +205,34 @@ def test_prim_specs_skips_metadata_braces_and_nests_paths():
     ]
 
 
+# A brace and a fake `def` buried in a quoted string or an asset path must not
+# desync the scanner — each below carries one such trap and must still resolve to
+# exactly /World and /World/Hub (a Mesh), the genuine prims.
+def test_prim_specs_skips_triple_quoted_strings():
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\ndef Xform "World" {\n'
+        '    string doc = """has } brace and def Foo "X" """\n    def Mesh "Hub" {}\n}\n'
+    )
+    assert validator._prim_specs(body) == [("def", "Xform", "/World"), ("def", "Mesh", "/World/Hub")]
+
+
+def test_prim_specs_skips_single_quoted_strings():
+    body = (
+        "#usda 1.0\n(\n    defaultPrim = \"World\"\n)\ndef Xform \"World\" {\n"
+        "    string s = 'has } brace'\n    def Mesh \"Hub\" {}\n}\n"
+    )
+    assert validator._prim_specs(body) == [("def", "Xform", "/World"), ("def", "Mesh", "/World/Hub")]
+
+
+def test_prim_specs_skips_asset_paths():
+    # An asset path can hold (, ), #, and " — none may be read as structure.
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\ndef Xform "World" {\n'
+        '    custom asset thumb = @logo(1)#x".usd@\n    def Mesh "Hub" {}\n}\n'
+    )
+    assert validator._prim_specs(body) == [("def", "Xform", "/World"), ("def", "Mesh", "/World/Hub")]
+
+
 def test_same_type_redefinition_is_not_a_conflict():
     # Two specialists defining the same path with the same type is a legal USD
     # opinion-merge, not a conflict (FM1: don't false-positive on layering).
