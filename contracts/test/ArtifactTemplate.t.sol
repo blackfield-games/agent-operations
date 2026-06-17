@@ -288,6 +288,78 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.balanceOf(player, id), 2);
     }
 
+    // --- mint fee (ComputeMeter) ---
+
+    function test_mint_chargesRarityScaledFee() public {
+        vm.prank(owner);
+        art.setMintFeeRate(2e15);
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m")); // 50% rarity
+
+        // ceil(2e15 * 4 * 5000 / 10000) = 4e15, exact (no rounding).
+        uint256 expectedFee = 4e15;
+        uint256 creditBefore = meter.credit(player);
+
+        // The debit is observable as ComputeMeter.Spent(buyer=to, spender=art, fee,
+        // jobId=templateId) — the mint carries the templateId as the spend jobId.
+        vm.expectEmit(true, true, false, true, address(meter));
+        emit Spent(player, address(art), expectedFee, bytes32(id));
+
+        vm.prank(minter);
+        art.mint(player, id, 4, "");
+
+        assertEq(meter.credit(player), creditBefore - expectedFee, "credit debited by fee");
+        assertEq(meter.spentByBuyer(player), expectedFee, "spend recorded");
+        assertEq(art.balanceOf(player, id), 4, "units still minted");
+    }
+
+    function test_mint_feeRoundsUp() public {
+        // rate=1, rarity=1, amount=1 -> raw 1/10000 < 1. Floor would round to a free
+        // mint; ceil charges exactly 1 unit. Pins the rounding direction.
+        vm.prank(owner);
+        art.setMintFeeRate(1);
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+
+        uint256 creditBefore = meter.credit(player);
+        vm.prank(minter);
+        art.mint(player, id, 1, "");
+
+        assertEq(meter.credit(player), creditBefore - 1, "ceil charges 1, not 0");
+        assertEq(meter.spentByBuyer(player), 1);
+    }
+
+    function test_mint_revertsOnInsufficientCredit() public {
+        // poor has no compute credit, so the fee debit reverts and nothing mints.
+        address poor = address(0xDEAD11);
+        vm.prank(owner);
+        art.setMintFeeRate(1e15);
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 10_000, keccak256("m"));
+
+        vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
+        vm.prank(minter);
+        art.mint(poor, id, 1, "");
+
+        assertEq(art.balanceOf(poor, id), 0, "no units minted");
+        assertEq(art.totalMinted(), 0, "counter rolled back");
+        assertEq(art.mintedByTemplate(id), 0, "per-template counter rolled back");
+    }
+
+    function test_mint_zeroRarityIsFree() public {
+        // A 0-bps template charges no fee, so even a zero-credit recipient can mint
+        // it. The global fee gate stays closed by the non-zero mintFeeRate guard.
+        address poor = address(0xF00D);
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 0, keccak256("m"));
+
+        vm.prank(minter);
+        art.mint(poor, id, 7, "");
+
+        assertEq(art.balanceOf(poor, id), 7);
+        assertEq(meter.spentByBuyer(poor), 0, "no fee debited for rarity-0");
+    }
+
     // --- HUD read-path counters (templatesByAuthor / totalMinted / mintedByTemplate) ---
 
     function test_registerTemplate_tracksTemplatesByAuthor() public {
