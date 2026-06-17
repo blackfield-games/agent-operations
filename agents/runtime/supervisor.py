@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import TypedDict, Annotated
 
 from langgraph.graph import StateGraph, END
@@ -115,7 +116,7 @@ PIPELINE_ORDER = list(SPECIALISTS)
 
 
 def _failing_specialist(issues: list[str]) -> str:
-    """Map validator issues to the earliest pipeline node that should re-run.
+    r"""Map validator issues to the earliest pipeline node that should re-run.
 
     The validator phrases issues with the offending specialist's name, e.g.
     "missing specialist layers: ['biome', 'prop']" or "triangle budget exceeded
@@ -123,12 +124,21 @@ def _failing_specialist(issues: list[str]) -> str:
     back to whichever appears earliest in the pipeline. Unattributable failures
     (e.g. a pure style rejection naming no specialist) fall back to director,
     which owns the world brief / style intent.
+
+    Match on word boundaries, not substrings: the composition-conflict gate embeds
+    prim paths in its issues (`</World/terrain_lod/Lamp>`), and a plain substring
+    scan routes that conflict to `terrain` — an innocent upstream node — because
+    "terrain" sits inside "terrain_lod". `_` is a regex word char, so `\bterrain\b`
+    skips `terrain_lod`/`propeller`/`npcs` while still matching the explicitly named
+    culprits and punctuation-delimited names (`['biome']`, `terrain/r…`). A prim path
+    whose segment is *exactly* a specialist name (`/World/Terrain`) still matches —
+    a narrow, accepted residual.
     """
     candidates = {
         name
         for issue in issues
         for name in PIPELINE_ORDER
-        if name in issue.lower()
+        if re.search(rf"\b{re.escape(name)}\b", issue.lower())
     }
     if not candidates:
         return "director"
