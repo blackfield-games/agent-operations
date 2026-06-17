@@ -57,6 +57,11 @@ contract RenderReceipts is Ownable2Step {
     ///         `receiptCount`. `earner` is also indexed in `ReceiptIssued`, so
     ///         clients can cross-reference the event stream.
     mapping(address earner => uint256 count) public receiptsByEarner;
+    /// @notice Whether a receipt has already been issued for a job. `jobId` is the
+    ///         render job's UUID — globally unique — so this fences a replayed relay
+    ///         to exactly one attestation per validated job: the on-chain twin of the
+    ///         coordinator's settle-exactly-once guard.
+    mapping(bytes32 jobId => bool issued) public receiptIssued;
     mapping(address coordinator => bool authorized) public authorizedCoordinators;
 
     event ReceiptIssued(
@@ -71,6 +76,7 @@ contract RenderReceipts is Ownable2Step {
 
     error NotAuthorized();
     error SchemaNotSet();
+    error DuplicateReceipt(bytes32 jobId);
 
     constructor(address eas_, address owner_) Ownable(owner_) {
         EAS = IEAS(eas_);
@@ -103,6 +109,11 @@ contract RenderReceipts is Ownable2Step {
     ) external returns (bytes32 uid) {
         if (!authorizedCoordinators[msg.sender]) revert NotAuthorized();
         if (schemaUid == bytes32(0)) revert SchemaNotSet();
+        if (receiptIssued[jobId]) revert DuplicateReceipt(jobId);
+
+        // Mark issued before the external attest (checks-effects-interactions) so a
+        // reentrant or replayed relay cannot mint a second attestation for the job.
+        receiptIssued[jobId] = true;
 
         bytes memory data = abi.encode(earner, jobId, renderSeconds, jobKind, outputHash, regionId);
         uid = EAS.attest(
