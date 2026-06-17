@@ -3647,6 +3647,121 @@ mod tests {
         assert!(backfilled.unwrap() > 0, "backfilled created_at must be a real timestamp");
     }
 
+    // ---- absolute wall-clock TTL (reap_ttl_expired) ----
+
+    // A small multiple for clear test arithmetic; the live reaper uses the larger
+    // JOB_TTL_DEADLINE_MULTIPLE. reap_ttl_expired takes the multiple as a param so
+    // these stay independent of the production constant's exact value.
+    const TEST_TTL_MULTIPLE: u32 = 10;
+
+    /// The headline case the fault budget cannot terminate (mesh-attempt-budget-
+    /// earner-fault's FM1): a poison job a single connected earner keeps faulting
+    /// on parks in `queued` with one fault — never re-offered to that earner, so
+    /// never re-dispatched, so the fault counter never advances and `max_faults`
+    /// (which needs DISTINCT earners) is never reached. The deadline reaper only
+    /// scans in_flight jobs, so it can't touch a queued job either. Only the
+    /// absolute TTL dead-letters it.
+    #[test]
+    fn ttl_dead_letters_a_queued_poison_job_a_single_earner_cannot() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        store.enqueue(&job).unwrap();
+        let anchor = store.job_created_at(&job.id).unwrap().unwrap();
+        let ttl = 60 * TEST_TTL_MULTIPLE as i64;
+
+        // One earner faults: back to queued, one fault, NOT dead-lettered.
+        let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+        assert!(!store.requeue_earner_fault(&taken, 10).unwrap());
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+
+        // The deadline reaper, even far past the TTL, leaves a *queued* job alone:
+        // it only reaps in_flight dispatches. This is the gap the TTL closes.
+        assert!(store.reap_expired(anchor + ttl + 1, 5).unwrap().failed.is_empty());
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+
+        // Just inside the TTL: still spared.
+        assert!(store.reap_ttl_expired(anchor + ttl - 1, TEST_TTL_MULTIPLE).unwrap().is_empty());
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+
+        // At the TTL boundary (>=): dead-lettered to the terminal failed state.
+        let expired = store.reap_ttl_expired(anchor + ttl, TEST_TTL_MULTIPLE).unwrap();
+        assert_eq!(expired, vec![job.id], "the poison job is dead-lettered exactly at the TTL");
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("failed"));
+        assert_eq!(store.failed_count().unwrap(), 1);
+    }
+
+    /// An in-flight job past the TTL is also caught (the TTL is created_at-anchored,
+    /// so it bounds total wall-clock regardless of dispatch/heartbeat state), while
+    /// a job still within its window — queued or in-flight — is left untouched.
+    #[test]
+    fn ttl_spares_jobs_within_window_and_reaps_in_flight_past_it() {
+        let store = Store::open_in_memory().unwrap();
+        let queued = job_with_deadline(60);
+        let inflight = job_with_deadline(60);
+        store.enqueue(&queued).unwrap();
+        store.enqueue(&inflight).unwrap();
+        store.take_next(|j| j.id == inflight.id).unwrap().unwrap();
+        let anchor = store.job_created_at(&queued.id).unwrap().unwrap();
+        let ttl = 60 * TEST_TTL_MULTIPLE as i64;
+
+        // Both within window: nothing reaped, statuses intact.
+        assert!(store.reap_ttl_expired(anchor + ttl - 1, TEST_TTL_MULTIPLE).unwrap().is_empty());
+        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(store.job_status(&inflight.id).unwrap().as_deref(), Some("in_flight"));
+
+        // Past window: both dead-lettered (queued and in_flight alike).
+        let mut expired = store.reap_ttl_expired(anchor + ttl, TEST_TTL_MULTIPLE).unwrap();
+        expired.sort();
+        let mut want = vec![queued.id, inflight.id];
+        want.sort();
+        assert_eq!(expired, want);
+        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("failed"));
+        assert_eq!(store.job_status(&inflight.id).unwrap().as_deref(), Some("failed"));
+        assert_eq!(store.in_flight_count().unwrap(), 0, "the reaped in_flight job left in_flight");
+    }
+
+    /// `deadline_secs == 0` is the operator's "unbounded" signal: such a job has no
+    /// per-dispatch deadline and must have no wall-clock TTL either, however old.
+    #[test]
+    fn ttl_exempts_unbounded_deadline_zero_jobs() {
+        let store = Store::open_in_memory().unwrap();
+        let queued = job_with_deadline(0);
+        let inflight = job_with_deadline(0);
+        store.enqueue(&queued).unwrap();
+        store.enqueue(&inflight).unwrap();
+        store.take_next(|j| j.id == inflight.id).unwrap().unwrap();
+        let anchor = store.job_created_at(&queued.id).unwrap().unwrap();
+
+        // A decade past creation: still untouched, because deadline_secs == 0.
+        let far_future = anchor + 10 * 365 * 24 * 3600;
+        assert!(store.reap_ttl_expired(far_future, TEST_TTL_MULTIPLE).unwrap().is_empty());
+        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(store.job_status(&inflight.id).unwrap().as_deref(), Some("in_flight"));
+    }
+
+    /// FM3: a job that settled to `done` (or was already `failed`) since the scan
+    /// must not be re-transitioned. A completed job past the TTL is a no-op and is
+    /// never reported as expired — the status-guarded UPDATE protects the settle.
+    #[test]
+    fn ttl_is_a_noop_for_a_settled_job() {
+        let mut store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        store.enqueue(&job).unwrap();
+        let anchor = store.job_created_at(&job.id).unwrap().unwrap();
+        let ttl = 60 * TEST_TTL_MULTIPLE as i64;
+
+        // Dispatch and settle it before the TTL sweep runs.
+        store.take_next(|j| j.id == job.id).unwrap().unwrap();
+        assert!(store.record_completed(&signed_result(job.id, "ok")).unwrap());
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("done"));
+
+        // Sweep far past the TTL: the done job is neither reaped nor reported.
+        let expired = store.reap_ttl_expired(anchor + ttl + 1_000, TEST_TTL_MULTIPLE).unwrap();
+        assert!(expired.is_empty(), "a settled job must not be TTL-expired");
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("done"), "settle is preserved");
+        assert_eq!(store.failed_count().unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight() {
         // Build state on a non-seeded in-memory store so the queue truly starts
