@@ -4,6 +4,7 @@ pragma solidity ^0.8.27;
 import {Test} from "forge-std/Test.sol";
 import {ArtifactTemplate} from "../src/ArtifactTemplate.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {IERC1155Receiver} from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
 contract ArtifactTemplateTest is Test {
     ArtifactTemplate art;
@@ -115,6 +116,37 @@ contract ArtifactTemplateTest is Test {
         art.registerTemplate(author, 1, bytes32(0));
     }
 
+    function test_registerTemplate_revertsZeroAuthor() public {
+        // author==0 is the UnknownTemplate sentinel; registering it would consume
+        // an id + a leaderboard slot for a template no one can ever mint.
+        vm.expectRevert(ArtifactTemplate.ZeroAuthor.selector);
+        vm.prank(minter);
+        art.registerTemplate(address(0), 1, keccak256("m"));
+
+        assertEq(art.nextTemplateId(), 0);
+        assertEq(art.templatesByAuthor(address(0)), 0);
+    }
+
+    function test_registerTemplate_revertsRarityAboveMax() public {
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.InvalidRarity.selector, uint16(10001)));
+        vm.prank(minter);
+        art.registerTemplate(author, 10001, keccak256("m"));
+
+        assertEq(art.nextTemplateId(), 0);
+    }
+
+    function test_registerTemplate_acceptsRarityAtMax() public {
+        // The bound is inclusive: 10000 bps == 100% is a valid full-scale rarity.
+        // Read MAX_RARITY before the prank — an art.* call in the arg list would
+        // otherwise consume the prank and registerTemplate would revert NotMinter.
+        uint16 maxRarity = art.MAX_RARITY();
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, maxRarity, keccak256("m"));
+
+        (, uint16 r,) = art.templates(id);
+        assertEq(r, 10_000);
+    }
+
     // --- mint ---
 
     function test_mint_happyPath() public {
@@ -143,6 +175,52 @@ contract ArtifactTemplateTest is Test {
         vm.expectRevert(ArtifactTemplate.UnknownTemplate.selector);
         vm.prank(minter);
         art.mint(player, 999, 1, "");
+    }
+
+    function test_mint_revertsZeroRecipient() public {
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+
+        vm.expectRevert(ArtifactTemplate.ZeroRecipient.selector);
+        vm.prank(minter);
+        art.mint(address(0), id, 1, "");
+
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.mintedByTemplate(id), 0);
+    }
+
+    function test_mint_revertsZeroAmount() public {
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"));
+
+        // A zero-amount mint would emit a spurious Minted/TransferSingle and fire
+        // the receiver hook for nothing; reject it instead.
+        vm.expectRevert(ArtifactTemplate.ZeroAmount.selector);
+        vm.prank(minter);
+        art.mint(player, id, 0, "");
+
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.balanceOf(player, id), 0);
+    }
+
+    /// @dev A minter contract that is also the mint recipient reenters mint() from
+    ///      its ERC-1155 receiver hook. CEI (counters before _mint) means the
+    ///      reentrant call sees the outer mint already counted, and the totals are
+    ///      exact once the nested calls settle — no drift, no double-count.
+    function test_mint_reentrantMinterKeepsCounterIntegrity() public {
+        ReentrantMinter rm = new ReentrantMinter(art);
+        vm.prank(owner);
+        art.setMinter(address(rm));
+
+        uint256 id = rm.register(author, 1000);
+        rm.fire(5, 3); // outer mint 5; the receiver hook reenters and mints 3 more
+
+        assertEq(art.totalMinted(), 8);
+        assertEq(art.mintedByTemplate(id), 8);
+        assertEq(art.balanceOf(address(rm), id), 8);
+        // Proof of effects-before-interaction: when the outer mint's hook fired and
+        // reentered, totalMinted already carried the outer 5.
+        assertEq(rm.observedTotalMintedAtHook(), 5);
     }
 
     function test_mint_multipleAccumulatesBalance() public {
@@ -270,5 +348,51 @@ contract ArtifactTemplateTest is Test {
         vm.prank(player);
         art.setMinter(stranger);
         assertEq(art.minter(), stranger);
+    }
+}
+
+/// @notice Minter + mint recipient that reenters mint() once from its ERC-1155
+///         receiver hook, recording the supply counter it observed mid-hook so a
+///         test can prove the outer effects landed before the interaction (CEI).
+contract ReentrantMinter is IERC1155Receiver {
+    ArtifactTemplate immutable art;
+    uint256 public templateId;
+    uint256 reentryAmount;
+    bool entered;
+    uint256 public observedTotalMintedAtHook;
+
+    constructor(ArtifactTemplate art_) {
+        art = art_;
+    }
+
+    function register(address author, uint16 rarity) external returns (uint256) {
+        templateId = art.registerTemplate(author, rarity, keccak256("r"));
+        return templateId;
+    }
+
+    function fire(uint256 outerAmount, uint256 reentryAmount_) external {
+        reentryAmount = reentryAmount_;
+        art.mint(address(this), templateId, outerAmount, "");
+    }
+
+    function onERC1155Received(address, address, uint256, uint256, bytes calldata) external returns (bytes4) {
+        if (!entered) {
+            entered = true;
+            observedTotalMintedAtHook = art.totalMinted();
+            art.mint(address(this), templateId, reentryAmount, "");
+        }
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return this.onERC1155BatchReceived.selector;
+    }
+
+    function supportsInterface(bytes4) external pure returns (bool) {
+        return true;
     }
 }
