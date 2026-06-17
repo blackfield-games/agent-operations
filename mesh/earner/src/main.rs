@@ -468,14 +468,20 @@ async fn poll_once(
     let Some(job) = job else { return Ok(false) };
 
     // Capability self-guard (mirrors the ws `handle_offer` guard). Unlike the ws
-    // dispatcher, the HTTP `/jobs/next` endpoint is stateless and does NOT filter
-    // by our advertised kinds, so it can hand us a kind we can't render. Drop it
-    // WITHOUT rendering or submitting — the job stays in_flight and the
-    // coordinator's deadline reaper requeues it for a capable earner. Back off
-    // (Ok(false)) rather than re-polling at once, so a run of unsupported jobs
-    // can't spin us into draining the whole queue into in_flight.
+    // dispatcher, the stateless HTTP `/jobs/next` does NOT filter by our
+    // advertised kinds, so it can hand us a kind we can't render. This legacy
+    // transport has no per-poll decline message, so we just drop the job WITHOUT
+    // rendering or submitting and back off (Ok(false)). Honest accounting: the
+    // job was already marked in_flight with an attempt charged by /jobs/next, so
+    // it stays in_flight until the deadline reaper requeues it — and that requeue
+    // is attempt-CHARGING (unlike the ws Decline path, which refunds), so a job
+    // only an incapable earner ever polls will burn attempts toward dead-letter.
+    // That is the cost of the stateless transport; the primary goal (never render
+    // garbage) still holds, and a real earner advertises every kind so this only
+    // bites a buggy/malicious coordinator. Backing off rather than re-polling at
+    // once keeps a run of unsupported jobs from draining the queue into in_flight.
     if !supported.contains(&job.kind) {
-        tracing::warn!(job_id = %job.id, kind = ?job.kind, "declining job: unsupported job kind");
+        tracing::warn!(job_id = %job.id, kind = ?job.kind, "dropping unsupported job kind (http, no decline on this transport)");
         return Ok(false);
     }
 
