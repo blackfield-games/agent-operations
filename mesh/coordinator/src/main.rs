@@ -3310,6 +3310,92 @@ mod tests {
         assert_eq!(store.job_status(&live.id).unwrap().as_deref(), Some("queued"));
     }
 
+    /// The core of the earner-fault fix (FM1/FM3): an earner-fault requeue refunds
+    /// the dispatch attempt `take_next` charged, so a faulty earner can't burn a
+    /// job's renderability budget. The job survives more earner faults than
+    /// `max_attempts`, then still dead-letters after exactly `max_attempts` genuine
+    /// charge requeues — proving the faults never touched the attempt budget. If
+    /// the refund were missing, the accumulated attempts would dead-letter the job
+    /// on the very first charge requeue and the "1st charge → queued" step below
+    /// would fail.
+    #[test]
+    fn requeue_earner_fault_refunds_attempt_so_faults_dont_burn_attempt_budget() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        store.enqueue(&job).unwrap();
+
+        // Five earner faults (max_faults high so none dead-letters), each preceded
+        // by a redispatch. With max_attempts=2 the OLD attempt-charging behavior
+        // would have dead-lettered after the 2nd.
+        for i in 1..=5 {
+            let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+            assert!(
+                !store.requeue_earner_fault(&taken, 100).unwrap(),
+                "earner fault {i} must requeue, never dead-letter (faults < max_faults)"
+            );
+            assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        }
+
+        // The renderability budget is untouched: it still takes exactly
+        // max_attempts=2 genuine charge requeues to dead-letter, despite 5 faults.
+        let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+        assert!(!store.requeue(&taken, 2).unwrap(), "1st charge: attempts 1 < 2 → queued");
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+        assert!(store.requeue(&taken, 2).unwrap(), "2nd charge: attempts 2 >= 2 → dead-letter");
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("failed"));
+    }
+
+    /// FM1: a poison job (a spec no connected earner can satisfy → every earner
+    /// faults) must still terminate. Earner faults accumulate on the separate
+    /// `faults` budget and dead-letter at exactly `max_faults`, independent of the
+    /// (here generous) attempt budget — so the no-charge path can't loop forever.
+    #[test]
+    fn requeue_earner_fault_dead_letters_poison_job_at_max_faults() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        store.enqueue(&job).unwrap();
+
+        for fault in 1..=3 {
+            let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+            let dead = store.requeue_earner_fault(&taken, 3).unwrap();
+            if fault < 3 {
+                assert!(!dead, "fault {fault} < max_faults 3 → requeued");
+                assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+            } else {
+                assert!(dead, "fault 3 == max_faults → dead-lettered");
+                assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("failed"));
+            }
+        }
+    }
+
+    /// Like `requeue`, the earner-fault requeue acts ONLY on an in_flight job: an
+    /// unknown, queued, or settled job is a no-op, so a late fault reject for a
+    /// reaped/reassigned/settled job can't clobber it or charge a phantom fault.
+    #[test]
+    fn requeue_earner_fault_is_noop_for_non_in_flight() {
+        let mut store = Store::open_in_memory().unwrap();
+
+        // Unknown → no-op; nothing created.
+        let ghost = job_with_deadline(60);
+        assert!(!store.requeue_earner_fault(&ghost, 3).unwrap());
+        assert!(store.job_status(&ghost.id).unwrap().is_none());
+
+        // Queued (not in_flight) → no-op; stays queued.
+        let queued = job_with_deadline(60);
+        store.enqueue(&queued).unwrap();
+        assert!(!store.requeue_earner_fault(&queued, 3).unwrap());
+        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+
+        // Done → no-op; must NOT be resurrected to queued.
+        let done = job_with_deadline(60);
+        store.enqueue(&done).unwrap();
+        store.take_next(|j| j.id == done.id).unwrap();
+        store.record_completed(&signed_result(done.id, "x")).unwrap();
+        assert!(!store.requeue_earner_fault(&done, 3).unwrap());
+        assert_eq!(store.job_status(&done.id).unwrap().as_deref(), Some("done"));
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight() {
         // Build state on a non-seeded in-memory store so the queue truly starts
