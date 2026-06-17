@@ -1701,6 +1701,51 @@ mod tests {
         assert_eq!(json["jobs_completed"], 0);
     }
 
+    /// A result claiming more render-seconds than the job's deadline plausibly
+    /// allowed (u32::MAX vs a 60s deadline → bound 120) is rejected 422 and not
+    /// metered — the bound that stops /stats and payout poisoning.
+    #[tokio::test]
+    async fn submit_with_implausible_render_seconds_rejected_unprocessable() {
+        let state = test_state_empty().await;
+        let job = seed_job(); // deadline_secs = 60 → plausibility bound 120
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let mut bad = signed_result(job_id, "deadbeef"); // valid hash + signature
+        bad.render_seconds = u32::MAX; // the only defect; signature stays valid
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&bad).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Not settled, still in_flight for the reaper — like every content reject.
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
+        let json = body_json(get(state.clone(), &format!("/jobs/{job_id}/status")).await).await;
+        assert_eq!(json["status"], "in_flight");
+    }
+
+    /// FM2: an honest earner that finished within the slack (render_seconds ==
+    /// deadline * SLACK, the inclusive bound) still settles end-to-end — the
+    /// bound refuses fabricated values, not legitimate near-deadline work.
+    #[tokio::test]
+    async fn submit_at_the_render_seconds_slack_bound_settles() {
+        let state = test_state_empty().await;
+        let job = seed_job(); // deadline_secs = 60 → bound 120
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let mut good = signed_result(job_id, "deadbeef");
+        good.render_seconds = 120; // exactly deadline * SLACK
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 1);
+    }
+
     /// The content gate sits after the signature gate: a result that is BOTH
     /// badly signed and malformed surfaces the 401, so the gate ordering does not
     /// leak job state to an unauthenticated caller.
@@ -2316,6 +2361,37 @@ mod tests {
         // The caller's seq-fenced requeue then returns the job to the queue.
         requeue(&state, offered, seq).await;
         assert_eq!(state.store.lock().await.job_status(&job_id).unwrap().as_deref(), Some("queued"));
+    }
+
+    /// WS twin of the render-seconds bound: an implausible value (u32::MAX vs a
+    /// 60s deadline) is a content fault → Requeue (the job may be renderable by
+    /// an honest earner), nothing settled. The deadline comes from the offered
+    /// job, so the bound runs pre-lock with no store read.
+    #[tokio::test]
+    async fn ws_submit_with_implausible_render_seconds_requeues_without_settling() {
+        let state = test_state_empty().await;
+        let job = seed_job(); // deadline_secs = 60 → bound 120
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let (offered, seq) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        assert_eq!((offered.id, seq), (job_id, 1));
+
+        let mut bad = signed_result(job_id, "deadbeef"); // valid sig + hash
+        bad.render_seconds = u32::MAX; // the only defect
+        match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
+            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }) => {
+                assert_eq!(jid, job_id);
+                assert_eq!(reason, validate::ValidationError::ImplausibleRenderSeconds.reason());
+            }
+            other => panic!("expected Requeue with the content-gate reason, got {other:?}"),
+        }
+
+        // Nothing settled: still in_flight under our (only) dispatch.
+        assert_eq!(
+            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            Some("in_flight")
+        );
     }
 
     /// HTTP-poll fence (FM3): `/jobs/next` stamps `dispatch_seq` in a header, and
