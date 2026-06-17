@@ -1418,6 +1418,24 @@ mod tests {
         }
     }
 
+    /// A `JobResult` validly signed by the dev key over a verbatim (possibly
+    /// malformed) `output_hash`. Unlike [`signed_result`], the hash is NOT
+    /// expanded — the signature is taken over exactly what is sent — so the
+    /// signature gate passes and the content gate is the only thing that can
+    /// reject. Isolates the content gate from the signature gate.
+    fn signed_result_raw_hash(job_id: Uuid, output_hash: &str) -> JobResult {
+        let sk = dev_signing_key();
+        let sig = verify::sign_for_test(&sk, &job_id, output_hash);
+        JobResult {
+            job_id,
+            earner_address: dev_address(),
+            output_hash: output_hash.into(),
+            output_url: "memory://x".into(),
+            render_seconds: 1,
+            signature_hex: sig,
+        }
+    }
+
     #[tokio::test]
     async fn submit_matching_id_accepted_mismatch_rejected() {
         let state = test_state_empty().await;
@@ -1475,6 +1493,74 @@ mod tests {
 
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_completed"], 0);
+    }
+
+    // ---- result content gate (http submit) ----
+
+    /// A validly-signed result whose `output_hash` is not a 256-bit digest is
+    /// 422 (Unprocessable), distinct from the 401 a bad signature gets: the
+    /// signature verifies, the content gate fails. The job is not settled and is
+    /// left in_flight for the reaper (mirroring the bad-signature disposition).
+    #[tokio::test]
+    async fn submit_with_malformed_output_hash_rejected_unprocessable() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap(); // → in_flight, seq 1
+
+        // "deadbeef" is a valid label but only 8 chars as a raw hash — signed
+        // verbatim so the signature gate passes and the content gate is what bites.
+        let bad = signed_result_raw_hash(job_id, "deadbeef");
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&bad).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Not settled, and still in_flight (not requeued, not done) — the reaper
+        // owns its fate, exactly as for a bad-signature submit.
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
+        let json = body_json(get(state.clone(), &format!("/jobs/{job_id}/status")).await).await;
+        assert_eq!(json["status"], "in_flight");
+    }
+
+    /// A result claiming zero render-seconds (validly signed — render_seconds is
+    /// not part of the signed digest) is rejected 422 and not metered.
+    #[tokio::test]
+    async fn submit_with_zero_render_seconds_rejected_unprocessable() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let mut bad = signed_result(job_id, "deadbeef"); // valid hash + signature
+        bad.render_seconds = 0; // the only defect; signature stays valid
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&bad).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
+    }
+
+    /// The content gate sits after the signature gate: a result that is BOTH
+    /// badly signed and malformed surfaces the 401, so the gate ordering does not
+    /// leak job state to an unauthenticated caller.
+    #[tokio::test]
+    async fn submit_bad_signature_takes_precedence_over_content_gate() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let mut bad = signed_result_raw_hash(job_id, "deadbeef"); // malformed hash
+        bad.signature_hex.pop();
+        bad.signature_hex.push('f'); // ...and now also a broken signature
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&bad).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ---- websocket dispatch integration tests ----
@@ -1765,6 +1851,42 @@ mod tests {
         let credited = store.completed_count_by_earner().unwrap();
         assert_eq!(credited.get(&b_addr), Some(&1), "credit lands on B, the current holder");
         assert_eq!(credited.len(), 1, "and on no one else (A was never credited)");
+    }
+
+    /// ws content gate: a Submit whose result fails the content gate (here a
+    /// malformed output_hash, validly signed so the signature gate passes) is
+    /// Requeued — the job, which may be perfectly renderable, returns to the
+    /// queue for another earner — and nothing is settled. The reject reason is the
+    /// content gate's. `handle_submit` returns Requeue; the caller's seq-fenced
+    /// `requeue` then puts the job back, both driven here.
+    #[tokio::test]
+    async fn ws_submit_failing_content_gate_requeues_without_settling() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let (offered, seq) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        assert_eq!((offered.id, seq), (job_id, 1));
+
+        let bad = signed_result_raw_hash(job_id, "deadbeef"); // valid sig, malformed hash
+        match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
+            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }) => {
+                assert_eq!(jid, job_id);
+                assert_eq!(reason, validate::ValidationError::MalformedOutputHash.reason());
+            }
+            other => panic!("expected Requeue with the content-gate reason, got {other:?}"),
+        }
+
+        // Nothing settled: still in_flight under our (only) dispatch.
+        assert_eq!(
+            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            Some("in_flight")
+        );
+
+        // The caller's seq-fenced requeue then returns the job to the queue.
+        requeue(&state, offered, seq).await;
+        assert_eq!(state.store.lock().await.job_status(&job_id).unwrap().as_deref(), Some("queued"));
     }
 
     /// HTTP-poll fence (FM3): `/jobs/next` stamps `dispatch_seq` in a header, and
