@@ -13,12 +13,27 @@ to commit the composed world or route back to a specialist.
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 
 from common.types import WorldBrief, LayerSpec, ValidatorVerdict
 
 STYLE_SIM_THRESHOLD = 0.72
+
+# Metrics a specialist's role is contracted to ALWAYS emit, keyed by role. The
+# value is the set of required metric keys; every metric is a finite number
+# (LayerSpec.metrics is dict[str, float], so the value type is uniform — the
+# contract is "present and finite", with int and float both legal). Only roles
+# with a real downstream consumer are listed: the optimizer's budget verdict
+# (read by run() below) and the triangle count the optimizer sums across prior
+# layers. A role with no entry imposes NO requirement, so the specialists that
+# legitimately emit no metrics (director, biome, prop, lighting, npc) are
+# unaffected — keeping the schema to what a role genuinely always emits.
+ROLE_METRICS: dict[str, set[str]] = {
+    "optimization": {"over_budget"},
+    "terrain": {"triangles"},
+}
 
 # USD text layers must begin with this cookie; pxr refuses to open a file without
 # it and the engine silently skips a sublayer it cannot parse.
@@ -47,8 +62,23 @@ async def run(
     if missing:
         issues.append(f"missing specialist layers: {sorted(missing)}")
 
+    # Per-role metrics contract: a specialist whose role must report a metric (the
+    # optimizer's over_budget verdict, terrain's triangle count the optimizer sums)
+    # but emits it missing, mis-spelled, or non-finite silently drops the signal —
+    # the gate below (or the optimizer's sum) never sees it and the world ships
+    # over-budget. Reject and route back, naming the specialist. Checked before the
+    # over_budget gate so a missing/garbage metric is reported as such, not masked
+    # by the gate's `.get(..., 0.0)` default.
+    for layer in layers:
+        issues.extend(_metrics_issues(layer))
+
+    # Read the gate only on a finite numeric value: a missing/garbage over_budget is
+    # already reported by the metrics schema above, and comparing a non-number here
+    # would raise (e.g. "str" > 0). A missing metric defaults to 0.0 (gate passes;
+    # the schema is what rejects it).
     opt = next((layer for layer in layers if layer.specialist == "optimization"), None)
-    if opt and opt.metrics.get("over_budget", 0.0) > 0:
+    over_budget = opt.metrics.get("over_budget", 0.0) if opt else 0.0
+    if _is_finite_number(over_budget) and over_budget > 0:
         issues.append("triangle budget exceeded — re-run optimization with stricter LODs")
 
     # Open every emitted layer and confirm the engine could too: a garbled header,
@@ -74,6 +104,46 @@ async def run(
     accepted = len(issues) == 0
 
     return ValidatorVerdict(accepted=accepted, issues=issues)
+
+
+def _is_finite_number(value: object) -> bool:
+    """True for a real finite numeric metric: an int or float (int is legal against
+    the float contract — FM3) that is neither NaN nor inf. bool is an int subclass
+    but never a valid metric, so it's excluded. isinstance is checked first so
+    math.isfinite never sees a non-number."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _metrics_issues(layer: LayerSpec) -> list[str]:
+    """Why `layer` violates its role's metrics contract, or [] if it satisfies it
+    (or its role declares none — degrade cleanly, never KeyError, FM4).
+
+    A required key that is missing, non-numeric, or NaN/inf is reported with the
+    specialist named first so the supervisor's `_failing_specialist` routes the fix
+    back to it; the metric keys (`over_budget`, `triangles`) contain no specialist
+    name as a word, so they can't misroute. A present, finite int-or-float value is
+    accepted — an int is not a type error against the float contract (FM3).
+    """
+    required = ROLE_METRICS.get(layer.specialist)
+    if not required:
+        return []
+    out: list[str] = []
+    for key in sorted(required):
+        if key not in layer.metrics:
+            out.append(
+                f"{layer.specialist} layer {layer.path} is missing the required "
+                f"metric '{key}' its role must emit"
+            )
+        elif not _is_finite_number(layer.metrics[key]):
+            out.append(
+                f"{layer.specialist} layer {layer.path} metric '{key}' must be a "
+                f"finite number, got {layer.metrics[key]!r}"
+            )
+    return out
 
 
 def _layer_wellformedness(path: Path) -> str | None:
