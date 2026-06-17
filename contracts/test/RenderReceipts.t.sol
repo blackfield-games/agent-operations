@@ -41,6 +41,50 @@ contract MockEAS is IEAS {
     }
 }
 
+/// @dev Hostile EAS that reenters issueReceipt with the same jobId mid-attest,
+///      to prove receiptIssued is set before the external call (checks-effects-
+///      interactions) and a reentrant relay cannot mint a second attestation.
+contract ReentrantEAS is IEAS {
+    RenderReceipts public target;
+    address public reEarner;
+    bytes32 public reJobId;
+    uint256 public attestCalls;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    function arm(RenderReceipts target_, address earner_, bytes32 jobId_) external {
+        target = target_;
+        reEarner = earner_;
+        reJobId = jobId_;
+    }
+
+    function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
+        attestCalls++;
+        if (!reentered) {
+            reentered = true;
+            try target.issueReceipt(reEarner, reJobId, 1, 0, bytes32(0), bytes32(0)) returns (
+                bytes32
+            ) {
+            // reentry unexpectedly succeeded — reentryReverted stays false
+            }
+            catch (bytes memory err) {
+                reentryReverted = true;
+                reentryRevertSelector = bytes4(err);
+            }
+        }
+        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata)
+        external
+        payable
+        returns (bytes32[] memory)
+    {
+        revert("not implemented");
+    }
+}
+
 contract MockSchemaRegistry is ISchemaRegistry {
     bytes32 public constant FIXED_UID = keccak256("blackfield.render.schema.v1");
 
@@ -395,6 +439,35 @@ contract RenderReceiptsTest is Test {
         vm.expectRevert(RenderReceipts.NotAuthorized.selector);
         vm.prank(stranger);
         receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+    }
+
+    /// @dev The receiptIssued flag is set before the external attest, so a hostile
+    ///      EAS reentering issueReceipt with the same jobId mid-attest is rejected:
+    ///      exactly one attestation and one receipt result, counters consistent.
+    ///      (Would fail if the flag were written after the attest call.)
+    function test_issueReceipt_reentrantAttestCannotDoubleIssue() public {
+        ReentrantEAS reentrantEas = new ReentrantEAS();
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner);
+
+        bytes32 jobId = keccak256("reentrant-job");
+        reentrantEas.arm(r, earner, jobId);
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(reentrantEas), true); // reentry's msg.sender is the EAS
+        vm.stopPrank();
+
+        vm.prank(coordinator);
+        r.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        assertTrue(reentrantEas.reentered());
+        assertTrue(reentrantEas.reentryReverted());
+        assertEq(reentrantEas.reentryRevertSelector(), RenderReceipts.DuplicateReceipt.selector);
+
+        assertEq(reentrantEas.attestCalls(), 1);
+        assertEq(r.receiptCount(), 1);
+        assertEq(r.receiptsByEarner(earner), 1);
     }
 
     /// @dev The owner administers coordinators but is not itself a coordinator;
