@@ -748,5 +748,10 @@
     "inputs": [],
     "name": "StakeTooLow",
     "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroStake",
+    "type": "error"
   }
 ]
