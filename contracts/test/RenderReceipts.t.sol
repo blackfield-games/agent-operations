@@ -221,6 +221,67 @@ contract RenderReceiptsTest is Test {
         assertEq(dRegionId, regionId);
     }
 
+    /// @dev The forwarded `data` must match the registered schema's field layout
+    ///      exactly: `(address, bytes32, uint64, uint16, bytes32, bytes32)` in that
+    ///      order. EAS readers decode against the registered schema string, so a
+    ///      reordered or retyped field here makes every attestation unreadable. This
+    ///      pins the on-chain `abi.encode` to the schema declared in `registerSchema`.
+    function test_issueReceipt_encodingMatchesRegisteredSchemaLayout() public {
+        _arm();
+
+        address e = address(0x1234);
+        bytes32 jobId = keccak256("layout-job");
+        uint64 renderSeconds = 7;
+        uint16 jobKind = 2;
+        bytes32 outputHash = keccak256("out");
+        bytes32 regionId = keccak256("reg");
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(e, jobId, renderSeconds, jobKind, outputHash, regionId);
+
+        // Decode in the schema's declared order; every field round-trips.
+        (
+            address dEarner,
+            bytes32 dJobId,
+            uint64 dRenderSeconds,
+            uint16 dJobKind,
+            bytes32 dOutputHash,
+            bytes32 dRegionId
+        ) = abi.decode(eas.lastData(), (address, bytes32, uint64, uint16, bytes32, bytes32));
+        assertEq(dEarner, e);
+        assertEq(dJobId, jobId);
+        assertEq(dRenderSeconds, renderSeconds);
+        assertEq(dJobKind, jobKind);
+        assertEq(dOutputHash, outputHash);
+        assertEq(dRegionId, regionId);
+
+        // Byte-identical to a from-scratch encode in the declared field order.
+        assertEq(eas.lastData(), abi.encode(e, jobId, renderSeconds, jobKind, outputHash, regionId));
+    }
+
+    /// @dev Boundary values for the two narrow numeric fields encode without
+    ///      truncation: the schema declares `uint64 renderSeconds` and `uint16
+    ///      jobKind`, so max-width inputs (and a jobKind beyond the documented 0..4
+    ///      set — range is an off-chain concern) must round-trip intact.
+    function test_issueReceipt_encodesBoundaryValuesWithoutTruncation() public {
+        _arm();
+
+        uint64 renderSeconds = type(uint64).max;
+        uint16 jobKind = type(uint16).max;
+        bytes32 jobId = bytes32(type(uint256).max);
+        bytes32 outputHash = bytes32(type(uint256).max);
+        bytes32 regionId = bytes32(type(uint256).max);
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, renderSeconds, jobKind, outputHash, regionId);
+
+        (, bytes32 dJobId, uint64 dRenderSeconds, uint16 dJobKind,,) =
+            abi.decode(eas.lastData(), (address, bytes32, uint64, uint16, bytes32, bytes32));
+        assertEq(dRenderSeconds, type(uint64).max);
+        assertEq(dJobKind, type(uint16).max);
+        assertEq(dJobId, jobId);
+    }
+
     function test_issueReceipt_incrementsReceiptCount() public {
         _arm();
 
@@ -268,6 +329,82 @@ contract RenderReceiptsTest is Test {
         vm.expectRevert(RenderReceipts.NotAuthorized.selector);
         vm.prank(coordinator);
         receipts.issueReceipt(earner, keccak256("j"), 1, 0, bytes32(0), bytes32(0));
+    }
+
+    // --- issueReceipt idempotency (one attestation per job) ---
+
+    function test_issueReceipt_duplicateJobIdReverts() public {
+        _arm();
+        bytes32 jobId = keccak256("once");
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+        assertTrue(receipts.receiptIssued(jobId));
+
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.DuplicateReceipt.selector, jobId));
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        // The rejected replay left no trace: no second attest, no double count.
+        assertEq(eas.attestCalls(), 1);
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.receiptsByEarner(earner), 1);
+    }
+
+    /// @dev The guard is keyed on jobId alone, so the same job cannot be re-attested
+    ///      to a *different* earner — closing the obvious double-credit escape hatch.
+    function test_issueReceipt_duplicateRevertsAcrossDifferentEarners() public {
+        _arm();
+        bytes32 jobId = keccak256("shared");
+        address earnerB = address(0xEA34);
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.DuplicateReceipt.selector, jobId));
+        vm.prank(coordinator);
+        receipts.issueReceipt(earnerB, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        assertEq(receipts.receiptsByEarner(earnerB), 0);
+        assertEq(receipts.receiptCount(), 1);
+    }
+
+    /// @dev The guard fences per job, not globally: distinct jobIds each issue.
+    function test_issueReceipt_distinctJobIdsBothSucceed() public {
+        _arm();
+
+        vm.startPrank(coordinator);
+        receipts.issueReceipt(earner, keccak256("j1"), 10, 0, bytes32(0), bytes32(0));
+        receipts.issueReceipt(earner, keccak256("j2"), 10, 0, bytes32(0), bytes32(0));
+        vm.stopPrank();
+
+        assertEq(receipts.receiptCount(), 2);
+        assertFalse(receipts.receiptIssued(keccak256("never")));
+    }
+
+    /// @dev Auth is checked before the duplicate guard, so an unauthorized caller
+    ///      gets NotAuthorized even for an already-issued job — the dedup state is
+    ///      not an oracle that leaks which jobs have been attested.
+    function test_issueReceipt_unauthorizedRevertsEvenForIssuedJob() public {
+        _arm();
+        bytes32 jobId = keccak256("issued");
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        vm.prank(stranger);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+    }
+
+    /// @dev The owner administers coordinators but is not itself a coordinator;
+    ///      issuing requires explicit self-authorization (authority separation).
+    function test_issueReceipt_ownerIsNotImplicitlyAuthorized() public {
+        _arm();
+
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        vm.prank(owner);
+        receipts.issueReceipt(earner, keccak256("j"), 10, 0, bytes32(0), bytes32(0));
     }
 
     // --- Ownable2Step ---
