@@ -2479,6 +2479,93 @@ mod tests {
         );
     }
 
+    /// Every earner-attributable reject on a renderable job is tagged
+    /// `EarnerFault`, so the requeue refunds the dispatch attempt instead of
+    /// charging the renderability budget: bad signature, submit-before-accept,
+    /// and a submit whose job_id doesn't match the offer. (The content-gate and
+    /// render-seconds faults assert `EarnerFault` in their own tests above.)
+    #[tokio::test]
+    async fn handle_submit_tags_earner_attributable_rejects_as_earner_fault() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        let (offered, seq) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+
+        fn assert_earner_fault(outcome: SubmitOutcome, ctx: &str) {
+            match outcome {
+                SubmitOutcome::Requeue(_, kind) => {
+                    assert_eq!(kind, RequeueKind::EarnerFault, "{ctx} must be an earner fault")
+                }
+                other => panic!("{ctx}: expected Requeue(EarnerFault), got {other:?}"),
+            }
+        }
+
+        // Bad signature (accepted, id matches): flip the last hex nibble to a
+        // guaranteed-different value so the corruption never no-ops.
+        let mut bad_sig = signed_result(job_id, "deadbeef");
+        let last = bad_sig.signature_hex.pop().unwrap();
+        bad_sig.signature_hex.push(if last == 'f' { '0' } else { 'f' });
+        assert_earner_fault(
+            handle_submit(&state, &Some((offered.clone(), seq)), true, bad_sig).await,
+            "bad signature",
+        );
+
+        // Submit before Accept (validly signed, accepted = false).
+        assert_earner_fault(
+            handle_submit(&state, &Some((offered.clone(), seq)), false, signed_result(job_id, "deadbeef"))
+                .await,
+            "submit before accept",
+        );
+
+        // Submit whose job_id is not the offered job (a result for another job).
+        assert_earner_fault(
+            handle_submit(&state, &Some((offered.clone(), seq)), true, signed_result(Uuid::new_v4(), "x"))
+                .await,
+            "job_id mismatch",
+        );
+
+        // None of these touched the store: the job is still in_flight, uncredited.
+        let store = state.store.lock().await;
+        assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("in_flight"));
+        assert_eq!(store.completed_count().unwrap(), 0);
+    }
+
+    /// FM4 mechanism: a job in the per-session `skip` set is not handed back to
+    /// the same earner, so a faulting earner can't be re-offered the job it just
+    /// faulted on (no reject/re-offer hot loop). The job stays queued for others.
+    #[tokio::test]
+    async fn take_supported_job_skips_faulted_jobs() {
+        let state = test_state_empty().await;
+        let a = job_with_deadline(60); // both Terrain (seed_job base), distinct ids
+        let b = job_with_deadline(60);
+        enqueue(&state, &a).await;
+        enqueue(&state, &b).await;
+        let supported = vec![JobKind::Terrain];
+
+        // Both queued jobs skipped → nothing offerable (the earner idles).
+        let mut skip: HashSet<Uuid> = HashSet::new();
+        skip.insert(a.id);
+        skip.insert(b.id);
+        assert!(
+            take_supported_job(&state, &supported, &skip).await.is_none(),
+            "all supported jobs skipped → no offer (no hot loop)"
+        );
+
+        // Drop b from skip: take_next (rowid DESC) hands back b; a stays skipped.
+        skip.remove(&b.id);
+        let (taken, _) = take_supported_job(&state, &supported, &skip).await.unwrap();
+        assert_eq!(taken.id, b.id, "only the non-skipped job is offerable");
+
+        // a remains renderable but skipped for THIS earner → still not offered,
+        // and still queued (available to a different earner).
+        assert!(
+            take_supported_job(&state, &supported, &skip).await.is_none(),
+            "a is renderable but skipped for this earner"
+        );
+        assert_eq!(state.store.lock().await.job_status(&a.id).unwrap().as_deref(), Some("queued"));
+    }
+
     /// HTTP-poll fence (FM3): `/jobs/next` stamps `dispatch_seq` in a header, and
     /// `/jobs/{id}/submit` must echo the CURRENT seq. A submit with no header is
     /// refused (can't be tied to a dispatch); one echoing a seq from a since-
