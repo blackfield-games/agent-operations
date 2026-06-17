@@ -30,6 +30,11 @@ STYLE_SIM_THRESHOLD = 0.72
 # layers. A role with no entry imposes NO requirement, so the specialists that
 # legitimately emit no metrics (director, biome, prop, lighting, npc) are
 # unaffected — keeping the schema to what a role genuinely always emits.
+#
+# NOTE: the optimizer sums `triangles` across ALL prior layers, but only terrain
+# emits geometry today, so terrain is the sole contracted emitter. If a future
+# stub (biome/prop/…) starts contributing geometry, add `triangles` to its
+# contract here so a mis-spelled key there can't silently under-count the budget.
 ROLE_METRICS: dict[str, set[str]] = {
     "optimization": {"over_budget"},
     "terrain": {"triangles"},

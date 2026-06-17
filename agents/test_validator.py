@@ -228,6 +228,37 @@ def test_metrics_no_schema_role_imposes_no_requirement(tmp_path):
     assert validator._metrics_issues(biome) == []
 
 
+def test_is_finite_number_accepts_int_and_float_rejects_nonfinite_and_nonnumeric():
+    # FM3: int and float are both legal; NaN, inf (the dangerous one — inf > 0 is
+    # True, so dropping the isfinite check would let it through), bool, numeric-looking
+    # strings, and None are not.
+    assert validator._is_finite_number(0)
+    assert validator._is_finite_number(262144)  # int
+    assert validator._is_finite_number(-3)
+    assert validator._is_finite_number(1.5)  # float
+    assert not validator._is_finite_number(float("nan"))
+    assert not validator._is_finite_number(float("inf"))
+    assert not validator._is_finite_number(float("-inf"))
+    assert not validator._is_finite_number(True)  # bool is an int subclass, not a metric
+    assert not validator._is_finite_number("5")
+    assert not validator._is_finite_number(None)
+
+
+async def test_run_routes_to_earliest_when_metric_and_wellformedness_issues_coexist(tmp_path):
+    # A metric issue on a downstream specialist (optimization missing over_budget)
+    # co-occurs with a well-formedness issue on an upstream one (terrain's file is
+    # garbage). Route-back must still pick the pipeline-earliest (terrain) — proving
+    # metric issues participate in the same earliest-specialist routing.
+    opt = _layer(tmp_path, "optimization", metrics={})
+    layers = _with_override(tmp_path, "optimization", opt)
+    (tmp_path / f"terrain/{REGION}.usda").write_text("garbage\n")
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("optimization" in i and "over_budget" in i for i in verdict.issues)
+    assert any("terrain" in i for i in verdict.issues)
+    assert _failing_specialist(verdict.issues) == "terrain"
+
+
 # ---- composition conflicts (cross-layer) ----
 
 # /World/Hub as a Mesh vs. as an Xform — the two bodies disagree only on Hub's
