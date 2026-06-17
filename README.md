@@ -23,7 +23,7 @@ Three loosely coupled backends sit behind the game client.
 
 ### Mesh
 
-A distributed render pool. The coordinator service (Rust, Axum) queues render jobs and dispatches them to earner clients over WebSocket or HTTP polling. Each earner registers its available GPU and the job types it can handle, and signs every result with a secp256k1 session key; the coordinator verifies the signature before accepting the result. The job queue and results persist in SQLite, so an interrupted coordinator reclaims in-flight work on restart rather than dropping it. Shared wire types live in `proto`. Connected GPUs and queue depth are exposed at `/stats`.
+A distributed render pool. The coordinator service (Rust, Axum) queues render jobs and dispatches them to earner clients over WebSocket or HTTP polling. Each earner registers its available GPU and the job types it can handle, and signs every result with a secp256k1 session key; the coordinator verifies the signature and checks the result is well-formed before accepting it, then records a pending EAS render receipt for each validated job. The job queue, results, and pending receipts persist in SQLite, so an interrupted coordinator reclaims in-flight work on restart rather than dropping it. Shared wire types live in `proto`. Connected GPUs, queue depth, and the attestation backlog are exposed at `/stats`.
 
 ### Contracts
 
