@@ -142,10 +142,10 @@ contract RenderReceipts is Ownable2Step {
 
         // Effects before the external attest (checks-effects-interactions): the fence,
         // the credited earner, and both live counters are consistent before the call,
-        // so a reentrant relay is rejected by the fence and a cross-function reentrant
-        // revoke during attest sees coherent counters. Only `receiptUid` is set after —
-        // EAS derives the uid, so it is unknowable until attest returns; a revoke that
-        // raced the pending uid would read zero and EAS rejects a zero uid.
+        // so a reentrant relay is rejected by the fence. Only `receiptUid` is set after —
+        // EAS derives the uid, so it is unknowable until attest returns; a reentrant
+        // revoke that races the pending uid reads zero and is rejected by revokeReceipt's
+        // own uid==0 guard, so the issue still completes or reverts atomically.
         receiptIssued[jobId] = true;
         _receiptEarner[jobId] = earner;
         ++receiptCount;
@@ -181,6 +181,14 @@ contract RenderReceipts is Ownable2Step {
         if (!receiptIssued[jobId]) revert NotIssued(jobId);
         if (receiptRevoked[jobId]) revert AlreadyRevoked(jobId);
 
+        bytes32 uid = receiptUid[jobId];
+        // A receipt is only fully materialized once its uid is persisted (set after the
+        // issue-time attest). The single state where receiptIssued is set but receiptUid
+        // is still zero is a reentrant revoke during issueReceipt's attest — reject it
+        // here so the guarantee is self-contained, not dependent on EAS reverting a zero
+        // uid. Outside that reentrant window this branch is unreachable.
+        if (uid == bytes32(0)) revert NotIssued(jobId);
+
         // Effects before interaction (CEI): mark revoked and decrement before the
         // external EAS.revoke, so a reentrant or replayed revoke is rejected by the
         // AlreadyRevoked guard and cannot double-decrement. The guards above prove one
@@ -188,7 +196,6 @@ contract RenderReceipts is Ownable2Step {
         // arithmetic backstops any underflow regardless).
         receiptRevoked[jobId] = true;
         address earner = _receiptEarner[jobId];
-        bytes32 uid = receiptUid[jobId];
         --receiptCount;
         --receiptsByEarner[earner];
         ++revokedCount;
