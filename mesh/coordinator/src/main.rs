@@ -2324,6 +2324,74 @@ mod tests {
         assert_eq!(json["jobs_failed"], 1);
     }
 
+    /// FM4 end-to-end: an earner that submits a faulty result (bad signature) is
+    /// Rejected, and the coordinator does NOT re-offer it the same job — the
+    /// per-session skip set breaks the reject/re-offer hot loop. The job returns
+    /// to the queue, renderable for another earner, and an earner fault never
+    /// dead-letters it (it stays `queued`, not `failed`).
+    #[tokio::test]
+    async fn ws_earner_fault_does_not_reoffer_same_job_nor_dead_letter() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Submit a corrupted signature → earner fault (flip the last nibble to a
+        // guaranteed-different value so the corruption never no-ops).
+        let mut bad = signed_result(job_id, "deadbeef");
+        let last = bad.signature_hex.pop().unwrap();
+        bad.signature_hex.push(if last == 'f' { '0' } else { 'f' });
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(bad)).unwrap(),
+        ))
+        .await
+        .unwrap();
+        match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::Rejected { job_id: jid, .. } => assert_eq!(jid, job_id),
+            other => panic!("expected Rejected for the faulty result, got {other:?}"),
+        }
+
+        // The same earner must NOT be re-offered the faulted job. A re-offer would
+        // arrive within a poll tick (~100ms); we wait well past that and assert no
+        // further message comes — if the skip set regressed, a JobOffer would land
+        // here and the timeout would NOT fire.
+        let reoffer =
+            tokio::time::timeout(Duration::from_millis(500), next_coordinator_msg(&mut ws)).await;
+        assert!(reoffer.is_err(), "faulted job re-offered to the same earner: {reoffer:?}");
+
+        // The job itself is back on the queue, renderable for another earner —
+        // not dead-lettered by the fault. (Asserted directly on the job rather
+        // than via /stats in-flight counts, which include test_state_empty's
+        // drained seed jobs.)
+        assert_eq!(
+            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            Some("queued"),
+            "an earner fault must not dead-letter a renderable job"
+        );
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_failed"], 0, "nothing dead-lettered");
+        assert_eq!(json["jobs_completed"], 0, "nothing credited");
+    }
+
     /// A `JobResult` validly signed by an arbitrary key (distinct from the dev
     /// key `signed_result` uses), credited to that key's derived address — lets a
     /// test assert credit lands on a SPECIFIC earner, not just "someone".
