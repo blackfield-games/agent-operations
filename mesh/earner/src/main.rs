@@ -244,11 +244,16 @@ where
         + Unpin,
     <S as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
 {
+    // Advertised capability set — captured ONCE and used both for Hello and for
+    // the per-offer self-guard in `handle_offer`, so the guard always checks
+    // against exactly what we told the coordinator (no Hello/guard skew, and no
+    // mid-session race: a single session never re-Hellos).
+    let supported = all_supported();
     let hello = EarnerMsg::Hello {
         earner_address: session.address.clone(),
         gpu_model: args.gpu_model.clone(),
         vram_gb: args.vram_gb,
-        supported: all_supported(),
+        supported: supported.clone(),
     };
     ws.send(WsMessage::text(serde_json::to_string(&hello)?))
         .await
@@ -279,7 +284,9 @@ where
         };
         match msg {
             CoordinatorMsg::JobOffer(job) => {
-                if let Err(e) = handle_offer(&mut ws, session, job, args.heartbeat_secs).await {
+                if let Err(e) =
+                    handle_offer(&mut ws, session, &supported, job, args.heartbeat_secs).await
+                {
                     tracing::warn!(error = %e, "job offer handling failed");
                 }
             }
@@ -334,6 +341,7 @@ fn backoff_delay(consecutive_failures: u32, max_secs: u64) -> Duration {
 async fn handle_offer<S>(
     ws: &mut S,
     session: &Session,
+    supported: &[JobKind],
     job: JobSpec,
     heartbeat_secs: u64,
 ) -> Result<()>
@@ -342,6 +350,27 @@ where
     <S as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
 {
     tracing::info!(job_id = %job.id, kind = ?job.kind, region = %job.region.region_id(), "job offered");
+
+    // Capability self-guard: never render a kind we didn't advertise. The
+    // coordinator's ws dispatch normally filters by our Hello `supported` set,
+    // but a coordinator bug, a stale capability view, or a malicious coordinator
+    // could still offer an unsupported kind — which the stub would "render" into
+    // garbage (and a real per-kind runner would crash on), only to fail
+    // validation and burn the job's budget. Decline it back over the socket
+    // (a normal protocol message, NOT a disconnect) so the coordinator requeues
+    // it for a capable earner; we render nothing and stay connected for the next
+    // offer.
+    if !supported.contains(&job.kind) {
+        tracing::warn!(job_id = %job.id, kind = ?job.kind, "declining offer: unsupported job kind");
+        ws.send(WsMessage::text(serde_json::to_string(&EarnerMsg::Decline {
+            job_id: job.id,
+            reason: format!("unsupported job kind: {}", job.kind.as_str()),
+        })?))
+        .await
+        .map_err(|e| anyhow!(e))
+        .context("sending Decline")?;
+        return Ok(());
+    }
 
     // Accept first so the coordinator marks it in-flight for us.
     ws.send(WsMessage::text(serde_json::to_string(&EarnerMsg::Accept {
@@ -655,7 +684,7 @@ mod tests {
         // Large heartbeat interval: the stub render returns instantly, so the
         // render completes before any beat fires — exactly two frames are sent.
         let mut sink = RecordingSink::default();
-        handle_offer(&mut sink, &session, job, 3600).await.unwrap();
+        handle_offer(&mut sink, &session, &all_supported(), job, 3600).await.unwrap();
 
         assert_eq!(sink.sent.len(), 2, "expected Accept then Submit, got {:?}", sink.sent);
 
@@ -682,6 +711,79 @@ mod tests {
             }
             other => panic!("second frame must be Submit, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handle_offer_declines_an_unsupported_kind_without_rendering() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        // We advertise ONLY Terrain but are offered a DiffusionTile job — what a
+        // buggy/malicious coordinator (or a stale capability view) could do.
+        let supported = vec![JobKind::Terrain];
+        let job = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::DiffusionTile,
+            region: proto::RegionCoord { x: 1, y: 2, layer: 0 },
+            deadline_secs: 120,
+            max_payout_wei: "1000000000000000000".to_string(),
+            inputs: serde_json::json!({}),
+        };
+        let job_id = job.id;
+
+        let mut sink = RecordingSink::default();
+        handle_offer(&mut sink, &session, &supported, job, 3600).await.unwrap();
+
+        // Exactly one frame — a Decline naming the job + the offending kind. No
+        // Accept, no Submit: nothing was rendered.
+        assert_eq!(
+            sink.sent.len(),
+            1,
+            "an unsupported offer must send only a Decline, got {:?}",
+            sink.sent
+        );
+        match decode_frame(&sink.sent[0]) {
+            EarnerMsg::Decline { job_id: declined, reason } => {
+                assert_eq!(declined, job_id);
+                assert!(reason.contains("diffusion_tile"), "reason should name the kind: {reason}");
+            }
+            other => panic!("the only frame must be Decline, got {other:?}"),
+        }
+        assert!(
+            !sink.sent.iter().any(|f| matches!(
+                decode_frame(f),
+                EarnerMsg::Accept { .. } | EarnerMsg::Submit(_)
+            )),
+            "must never Accept or Submit an unsupported job",
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_offer_accepts_a_supported_kind_from_a_restricted_set() {
+        // Discriminates against a guard that declines whenever the advertised set
+        // isn't the full ALL set: a restricted set that DOES contain the offered
+        // kind must still accept + render unchanged.
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let supported = vec![JobKind::Terrain];
+        let job = JobSpec {
+            id: Uuid::new_v4(),
+            kind: JobKind::Terrain,
+            region: proto::RegionCoord { x: 0, y: 0, layer: 0 },
+            deadline_secs: 120,
+            max_payout_wei: "1000000000000000000".to_string(),
+            inputs: serde_json::json!({}),
+        };
+        let job_id = job.id;
+
+        let mut sink = RecordingSink::default();
+        handle_offer(&mut sink, &session, &supported, job, 3600).await.unwrap();
+
+        assert_eq!(
+            sink.sent.len(),
+            2,
+            "a supported offer must Accept then Submit, got {:?}",
+            sink.sent
+        );
+        assert!(matches!(decode_frame(&sink.sent[0]), EarnerMsg::Accept { job_id: a } if a == job_id));
+        assert!(matches!(decode_frame(&sink.sent[1]), EarnerMsg::Submit(_)));
     }
 
     // ---- ws full session loop: ws_session over a dual Sink+Stream mock ----
