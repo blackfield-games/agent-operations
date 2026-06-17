@@ -79,6 +79,7 @@ impl Store {
                  status       TEXT NOT NULL,
                  started_at   INTEGER,
                  attempts     INTEGER NOT NULL DEFAULT 0,
+                 faults       INTEGER NOT NULL DEFAULT 0,
                  dispatch_seq INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS results (
@@ -133,6 +134,13 @@ impl Store {
                 "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
                 [],
             ),
+        )?;
+        // Migrate pre-existing DBs (created before `faults` was added). Earner-fault
+        // rejects charge this counter instead of the dispatch `attempts` budget; an
+        // existing job defaults to 0 faults, which is correct (none recorded yet).
+        // Swallow only the duplicate-column error.
+        ignore_duplicate_column(
+            conn.execute("ALTER TABLE jobs ADD COLUMN faults INTEGER NOT NULL DEFAULT 0", []),
         )?;
         // Migrate pre-existing DBs (created before `dispatch_seq` was added). The
         // per-dispatch fence defaults to 0; the first `take_next` after a restart
@@ -213,12 +221,17 @@ impl Store {
         Ok(None)
     }
 
-    /// Put a job back on the queue (rejected submission / dropped connection),
-    /// or dead-letter it if it has already been dispatched `max_attempts` times —
-    /// but ONLY while it is still `in_flight`.
+    /// Put a job back on the queue after a deadline-miss / dropped-connection
+    /// requeue — where the dispatch was a genuine (if failed) rendering attempt —
+    /// or dead-letter it if it has already been dispatched `max_attempts` times,
+    /// but ONLY while it is still `in_flight`. This is the *attempt-charging*
+    /// requeue: it consumes the renderability budget `take_next` charged at
+    /// dispatch. An EARNER-fault reject (bad signature, malformed/implausible
+    /// content) must NOT burn that budget — route those to
+    /// [`requeue_earner_fault`](Self::requeue_earner_fault) instead.
     ///
-    /// This is an earner-driven action (its offer was rejected or its socket
-    /// dropped). If the reaper has already requeued or dead-lettered the job, the
+    /// This is an earner-driven action (its socket dropped, or a non-fault
+    /// requeue). If the reaper has already requeued or dead-lettered the job, the
     /// late reject/disconnect is a no-op, so it can't resurrect a terminal job or
     /// re-queue one the reaper just parked. Reads `attempts` to decide:
     /// `>= max_attempts` → terminal `failed`, otherwise back to `queued`; clears
@@ -258,6 +271,60 @@ impl Store {
         self.conn.execute(
             "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2 AND status = ?3",
             (new_status, job.id.to_string(), STATUS_IN_FLIGHT),
+        )?;
+        Ok(new_status == STATUS_FAILED)
+    }
+
+    /// Return a job to the queue after an EARNER-fault result reject (bad/forged
+    /// signature, malformed/implausible content, or a submit-protocol violation)
+    /// WITHOUT consuming a dispatch attempt: the job itself is still renderable,
+    /// so only the faulting earner should be penalized, never the job. The
+    /// dispatch attempt that `take_next` provisionally charged is refunded
+    /// (`attempts -= 1`) and a separate `faults` counter is charged instead. The
+    /// job is dead-lettered only once it has accumulated `max_faults` earner
+    /// faults, so a poison job (a spec no connected earner can satisfy) still
+    /// terminates rather than looping forever — while a renderable job can no
+    /// longer be burned to `failed` by an earner that keeps submitting garbage.
+    ///
+    /// Like [`requeue`](Self::requeue) this acts ONLY on a still-`in_flight` job
+    /// and is a no-op otherwise (a reaper-parked or terminal job is left
+    /// untouched). The dispatch-seq fence one layer up (the coordinator `requeue`
+    /// helper) has already confirmed, under this same store lock, that we still
+    /// hold the current dispatch — so the read+update here is atomic against any
+    /// other dispatch, exactly as in `requeue`.
+    ///
+    /// Returns `true` iff the job was dead-lettered (moved to `failed`); `false`
+    /// if it was requeued OR a no-op (not in_flight / unknown).
+    pub fn requeue_earner_fault(&self, job: &JobSpec, max_faults: u32) -> Result<bool> {
+        let row: Option<(String, u32)> = self
+            .conn
+            .query_row(
+                "SELECT status, faults FROM jobs WHERE id = ?1",
+                [job.id.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let Some((status, faults)) = row else { return Ok(false) }; // unknown job
+        if status != STATUS_IN_FLIGHT {
+            return Ok(false); // already reaped or terminal — don't clobber
+        }
+
+        let new_faults = faults + 1;
+        let new_status = if new_faults >= max_faults { STATUS_FAILED } else { STATUS_QUEUED };
+        // Refund the dispatch attempt `take_next` charged (this dispatch was an
+        // earner fault, not a real rendering attempt) and record the fault, in one
+        // UPDATE guarded on in_flight so it stays atomic with the read above.
+        // `MAX(attempts - 1, 0)` floors the refund — an in_flight job always has
+        // attempts >= 1, so this only guards a hypothetical underflow.
+        self.conn.execute(
+            "UPDATE jobs
+             SET status = ?1, started_at = NULL, attempts = MAX(attempts - 1, 0), faults = ?2
+             WHERE id = ?3 AND status = ?4",
+            (new_status, new_faults, job.id.to_string(), STATUS_IN_FLIGHT),
         )?;
         Ok(new_status == STATUS_FAILED)
     }
@@ -623,12 +690,14 @@ impl Store {
         Ok(oldest)
     }
 
-    /// Count of jobs dispatched more than once (`attempts > 1`): `take_next`
-    /// handed them out, the reaper requeued them on a missed deadline, and they
-    /// were dispatched again. A cumulative reaper-churn signal for `/stats` —
-    /// counts each such job once regardless of current status, since `attempts`
-    /// is bumped on every dispatch and never reset. Zero on a healthy mesh where
-    /// every job lands on its first dispatch.
+    /// Count of jobs whose renderability budget shows more than one dispatch
+    /// (`attempts > 1`): `take_next` handed them out, the reaper requeued them on
+    /// a missed deadline, and they were dispatched again. A cumulative
+    /// reaper-churn signal for `/stats` — counts each such job once regardless of
+    /// current status. `attempts` is bumped on every dispatch but *refunded* by an
+    /// earner-fault requeue (those charge the separate `faults` budget), so this
+    /// tracks deadline/disconnect-driven redispatches, not earner-fault churn.
+    /// Zero on a healthy mesh where every job lands on its first dispatch.
     pub fn redispatched_count(&self) -> Result<usize> {
         let count: i64 =
             self.conn
