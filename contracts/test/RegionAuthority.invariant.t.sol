@@ -26,6 +26,10 @@ contract RegionAuthorityHandler is Test {
     mapping(uint256 tokenId => address holder) public holderOf;
     mapping(uint256 tokenId => uint256 amount) public stakeOf;
     uint256 public ghost_activeStakeSum;
+    // Fees deposited and not yet paid out (claimFees/withdraw), regardless of whether
+    // they currently sit in accruedFees or withdrawable — a transfer/burn only moves
+    // them between those buckets, so this aggregate is unchanged by either.
+    uint256 public ghost_unclaimedFees;
 
     constructor(RegionAuthority region_, MockToken token_, address[] memory actors_) {
         region = region_;
@@ -76,8 +80,70 @@ contract RegionAuthorityHandler is Test {
         activeTokenIds.pop();
     }
 
+    function depositFees(uint256 fromSeed, uint256 idxSeed, uint256 amount) external {
+        if (activeTokenIds.length == 0) return;
+        uint256 tokenId = activeTokenIds[idxSeed % activeTokenIds.length];
+        address from = actors[fromSeed % actors.length];
+        uint256 bal = token.balanceOf(from);
+        if (bal == 0) return;
+        amount = bound(amount, 1, bal);
+
+        vm.prank(from);
+        region.depositFees(tokenId, amount);
+        ghost_unclaimedFees += amount;
+    }
+
+    function claimFees(uint256 idxSeed) external {
+        if (activeTokenIds.length == 0) return;
+        uint256 tokenId = activeTokenIds[idxSeed % activeTokenIds.length];
+        uint256 accrued = region.accruedFees(tokenId);
+        if (accrued == 0) return; // would revert NothingToClaim
+
+        vm.prank(holderOf[tokenId]);
+        region.claimFees(tokenId);
+        ghost_unclaimedFees -= accrued;
+    }
+
+    function withdraw(uint256 actorSeed) external {
+        address actor = actors[actorSeed % actors.length];
+        uint256 w = region.withdrawable(actor);
+        if (w == 0) return; // would revert NothingToClaim
+
+        vm.prank(actor);
+        region.withdraw();
+        ghost_unclaimedFees -= w;
+    }
+
+    function transferRegion(uint256 idxSeed, uint256 toSeed) external {
+        if (activeTokenIds.length == 0) return;
+        uint256 tokenId = activeTokenIds[idxSeed % activeTokenIds.length];
+        address from = holderOf[tokenId];
+        address to = actors[toSeed % actors.length];
+        if (to == from) return;
+
+        vm.prank(from);
+        region.transferFrom(from, to, tokenId);
+        holderOf[tokenId] = to; // accrued settles to from's withdrawable; aggregate unchanged
+    }
+
     function activeCount() external view returns (uint256) {
         return activeTokenIds.length;
+    }
+
+    /// @dev The contract's own books: Σ stakes + Σ accrued (over active regions) +
+    ///      Σ withdrawable (over all actors, the only addresses that ever hold a
+    ///      balance here). Reconciled against the real token balance by the invariant.
+    function internalAccountingSum() external view returns (uint256) {
+        uint256 sum;
+        for (uint256 i = 0; i < activeTokenIds.length; i++) {
+            uint256 id = activeTokenIds[i];
+            (uint256 staked,) = region.stakes(id);
+            sum += staked + region.accruedFees(id);
+        }
+        for (uint256 i = 0; i < actors.length; i++) {
+            sum += region.withdrawable(actors[i]);
+        }
+        return sum;
     }
 }
 
@@ -109,9 +175,19 @@ contract RegionAuthorityInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// @dev The region holds exactly the sum of all currently active stakes.
-    function invariant_balanceEqualsActiveStakes() public view {
-        assertEq(token.balanceOf(address(region)), handler.ghost_activeStakeSum());
+    /// @dev Conservation against independently-tracked ghosts: the region's real
+    ///      balance is exactly the active stakes plus every deposited-but-unpaid fee
+    ///      (deposit args in, claimFees/withdraw payouts out) — transfers and burns
+    ///      only shuffle fees between accrued and withdrawable, never the total.
+    function invariant_balanceEqualsStakesPlusUnclaimedFees() public view {
+        assertEq(token.balanceOf(address(region)), handler.ghost_activeStakeSum() + handler.ghost_unclaimedFees());
+    }
+
+    /// @dev The contract's internal books reconcile to its balance: balance ==
+    ///      Σ stakes + Σ accrued + Σ withdrawable. Catches any drift between the
+    ///      accounting mappings and the real tokens regardless of the ghosts.
+    function invariant_balanceReconcilesInternalAccounting() public view {
+        assertEq(token.balanceOf(address(region)), handler.internalAccountingSum());
     }
 }
 
