@@ -215,7 +215,7 @@ def test_compose_world_happy_path_all_known_specialists(tmp_path):
 
 
 def test_compose_rejects_empty_layer_path_naming_specialist(tmp_path):
-    """An empty path would emit `@.//@` and reference nothing; reject it, fail-fast
+    """An empty path would emit `@./@` and reference nothing; reject it, fail-fast
     (no file written), and name the offending specialist."""
     layers = [
         LayerSpec(specialist="terrain", region_id="r+0000_+0000_l0", path="", summary="x", metrics={}),
@@ -242,6 +242,30 @@ def test_compose_rejects_newline_in_path_naming_specialist(tmp_path):
         LayerSpec(specialist="prop", region_id="r+0000_+0000_l0", path="prop/a\n].usda", summary="x", metrics={}),
     ]
     with pytest.raises(ValueError, match="prop"):
+        compose_world(layers, tmp_path)
+    assert not (tmp_path / "world.usda").exists()
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "biome/a\rb.usda",  # carriage return
+        "biome/a\tb.usda",  # tab
+        "biome/ a.usda",  # embedded space
+        "   ",  # whitespace-only
+        "@biome/a.usda",  # leading @ delimiter
+        "biome/a.usda@",  # trailing @ delimiter
+    ],
+)
+def test_compose_rejects_other_usda_breaking_paths(tmp_path, bad_path):
+    """Belt-and-suspenders for the allowlist: every non-allowed breaker (CR, tab,
+    space, whitespace-only, leading/trailing @) is rejected fail-fast, not just
+    the mid-string @ and newline cases above. A future blocklist/`\\s` rewrite that
+    regressed any of these would be caught here."""
+    layers = [
+        LayerSpec(specialist="biome", region_id="r+0000_+0000_l0", path=bad_path, summary="x", metrics={}),
+    ]
+    with pytest.raises(ValueError, match="biome"):
         compose_world(layers, tmp_path)
     assert not (tmp_path / "world.usda").exists()
 
