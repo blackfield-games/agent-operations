@@ -204,9 +204,15 @@ contract ArtifactTemplateTest is Test {
     }
 
     /// @dev A minter contract that is also the mint recipient reenters mint() from
-    ///      its ERC-1155 receiver hook. CEI (counters before _mint) means the
-    ///      reentrant call sees the outer mint already counted, and the totals are
-    ///      exact once the nested calls settle — no drift, no double-count.
+    ///      its ERC-1155 receiver hook. The counters are unconditional commutative
+    ///      adds with no reentrant read-before-write, so the quiescent totals are
+    ///      exact under either ordering — the `== 8` checks below are commutativity
+    ///      sanity checks, not the CEI proof. The discriminator is the mid-hook
+    ///      observation: with effects-before-interaction the reentrant call sees the
+    ///      outer mint already counted (the pre-reorder ordering would show 0). The
+    ///      reorder is the correct pattern (OZ warns against state writes after the
+    ///      acceptance check) and keeps the contract robust to a future counter read
+    ///      that gates behavior — it is not patching a live drift bug.
     function test_mint_reentrantMinterKeepsCounterIntegrity() public {
         ReentrantMinter rm = new ReentrantMinter(art);
         vm.prank(owner);
@@ -215,11 +221,11 @@ contract ArtifactTemplateTest is Test {
         uint256 id = rm.register(author, 1000);
         rm.fire(5, 3); // outer mint 5; the receiver hook reenters and mints 3 more
 
-        assertEq(art.totalMinted(), 8);
+        assertEq(art.totalMinted(), 8); // commutativity sanity — holds under either ordering
         assertEq(art.mintedByTemplate(id), 8);
         assertEq(art.balanceOf(address(rm), id), 8);
-        // Proof of effects-before-interaction: when the outer mint's hook fired and
-        // reentered, totalMinted already carried the outer 5.
+        // CEI discriminator: the outer mint's counter write landed before its hook
+        // reentered, so the reentrant call observed the outer 5 already counted.
         assertEq(rm.observedTotalMintedAtHook(), 5);
     }
 
