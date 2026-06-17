@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 # via env for slow/fast backends; tests monkeypatch it to a tiny value.
 NODE_TIMEOUT_SECS = float(os.environ.get("AGENT_NODE_TIMEOUT_SECS", "120"))
 
+# Hard cap on validator rounds. After this many validate → route-back →
+# revalidate cycles, a still-rejected region ENDs with its last non-accepted
+# verdict instead of recursing forever — a persistently-failing stage must not
+# hang the pipeline. Recursion guard from research-agent-runtime.md.
+MAX_ROUNDS = 3
+
 
 def merge_layers(existing: list[LayerSpec], new: list[LayerSpec]) -> list[LayerSpec]:
     """Reducer for State.layers: concatenate, then keep only the latest layer
@@ -171,7 +177,7 @@ def _after_validator(state: State) -> str:
         return END
     if verdict.accepted:
         return END
-    if state.get("rounds", 0) >= 3:  # recursion guard from research-agent-runtime.md
+    if state.get("rounds", 0) >= MAX_ROUNDS:  # recursion guard, see MAX_ROUNDS
         return END
     return _failing_specialist(verdict.issues)
 
