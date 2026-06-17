@@ -471,6 +471,30 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.mintedByTemplate(id), 1e30);
     }
 
+    function test_mint_capHoldsUnderReentrancy() public {
+        // The security-critical property: the cap holds under reentrancy ONLY
+        // because the counter commits BEFORE _mint. The reentrant mint (from the
+        // ERC-1155 receiver hook) sees the outer mint already counted, so its own
+        // cap check uses the committed total. cap=8, outer=5, reentry=5: the
+        // reentry's check is 5+5=10 > 8 → SupplyExceeded, which propagates through
+        // the receiver hook and reverts the whole mint (nothing committed). Were the
+        // counter written AFTER _mint, the reentry would see 0, slip past (0+5≤8),
+        // and the two mints would total 10 > cap — so this expectRevert is the CEI
+        // discriminator, not a generic revert check.
+        ReentrantMinter rm = new ReentrantMinter(art);
+        vm.prank(owner);
+        art.setMinter(address(rm));
+        uint256 id = rm.registerCapped(author, 0, 8); // rarity 0 = free mint
+
+        vm.expectRevert(); // SupplyExceeded bubbles up through the receiver hook
+        rm.fire(5, 5);
+
+        // The whole tx reverted: the cap was never breached, nothing minted.
+        assertEq(art.mintedByTemplate(id), 0);
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.balanceOf(address(rm), id), 0);
+    }
+
     // --- fee-rate config ---
 
     function test_constructor_revertsZeroComputeMeter() public {
@@ -628,6 +652,11 @@ contract ReentrantMinter is IERC1155Receiver {
 
     function register(address author, uint16 rarity) external returns (uint256) {
         templateId = art.registerTemplate(author, rarity, keccak256("r"), 0);
+        return templateId;
+    }
+
+    function registerCapped(address author, uint16 rarity, uint256 maxSupply) external returns (uint256) {
+        templateId = art.registerTemplate(author, rarity, keccak256("rc"), maxSupply);
         return templateId;
     }
 
