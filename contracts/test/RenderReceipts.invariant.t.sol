@@ -21,6 +21,10 @@ contract MockEAS is IEAS {
     bytes public lastData;
     uint256 public lastValue;
 
+    mapping(bytes32 => bool) public isAttested;
+    mapping(bytes32 => bool) public isRevoked;
+    uint256 public revokeCalls;
+
     function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
         attestCalls++;
         lastRequest = request;
@@ -31,7 +35,16 @@ contract MockEAS is IEAS {
         lastRefUid = request.data.refUid;
         lastData = request.data.data;
         lastValue = request.data.value;
-        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+        bytes32 uid = keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+        isAttested[uid] = true;
+        return uid;
+    }
+
+    function revoke(IEAS.RevocationRequest calldata request) external payable {
+        require(isAttested[request.data.uid], "unknown uid");
+        require(!isRevoked[request.data.uid], "already revoked");
+        isRevoked[request.data.uid] = true;
+        revokeCalls++;
     }
 
     function multiAttest(IEAS.MultiAttestationRequest[] calldata)

@@ -19,6 +19,14 @@ contract MockEAS is IEAS {
     bytes public lastData;
     uint256 public lastValue;
 
+    // Revoke modelling: only an attestation this mock actually minted, and not yet
+    // revoked, can be revoked — same precondition the real EAS enforces.
+    mapping(bytes32 => bool) public isAttested;
+    mapping(bytes32 => bool) public isRevoked;
+    uint256 public revokeCalls;
+    bytes32 public lastRevokedUid;
+    bytes32 public lastRevokeSchema;
+
     function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
         attestCalls++;
         lastRequest = request;
@@ -29,7 +37,18 @@ contract MockEAS is IEAS {
         lastRefUid = request.data.refUid;
         lastData = request.data.data;
         lastValue = request.data.value;
-        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+        bytes32 uid = keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+        isAttested[uid] = true;
+        return uid;
+    }
+
+    function revoke(IEAS.RevocationRequest calldata request) external payable {
+        require(isAttested[request.data.uid], "unknown uid");
+        require(!isRevoked[request.data.uid], "already revoked");
+        isRevoked[request.data.uid] = true;
+        revokeCalls++;
+        lastRevokedUid = request.data.uid;
+        lastRevokeSchema = request.schema;
     }
 
     function multiAttest(IEAS.MultiAttestationRequest[] calldata)
@@ -74,6 +93,10 @@ contract ReentrantEAS is IEAS {
             }
         }
         return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {
+        revert("not implemented");
     }
 
     function multiAttest(IEAS.MultiAttestationRequest[] calldata)

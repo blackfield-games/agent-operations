@@ -19,6 +19,10 @@ contract MockEAS is IEAS {
     {
         revert("not implemented");
     }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {
+        revert("not implemented");
+    }
 }
 
 contract MockSchemaRegistry is ISchemaRegistry {

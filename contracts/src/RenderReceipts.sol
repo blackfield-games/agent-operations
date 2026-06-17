@@ -31,6 +31,18 @@ interface IEAS {
         external
         payable
         returns (bytes32[] memory);
+
+    struct RevocationRequestData {
+        bytes32 uid;
+        uint256 value;
+    }
+
+    struct RevocationRequest {
+        bytes32 schema;
+        RevocationRequestData data;
+    }
+
+    function revoke(RevocationRequest calldata request) external payable;
 }
 
 interface ISchemaRegistry {
