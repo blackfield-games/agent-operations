@@ -61,19 +61,33 @@ interface ISchemaRegistry {
 contract RenderReceipts is Ownable2Step {
     IEAS public immutable EAS;
     bytes32 public schemaUid;
-    /// @notice Running count of issued receipts (EAS render attestations).
-    ///         The HUD reads this for the total number of validated render jobs.
+    /// @notice Running count of LIVE receipts — issued and not since revoked. The HUD
+    ///         reads this for the number of currently-valid render attestations; a
+    ///         revoke decrements it. Cumulative issued is `receiptCount + revokedCount`.
     uint256 public receiptCount;
-    /// @notice Per-earner running count of issued receipts, for the HUD
-    ///         earner-leaderboard read path. Across all earners these sum to
-    ///         `receiptCount`. `earner` is also indexed in `ReceiptIssued`, so
-    ///         clients can cross-reference the event stream.
+    /// @notice Per-earner running count of LIVE receipts, for the HUD earner-leaderboard
+    ///         read path. Across all earners these sum to `receiptCount`; a revoke
+    ///         decrements the credited earner's slot. `earner` is also indexed in
+    ///         `ReceiptIssued`, so clients can cross-reference the event stream.
     mapping(address earner => uint256 count) public receiptsByEarner;
-    /// @notice Whether a receipt has already been issued for a job. `jobId` is the
-    ///         render job's UUID — globally unique — so this fences a replayed relay
-    ///         to exactly one attestation per validated job: the on-chain twin of the
-    ///         coordinator's settle-exactly-once guard.
+    /// @notice Whether a receipt has ever been issued for a job. `jobId` is the render
+    ///         job's UUID — globally unique — so this fences a replayed relay to exactly
+    ///         one attestation per validated job: the on-chain twin of the coordinator's
+    ///         settle-exactly-once guard. Stays set after a revoke, so a revoked job can
+    ///         never be re-issued.
     mapping(bytes32 jobId => bool issued) public receiptIssued;
+    /// @notice Whether an issued receipt has since been revoked. A revoked receipt is
+    ///         not live (excluded from `receiptCount`) and cannot be revoked again.
+    mapping(bytes32 jobId => bool revoked) public receiptRevoked;
+    /// @notice The EAS attestation uid minted for a job, persisted at issue so revoke
+    ///         can pass it to `EAS.revoke`. Zero until the job is issued.
+    mapping(bytes32 jobId => bytes32 uid) public receiptUid;
+    /// @notice The earner credited at issue, kept so revoke decrements the correct
+    ///         `receiptsByEarner` slot from stored state rather than a caller argument.
+    mapping(bytes32 jobId => address earner) internal _receiptEarner;
+    /// @notice Running count of revoked receipts. With the live `receiptCount` this
+    ///         reconstructs cumulative issued: `receiptCount + revokedCount`.
+    uint256 public revokedCount;
     mapping(address coordinator => bool authorized) public authorizedCoordinators;
 
     event ReceiptIssued(
@@ -83,12 +97,15 @@ contract RenderReceipts is Ownable2Step {
         uint16 jobKind,
         uint64 renderSeconds
     );
+    event ReceiptRevoked(bytes32 indexed uid, address indexed earner, bytes32 indexed jobId);
     event CoordinatorSet(address indexed coordinator, bool authorized);
     event SchemaRegistered(bytes32 indexed uid);
 
     error NotAuthorized();
     error SchemaNotSet();
     error DuplicateReceipt(bytes32 jobId);
+    error NotIssued(bytes32 jobId);
+    error AlreadyRevoked(bytes32 jobId);
 
     constructor(address eas_, address owner_) Ownable(owner_) {
         EAS = IEAS(eas_);
@@ -123,9 +140,16 @@ contract RenderReceipts is Ownable2Step {
         if (schemaUid == bytes32(0)) revert SchemaNotSet();
         if (receiptIssued[jobId]) revert DuplicateReceipt(jobId);
 
-        // Mark issued before the external attest (checks-effects-interactions) so a
-        // reentrant or replayed relay cannot mint a second attestation for the job.
+        // Effects before the external attest (checks-effects-interactions): the fence,
+        // the credited earner, and both live counters are consistent before the call,
+        // so a reentrant relay is rejected by the fence and a cross-function reentrant
+        // revoke during attest sees coherent counters. Only `receiptUid` is set after —
+        // EAS derives the uid, so it is unknowable until attest returns; a revoke that
+        // raced the pending uid would read zero and EAS rejects a zero uid.
         receiptIssued[jobId] = true;
+        _receiptEarner[jobId] = earner;
+        ++receiptCount;
+        ++receiptsByEarner[earner];
 
         bytes memory data = abi.encode(earner, jobId, renderSeconds, jobKind, outputHash, regionId);
         uid = EAS.attest(
@@ -142,8 +166,39 @@ contract RenderReceipts is Ownable2Step {
             })
         );
 
-        ++receiptCount;
-        ++receiptsByEarner[earner];
+        receiptUid[jobId] = uid;
         emit ReceiptIssued(uid, earner, jobId, jobKind, renderSeconds);
+    }
+
+    /// @notice Revoke a previously-issued render receipt — used when a settled job is
+    ///         later found invalid (failed re-validation, disputed output). Gated to the
+    ///         same `authorizedCoordinators` set as issuance (not issuer-only, so a
+    ///         rotated/deauthorized coordinator can never strand a receipt). Flips the
+    ///         per-job fence to revoked — neither re-issuable nor revocable again —
+    ///         decrements the live counters, then revokes the stored EAS attestation.
+    function revokeReceipt(bytes32 jobId) external {
+        if (!authorizedCoordinators[msg.sender]) revert NotAuthorized();
+        if (!receiptIssued[jobId]) revert NotIssued(jobId);
+        if (receiptRevoked[jobId]) revert AlreadyRevoked(jobId);
+
+        // Effects before interaction (CEI): mark revoked and decrement before the
+        // external EAS.revoke, so a reentrant or replayed revoke is rejected by the
+        // AlreadyRevoked guard and cannot double-decrement. The guards above prove one
+        // un-revoked issue exists for this job, so both decrements are >= 1 (checked
+        // arithmetic backstops any underflow regardless).
+        receiptRevoked[jobId] = true;
+        address earner = _receiptEarner[jobId];
+        bytes32 uid = receiptUid[jobId];
+        --receiptCount;
+        --receiptsByEarner[earner];
+        ++revokedCount;
+
+        emit ReceiptRevoked(uid, earner, jobId);
+
+        EAS.revoke(
+            IEAS.RevocationRequest({
+                schema: schemaUid, data: IEAS.RevocationRequestData({uid: uid, value: 0})
+            })
+        );
     }
 }
