@@ -170,7 +170,7 @@ def test_after_validator_ends_on_recursion_guard():
     # persistently-failing region can't recurse forever.
     state = {
         "verdict": ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"]),
-        "rounds": 3,
+        "rounds": sup.MAX_ROUNDS,
     }
     assert sup._after_validator(state) == END
 
@@ -208,3 +208,29 @@ async def test_route_back_loop_reruns_validator_then_accepts(tmp_path, monkeypat
     # so the layer set stays one-per-specialist (a plain operator.add would give 12).
     assert len(result["layers"]) == 7
     assert sorted(layer.specialist for layer in result["layers"]) == sorted(sup.SPECIALISTS)
+
+
+async def test_persistently_failing_validator_terminates_at_round_cap(tmp_path, monkeypatch):
+    # FM3: a stage that never passes must not loop forever. The predicate test
+    # above hand-sets rounds=MAX_ROUNDS; this drives the WHOLE compiled graph with
+    # a validator that ALWAYS rejects (attributable, so every route-back targets a
+    # real specialist and the run keeps cycling). The rounds cap must terminate it
+    # at MAX_ROUNDS with the last non-accepted verdict — not recurse forever, and
+    # not trip LangGraph's own GraphRecursionError first. Stubs write under cwd.
+    monkeypatch.chdir(tmp_path)
+
+    calls = {"n": 0}
+
+    async def always_reject(brief, layers):
+        calls["n"] += 1
+        return ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"])
+
+    monkeypatch.setattr(sup.validator, "run", always_reject)
+
+    brief = WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
+    result = await sup.build_graph().ainvoke({"brief": brief, "layers": [], "rounds": 0})
+
+    # Ended cleanly at the cap (no exception, no hang), with the rejection surfaced.
+    assert result["verdict"].accepted is False
+    assert result["rounds"] == sup.MAX_ROUNDS
+    assert calls["n"] == sup.MAX_ROUNDS, "validator runs exactly MAX_ROUNDS times, then the guard ENDs"
