@@ -3555,6 +3555,74 @@ mod tests {
         assert_eq!(store.job_status(&done.id).unwrap().as_deref(), Some("done"));
     }
 
+    // ---- created_at: the immutable wall-clock-TTL anchor ----
+
+    /// `enqueue` stamps a creation time, and it is the anchor the TTL measures
+    /// against — so it must NOT move when the job is dispatched, reaped, faulted,
+    /// or re-enqueued. If any of those slid it, a job that keeps churning would
+    /// reset its own clock and never hit the TTL (the task's FM1).
+    #[test]
+    fn created_at_is_stamped_once_and_never_slides() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        store.enqueue(&job).unwrap();
+
+        let anchor = store.job_created_at(&job.id).unwrap().expect("created_at set at enqueue");
+
+        // Dispatch (started_at moves, created_at must not).
+        store.take_next(|j| j.id == job.id).unwrap().unwrap();
+        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "dispatch must not slide created_at");
+
+        // Deadline reap → requeue.
+        store.reap_expired(now_secs() + 10_000, 5).unwrap();
+        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "reap/requeue must not slide created_at");
+
+        // Earner fault → requeue.
+        let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+        store.requeue_earner_fault(&taken, 100).unwrap();
+        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "fault/requeue must not slide created_at");
+
+        // Re-enqueue the SAME id (operator re-submit) must preserve the anchor,
+        // not reset it — otherwise a stuck job could be kept alive by re-submits.
+        store.enqueue(&job).unwrap();
+        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "re-enqueue must preserve created_at");
+    }
+
+    /// A DB written before the `created_at` column existed must, after the
+    /// migration, carry a non-NULL backfilled creation time on every row — so an
+    /// already-queued job gets a finite TTL from the upgrade boot forward rather
+    /// than a NULL the reaper skips forever (FM4).
+    #[test]
+    fn created_at_backfills_legacy_rows_on_migration() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+        let job_id = Uuid::new_v4();
+
+        // Simulate a legacy DB: a jobs table WITHOUT created_at, one queued row.
+        {
+            let raw = rusqlite::Connection::open(&db_path).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE jobs (
+                     id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, status TEXT NOT NULL,
+                     started_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+                     faults INTEGER NOT NULL DEFAULT 0, dispatch_seq INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO jobs (id, spec_json, status) VALUES (?1, ?2, 'queued')",
+                (job_id.to_string(), "{}"),
+            )
+            .unwrap();
+        }
+
+        // Opening through Store runs the idempotent migration + backfill.
+        let store = Store::open(&db_path).unwrap();
+        let backfilled = store.job_created_at(&job_id).unwrap();
+        assert!(backfilled.is_some(), "legacy row must be backfilled to a non-NULL created_at");
+        assert!(backfilled.unwrap() > 0, "backfilled created_at must be a real timestamp");
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight() {
         // Build state on a non-seeded in-memory store so the queue truly starts

@@ -80,7 +80,8 @@ impl Store {
                  started_at   INTEGER,
                  attempts     INTEGER NOT NULL DEFAULT 0,
                  faults       INTEGER NOT NULL DEFAULT 0,
-                 dispatch_seq INTEGER NOT NULL DEFAULT 0
+                 dispatch_seq INTEGER NOT NULL DEFAULT 0,
+                 created_at   INTEGER
              );
              CREATE TABLE IF NOT EXISTS results (
                  job_id      TEXT NOT NULL,
@@ -152,6 +153,19 @@ impl Store {
                 [],
             ),
         )?;
+        // Migrate pre-existing DBs (created before `created_at` — the immutable
+        // wall-clock-TTL anchor — was added). The column lands NULL on every
+        // existing row; backfill those to now so a job already in the queue gets
+        // a sane creation time and a finite TTL from this boot forward (rather
+        // than a NULL the reaper would skip forever). New rows set it at enqueue.
+        // Swallow only the duplicate-column error.
+        ignore_duplicate_column(
+            conn.execute("ALTER TABLE jobs ADD COLUMN created_at INTEGER", []),
+        )?;
+        conn.execute(
+            "UPDATE jobs SET created_at = CAST(strftime('%s','now') AS INTEGER) WHERE created_at IS NULL",
+            [],
+        )?;
         Ok(Self { conn })
     }
 
@@ -165,10 +179,17 @@ impl Store {
     }
 
     /// Insert (or upsert by id) a job in the `queued` state.
+    ///
+    /// `created_at` is stamped once on the initial insert and deliberately left
+    /// untouched by the `ON CONFLICT` update: it is the immutable anchor for the
+    /// absolute wall-clock TTL (see [`reap_ttl_expired`](Self::reap_ttl_expired)),
+    /// so re-enqueueing the same id (e.g. an operator re-submit) cannot reset the
+    /// clock and keep a stuck job alive forever.
     pub fn enqueue(&self, job: &JobSpec) -> Result<()> {
         let spec_json = serde_json::to_string(job)?;
         self.conn.execute(
-            "INSERT INTO jobs (id, spec_json, status) VALUES (?1, ?2, ?3)
+            "INSERT INTO jobs (id, spec_json, status, created_at)
+             VALUES (?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER))
              ON CONFLICT(id) DO UPDATE SET spec_json = ?2, status = ?3",
             (job.id.to_string(), spec_json, STATUS_QUEUED),
         )?;
@@ -494,6 +515,26 @@ impl Store {
             (now_secs, job_id.to_string(), STATUS_IN_FLIGHT),
         )?;
         Ok(updated > 0)
+    }
+
+    /// Immutable creation timestamp (epoch seconds) of a job, or `None` if the
+    /// id is unknown (or the row predates the column and was never backfilled).
+    /// Test-only: lets the TTL tests assert the anchor is set at enqueue and is
+    /// not slid by requeue/fault/reap.
+    #[cfg(test)]
+    pub fn job_created_at(&self, id: &uuid::Uuid) -> Result<Option<i64>> {
+        let created_at = self
+            .conn
+            .query_row(
+                "SELECT created_at FROM jobs WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(created_at)
     }
 
     /// Current lifecycle status of a job, or `None` if the id is unknown.
