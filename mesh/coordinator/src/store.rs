@@ -629,6 +629,19 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Number of settled jobs whose EAS render receipt has not yet been relayed
+    /// on-chain — the attestation backlog depth, surfaced at `/stats`. Currently
+    /// every settled job stays pending (no on-chain submitter yet), so this
+    /// tracks `completed_count`; it will drain once the relayer lands.
+    pub fn pending_attestation_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_attestations",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// Sum of `render_seconds` across all recorded results — the mesh-output
     /// metric surfaced at `/stats` ("N render-seconds produced"). Decodes each
     /// stored `JobResult` in Rust and sums its `render_seconds`, mirroring the

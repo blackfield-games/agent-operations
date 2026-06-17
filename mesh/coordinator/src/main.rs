@@ -197,6 +197,11 @@ struct Stats {
     /// requeued them on a missed deadline and they were handed out again. A
     /// cumulative reaper-churn signal for the HUD; 0 on a healthy mesh.
     jobs_redispatched: usize,
+    /// Settled jobs whose EAS render receipt has not yet been relayed on-chain —
+    /// the attestation backlog depth. Each validated settle durably enqueues a
+    /// pending receipt; this drains once the (operator-gated) on-chain relayer
+    /// submits them. Until then it tracks `jobs_completed`.
+    pending_attestations: usize,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -507,6 +512,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let pending_attestations = match store.pending_attestation_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: pending_attestation_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -523,6 +535,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_payout_wei,
         oldest_in_flight_secs,
         jobs_redispatched,
+        pending_attestations,
     }))
 }
 
