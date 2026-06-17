@@ -346,6 +346,26 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.mintedByTemplate(id), 0, "per-template counter rolled back");
     }
 
+    function test_mint_revertsWhenUnauthorizedSpender() public {
+        // FM1: until the deploy authorizes ArtifactTemplate as a ComputeMeter spender,
+        // every fee-charging mint reverts NotAuthorized at the meter — the on-chain fee
+        // wiring is inert. Revoke the setUp authorization and prove the mint reverts
+        // even though the recipient is fully funded (the revert is the authorization,
+        // not the credit), minting nothing.
+        vm.prank(owner);
+        meter.setSpender(address(art), false);
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"));
+
+        vm.expectRevert(ComputeMeter.NotAuthorized.selector);
+        vm.prank(minter);
+        art.mint(player, id, 4, "");
+
+        assertEq(art.balanceOf(player, id), 0, "no units minted");
+        assertEq(art.totalMinted(), 0, "counter rolled back");
+        assertEq(art.mintedByTemplate(id), 0, "per-template counter rolled back");
+    }
+
     function test_mint_zeroRarityIsFree() public {
         // A 0-bps template charges no fee, so even a zero-credit recipient can mint
         // it. The global fee gate stays closed by the non-zero mintFeeRate guard.
