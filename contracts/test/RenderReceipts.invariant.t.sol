@@ -90,6 +90,7 @@ contract RenderReceiptsHandler is Test {
     uint256 public ghost_duplicateRejections;
 
     uint256 public ghost_issued;
+    uint256 public ghost_revoked;
     bool public ghost_unauthorizedSuccess;
     bool public ghost_forwardMismatch;
 
@@ -150,6 +151,23 @@ contract RenderReceiptsHandler is Test {
             }
         } catch (bytes memory err) {
             if (bytes4(err) == RenderReceipts.DuplicateReceipt.selector) ghost_duplicateRejections++;
+        }
+    }
+
+    /// @notice Drives bounded revokeReceipt calls over the same job/actor pools. Most
+    ///         draws hit NotIssued/AlreadyRevoked/NotAuthorized (caught); the ones that
+    ///         land on an issued, not-yet-revoked job exercise the decrement path so the
+    ///         live==issued-revoked invariants are genuinely tested.
+    function revokeReceipt(uint256 actorSeed, uint256 jobSeed) external {
+        address actor = actors[actorSeed % actors.length];
+        bytes32 jobId = jobs[jobSeed % jobs.length];
+
+        vm.prank(actor);
+        try receipts.revokeReceipt(jobId) {
+            ghost_revoked++;
+            if (!isAuthorized[actor]) ghost_unauthorizedSuccess = true;
+        } catch {
+            // NotAuthorized / NotIssued / AlreadyRevoked — all expected.
         }
     }
 
@@ -236,23 +254,39 @@ contract RenderReceiptsInvariantTest is Test {
         assertEq(handler.sumReceipts(), receipts.receiptCount());
     }
 
-    /// @dev Guards against `invariant_noJobIssuedTwice` passing vacuously: by the end
-    ///      of the campaign the fuzzer must have actually replayed a jobId and been
-    ///      rejected, so the dedup path was genuinely exercised (≈189 in practice).
+    /// @dev Guards against the dedup/revoke invariants passing vacuously: by the end of
+    ///      the campaign the fuzzer must have actually replayed a jobId (dedup rejection)
+    ///      AND landed a successful revoke, so both paths were genuinely exercised.
     function afterInvariant() external view {
         assertGt(handler.ghost_duplicateRejections(), 0);
+        assertGt(handler.ghost_revoked(), 0);
     }
 
     /// @dev No jobId is ever issued more than once: the dedup guard holds under
     ///      fuzzing even though the handler keeps replaying the same small job pool.
+    ///      (A revoke never re-opens a job — the fence stays set.)
     function invariant_noJobIssuedTwice() public view {
         assertLe(handler.maxSuccessesPerJob(), 1);
     }
 
-    /// @dev Every successful issue increments receiptCount exactly once — rejected
-    ///      duplicates leave it untouched.
-    function invariant_receiptCountEqualsIssued() public view {
-        assertEq(receipts.receiptCount(), handler.ghost_issued());
+    /// @dev The core count invariant: live receipts == issued - revoked, with issued
+    ///      and revoked tracked independently by the handler. Each issue +1s
+    ///      receiptCount, each revoke -1s it.
+    function invariant_liveReceiptsEqualIssuedMinusRevoked() public view {
+        assertEq(receipts.receiptCount(), handler.ghost_issued() - handler.ghost_revoked());
+    }
+
+    /// @dev The revoked tally equals the number of successful revokes, and with the live
+    ///      count reconstructs cumulative issued — the books never drift.
+    function invariant_revokedCountReconcilesIssued() public view {
+        assertEq(receipts.revokedCount(), handler.ghost_revoked());
+        assertEq(receipts.receiptCount() + receipts.revokedCount(), handler.ghost_issued());
+    }
+
+    /// @dev Each successful revoke causes exactly one EAS.revoke call — no spurious or
+    ///      missing forwards on the revoke side.
+    function invariant_oneRevokeCallPerRevokedReceipt() public view {
+        assertEq(eas.revokeCalls(), handler.ghost_revoked());
     }
 }
 
@@ -314,5 +348,40 @@ contract RenderReceiptsFuzzTest is Test {
         vm.expectRevert(RenderReceipts.NotAuthorized.selector);
         vm.prank(sender);
         receipts.issueReceipt(address(0xEA12), keccak256("job"), 10, 0, bytes32(0), bytes32(0));
+    }
+
+    function testFuzz_revokeReceipt_unauthorizedReverts(address sender) public {
+        vm.assume(sender != coordinator);
+        bytes32 jobId = keccak256("job");
+        vm.prank(coordinator);
+        receipts.issueReceipt(address(0xEA12), jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        vm.prank(sender);
+        receipts.revokeReceipt(jobId);
+    }
+
+    function testFuzz_revokeReceipt_revokesStoredUidAndDecrements(
+        address earner,
+        bytes32 jobId,
+        uint64 renderSeconds,
+        uint16 jobKind,
+        bytes32 outputHash,
+        bytes32 regionId
+    ) public {
+        vm.assume(earner != address(0));
+
+        vm.startPrank(coordinator);
+        bytes32 uid = receipts.issueReceipt(earner, jobId, renderSeconds, jobKind, outputHash, regionId);
+        receipts.revokeReceipt(jobId);
+        vm.stopPrank();
+
+        // The stored uid (not a caller argument) was the one revoked at EAS.
+        assertEq(eas.revokeCalls(), 1);
+        assertTrue(eas.isRevoked(uid));
+        assertTrue(receipts.receiptRevoked(jobId));
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.receiptsByEarner(earner), 0);
+        assertEq(receipts.revokedCount(), 1);
     }
 }
