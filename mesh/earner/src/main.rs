@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
 /// Legacy HTTP poll loop. Registers, then polls `/jobs/next` forever.
 async fn run_http(args: &Args, session: &Session) -> Result<()> {
     let client = reqwest::Client::new();
+    let supported = all_supported();
 
     if let Err(e) = register(&client, args, session).await {
         // Non-fatal: the coordinator may not yet support /register, or be down.
@@ -165,7 +166,7 @@ async fn run_http(args: &Args, session: &Session) -> Result<()> {
     }
 
     loop {
-        match poll_once(&client, args, session).await {
+        match poll_once(&client, args, session, &supported).await {
             Ok(true) => {}
             Ok(false) => tokio::time::sleep(Duration::from_secs(args.poll_secs)).await,
             Err(e) => {
@@ -447,7 +448,12 @@ fn keep_polling_after_submit(status: reqwest::StatusCode) -> bool {
     status.is_success()
 }
 
-async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> Result<bool> {
+async fn poll_once(
+    client: &reqwest::Client,
+    args: &Args,
+    session: &Session,
+    supported: &[JobKind],
+) -> Result<bool> {
     let url = format!("{}/jobs/next", args.coordinator);
     let resp = client.get(&url).send().await?;
     // The coordinator stamps the dispatch_seq for this hand-out in a header; we
@@ -460,6 +466,19 @@ async fn poll_once(client: &reqwest::Client, args: &Args, session: &Session) -> 
         .and_then(|s| s.parse::<i64>().ok());
     let job: Option<JobSpec> = resp.json().await?;
     let Some(job) = job else { return Ok(false) };
+
+    // Capability self-guard (mirrors the ws `handle_offer` guard). Unlike the ws
+    // dispatcher, the HTTP `/jobs/next` endpoint is stateless and does NOT filter
+    // by our advertised kinds, so it can hand us a kind we can't render. Drop it
+    // WITHOUT rendering or submitting — the job stays in_flight and the
+    // coordinator's deadline reaper requeues it for a capable earner. Back off
+    // (Ok(false)) rather than re-polling at once, so a run of unsupported jobs
+    // can't spin us into draining the whole queue into in_flight.
+    if !supported.contains(&job.kind) {
+        tracing::warn!(job_id = %job.id, kind = ?job.kind, "declining job: unsupported job kind");
+        return Ok(false);
+    }
+
     let Some(dispatch_seq) = dispatch_seq else {
         tracing::warn!(job_id = %job.id, "offered job without a dispatch-seq header; skipping");
         return Ok(false);
@@ -1011,7 +1030,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         // A submit accepted with 2xx means more work may be queued → keep polling.
-        let keep = poll_once(&client, &args, &session).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
         assert!(keep, "a successful submit (2xx) should keep polling");
 
         // The earner POSTed a JobResult to /jobs/{id}/submit whose signature
@@ -1059,7 +1078,7 @@ mod tests {
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        let keep = poll_once(&client, &args, &session).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
         assert!(!keep, "no job available → back off rather than re-poll immediately");
 
         let requests = server.received_requests().await.unwrap();
@@ -1091,8 +1110,46 @@ mod tests {
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        let keep = poll_once(&client, &args, &session).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
         assert!(!keep, "a 409-rejected submit must back off, not keep polling");
+    }
+
+    #[tokio::test]
+    async fn poll_once_drops_an_unsupported_job_without_submitting() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        // The stateless /jobs/next hands out a DiffusionTile job, but we only
+        // support Terrain. The earner must drop it: no render, no submit, back off.
+        let mut job = dev_job();
+        job.kind = JobKind::DiffusionTile;
+
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-dispatch-seq", "3")
+                    .set_body_json(&job),
+            )
+            .mount(&server)
+            .await;
+        // A submit would be a bug; mount a catch-all POST so one would be recorded
+        // (and fail the no-submit assertion) rather than 404-ing silently.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        let keep = poll_once(&client, &args, &session, &[JobKind::Terrain]).await.unwrap();
+        assert!(!keep, "an unsupported job must back off, not keep polling");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| !r.url.path().ends_with("/submit")),
+            "no submit must be attempted for an unsupported job: {requests:?}"
+        );
     }
 
     // ---- http register path: register over a wiremock coordinator ----
