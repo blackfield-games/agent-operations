@@ -30,8 +30,8 @@ A distributed render pool. The coordinator service (Rust, Axum) queues render jo
 A Foundry project targeting Base.
 
 - **ComputeMeter** converts $BLCKFLD into per-buyer compute credit, debited as validated jobs complete.
-- **RegionAuthority** mints a region NFT against a $BLCKFLD stake; fees earned within a region — including artifact mint royalties — are deposited on-chain and claimed by the current holder, with accrued fees settled to the outgoing holder on transfer.
-- **RenderReceipts** publishes each validated render's attestation to the Ethereum Attestation Service, and lets an authorized coordinator revoke the receipt for a render later found invalid, withdrawing the on-chain attestation and excluding it from the live receipt counts.
+- **RegionAuthority** mints a region NFT against a $BLCKFLD stake; fees earned within a region — including artifact mint royalties and validated render fees — are deposited on-chain and claimed by the current holder, with accrued fees settled to the outgoing holder on transfer.
+- **RenderReceipts** publishes each validated render's attestation to the Ethereum Attestation Service, and lets an authorized coordinator revoke the receipt for a render later found invalid, withdrawing the on-chain attestation and excluding it from the live receipt counts. Each validated receipt also routes a configurable real-$BLCKFLD fee-share — scaled by the render's seconds and paid by the issuing coordinator — into the receipt's region fee pool on `RegionAuthority`; a region with no staked holder simply skips the fee so the attestation is never blocked.
 - **ArtifactTemplate** mints player-authored equipment and structure templates as ERC-1155 tokens; each mint debits a rarity-scaled $BLCKFLD fee from the recipient's `ComputeMeter` credit and routes a separate rarity-scaled $BLCKFLD royalty into the minted artifact's region fee pool on `RegionAuthority`. A template may declare an optional max supply at registration (0 = unlimited), capping how many units can ever be minted so a high-rarity tier can be made genuinely scarce.
 
 ### Agents
