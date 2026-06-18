@@ -4205,7 +4205,14 @@ mod tests {
             store.job_dispatched_to(&job.id).unwrap().as_deref(),
             Some("0xws")
         );
-        store.reap_expired(now_secs(), 5).unwrap(); // → queued, dispatched_to retained while queued
+        store.reap_expired(now_secs(), 5).unwrap(); // → queued
+                                                    // The stale holder is RETAINED while queued (the requeue paths don't clear it);
+                                                    // this is safe precisely because reap_stale_holders only scans in_flight rows.
+        assert_eq!(
+            store.job_dispatched_to(&job.id).unwrap().as_deref(),
+            Some("0xws"),
+            "a requeued (queued) row keeps its stale holder until re-dispatch"
+        );
         store.take_next(|_| true).unwrap(); // HTTP re-dispatch
         assert_eq!(
             store.job_dispatched_to(&job.id).unwrap(),
