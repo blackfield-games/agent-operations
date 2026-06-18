@@ -425,10 +425,13 @@ async fn serve(
         .header_read_timeout(header_read_timeout);
     // Graceful drain, by hand: hyper-util's `GracefulShutdown` doesn't implement
     // `GracefulConnection` for h1's *upgradeable* connection (the one ws needs),
-    // so we track live connections in a `JoinSet` and broadcast a drain signal
-    // over a `watch`. On shutdown each task calls `graceful_shutdown()` and runs
-    // to completion, so in-flight requests and ws sessions finish instead of
-    // being dropped.
+    // so we track served connections in a `JoinSet` and broadcast a drain signal
+    // over a `watch`. On shutdown each task calls `graceful_shutdown()` (disable
+    // keep-alive) and runs its connection future to completion, so an in-flight
+    // HTTP request finishes instead of being cut off. A ws connection's served
+    // future completes at the 101 upgrade handoff (axum runs the session on a
+    // detached task), so the drain returns promptly rather than awaiting the ws
+    // to close — matching `axum::serve`.
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let mut conns = tokio::task::JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -3764,6 +3767,40 @@ mod tests {
             .await
             .expect("the drained connection was closed (EOF), not left open")
             .ok();
+    }
+
+    /// A live ws session must not block graceful shutdown. axum drives the ws
+    /// message loop on a detached task and the served connection future completes
+    /// at the 101 upgrade handoff, so `serve()` returns promptly on shutdown even
+    /// with a connected earner — it does NOT await the upgraded socket's close.
+    /// A long handshake timeout keeps the session from self-terminating inside the
+    /// window, so a regression where the drain awaited the ws to close would hang
+    /// past the bound and fail here.
+    #[tokio::test]
+    async fn serve_returns_on_shutdown_with_live_ws_session() {
+        let state = test_state_empty_handshake(Duration::from_secs(30)).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = router(state);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        // Drain the challenge so the upgrade + detached ws_session are provably live.
+        recv_challenge(&mut ws).await;
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("serve() returned on shutdown despite a live ws session")
+            .unwrap()
+            .unwrap();
+        drop(ws);
     }
 
     #[tokio::test]
