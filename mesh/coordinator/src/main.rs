@@ -9,7 +9,7 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        DefaultBodyLimit, Path, Query, State,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tower::ServiceBuilder;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
@@ -666,6 +667,16 @@ const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// `COORDINATOR_HTTP_BODY_TIMEOUT_SECS`).
 const DEFAULT_HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Hard cap on a request body before it is buffered and deserialized, applied to
+/// the body-bearing POST routes. axum's built-in default is 2 MiB; this drops it
+/// ~64x to just above the largest legitimate body — a `CreateJobRequest` whose
+/// `inputs` is capped at [`validate::MAX_INPUTS_BYTES`] plus its small framing —
+/// so an oversized body is refused with `413` before serde allocates the parse
+/// tree, not after. The precise per-field caps still run in
+/// [`validate::validate_job_spec`]; this is the coarse pre-parse backstop that
+/// bounds transient request memory (the per-field cap only bounds the stored row).
+const MAX_REQUEST_BODY_BYTES: usize = 2 * validate::MAX_INPUTS_BYTES;
+
 /// Default cap on concurrently served connections — a process-level backstop
 /// against a connection flood. The per-FD header/body timeouts bound how long
 /// each connection lingers, but a client that opens and recycles connections
@@ -918,21 +929,26 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
     // body on these routes is closed with a legible status the earner's reqwest
     // path treats as a transient error to retry, not a hard fault.
     let body_timeout = TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, body_read_timeout);
+    // The body-bearing POST routes carry two guards together: a body-read timeout
+    // (408 on a stalled body) and a pre-parse size cap (413 before serde buffers /
+    // allocates — see [`MAX_REQUEST_BODY_BYTES`]). Bundled in one `ServiceBuilder`
+    // so each route takes a single `.layer()` (two chained `.layer()`s on a
+    // `MethodRouter` leave the error type unbound); both inner layers are `Copy`,
+    // so the closure mints a fresh stack per route.
+    let body_guard =
+        || ServiceBuilder::new().layer(body_timeout).layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
     Router::new()
         .route("/health", get(health))
-        .route("/register", post(register).layer(body_timeout))
+        .route("/register", post(register).layer(body_guard()))
         .route("/stats", get(stats))
         .route("/earners", get(earners))
-        // POST carries the body timeout (a mutating, body-bearing route like
+        // POST carries the body guards (a mutating, body-bearing route like
         // /register and /submit); GET /jobs is a body-less listing left unwrapped,
-        // so .layer is applied to the post handler only, then the get added after.
-        .route(
-            "/jobs",
-            post(create_job).layer(body_timeout).get(list_jobs),
-        )
+        // so the layer applies to the post handler only, then the get added after.
+        .route("/jobs", post(create_job).layer(body_guard()).get(list_jobs))
         .route("/jobs/{id}", get(job_detail))
         .route("/jobs/next", get(next_job))
-        .route("/jobs/{id}/submit", post(submit).layer(body_timeout))
+        .route("/jobs/{id}/submit", post(submit).layer(body_guard()))
         .route("/jobs/{id}/status", get(job_status))
         .route("/ws", get(ws_handler))
         .with_state(state)

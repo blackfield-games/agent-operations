@@ -102,8 +102,10 @@ pub const MAX_DEADLINE_SECS: u32 = 86_400;
 pub const MAX_PAYOUT_WEI: u128 = 10u128.pow(30);
 
 /// Upper bound on the serialized `inputs` JSON (16 KiB). Inputs are asset URLs +
-/// hashes (small); the cap stops a multi-megabyte blob from bloating the SQLite
-/// row or amplifying request memory.
+/// hashes (small); the cap stops a multi-megabyte blob from bloating the stored
+/// SQLite row. This bounds the *persisted* size; the transient request buffer is
+/// bounded before parsing by the coordinator's pre-parse body-size cap
+/// (`MAX_REQUEST_BODY_BYTES`).
 pub const MAX_INPUTS_BYTES: usize = 16 * 1024;
 
 /// Validate a job-creation request before it is enqueued. Pure function of the
