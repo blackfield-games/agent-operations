@@ -262,9 +262,9 @@ impl Store {
         Ok(())
     }
 
-    /// Pop the most recently inserted queued job whose kind passes `accept`,
-    /// marking it `in_flight` and stamping a fresh per-dispatch fence. Returns
-    /// the job with its new `dispatch_seq`, or `None` if no queued job matches.
+    /// Pop the oldest-waiting queued job whose kind passes `accept`, marking it
+    /// `in_flight` and stamping a fresh per-dispatch fence. Returns the job with
+    /// its new `dispatch_seq`, or `None` if no queued job matches.
     ///
     /// `dispatch_seq` is a monotonic per-job counter bumped on every dispatch. It
     /// identifies *this* hand-out: the coordinator remembers it for the session
@@ -272,8 +272,13 @@ impl Store {
     /// requeueing, or sliding the deadline — so a job reaped and reassigned to a
     /// new earner can neither be settled nor preempted by the previous holder.
     ///
-    /// "Most recent" mirrors the prior `Vec::pop` / `rposition` behavior:
-    /// rowid is monotonic on insert, so highest rowid == most recent.
+    /// Dispatch is oldest-first (FIFO by `created_at`, `rowid` as the stable
+    /// tiebreaker for same-second inserts): the longest-waiting renderable job is
+    /// handed out first so a steady arrival rate can't starve an old job until the
+    /// wall-clock TTL reaps it. `created_at` is the immutable per-job anchor (a
+    /// requeue never slides it), so a requeued job correctly returns to the front
+    /// by age. The order is served by `idx_jobs_status_created_at(status,
+    /// created_at)` — no temp-b-tree sort.
     ///
     /// The anonymous (HTTP) dispatch records no holder — see [`take_next_for`] for
     /// the WS variant that stamps the earner address so the liveness reaper can
@@ -311,7 +316,8 @@ impl Store {
         F: Fn(&JobSpec) -> bool,
     {
         let mut stmt = self.conn.prepare(
-            "SELECT id, spec_json, dispatch_seq FROM jobs WHERE status = ?1 ORDER BY rowid DESC",
+            "SELECT id, spec_json, dispatch_seq FROM jobs WHERE status = ?1
+             ORDER BY created_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map([STATUS_QUEUED], |row| {
             let id: String = row.get(0)?;

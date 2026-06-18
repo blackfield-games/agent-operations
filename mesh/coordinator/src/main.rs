@@ -1557,7 +1557,7 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
     }
 }
 
-/// Take the most recent queued job whose kind the earner supports and that it
+/// Take the oldest-waiting queued job whose kind the earner supports and that it
 /// has not already faulted on this session, marking it in-flight. Returns the job
 /// with the `dispatch_seq` stamped on this hand-out, which the session remembers
 /// to fence later settle/requeue/heartbeat actions. Leaves unsupported jobs — and
@@ -2183,13 +2183,13 @@ mod tests {
     #[tokio::test]
     async fn next_job_filters_to_supported_kind_and_stamps_seq() {
         // An earner advertising only Terrain must be handed the Terrain job, NOT
-        // the more-recent DiffusionTile that take_next returns first (rowid DESC).
-        // Discriminating: the filter skips a non-matching most-recent job. The
-        // supported hand-out still stamps the dispatch_seq fence header.
+        // the older DiffusionTile that FIFO dispatch examines first. Discriminating:
+        // the filter skips the non-matching oldest job and hands out the supported
+        // (newer) one, still stamping the dispatch_seq fence header.
         let state = test_state_empty().await;
+        enqueue(&state, &job_of(JobKind::DiffusionTile)).await; // older, unsupported
         let terrain = job_of(JobKind::Terrain);
-        enqueue(&state, &terrain).await;
-        enqueue(&state, &job_of(JobKind::DiffusionTile)).await; // most recent
+        enqueue(&state, &terrain).await; // newer, supported
 
         let addr = test_address("cap");
         let reg = post_json(
@@ -2281,17 +2281,17 @@ mod tests {
     #[tokio::test]
     async fn next_job_unfiltered_without_earner_param() {
         // A legacy poll with no earner param keeps the unfiltered behavior: it
-        // returns the most-recent queued job regardless of kind.
+        // returns the oldest queued job regardless of kind (FIFO dispatch).
         let state = test_state_empty().await;
-        enqueue(&state, &job_of(JobKind::Terrain)).await;
-        let diffusion = job_of(JobKind::DiffusionTile);
-        enqueue(&state, &diffusion).await; // most recent
+        let terrain = job_of(JobKind::Terrain);
+        enqueue(&state, &terrain).await; // oldest
+        enqueue(&state, &job_of(JobKind::DiffusionTile)).await; // newer
 
         let json = body_json(get(state.clone(), "/jobs/next").await).await;
         assert_eq!(
             json["id"].as_str().unwrap(),
-            diffusion.id.to_string(),
-            "no earner param → unfiltered, returns most-recent"
+            terrain.id.to_string(),
+            "no earner param → unfiltered, returns the oldest queued job"
         );
     }
 
@@ -4012,7 +4012,8 @@ mod tests {
             "all supported jobs skipped → no offer (no hot loop)"
         );
 
-        // Drop b from skip: take_next (rowid DESC) hands back b; a stays skipped.
+        // Drop b from skip: a stays skipped (rejected by the accept closure), so b
+        // is the only offerable job and is handed back regardless of dispatch order.
         skip.remove(&b.id);
         let (taken, _) = take_supported_job(&state, "0xtestearner", &supported, &skip)
             .await
@@ -4160,10 +4161,15 @@ mod tests {
             let job = seed_job();
             let job_id = job.id;
             enqueue(&state, &job).await;
-            // Move it in_flight first (submit gate requires it). take_next pops
-            // the most-recently inserted queued job — the one we just enqueued —
-            // leaving the auto-seeded job queued.
-            let taken = state.store.lock().await.take_next(|_| true).unwrap();
+            // Move it in_flight first (submit gate requires it). Select this job by
+            // id — FIFO would otherwise hand out the older auto-seeded job — leaving
+            // the auto-seeded job queued.
+            let taken = state
+                .store
+                .lock()
+                .await
+                .take_next(|j| j.id == job_id)
+                .unwrap();
             assert_eq!(taken.unwrap().0.id, job_id);
 
             let result = signed_result(job_id, "deadbeef");
@@ -5978,20 +5984,20 @@ mod tests {
         assert_eq!(json["total_attempts"], 0, "fresh mesh reports 0 attempts");
         assert_eq!(json["total_faults"], 0, "fresh mesh reports 0 faults");
 
-        // Drive ONE job (enqueued last → highest rowid → the one take_next pops,
-        // leaving the seeds untouched at attempts 0) through a redispatch and an
-        // earner fault, directly via the store the handler reads.
+        // Drive ONE job (selected by id so the queued seeds stay untouched at
+        // attempts 0 regardless of FIFO order) through a redispatch and an earner
+        // fault, directly via the store the handler reads.
         let job = job_with_deadline(100);
         let id = job.id;
         {
             let store = state.store.lock().await;
             store.enqueue(&job).unwrap();
-            store.take_next(|_| true).unwrap(); // attempts → 1
+            store.take_next(|j| j.id == id).unwrap(); // attempts → 1
             store.touch(&id, 1000).unwrap();
             store.reap_expired(1100, 999).unwrap(); // requeue past deadline (attempts unchanged)
-            store.take_next(|_| true).unwrap(); // attempts → 2 (redispatched)
+            store.take_next(|j| j.id == id).unwrap(); // attempts → 2 (redispatched)
             store.requeue_earner_fault(&job, 999, None).unwrap(); // attempts → 1, faults → 1
-            store.take_next(|_| true).unwrap(); // attempts → 2
+            store.take_next(|j| j.id == id).unwrap(); // attempts → 2
         }
 
         let json = body_json(get(state.clone(), "/stats").await).await;
