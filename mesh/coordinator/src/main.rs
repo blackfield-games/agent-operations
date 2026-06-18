@@ -88,6 +88,13 @@ struct Args {
     /// (aggressive — a job a legitimate redispatch would finish may be reaped).
     #[arg(long, env = "COORDINATOR_TTL_DEADLINE_MULTIPLE", default_value_t = JOB_TTL_DEADLINE_MULTIPLE)]
     ttl_deadline_multiple: u32,
+    /// Seconds the coordinator waits for a connecting ws client to complete the
+    /// registration handshake (read the challenge, send a valid Hello) before
+    /// closing the socket. Bounds an unauthenticated slowloris that would
+    /// otherwise hold a `ws_session` task + FD open forever. An honest earner
+    /// replies in milliseconds, so the default is generous; must be >= 1.
+    #[arg(long, env = "COORDINATOR_HANDSHAKE_TIMEOUT_SECS", default_value_t = DEFAULT_HANDSHAKE_TIMEOUT.as_secs())]
+    handshake_timeout_secs: u64,
     /// How often (seconds) the attestation relayer drains pending EAS receipts to
     /// the chain. Only runs when a relay is configured (see `--relay-dev-mock`).
     #[arg(long, env = "COORDINATOR_RELAY_INTERVAL_SECS", default_value = "10")]
@@ -141,6 +148,10 @@ struct AppState {
     /// `created_at + deadline_secs * ttl_deadline_multiple`. Mirrors
     /// `--ttl-deadline-multiple` / `COORDINATOR_TTL_DEADLINE_MULTIPLE`.
     ttl_deadline_multiple: u32,
+    /// Wall-clock bound on the ws registration handshake (challenge→Hello). The
+    /// gate that closes a slowloris connection; read by `recv_hello`. Mirrors
+    /// `--handshake-timeout-secs` / `COORDINATOR_HANDSHAKE_TIMEOUT_SECS`.
+    handshake_timeout: Duration,
 }
 
 impl AppState {
@@ -153,6 +164,7 @@ impl AppState {
         max_faults: u32,
         earner_ttl_secs: i64,
         ttl_deadline_multiple: u32,
+        handshake_timeout: Duration,
     ) -> Result<Arc<Self>> {
         // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
         // dead-letters every non-terminal job on its first tick — the safety
@@ -162,6 +174,13 @@ impl AppState {
         anyhow::ensure!(
             ttl_deadline_multiple > 0,
             "ttl_deadline_multiple must be >= 1 (0 would dead-letter every job on the first reap tick)"
+        );
+        // A zero handshake timeout fires `timeout(ZERO, …)` immediately, rejecting
+        // every connection before it can send its Hello — the slowloris bound
+        // becomes a total registration outage. Reject it at construction.
+        anyhow::ensure!(
+            !handshake_timeout.is_zero(),
+            "handshake_timeout must be > 0 (0 would reject every registration before its Hello)"
         );
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
@@ -181,6 +200,7 @@ impl AppState {
             max_faults,
             earner_ttl_secs,
             ttl_deadline_multiple,
+            handshake_timeout,
         }))
     }
 }
@@ -320,6 +340,7 @@ async fn main() -> Result<()> {
         args.max_faults,
         args.earner_ttl_secs as i64,
         args.ttl_deadline_multiple,
+        Duration::from_secs(args.handshake_timeout_secs),
     )?;
     tracing::info!(db = %args.db, "store ready");
 
@@ -423,6 +444,18 @@ fn prune_stale_earners(
 /// this const directly. A dev can shrink it for fast-expiry testing; an operator
 /// with long-deadline jobs can tighten the bound — without a rebuild.
 const JOB_TTL_DEADLINE_MULTIPLE: u32 = 1440;
+
+/// Default wall-clock bound on the ws registration handshake: the coordinator
+/// closes a connection that hasn't completed the challenge→Hello exchange within
+/// this window. An honest earner replies within milliseconds of reading the
+/// challenge, so 10s is generous headroom for a laggy link while still denying a
+/// slowloris (open a connection, read or ignore the challenge, never send a
+/// Hello) the ability to park a live `ws_session` task + socket indefinitely.
+/// Backs `Args::handshake_timeout_secs` (`--handshake-timeout-secs` /
+/// `COORDINATOR_HANDSHAKE_TIMEOUT_SECS`); the gate reads the configured
+/// `AppState::handshake_timeout` at runtime, so a test can shrink it to a
+/// sub-second value without a slow suite.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
@@ -1572,7 +1605,25 @@ const HELLO_NONCE_BYTES: usize = 16;
 /// for this handshake (never stored), so a Hello captured off the wire and
 /// replayed on a new connection — which receives a different challenge — fails
 /// signature recovery, and there is no nonce store for an attacker to exhaust.
+/// Run the registration handshake under a single wall-clock deadline. A client
+/// that opens a connection, reads (or ignores) the challenge, and never sends a
+/// valid Hello — or that drip-feeds pings to keep the pre-Hello loop alive —
+/// would otherwise park a live `ws_session` task + socket forever (slowloris).
+/// One `timeout` around the WHOLE inner exchange bounds the entire handshake
+/// wall-clock, so frame-flooding can't extend it (the deadline is not reset per
+/// frame). On elapse we fail closed: return `None` (no registry insert, no
+/// eviction), the caller returns, and axum closes the socket.
 async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<String> {
+    match tokio::time::timeout(state.handshake_timeout, recv_hello_inner(socket, state)).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!("ws: registration handshake timed out before a valid Hello; closing");
+            None
+        }
+    }
+}
+
+async fn recv_hello_inner(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<String> {
     let mut nonce = [0u8; HELLO_NONCE_BYTES];
     if getrandom::getrandom(&mut nonce).is_err() {
         tracing::error!("ws: failed to generate a registration challenge; closing");
@@ -1885,11 +1936,31 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
 
+    /// In-memory store-backed state (no disk) with a custom handshake timeout, for
+    /// the anti-slowloris tests that need a sub-second bound.
+    fn test_state_handshake(handshake_timeout: Duration) -> Arc<AppState> {
+        AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout,
+        )
+        .unwrap()
+    }
+
     /// In-memory store-backed state (no disk). `with_store` seeds one job per
     /// `JobKind` because the in-memory DB starts empty; tests that need an empty
     /// queue drain it first via `/jobs/next` or use `test_state_empty`.
     fn test_state() -> Arc<AppState> {
-        AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap()
+        test_state_handshake(DEFAULT_HANDSHAKE_TIMEOUT)
+    }
+
+    /// Drain every auto-seeded job from `state` so its queue starts empty.
+    async fn drain_seeded_jobs(state: &Arc<AppState>) {
+        let store = state.store.lock().await;
+        while store.take_next(|_| true).unwrap().is_some() {}
     }
 
     /// In-memory state with every auto-seeded job removed, so the queue starts
@@ -1897,11 +1968,7 @@ mod tests {
     /// that assert `jobs_queued == 0`).
     async fn test_state_empty() -> Arc<AppState> {
         let state = test_state();
-        // Drain every seeded job so the queue is empty regardless of how many
-        // kinds `seed_jobs` enqueues.
-        let store = state.store.lock().await;
-        while store.take_next(|_| true).unwrap().is_some() {}
-        drop(store);
+        drain_seeded_jobs(&state).await;
         state
     }
 
@@ -4473,7 +4540,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -4512,7 +4579,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -4566,7 +4633,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -4585,7 +4652,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -4685,7 +4752,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -5219,6 +5286,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -6182,7 +6250,8 @@ mod tests {
     #[tokio::test]
     async fn ttl_deadline_multiple_knob_is_honored() {
         let state =
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2).unwrap();
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT)
+                .unwrap();
         assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
 
         let job = job_with_deadline(10);
@@ -6215,11 +6284,13 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_ttl_deadline_multiple() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0).is_err(),
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT)
+                .is_err(),
             "multiple=0 must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1).is_ok(),
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT)
+                .is_ok(),
             "the smallest valid multiple (1) constructs"
         );
     }
@@ -6253,6 +6324,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -6610,6 +6682,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -6658,6 +6731,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
 
         let terrain_job = JobSpec {
@@ -6711,6 +6785,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6727,6 +6802,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
 
         let mut ids = Vec::new();
@@ -6816,6 +6892,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
 
         let queued = job_with_deadline(60);
@@ -6921,6 +6998,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -6964,6 +7042,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -7020,6 +7099,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -7070,6 +7150,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -7111,6 +7192,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -7165,6 +7247,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -7225,6 +7308,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -7284,6 +7368,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         });
         let pay = test_address("pay");
         let resp = post_json(
