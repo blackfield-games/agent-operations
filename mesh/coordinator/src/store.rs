@@ -850,10 +850,6 @@ impl Store {
         Ok(updated > 0)
     }
 
-    /// Immutable creation timestamp (epoch seconds) of a job, or `None` if the
-    /// id is unknown (or the row predates the column and was never backfilled).
-    /// Test-only: lets the TTL tests assert the anchor is set at enqueue and is
-    /// not slid by requeue/fault/reap.
     /// Test-only: overwrite a job's `created_at` anchor so a test can build a
     /// deterministic age ordering that disagrees with `rowid` (the live `enqueue`
     /// stamps wall-clock seconds, which tie within a fast test). Returns whether a
@@ -867,6 +863,10 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Immutable creation timestamp (epoch seconds) of a job, or `None` if the
+    /// id is unknown (or the row predates the column and was never backfilled).
+    /// Test-only: lets the TTL tests assert the anchor is set at enqueue and is
+    /// not slid by requeue/fault/reap.
     #[cfg(test)]
     pub fn job_created_at(&self, id: &uuid::Uuid) -> Result<Option<i64>> {
         let created_at = self
