@@ -1816,6 +1816,123 @@ mod tests {
         assert!(json.is_null(), "queue is empty after draining every seed");
     }
 
+    /// A queued `JobSpec` of a chosen kind, for the capability-filter tests.
+    fn job_of(kind: JobKind) -> JobSpec {
+        JobSpec {
+            id: Uuid::new_v4(),
+            kind,
+            region: RegionCoord { x: 1, y: 2, layer: 0 },
+            deadline_secs: 60,
+            max_payout_wei: "1000000000000000000".into(),
+            inputs: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_job_filters_to_supported_kind_and_stamps_seq() {
+        // An earner advertising only Terrain must be handed the older Terrain job,
+        // NOT the most-recent DiffusionTile take_next returns first (rowid DESC).
+        // Discriminating: the filter skips a non-matching most-recent job. The
+        // supported hand-out still stamps the dispatch_seq fence header.
+        let state = test_state_empty().await;
+        let terrain = job_of(JobKind::Terrain);
+        enqueue(&state, &terrain).await;
+        enqueue(&state, &job_of(JobKind::DiffusionTile)).await; // most recent
+
+        let addr = test_address("cap");
+        let reg = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        assert_eq!(reg.status(), StatusCode::OK);
+
+        let resp = get(state.clone(), &format!("/jobs/next?earner={addr}")).await;
+        let seq = resp
+            .headers()
+            .get(DISPATCH_SEQ_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["id"].as_str().unwrap(),
+            terrain.id.to_string(),
+            "filtered poll returns the supported Terrain job, skipping the newer DiffusionTile"
+        );
+        assert!(seq.is_some(), "a supported hand-out stamps the dispatch_seq header");
+    }
+
+    #[tokio::test]
+    async fn next_job_skips_when_earner_supports_no_queued_kind() {
+        // An earner whose kinds match NO queued job gets null + no seq header, and
+        // the job is left queued (no attempt charged) — an unfiltered re-poll still
+        // returns it, proving take_next never took it.
+        let state = test_state_empty().await;
+        let diffusion = job_of(JobKind::DiffusionTile);
+        enqueue(&state, &diffusion).await;
+
+        let addr = test_address("cap");
+        post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+
+        let resp = get(state.clone(), &format!("/jobs/next?earner={addr}")).await;
+        let seq = resp
+            .headers()
+            .get(DISPATCH_SEQ_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let json = body_json(resp).await;
+        assert!(json.is_null(), "no supported job → null");
+        assert!(seq.is_none(), "no hand-out → no dispatch_seq header");
+
+        let json = body_json(get(state.clone(), "/jobs/next").await).await;
+        assert_eq!(
+            json["id"].as_str().unwrap(),
+            diffusion.id.to_string(),
+            "the skipped job stayed queued (no attempt burned)"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_job_unfiltered_without_earner_param() {
+        // A legacy poll with no earner param keeps the unfiltered behavior: it
+        // returns the most-recent queued job regardless of kind.
+        let state = test_state_empty().await;
+        enqueue(&state, &job_of(JobKind::Terrain)).await;
+        let diffusion = job_of(JobKind::DiffusionTile);
+        enqueue(&state, &diffusion).await; // most recent
+
+        let json = body_json(get(state.clone(), "/jobs/next").await).await;
+        assert_eq!(
+            json["id"].as_str().unwrap(),
+            diffusion.id.to_string(),
+            "no earner param → unfiltered, returns most-recent"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_job_unknown_earner_param_falls_back_to_unfiltered() {
+        // A present-but-unregistered earner param must NOT starve the poller: it
+        // falls back to the unfiltered take (the earner is unknown/broken; the
+        // pre-existing self-drop covers any unsupported hand-out), not null.
+        let state = test_state_empty().await;
+        let diffusion = job_of(JobKind::DiffusionTile);
+        enqueue(&state, &diffusion).await;
+
+        let ghost = test_address("ghost"); // never registered
+        let json = body_json(get(state.clone(), &format!("/jobs/next?earner={ghost}")).await).await;
+        assert_eq!(
+            json["id"].as_str().unwrap(),
+            diffusion.id.to_string(),
+            "unknown earner → unfiltered fallback, not starved"
+        );
+    }
+
     /// A fresh coordinator seeds exactly one queued job per JobKind, so the
     /// HUD's queued-by-kind backlog is representative from boot.
     #[tokio::test]
