@@ -4122,9 +4122,28 @@ mod tests {
     async fn create_job_rejects_oversized_inputs() {
         let state = test_state_empty().await;
         let mut body = create_job_body();
+        // ~17 KiB: over MAX_INPUTS_BYTES (16 KiB) but under MAX_REQUEST_BODY_BYTES
+        // (32 KiB), so it clears the pre-parse body cap and is rejected by the
+        // precise inputs gate (422), not the coarse body cap (413) — see below.
         body["inputs"] = serde_json::json!({ "blob": "x".repeat(17 * 1024) });
         let resp = post_json(state.clone(), "/jobs", &body).await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
+    }
+
+    /// A body past MAX_REQUEST_BODY_BYTES is refused 413 by the DefaultBodyLimit
+    /// layer BEFORE serde buffers and parses it — the pre-parse backstop that
+    /// bounds transient request memory (FM4), distinct from the post-parse inputs
+    /// gate above. Discriminating: drop `.layer(body_guard())`'s size cap and this
+    /// 40 KiB body is buffered + parsed into a `Value` and only then 422'd by the
+    /// inputs gate, so the status flips 413 -> 422.
+    #[tokio::test]
+    async fn create_job_rejects_body_over_the_pre_parse_cap() {
+        let state = test_state_empty().await;
+        let mut body = create_job_body();
+        body["inputs"] = serde_json::json!({ "blob": "x".repeat(40 * 1024) });
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
     }
 
