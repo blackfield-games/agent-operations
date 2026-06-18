@@ -265,8 +265,12 @@ async fn main() -> Result<()> {
     let store = Store::open(&args.db)?;
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
     // `with_store` also reclaims jobs left in_flight by a previous crash.
-    let state =
-        AppState::with_store(store, args.max_attempts, args.max_faults, args.earner_ttl_secs as i64)?;
+    let state = AppState::with_store(
+        store,
+        args.max_attempts,
+        args.max_faults,
+        args.earner_ttl_secs as i64,
+    )?;
     tracing::info!(db = %args.db, "store ready");
 
     // Background reaper: periodically requeue in-flight jobs past their
@@ -283,7 +287,11 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "DEV: draining attestations to an in-process MOCK relay — receipts are NOT submitted on-chain. Never enable in production."
         );
-        spawn_relayer(state.clone(), relay::MockRelay::succeeding(), args.relay_interval_secs);
+        spawn_relayer(
+            state.clone(),
+            relay::MockRelay::succeeding(),
+            args.relay_interval_secs,
+        );
     } else {
         tracing::info!(
             "on-chain attestation relayer disabled (operator-gated: needs a Base RPC + an authorized coordinator EAS signer). Pending receipts accumulate; see /stats pending_attestations."
@@ -306,7 +314,9 @@ async fn main() -> Result<()> {
 /// drain before exit.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("install Ctrl-C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
     };
     #[cfg(unix)]
     let terminate = async {
@@ -369,6 +379,20 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
         loop {
             tick.tick().await;
             let max_attempts = state.max_attempts;
+            // Snapshot the live-earner addresses BEFORE taking the store lock, so the
+            // registry lock and the store lock are never held at once (same discipline
+            // as drain_attestations). The liveness reaper reclaims an in_flight job
+            // whose recorded WS holder is not in this set.
+            let live: HashSet<String> = {
+                let now = now_secs();
+                let ttl = state.earner_ttl_secs;
+                let earners = state.earners.lock().await;
+                earners
+                    .iter()
+                    .filter(|(_, info)| info.is_live(now, ttl))
+                    .map(|(addr, _)| addr.clone())
+                    .collect()
+            };
             {
                 let store = state.store.lock().await;
                 match store.reap_expired(now_secs(), max_attempts) {
@@ -394,10 +418,41 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
                 // faulting earner, never re-dispatched, never reaching max_faults.
                 match store.reap_ttl_expired(now_secs(), JOB_TTL_DEADLINE_MULTIPLE) {
                     Ok(expired) if !expired.is_empty() => {
-                        tracing::warn!(count = expired.len(), "dead-lettered jobs (wall-clock TTL exceeded)");
+                        tracing::warn!(
+                            count = expired.len(),
+                            "dead-lettered jobs (wall-clock TTL exceeded)"
+                        );
                     }
                     Ok(_) => {}
                     Err(e) => tracing::error!(?e, "reaper: reap_ttl_expired failed"),
+                }
+                // Liveness reap: reclaim an in_flight job whose recorded WS holder has
+                // dropped out of the live set (silent past earner_ttl_secs), on the
+                // earner-TTL timescale instead of the per-job deadline. Grace ==
+                // earner_ttl_secs so a healthy earner's heartbeat (which refreshes both
+                // last_seen and the job's started_at) never trips it. HTTP-dispatched
+                // jobs (NULL holder) are skipped and stay on the deadline reaper.
+                match store.reap_stale_holders(
+                    &live,
+                    now_secs(),
+                    state.earner_ttl_secs,
+                    max_attempts,
+                ) {
+                    Ok(outcome) => {
+                        if !outcome.requeued.is_empty() {
+                            tracing::info!(
+                                count = outcome.requeued.len(),
+                                "requeued in-flight jobs whose holder went stale"
+                            );
+                        }
+                        if !outcome.failed.is_empty() {
+                            tracing::warn!(
+                                count = outcome.failed.len(),
+                                "dead-lettered stale-holder jobs (max attempts exhausted)"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(?e, "reaper: reap_stale_holders failed"),
                 }
             } // store lock dropped here, before we touch earners
 
@@ -500,7 +555,11 @@ fn seed_jobs() -> Vec<JobSpec> {
         .map(|(i, kind)| JobSpec {
             id: Uuid::new_v4(),
             kind,
-            region: RegionCoord { x: 42 + i as i32, y: -17, layer: 0 },
+            region: RegionCoord {
+                x: 42 + i as i32,
+                y: -17,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({ "seed": i as u64 }),
@@ -516,7 +575,11 @@ fn seed_job() -> JobSpec {
     JobSpec {
         id: Uuid::new_v4(),
         kind: JobKind::Terrain,
-        region: RegionCoord { x: 42, y: -17, layer: 0 },
+        region: RegionCoord {
+            x: 42,
+            y: -17,
+            layer: 0,
+        },
         deadline_secs: 60,
         max_payout_wei: "1000000000000000000".into(),
         inputs: serde_json::json!({"heightfield_seed": 0xb1acf1e1du64}),
@@ -606,7 +669,12 @@ async fn register(
     tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered");
     state.earners.lock().await.insert(
         earner_address,
-        EarnerInfo { gpu_model, vram_gb, supported, last_seen: now_secs() },
+        EarnerInfo {
+            gpu_model,
+            vram_gb,
+            supported,
+            last_seen: now_secs(),
+        },
     );
     Ok("registered")
 }
@@ -629,19 +697,18 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         }
     }
     let store = state.store.lock().await;
-    let (jobs_queued, jobs_in_flight, jobs_completed, jobs_failed) =
-        match (
-            store.queued_count(),
-            store.in_flight_count(),
-            store.completed_count(),
-            store.failed_count(),
-        ) {
-            (Ok(q), Ok(f), Ok(c), Ok(d)) => (q, f, c, d),
-            (q, f, c, d) => {
-                tracing::error!(?q, ?f, ?c, ?d, "stats: store count failed");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
+    let (jobs_queued, jobs_in_flight, jobs_completed, jobs_failed) = match (
+        store.queued_count(),
+        store.in_flight_count(),
+        store.completed_count(),
+        store.failed_count(),
+    ) {
+        (Ok(q), Ok(f), Ok(c), Ok(d)) => (q, f, c, d),
+        (q, f, c, d) => {
+            tracing::error!(?q, ?f, ?c, ?d, "stats: store count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let queued_by_kind = match store.queued_count_by_kind() {
         Ok(m) => m,
         Err(e) => {
@@ -943,7 +1010,10 @@ async fn submit(
     {
         Some(s) => s,
         None => {
-            tracing::warn!(?id, "rejected: missing/invalid {DISPATCH_SEQ_HEADER} header");
+            tracing::warn!(
+                ?id,
+                "rejected: missing/invalid {DISPATCH_SEQ_HEADER} header"
+            );
             return Err(StatusCode::BAD_REQUEST);
         }
     };
@@ -1088,10 +1158,7 @@ async fn submit(
 ///
 /// The earner registration and queue/completed state are shared with the HTTP
 /// endpoints, so `/stats` reflects ws activity identically.
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
     ws.on_upgrade(move |socket| ws_session(socket, state))
 }
 
@@ -1139,7 +1206,9 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     loop {
         // If we have no outstanding offer, try to grab a supported job.
         if offered.is_none() {
-            if let Some((job, seq)) = take_supported_job(&state, &supported, &faulted).await {
+            if let Some((job, seq)) =
+                take_supported_job(&state, &earner_address, &supported, &faulted).await
+            {
                 if !send_msg(&mut socket, &CoordinatorMsg::JobOffer(job.clone())).await {
                     // Socket died delivering the offer — a disconnect, so charge.
                     requeue(&state, job, seq, RequeueKind::Charge).await;
@@ -1366,7 +1435,12 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
         tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered (ws)");
         state.earners.lock().await.insert(
             earner_address.clone(),
-            EarnerInfo { gpu_model, vram_gb, supported, last_seen: now_secs() },
+            EarnerInfo {
+                gpu_model,
+                vram_gb,
+                supported,
+                last_seen: now_secs(),
+            },
         );
         return Some(earner_address);
     }
@@ -1380,11 +1454,17 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
 /// earner from being re-offered the same job in a reject/re-offer hot loop.
 async fn take_supported_job(
     state: &Arc<AppState>,
+    earner_address: &str,
     supported: &[JobKind],
     skip: &HashSet<Uuid>,
 ) -> Option<(JobSpec, i64)> {
     let store = state.store.lock().await;
-    match store.take_next(|job| supported.contains(&job.kind) && !skip.contains(&job.id)) {
+    // Record this earner as the job's holder (`take_next_for`) so the liveness reaper
+    // can reclaim it promptly if this earner goes stale, instead of waiting for the
+    // full deadline. The anonymous HTTP poll uses `take_next` (no holder).
+    match store.take_next_for(earner_address, |job| {
+        supported.contains(&job.kind) && !skip.contains(&job.id)
+    }) {
         Ok(job) => job,
         Err(e) => {
             tracing::error!(?e, "take_supported_job: take_next failed");
@@ -1436,10 +1516,14 @@ async fn requeue(state: &Arc<AppState>, job: JobSpec, seq: i64, kind: RequeueKin
         }
     }
     let (dead_lettered, why) = match kind {
-        RequeueKind::Charge => (store.requeue(&job, state.max_attempts), "max attempts exhausted"),
-        RequeueKind::EarnerFault => {
-            (store.requeue_earner_fault(&job, state.max_faults), "max earner faults exhausted")
-        }
+        RequeueKind::Charge => (
+            store.requeue(&job, state.max_attempts),
+            "max attempts exhausted",
+        ),
+        RequeueKind::EarnerFault => (
+            store.requeue_earner_fault(&job, state.max_faults),
+            "max earner faults exhausted",
+        ),
     };
     match dead_lettered {
         Ok(true) => tracing::warn!(job_id = %job.id, ?kind, "job dead-lettered ({why})"),
@@ -1640,7 +1724,11 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    async fn post_json(state: Arc<AppState>, uri: &str, value: &serde_json::Value) -> axum::response::Response {
+    async fn post_json(
+        state: Arc<AppState>,
+        uri: &str,
+        value: &serde_json::Value,
+    ) -> axum::response::Response {
         router(state)
             .oneshot(
                 Request::builder()
@@ -1687,8 +1775,17 @@ mod tests {
     #[tokio::test]
     async fn register_then_stats_reflects_earner() {
         let state = test_state_empty().await;
-        let msg = hello(&test_address("a"), 24, vec![JobKind::Terrain, JobKind::Foliage]);
-        let resp = post_json(state.clone(), "/register", &serde_json::to_value(&msg).unwrap()).await;
+        let msg = hello(
+            &test_address("a"),
+            24,
+            vec![JobKind::Terrain, JobKind::Foliage],
+        );
+        let resp = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(&msg).unwrap(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let resp = get(state.clone(), "/stats").await;
@@ -1712,7 +1809,12 @@ mod tests {
         let m2 = hello(&abc, 48, vec![JobKind::Terrain, JobKind::DiffusionTile]);
         let m3 = hello(&def, 16, vec![JobKind::NpcTick]);
         for m in [&m1, &m2, &m3] {
-            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            let resp = post_json(
+                state.clone(),
+                "/register",
+                &serde_json::to_value(m).unwrap(),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
@@ -1727,8 +1829,15 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_non_hello() {
         let state = test_state();
-        let msg = EarnerMsg::Accept { job_id: Uuid::new_v4() };
-        let resp = post_json(state.clone(), "/register", &serde_json::to_value(&msg).unwrap()).await;
+        let msg = EarnerMsg::Accept {
+            job_id: Uuid::new_v4(),
+        };
+        let resp = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(&msg).unwrap(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1751,15 +1860,31 @@ mod tests {
             hello(&good, 0, vec![JobKind::Terrain]),       // zero vram
         ];
         for m in &malformed {
-            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected 400 for {m:?}");
+            let resp = post_json(
+                state.clone(),
+                "/register",
+                &serde_json::to_value(m).unwrap(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {m:?}"
+            );
         }
 
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["gpus_joined"], 0, "no malformed earner may enter the registry");
+        assert_eq!(
+            json["gpus_joined"], 0,
+            "no malformed earner may enter the registry"
+        );
         assert_eq!(json["total_vram_gb"], 0);
         let earners = body_json(get(state.clone(), "/earners").await).await;
-        assert_eq!(earners.as_array().unwrap().len(), 0, "leaderboard stays empty");
+        assert_eq!(
+            earners.as_array().unwrap().len(),
+            0,
+            "leaderboard stays empty"
+        );
     }
 
     /// A mixed-case (EIP-55-checksummed) address must register: the settle-time
@@ -1776,7 +1901,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_json(get(state.clone(), "/stats").await).await["gpus_joined"], 1);
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            1
+        );
     }
 
     /// A malformed re-`Hello` for an already-registered address is rejected
@@ -1796,7 +1924,10 @@ mod tests {
         )
         .await;
         assert_eq!(ok.status(), StatusCode::OK);
-        assert_eq!(body_json(get(state.clone(), "/stats").await).await["gpus_joined"], 1);
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            1
+        );
 
         let bad = post_json(
             state.clone(),
@@ -1809,9 +1940,18 @@ mod tests {
         // The live entry is untouched: not evicted (count 1), not overwritten
         // (vram stays 24 not 99, supported still advertises terrain not empty).
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["gpus_joined"], 1, "rejected re-Hello must not evict the live earner");
-        assert_eq!(json["total_vram_gb"], 24, "original vram preserved, not overwritten with 99");
-        assert_eq!(json["supported_breakdown"]["terrain"], 1, "original supported set preserved");
+        assert_eq!(
+            json["gpus_joined"], 1,
+            "rejected re-Hello must not evict the live earner"
+        );
+        assert_eq!(
+            json["total_vram_gb"], 24,
+            "original vram preserved, not overwritten with 99"
+        );
+        assert_eq!(
+            json["supported_breakdown"]["terrain"], 1,
+            "original supported set preserved"
+        );
     }
 
     #[tokio::test]
@@ -1833,7 +1973,11 @@ mod tests {
         JobSpec {
             id: Uuid::new_v4(),
             kind,
-            region: RegionCoord { x: 1, y: 2, layer: 0 },
+            region: RegionCoord {
+                x: 1,
+                y: 2,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({}),
@@ -1872,7 +2016,10 @@ mod tests {
             terrain.id.to_string(),
             "filtered poll returns the supported Terrain job, skipping the newer DiffusionTile"
         );
-        assert!(seq.is_some(), "a supported hand-out stamps the dispatch_seq header");
+        assert!(
+            seq.is_some(),
+            "a supported hand-out stamps the dispatch_seq header"
+        );
     }
 
     #[tokio::test]
@@ -1929,7 +2076,10 @@ mod tests {
         let _ = get(state.clone(), &format!("/jobs/next?earner={addr}")).await;
 
         let last_seen = state.earners.lock().await.get(&addr).unwrap().last_seen;
-        assert!(last_seen > 0, "an identified poll refreshes the earner's last_seen");
+        assert!(
+            last_seen > 0,
+            "an identified poll refreshes the earner's last_seen"
+        );
     }
 
     #[tokio::test]
@@ -1988,9 +2138,8 @@ mod tests {
     use sha3::{Digest, Keccak256};
 
     fn dev_signing_key() -> SigningKey {
-        let bytes =
-            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
-                .unwrap();
+        let bytes = hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+            .unwrap();
         SigningKey::from_slice(&bytes).unwrap()
     }
 
@@ -2008,7 +2157,10 @@ mod tests {
     /// addresses, so tests keep using legible names (`"live"`, `"busy"`) while
     /// every registered address is well-formed.
     fn test_address(label: &str) -> String {
-        format!("0x{}", hex::encode(&Keccak256::digest(label.as_bytes())[..20]))
+        format!(
+            "0x{}",
+            hex::encode(&Keccak256::digest(label.as_bytes())[..20])
+        )
     }
 
     /// Expand a short, readable test label into a valid 256-bit lowercase-hex
@@ -2067,13 +2219,25 @@ mod tests {
 
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // mismatched path id vs body job_id → rejected
         let other = Uuid::new_v4();
         let uri = format!("/jobs/{}/submit", other);
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         // completed count reflects the one accepted submit
@@ -2201,7 +2365,13 @@ mod tests {
         let mut good = signed_result(job_id, "deadbeef");
         good.render_seconds = 120; // exactly deadline * SLACK
         let uri = format!("/jobs/{job_id}/submit");
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -2245,9 +2415,15 @@ mod tests {
         assert!(store.record_completed(&result).unwrap());
         assert_eq!(store.pending_attestation_count().unwrap(), 1);
 
-        let stored = store.pending_attestation(&job_id).unwrap().expect("pending row exists");
+        let stored = store
+            .pending_attestation(&job_id)
+            .unwrap()
+            .expect("pending row exists");
         // Round-trips through the canonical builder...
-        assert_eq!(stored, eas::PendingAttestation::build(&job, &result).unwrap());
+        assert_eq!(
+            stored,
+            eas::PendingAttestation::build(&job, &result).unwrap()
+        );
         // ...and the mapping is exactly the contract's.
         assert_eq!(stored.job_kind, 0); // Terrain
         assert_eq!(stored.earner, result.earner_address);
@@ -2270,7 +2446,10 @@ mod tests {
         let result = signed_result(job_id, "render-1");
         let mut store = state.store.lock().await;
         assert!(store.record_completed(&result).unwrap());
-        assert!(!store.record_completed(&result).unwrap(), "second settle refused (done)");
+        assert!(
+            !store.record_completed(&result).unwrap(),
+            "second settle refused (done)"
+        );
         assert_eq!(store.pending_attestation_count().unwrap(), 1);
     }
 
@@ -2301,7 +2480,9 @@ mod tests {
 
         // "deadbeef" is 8 chars — not a 256-bit digest, so the attestation can't build.
         let mut store = state.store.lock().await;
-        assert!(store.record_completed(&signed_result_raw_hash(job_id, "deadbeef")).unwrap());
+        assert!(store
+            .record_completed(&signed_result_raw_hash(job_id, "deadbeef"))
+            .unwrap());
         assert_eq!(store.pending_attestation_count().unwrap(), 0);
     }
 
@@ -2313,8 +2494,18 @@ mod tests {
         let jobs = [seed_job(), seed_job()];
         for job in &jobs {
             enqueue(&state, job).await;
-            state.store.lock().await.take_next(|j| j.id == job.id).unwrap();
-            state.store.lock().await.record_completed(&signed_result(job.id, "r")).unwrap();
+            state
+                .store
+                .lock()
+                .await
+                .take_next(|j| j.id == job.id)
+                .unwrap();
+            state
+                .store
+                .lock()
+                .await
+                .record_completed(&signed_result(job.id, "r"))
+                .unwrap();
         }
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["jobs_completed"], 2);
@@ -2330,7 +2521,12 @@ mod tests {
     /// attestation — the precondition for every drain test.
     async fn settle_one(state: &Arc<AppState>, job: &JobSpec) {
         enqueue(state, job).await;
-        state.store.lock().await.take_next(|j| j.id == job.id).unwrap();
+        state
+            .store
+            .lock()
+            .await
+            .take_next(|j| j.id == job.id)
+            .unwrap();
         assert!(state
             .store
             .lock()
@@ -2340,7 +2536,12 @@ mod tests {
     }
 
     async fn pending(state: &Arc<AppState>) -> usize {
-        state.store.lock().await.pending_attestation_count().unwrap()
+        state
+            .store
+            .lock()
+            .await
+            .pending_attestation_count()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2361,7 +2562,10 @@ mod tests {
         submitted.sort();
         let mut expected: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
         expected.sort();
-        assert_eq!(submitted, expected, "each pending job submitted exactly once");
+        assert_eq!(
+            submitted, expected,
+            "each pending job submitted exactly once"
+        );
     }
 
     #[tokio::test]
@@ -2393,9 +2597,16 @@ mod tests {
         let relay = MockRelay::already_issued();
         drain_attestations(&state, &relay).await;
 
-        assert_eq!(pending(&state).await, 0, "already-on-chain receipt is marked");
+        assert_eq!(
+            pending(&state).await,
+            0,
+            "already-on-chain receipt is marked"
+        );
         assert_eq!(relay.calls(), 1);
-        assert!(relay.submitted().is_empty(), "AlreadyIssued submits nothing new");
+        assert!(
+            relay.submitted().is_empty(),
+            "AlreadyIssued submits nothing new"
+        );
     }
 
     #[tokio::test]
@@ -2407,7 +2618,11 @@ mod tests {
         let relay = MockRelay::transient_then_ok(1);
         // First tick: the transient failure leaves the receipt pending, not dropped.
         drain_attestations(&state, &relay).await;
-        assert_eq!(pending(&state).await, 1, "transient failure is not terminal");
+        assert_eq!(
+            pending(&state).await,
+            1,
+            "transient failure is not terminal"
+        );
         assert_eq!(relay.calls(), 1);
         assert!(relay.submitted().is_empty());
 
@@ -2431,7 +2646,11 @@ mod tests {
         drain_attestations(&state, &relay).await;
 
         assert_eq!(pending(&state).await, 2, "nothing dropped");
-        assert_eq!(relay.calls(), 1, "batch stops at the first error — no hot loop");
+        assert_eq!(
+            relay.calls(),
+            1,
+            "batch stops at the first error — no hot loop"
+        );
     }
 
     /// A permanent error (e.g. an unauthorized signer) neither drops the receipt
@@ -2445,7 +2664,11 @@ mod tests {
         let relay = MockRelay::permanent();
         drain_attestations(&state, &relay).await;
 
-        assert_eq!(pending(&state).await, 1, "permanent error does not drop the receipt");
+        assert_eq!(
+            pending(&state).await,
+            1,
+            "permanent error does not drop the receipt"
+        );
         assert_eq!(relay.calls(), 1, "no hot loop");
         assert!(relay.submitted().is_empty());
     }
@@ -2481,7 +2704,11 @@ mod tests {
 
         release.notify_one();
         drive.await.unwrap();
-        assert_eq!(pending(&state).await, 0, "receipt marked once the submit returns");
+        assert_eq!(
+            pending(&state).await,
+            0,
+            "receipt marked once the submit returns"
+        );
     }
 
     #[tokio::test]
@@ -2496,7 +2723,10 @@ mod tests {
         drain_attestations(&state, &MockRelay::succeeding()).await;
 
         let after = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(after["pending_attestations"], 0, "the backlog drains as receipts land");
+        assert_eq!(
+            after["pending_attestations"], 0,
+            "the backlog drains as receipts land"
+        );
     }
 
     // ---- websocket dispatch integration tests ----
@@ -2620,7 +2850,10 @@ mod tests {
         // 5. Expect Accepted with the placeholder attestation uid.
         let verdict = next_coordinator_msg(&mut ws).await;
         match verdict {
-            CoordinatorMsg::Accepted { job_id: jid, attestation_uid } => {
+            CoordinatorMsg::Accepted {
+                job_id: jid,
+                attestation_uid,
+            } => {
                 assert_eq!(jid, job_id);
                 assert_eq!(attestation_uid, PLACEHOLDER_ATTESTATION_UID);
             }
@@ -2722,7 +2955,10 @@ mod tests {
                 store.requeue(&offered, 1).unwrap(),
                 "attempts>=max must dead-letter the job"
             );
-            assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("failed"));
+            assert_eq!(
+                store.job_status(&job_id).unwrap().as_deref(),
+                Some("failed")
+            );
         }
 
         // Submit a validly-signed result for the now-stale offer.
@@ -2741,12 +2977,21 @@ mod tests {
 
         // The job stays failed (not resurrected to done); nothing was credited.
         assert_eq!(
-            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&job_id)
+                .unwrap()
+                .as_deref(),
             Some("failed"),
             "stale submit must not resurrect a dead-lettered job"
         );
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["jobs_completed"], 0, "stale submit must not be credited");
+        assert_eq!(
+            json["jobs_completed"], 0,
+            "stale submit must not be credited"
+        );
         assert_eq!(json["jobs_failed"], 1);
     }
 
@@ -2802,14 +3047,23 @@ mod tests {
         // here and the timeout would NOT fire.
         let reoffer =
             tokio::time::timeout(Duration::from_millis(500), next_coordinator_msg(&mut ws)).await;
-        assert!(reoffer.is_err(), "faulted job re-offered to the same earner: {reoffer:?}");
+        assert!(
+            reoffer.is_err(),
+            "faulted job re-offered to the same earner: {reoffer:?}"
+        );
 
         // The job itself is back on the queue, renderable for another earner —
         // not dead-lettered by the fault. (Asserted directly on the job rather
         // than via /stats in-flight counts, which include test_state_empty's
         // drained seed jobs.)
         assert_eq!(
-            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&job_id)
+                .unwrap()
+                .as_deref(),
             Some("queued"),
             "an earner fault must not dead-letter a renderable job"
         );
@@ -2861,12 +3115,21 @@ mod tests {
         // and assert nothing comes — a regressed skip set would land a JobOffer.
         let reoffer =
             tokio::time::timeout(Duration::from_millis(500), next_coordinator_msg(&mut ws)).await;
-        assert!(reoffer.is_err(), "declined job re-offered to the same earner: {reoffer:?}");
+        assert!(
+            reoffer.is_err(),
+            "declined job re-offered to the same earner: {reoffer:?}"
+        );
 
         // The job is back on the queue, renderable for another earner — not left
         // in_flight (which a dropped decline would do) and not dead-lettered.
         assert_eq!(
-            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&job_id)
+                .unwrap()
+                .as_deref(),
             Some("queued"),
             "a decline must requeue the job, not strand it in_flight or dead-letter it"
         );
@@ -2933,7 +3196,10 @@ mod tests {
             other => panic!("a stale decline must leave the offer settleable, got {other:?}"),
         }
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["jobs_completed"], 1, "the held offer must still settle");
+        assert_eq!(
+            json["jobs_completed"], 1,
+            "the held offer must still settle"
+        );
     }
 
     /// A `JobResult` validly signed by an arbitrary key (distinct from the dev
@@ -2942,7 +3208,10 @@ mod tests {
     fn signed_result_by(key_hex: &str, job_id: Uuid, label: &str) -> JobResult {
         let sk = SigningKey::from_slice(&hex::decode(key_hex).unwrap()).unwrap();
         let point = sk.verifying_key().to_encoded_point(false);
-        let address = format!("0x{}", hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..]));
+        let address = format!(
+            "0x{}",
+            hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..])
+        );
         let output_hash = test_output_hash(label);
         JobResult {
             job_id,
@@ -2970,38 +3239,75 @@ mod tests {
         enqueue(&state, &job).await;
 
         // A takes the job: dispatch seq 1, in_flight under A.
-        let (job_a, seq_a) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        let (job_a, seq_a) = state
+            .store
+            .lock()
+            .await
+            .take_next(|_| true)
+            .unwrap()
+            .unwrap();
         assert_eq!((job_a.id, seq_a), (job_id, 1));
 
         // The deadline lapses and A's job returns to the queue (whether via the
         // reaper or A's own disconnect — both are in_flight→queued, seq preserved).
         {
             let store = state.store.lock().await;
-            assert!(!store.requeue(&job_a, state.max_attempts).unwrap(), "requeued, not dead-lettered");
-            assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("queued"));
+            assert!(
+                !store.requeue(&job_a, state.max_attempts).unwrap(),
+                "requeued, not dead-lettered"
+            );
+            assert_eq!(
+                store.job_status(&job_id).unwrap().as_deref(),
+                Some("queued")
+            );
         }
         // B takes the now-queued job: seq 2.
-        let (job_b, seq_b) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
-        assert_eq!((job_b.id, seq_b), (job_id, 2), "B's dispatch carries a fresh, higher seq");
+        let (job_b, seq_b) = state
+            .store
+            .lock()
+            .await
+            .take_next(|_| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (job_b.id, seq_b),
+            (job_id, 2),
+            "B's dispatch carries a fresh, higher seq"
+        );
 
         // FM2: A (seq 1) submits a valid result, but the lease is B's (seq 2).
         // Must Drop, settle nothing, credit no one.
         let result_a = signed_result(job_id, "aaaa"); // dev key == earner A
         match handle_submit(&state, &Some((job_a.clone(), seq_a)), true, result_a).await {
-            SubmitOutcome::Drop(CoordinatorMsg::Rejected { job_id: jid, .. }) => assert_eq!(jid, job_id),
+            SubmitOutcome::Drop(CoordinatorMsg::Rejected { job_id: jid, .. }) => {
+                assert_eq!(jid, job_id)
+            }
             other => panic!("stale holder's submit must Drop, got {other:?}"),
         }
         {
             let store = state.store.lock().await;
-            assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("in_flight"));
-            assert_eq!(store.completed_count().unwrap(), 0, "stale submit credited nothing");
+            assert_eq!(
+                store.job_status(&job_id).unwrap().as_deref(),
+                Some("in_flight")
+            );
+            assert_eq!(
+                store.completed_count().unwrap(),
+                0,
+                "stale submit credited nothing"
+            );
             assert_eq!(store.current_dispatch_seq(&job_id).unwrap(), Some(2));
         }
 
         // FM1: A's socket drops → requeue with A's stale seq. Must not preempt B.
         requeue(&state, job_a, seq_a, RequeueKind::Charge).await;
         assert_eq!(
-            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&job_id)
+                .unwrap()
+                .as_deref(),
             Some("in_flight"),
             "stale holder's disconnect must not requeue B's in-flight job"
         );
@@ -3011,14 +3317,24 @@ mod tests {
         let b_addr = result_b.earner_address.clone();
         assert_ne!(b_addr, dev_address(), "B must be a different earner than A");
         match handle_submit(&state, &Some((job_b, seq_b)), true, result_b).await {
-            SubmitOutcome::Accepted(CoordinatorMsg::Accepted { job_id: jid, .. }) => assert_eq!(jid, job_id),
+            SubmitOutcome::Accepted(CoordinatorMsg::Accepted { job_id: jid, .. }) => {
+                assert_eq!(jid, job_id)
+            }
             other => panic!("current holder's submit must be Accepted, got {other:?}"),
         }
         let store = state.store.lock().await;
         assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("done"));
         let credited = store.completed_count_by_earner().unwrap();
-        assert_eq!(credited.get(&b_addr), Some(&1), "credit lands on B, the current holder");
-        assert_eq!(credited.len(), 1, "and on no one else (A was never credited)");
+        assert_eq!(
+            credited.get(&b_addr),
+            Some(&1),
+            "credit lands on B, the current holder"
+        );
+        assert_eq!(
+            credited.len(),
+            1,
+            "and on no one else (A was never credited)"
+        );
     }
 
     /// ws content gate: a Submit whose result fails the content gate (here a
@@ -3034,14 +3350,29 @@ mod tests {
         let job_id = job.id;
         enqueue(&state, &job).await;
 
-        let (offered, seq) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        let (offered, seq) = state
+            .store
+            .lock()
+            .await
+            .take_next(|_| true)
+            .unwrap()
+            .unwrap();
         assert_eq!((offered.id, seq), (job_id, 1));
 
         let bad = signed_result_raw_hash(job_id, "deadbeef"); // valid sig, malformed hash
         match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
-            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }, kind) => {
+            SubmitOutcome::Requeue(
+                CoordinatorMsg::Rejected {
+                    job_id: jid,
+                    reason,
+                },
+                kind,
+            ) => {
                 assert_eq!(jid, job_id);
-                assert_eq!(reason, validate::ValidationError::MalformedOutputHash.reason());
+                assert_eq!(
+                    reason,
+                    validate::ValidationError::MalformedOutputHash.reason()
+                );
                 // A content fault is an earner fault: don't charge the attempt.
                 assert_eq!(kind, RequeueKind::EarnerFault);
             }
@@ -3050,13 +3381,28 @@ mod tests {
 
         // Nothing settled: still in_flight under our (only) dispatch.
         assert_eq!(
-            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&job_id)
+                .unwrap()
+                .as_deref(),
             Some("in_flight")
         );
 
         // The caller's seq-fenced earner-fault requeue then returns it to queued.
         requeue(&state, offered, seq, RequeueKind::EarnerFault).await;
-        assert_eq!(state.store.lock().await.job_status(&job_id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&job_id)
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
     }
 
     /// WS twin of the render-seconds bound: an implausible value (u32::MAX vs a
@@ -3070,15 +3416,30 @@ mod tests {
         let job_id = job.id;
         enqueue(&state, &job).await;
 
-        let (offered, seq) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        let (offered, seq) = state
+            .store
+            .lock()
+            .await
+            .take_next(|_| true)
+            .unwrap()
+            .unwrap();
         assert_eq!((offered.id, seq), (job_id, 1));
 
         let mut bad = signed_result(job_id, "deadbeef"); // valid sig + hash
         bad.render_seconds = u32::MAX; // the only defect
         match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
-            SubmitOutcome::Requeue(CoordinatorMsg::Rejected { job_id: jid, reason }, kind) => {
+            SubmitOutcome::Requeue(
+                CoordinatorMsg::Rejected {
+                    job_id: jid,
+                    reason,
+                },
+                kind,
+            ) => {
                 assert_eq!(jid, job_id);
-                assert_eq!(reason, validate::ValidationError::ImplausibleRenderSeconds.reason());
+                assert_eq!(
+                    reason,
+                    validate::ValidationError::ImplausibleRenderSeconds.reason()
+                );
                 assert_eq!(kind, RequeueKind::EarnerFault);
             }
             other => panic!("expected Requeue with the content-gate reason, got {other:?}"),
@@ -3086,7 +3447,13 @@ mod tests {
 
         // Nothing settled: still in_flight under our (only) dispatch.
         assert_eq!(
-            state.store.lock().await.job_status(&job_id).unwrap().as_deref(),
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&job_id)
+                .unwrap()
+                .as_deref(),
             Some("in_flight")
         );
     }
@@ -3102,12 +3469,22 @@ mod tests {
         let job = seed_job();
         let job_id = job.id;
         enqueue(&state, &job).await;
-        let (offered, seq) = state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        let (offered, seq) = state
+            .store
+            .lock()
+            .await
+            .take_next(|_| true)
+            .unwrap()
+            .unwrap();
 
         fn assert_earner_fault(outcome: SubmitOutcome, ctx: &str) {
             match outcome {
                 SubmitOutcome::Requeue(_, kind) => {
-                    assert_eq!(kind, RequeueKind::EarnerFault, "{ctx} must be an earner fault")
+                    assert_eq!(
+                        kind,
+                        RequeueKind::EarnerFault,
+                        "{ctx} must be an earner fault"
+                    )
                 }
                 other => panic!("{ctx}: expected Requeue(EarnerFault), got {other:?}"),
             }
@@ -3117,7 +3494,9 @@ mod tests {
         // guaranteed-different value so the corruption never no-ops.
         let mut bad_sig = signed_result(job_id, "deadbeef");
         let last = bad_sig.signature_hex.pop().unwrap();
-        bad_sig.signature_hex.push(if last == 'f' { '0' } else { 'f' });
+        bad_sig
+            .signature_hex
+            .push(if last == 'f' { '0' } else { 'f' });
         assert_earner_fault(
             handle_submit(&state, &Some((offered.clone(), seq)), true, bad_sig).await,
             "bad signature",
@@ -3125,21 +3504,34 @@ mod tests {
 
         // Submit before Accept (validly signed, accepted = false).
         assert_earner_fault(
-            handle_submit(&state, &Some((offered.clone(), seq)), false, signed_result(job_id, "deadbeef"))
-                .await,
+            handle_submit(
+                &state,
+                &Some((offered.clone(), seq)),
+                false,
+                signed_result(job_id, "deadbeef"),
+            )
+            .await,
             "submit before accept",
         );
 
         // Submit whose job_id is not the offered job (a result for another job).
         assert_earner_fault(
-            handle_submit(&state, &Some((offered.clone(), seq)), true, signed_result(Uuid::new_v4(), "x"))
-                .await,
+            handle_submit(
+                &state,
+                &Some((offered.clone(), seq)),
+                true,
+                signed_result(Uuid::new_v4(), "x"),
+            )
+            .await,
             "job_id mismatch",
         );
 
         // None of these touched the store: the job is still in_flight, uncredited.
         let store = state.store.lock().await;
-        assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("in_flight"));
+        assert_eq!(
+            store.job_status(&job_id).unwrap().as_deref(),
+            Some("in_flight")
+        );
         assert_eq!(store.completed_count().unwrap(), 0);
     }
 
@@ -3160,22 +3552,37 @@ mod tests {
         skip.insert(a.id);
         skip.insert(b.id);
         assert!(
-            take_supported_job(&state, &supported, &skip).await.is_none(),
+            take_supported_job(&state, "0xtestearner", &supported, &skip)
+                .await
+                .is_none(),
             "all supported jobs skipped → no offer (no hot loop)"
         );
 
         // Drop b from skip: take_next (rowid DESC) hands back b; a stays skipped.
         skip.remove(&b.id);
-        let (taken, _) = take_supported_job(&state, &supported, &skip).await.unwrap();
+        let (taken, _) = take_supported_job(&state, "0xtestearner", &supported, &skip)
+            .await
+            .unwrap();
         assert_eq!(taken.id, b.id, "only the non-skipped job is offerable");
 
         // a remains renderable but skipped for THIS earner → still not offered,
         // and still queued (available to a different earner).
         assert!(
-            take_supported_job(&state, &supported, &skip).await.is_none(),
+            take_supported_job(&state, "0xtestearner", &supported, &skip)
+                .await
+                .is_none(),
             "a is renderable but skipped for this earner"
         );
-        assert_eq!(state.store.lock().await.job_status(&a.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .await
+                .job_status(&a.id)
+                .unwrap()
+                .as_deref(),
+            Some("queued")
+        );
     }
 
     /// HTTP-poll fence (FM3): `/jobs/next` stamps `dispatch_seq` in a header, and
@@ -3194,7 +3601,9 @@ mod tests {
         let resp = get(state.clone(), "/jobs/next").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("x-dispatch-seq").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("x-dispatch-seq")
+                .and_then(|v| v.to_str().ok()),
             Some("1"),
             "next stamps the dispatch seq"
         );
@@ -3204,23 +3613,50 @@ mod tests {
 
         // No fence header → can't be tied to a dispatch → 400.
         let resp = post_json(state.clone(), &uri, &serde_json::to_value(&good).unwrap()).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "submit without a fence header is refused");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "submit without a fence header is refused"
+        );
 
         // Reassign: requeue and re-dispatch, so the current seq is now 2.
         {
             let store = state.store.lock().await;
-            assert!(!store.requeue(&job, state.max_attempts).unwrap(), "requeued, not dead-lettered");
+            assert!(
+                !store.requeue(&job, state.max_attempts).unwrap(),
+                "requeued, not dead-lettered"
+            );
         }
         state.store.lock().await.take_next(|_| true).unwrap(); // seq -> 2
 
         // Echoing the stale seq 1 → 409 (lease reassigned); nothing credited.
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT, "stale dispatch seq is refused");
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "stale dispatch seq is refused"
+        );
         assert_eq!(state.store.lock().await.completed_count().unwrap(), 0);
 
         // Echoing the current seq 2 → accepted + settled.
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 2).await;
-        assert_eq!(resp.status(), StatusCode::OK, "current dispatch seq settles");
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            2,
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "current dispatch seq settles"
+        );
         assert_eq!(state.store.lock().await.completed_count().unwrap(), 1);
     }
 
@@ -3251,8 +3687,13 @@ mod tests {
 
             let result = signed_result(job_id, "deadbeef");
             let uri = format!("/jobs/{}/submit", job_id);
-            let resp =
-                post_submit(state.clone(), &uri, &serde_json::to_value(&result).unwrap(), 1).await;
+            let resp = post_submit(
+                state.clone(),
+                &uri,
+                &serde_json::to_value(&result).unwrap(),
+                1,
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK);
 
             let json = body_json(get(state.clone(), "/stats").await).await;
@@ -3327,7 +3768,11 @@ mod tests {
                 ids.push(job.id);
             }
             seeded = ids.len();
-            assert_eq!(seeded, JobKind::ALL.len(), "fresh DB seeds one job per kind");
+            assert_eq!(
+                seeded,
+                JobKind::ALL.len(),
+                "fresh DB seeds one job per kind"
+            );
             taken_id = ids[0];
             assert_eq!(store.in_flight_count().unwrap(), seeded);
             assert_eq!(store.queued_count().unwrap(), 0);
@@ -3364,7 +3809,9 @@ mod tests {
         let done = job_with_deadline(60);
         store.enqueue(&done).unwrap();
         store.take_next(|j| j.id == done.id).unwrap();
-        store.record_completed(&signed_result(done.id, "d")).unwrap();
+        store
+            .record_completed(&signed_result(done.id, "d"))
+            .unwrap();
         // failed — dead-lettered at max_attempts = 1.
         let failed = job_with_deadline(60);
         store.enqueue(&failed).unwrap();
@@ -3378,7 +3825,10 @@ mod tests {
             Some("queued"),
             "the in_flight job must be reclaimed to queued"
         );
-        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("queued")
+        );
         assert_eq!(
             store.job_status(&done.id).unwrap().as_deref(),
             Some("done"),
@@ -3389,7 +3839,11 @@ mod tests {
             Some("failed"),
             "a dead-lettered job must NOT be revived"
         );
-        assert_eq!(store.completed_count().unwrap(), 1, "the recorded result is untouched");
+        assert_eq!(
+            store.completed_count().unwrap(),
+            1,
+            "the recorded result is untouched"
+        );
 
         // Idempotent: nothing is in_flight now, so a second recovery is a no-op.
         assert_eq!(store.recover_in_flight().unwrap(), 0);
@@ -3413,7 +3867,9 @@ mod tests {
             done_id = done.id;
             store.enqueue(&done).unwrap();
             store.take_next(|j| j.id == done.id).unwrap();
-            store.record_completed(&signed_result(done.id, "d")).unwrap();
+            store
+                .record_completed(&signed_result(done.id, "d"))
+                .unwrap();
 
             let in_flight = job_with_deadline(60);
             in_flight_id = in_flight.id;
@@ -3429,12 +3885,23 @@ mod tests {
 
         // The done job survived and is still credited; it is not requeued.
         assert_eq!(store.job_status(&done_id).unwrap().as_deref(), Some("done"));
-        assert_eq!(store.completed_count().unwrap(), 1, "pre-crash result must survive");
+        assert_eq!(
+            store.completed_count().unwrap(),
+            1,
+            "pre-crash result must survive"
+        );
 
         // The in_flight job was reclaimed to queued and redispatches exactly once.
-        assert_eq!(store.job_status(&in_flight_id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&in_flight_id).unwrap().as_deref(),
+            Some("queued")
+        );
         let taken = store.take_next(|_| true).unwrap();
-        assert_eq!(taken.map(|(j, _)| j.id), Some(in_flight_id), "the reclaimed job redispatches");
+        assert_eq!(
+            taken.map(|(j, _)| j.id),
+            Some(in_flight_id),
+            "the reclaimed job redispatches"
+        );
         assert!(
             store.take_next(|_| true).unwrap().is_none(),
             "and only once — nothing else is queued"
@@ -3476,15 +3943,26 @@ mod tests {
             1,
             "the pre-column in_flight job must be reclaimed after migration"
         );
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued")
+        );
         // dispatch_seq was also absent in the old schema; the migration defaults
         // it to 0 (FM4), and the first dispatch bumps it to 1.
-        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(0), "migrated dispatch_seq defaults to 0");
+        assert_eq!(
+            store.current_dispatch_seq(&job.id).unwrap(),
+            Some(0),
+            "migrated dispatch_seq defaults to 0"
+        );
         // attempts defaulted to 0 on migration → first dispatch makes it 1.
         let (_, seq) = store.take_next(|_| true).unwrap().unwrap();
         assert_eq!(seq, 1, "first dispatch after migration stamps seq 1");
         assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(1));
-        assert_eq!(store.redispatched_count().unwrap(), 0, "migrated attempts default to 0");
+        assert_eq!(
+            store.redispatched_count().unwrap(),
+            0,
+            "migrated attempts default to 0"
+        );
     }
 
     /// `dispatch_seq` is monotonic per job: every `take_next` bumps it, and it
@@ -3497,7 +3975,11 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let job = job_with_deadline(60);
         store.enqueue(&job).unwrap();
-        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(0), "queued job starts at 0");
+        assert_eq!(
+            store.current_dispatch_seq(&job.id).unwrap(),
+            Some(0),
+            "queued job starts at 0"
+        );
 
         let (_, seq1) = store.take_next(|_| true).unwrap().unwrap();
         assert_eq!(seq1, 1);
@@ -3506,14 +3988,22 @@ mod tests {
         // take_next stamps started_at to the wall clock, so reap relative to it.
         let out = store.reap_expired(now_secs() + 10_000, 5).unwrap();
         assert_eq!(out.requeued, vec![job.id]);
-        assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(1), "reap preserves the seq");
+        assert_eq!(
+            store.current_dispatch_seq(&job.id).unwrap(),
+            Some(1),
+            "reap preserves the seq"
+        );
 
         // Re-dispatch bumps strictly higher.
         let (_, seq2) = store.take_next(|_| true).unwrap().unwrap();
         assert_eq!(seq2, 2, "the reassigned dispatch carries a higher seq");
         assert_eq!(store.current_dispatch_seq(&job.id).unwrap(), Some(2));
 
-        assert_eq!(store.current_dispatch_seq(&Uuid::new_v4()).unwrap(), None, "unknown job → None");
+        assert_eq!(
+            store.current_dispatch_seq(&Uuid::new_v4()).unwrap(),
+            None,
+            "unknown job → None"
+        );
     }
 
     #[test]
@@ -3534,8 +4024,15 @@ mod tests {
         // max_attempts = 5: after one attempt job `a` should be requeued, not
         // failed.
         let reaped = store.reap_expired(now_secs(), 5).unwrap();
-        assert_eq!(reaped.requeued, vec![a_id], "only the past-deadline job is reaped");
-        assert!(reaped.failed.is_empty(), "no jobs should be dead-lettered yet");
+        assert_eq!(
+            reaped.requeued,
+            vec![a_id],
+            "only the past-deadline job is reaped"
+        );
+        assert!(
+            reaped.failed.is_empty(),
+            "no jobs should be dead-lettered yet"
+        );
         assert_eq!(store.queued_count().unwrap(), 1);
         assert_eq!(store.in_flight_count().unwrap(), 1);
     }
@@ -3595,9 +4092,208 @@ mod tests {
         assert!(outcome.requeued.is_empty());
         assert_eq!(outcome.failed, vec![id]);
         assert_eq!(store.failed_count().unwrap(), 1);
+        assert_eq!(store.job_status(&id).unwrap().as_deref(), Some("failed"));
+    }
+
+    // ---- liveness-based holder reaping (reap_stale_holders) ----
+
+    /// `take_next_for` stamps the holder; the anonymous `take_next` leaves it NULL,
+    /// so only WS dispatches are attributable to the liveness reaper.
+    #[test]
+    fn take_next_for_records_holder_and_take_next_leaves_null() {
+        let store = Store::open_in_memory().unwrap();
+        let ws = job_with_deadline(3600);
+        let http = job_with_deadline(3600);
+        store.enqueue(&ws).unwrap();
+        store.enqueue(&http).unwrap();
+
+        let (taken_ws, _) = store
+            .take_next_for("0xho1der", |j| j.id == ws.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken_ws.id, ws.id);
+        let (taken_http, _) = store.take_next(|j| j.id == http.id).unwrap().unwrap();
+        assert_eq!(taken_http.id, http.id);
+
         assert_eq!(
-            store.job_status(&id).unwrap().as_deref(),
+            store.job_dispatched_to(&ws.id).unwrap().as_deref(),
+            Some("0xho1der")
+        );
+        assert_eq!(
+            store.job_dispatched_to(&http.id).unwrap(),
+            None,
+            "HTTP dispatch records no holder"
+        );
+    }
+
+    /// A re-dispatch overwrites a stale `dispatched_to`: a WS job requeued and then
+    /// re-taken by HTTP reads back NULL (every in_flight transition sets the holder),
+    /// so the reaper never acts on a stale holder of a job it didn't currently hold.
+    #[test]
+    fn redispatch_overwrites_dispatched_to() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(0); // expires immediately so reap_expired requeues it
+        store.enqueue(&job).unwrap();
+
+        store.take_next_for("0xws", |_| true).unwrap();
+        assert_eq!(
+            store.job_dispatched_to(&job.id).unwrap().as_deref(),
+            Some("0xws")
+        );
+        store.reap_expired(now_secs(), 5).unwrap(); // → queued, dispatched_to retained while queued
+        store.take_next(|_| true).unwrap(); // HTTP re-dispatch
+        assert_eq!(
+            store.job_dispatched_to(&job.id).unwrap(),
+            None,
+            "HTTP re-dispatch clears the holder"
+        );
+    }
+
+    /// An in_flight job whose holder is not in the live set, past the grace, is
+    /// requeued (holder had attempts < max). Discriminating: an unfiltered scan that
+    /// ignored liveness would also reap a live-holder job; here only the dead one goes.
+    #[test]
+    fn reap_stale_holders_requeues_dead_holder_only() {
+        let store = Store::open_in_memory().unwrap();
+        let dead = job_with_deadline(3600); // long deadline: the deadline reaper would NOT catch this
+        let live = job_with_deadline(3600);
+        store.enqueue(&dead).unwrap();
+        store.enqueue(&live).unwrap();
+        store.take_next_for("0xdead", |j| j.id == dead.id).unwrap();
+        store.take_next_for("0xlive", |j| j.id == live.id).unwrap();
+
+        let live_set = HashSet::from(["0xlive".to_string()]);
+        // grace 0, well after dispatch → the dead holder's job is reclaimed.
+        let outcome = store
+            .reap_stale_holders(&live_set, now_secs() + 10_000, 0, 5)
+            .unwrap();
+        assert_eq!(
+            outcome.requeued,
+            vec![dead.id],
+            "only the dead-holder job is reclaimed"
+        );
+        assert!(outcome.failed.is_empty());
+        assert_eq!(
+            store.job_status(&dead.id).unwrap().as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store.job_status(&live.id).unwrap().as_deref(),
+            Some("in_flight"),
+            "live holder untouched"
+        );
+    }
+
+    /// FM2: a NULL holder (anonymous HTTP dispatch) is never reaped on liveness,
+    /// even when no earner is live — it stays on the deadline reaper. (A NULL
+    /// mishandled as "no live holder" would requeue every HTTP job every tick.)
+    #[test]
+    fn reap_stale_holders_skips_null_holder() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(3600);
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap(); // HTTP → dispatched_to NULL
+
+        let empty = HashSet::new();
+        let outcome = store
+            .reap_stale_holders(&empty, now_secs() + 10_000, 0, 5)
+            .unwrap();
+        assert!(
+            outcome.requeued.is_empty() && outcome.failed.is_empty(),
+            "NULL holder never liveness-reaped"
+        );
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("in_flight")
+        );
+    }
+
+    /// FM1: within the grace, a not-live holder's job is left alone — a transient
+    /// registry gap (a missed heartbeat window) must not trigger a spurious requeue.
+    #[test]
+    fn reap_stale_holders_respects_grace() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(3600);
+        store.enqueue(&job).unwrap();
+        store.take_next_for("0xdead", |_| true).unwrap(); // started_at = now
+
+        let empty = HashSet::new();
+        // now == dispatch time, grace 60 → within grace, not reaped despite a dead holder.
+        let outcome = store.reap_stale_holders(&empty, now_secs(), 60, 5).unwrap();
+        assert!(outcome.requeued.is_empty(), "within grace: no requeue");
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("in_flight")
+        );
+    }
+
+    /// A dead holder's job at/over max_attempts is dead-lettered, mirroring the
+    /// deadline reaper (the attempt was charged at dispatch).
+    #[test]
+    fn reap_stale_holders_dead_letters_at_max_attempts() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(3600);
+        store.enqueue(&job).unwrap();
+        store.take_next_for("0xdead", |_| true).unwrap(); // attempts → 1
+
+        let empty = HashSet::new();
+        let outcome = store
+            .reap_stale_holders(&empty, now_secs() + 10_000, 0, 1)
+            .unwrap();
+        assert!(outcome.requeued.is_empty());
+        assert_eq!(
+            outcome.failed,
+            vec![job.id],
+            "attempts(1) >= max(1) → dead-lettered"
+        );
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
             Some("failed")
+        );
+    }
+
+    /// FM4: after the liveness reap requeues a job, a late `requeue` from the
+    /// original holder's disconnect path is a no-op (the in_flight guard), so the
+    /// attempts counter is not corrupted by a double-requeue. The dispatch_seq is
+    /// preserved across the reap, and a re-dispatch bumps it strictly higher — the
+    /// basis on which the fence rejects the reaped holder's late settle.
+    #[test]
+    fn reap_stale_holders_then_late_requeue_is_noop() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(3600);
+        store.enqueue(&job).unwrap();
+        let (_, seq1) = store.take_next_for("0xdead", |_| true).unwrap().unwrap();
+
+        let empty = HashSet::new();
+        assert_eq!(
+            store
+                .reap_stale_holders(&empty, now_secs() + 10_000, 0, 5)
+                .unwrap()
+                .requeued,
+            vec![job.id]
+        );
+        assert_eq!(
+            store.current_dispatch_seq(&job.id).unwrap(),
+            Some(seq1),
+            "reap preserves the seq"
+        );
+
+        // The original holder's late disconnect tries to requeue the now-queued job:
+        // the in_flight guard makes it a no-op (no double-requeue, attempts intact).
+        assert!(
+            !store.requeue(&job, 5).unwrap(),
+            "late requeue of a non-in_flight job is a no-op"
+        );
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued")
+        );
+
+        // A reassigning dispatch bumps the seq strictly higher than the reaped one.
+        let (_, seq2) = store.take_next_for("0xnew", |_| true).unwrap().unwrap();
+        assert!(
+            seq2 > seq1,
+            "the reassigned dispatch carries a higher seq (fence basis)"
         );
     }
 
@@ -3617,12 +4313,18 @@ mod tests {
         store.enqueue(&job).unwrap();
         store.take_next(|_| true).unwrap(); // → in_flight
 
-        assert!(store.touch(&id, 5000).unwrap(), "touch must return true for an in_flight job");
+        assert!(
+            store.touch(&id, 5000).unwrap(),
+            "touch must return true for an in_flight job"
+        );
 
         // 99 seconds after t=5000 → not yet expired.
         let outcome = store.reap_expired(5099, BIG_MAX).unwrap();
         assert!(outcome.requeued.is_empty(), "must not reap before deadline");
-        assert!(outcome.failed.is_empty(), "must not dead-letter before deadline");
+        assert!(
+            outcome.failed.is_empty(),
+            "must not dead-letter before deadline"
+        );
 
         // Exactly at deadline → reaped.
         let outcome = store.reap_expired(5100, BIG_MAX).unwrap();
@@ -3669,7 +4371,10 @@ mod tests {
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert!(json["oldest_in_flight_secs"].is_null(), "no in-flight jobs → null");
+        assert!(
+            json["oldest_in_flight_secs"].is_null(),
+            "no in-flight jobs → null"
+        );
 
         // Put one job in flight; the field becomes the age of its dispatch. Just
         // taken, so it is ~0 and certainly a small NUMBER (proving None → Some).
@@ -3680,8 +4385,13 @@ mod tests {
             store.take_next(|_| true).unwrap();
         }
         let json = body_json(get(state.clone(), "/stats").await).await;
-        let age = json["oldest_in_flight_secs"].as_u64().expect("in-flight → numeric age");
-        assert!(age < 5, "freshly dispatched job age should be ~0, got {age}");
+        let age = json["oldest_in_flight_secs"]
+            .as_u64()
+            .expect("in-flight → numeric age");
+        assert!(
+            age < 5,
+            "freshly dispatched job age should be ~0, got {age}"
+        );
     }
 
     #[test]
@@ -3725,7 +4435,10 @@ mod tests {
 
         store.touch(&id, 5000).unwrap();
         let outcome = store.reap_expired(5090, BIG).unwrap();
-        assert!(outcome.requeued.is_empty(), "90s after first beat: should not reap");
+        assert!(
+            outcome.requeued.is_empty(),
+            "90s after first beat: should not reap"
+        );
         assert!(outcome.failed.is_empty());
 
         // Second heartbeat at t=5090.
@@ -3739,7 +4452,11 @@ mod tests {
 
         // 100s of silence since the last beat (t=5090+100=5190) → reap.
         let outcome = store.reap_expired(5190, BIG).unwrap();
-        assert_eq!(outcome.requeued, vec![id], "100s after last beat: must reap");
+        assert_eq!(
+            outcome.requeued,
+            vec![id],
+            "100s after last beat: must reap"
+        );
         assert!(outcome.failed.is_empty());
     }
 
@@ -3765,7 +4482,9 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         store.enqueue(&job).unwrap();
         store.take_next(|_| true).unwrap();
-        store.record_completed(&signed_result(id, "cafebabe")).unwrap();
+        store
+            .record_completed(&signed_result(id, "cafebabe"))
+            .unwrap();
         assert!(
             !store.touch(&id, 5000).unwrap(),
             "touch must return false for a done job"
@@ -3811,7 +4530,10 @@ mod tests {
 
         // 4. Send a heartbeat (progress=50) between Accept and Submit; the
         //    coordinator must handle it gracefully and keep the session alive.
-        let beat = EarnerMsg::Heartbeat { job_id: Some(job_id), progress_pct: 50 };
+        let beat = EarnerMsg::Heartbeat {
+            job_id: Some(job_id),
+            progress_pct: 50,
+        };
         ws.send(WsMessage::text(serde_json::to_string(&beat).unwrap()))
             .await
             .unwrap();
@@ -3827,7 +4549,10 @@ mod tests {
         // 6. Expect Accepted — heartbeat must not have broken the session.
         let verdict = next_coordinator_msg(&mut ws).await;
         match verdict {
-            CoordinatorMsg::Accepted { job_id: jid, attestation_uid } => {
+            CoordinatorMsg::Accepted {
+                job_id: jid,
+                attestation_uid,
+            } => {
                 assert_eq!(jid, job_id);
                 assert_eq!(attestation_uid, PLACEHOLDER_ATTESTATION_UID);
             }
@@ -3836,7 +4561,10 @@ mod tests {
 
         // /stats reflects the completed job.
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["jobs_completed"], 1, "completed count must be 1 after ws heartbeat test");
+        assert_eq!(
+            json["jobs_completed"], 1,
+            "completed count must be 1 after ws heartbeat test"
+        );
     }
 
     // ---- idempotent + gated submit ----
@@ -3848,7 +4576,13 @@ mod tests {
         let job_id = Uuid::new_v4();
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -3861,7 +4595,13 @@ mod tests {
 
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -3883,12 +4623,24 @@ mod tests {
         let uri = format!("/jobs/{}/submit", job_id);
 
         // First submit: accepted (in_flight → done).
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Second submit: job is now done, so the gate rejects with CONFLICT and
         // nothing is double-counted.
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -3921,7 +4673,9 @@ mod tests {
         // Unknown job (never enqueued) → refused, nothing recorded.
         let ghost = job_with_deadline(60);
         assert!(
-            !store.record_completed(&signed_result(ghost.id, "x")).unwrap(),
+            !store
+                .record_completed(&signed_result(ghost.id, "x"))
+                .unwrap(),
             "a result for an unknown job must be refused"
         );
         assert_eq!(store.completed_count().unwrap(), 0);
@@ -3930,10 +4684,15 @@ mod tests {
         let queued = job_with_deadline(60);
         store.enqueue(&queued).unwrap();
         assert!(
-            !store.record_completed(&signed_result(queued.id, "x")).unwrap(),
+            !store
+                .record_completed(&signed_result(queued.id, "x"))
+                .unwrap(),
             "a result for a queued job must be refused"
         );
-        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("queued")
+        );
         assert_eq!(store.completed_count().unwrap(), 0);
 
         // In_flight → settles once; a replayed result is then refused and neither
@@ -3942,12 +4701,16 @@ mod tests {
         store.enqueue(&live).unwrap();
         store.take_next(|j| j.id == live.id).unwrap();
         assert!(
-            store.record_completed(&signed_result(live.id, "x")).unwrap(),
+            store
+                .record_completed(&signed_result(live.id, "x"))
+                .unwrap(),
             "first settle of an in_flight job succeeds"
         );
         assert_eq!(store.job_status(&live.id).unwrap().as_deref(), Some("done"));
         assert!(
-            !store.record_completed(&signed_result(live.id, "x")).unwrap(),
+            !store
+                .record_completed(&signed_result(live.id, "x"))
+                .unwrap(),
             "a replayed result for an already-done job must be refused"
         );
         assert_eq!(store.completed_count().unwrap(), 1);
@@ -3956,10 +4719,18 @@ mod tests {
         let failed = job_with_deadline(60);
         store.enqueue(&failed).unwrap();
         store.take_next(|j| j.id == failed.id).unwrap();
-        assert!(store.requeue(&failed, 1).unwrap(), "attempts>=max dead-letters");
-        assert_eq!(store.job_status(&failed.id).unwrap().as_deref(), Some("failed"));
         assert!(
-            !store.record_completed(&signed_result(failed.id, "x")).unwrap(),
+            store.requeue(&failed, 1).unwrap(),
+            "attempts>=max dead-letters"
+        );
+        assert_eq!(
+            store.job_status(&failed.id).unwrap().as_deref(),
+            Some("failed")
+        );
+        assert!(
+            !store
+                .record_completed(&signed_result(failed.id, "x"))
+                .unwrap(),
             "a result for a dead-lettered job must be refused (no orphaned settle)"
         );
         assert_eq!(
@@ -3986,14 +4757,19 @@ mod tests {
         let queued = job_with_deadline(60);
         store.enqueue(&queued).unwrap();
         assert!(!store.requeue(&queued, 5).unwrap());
-        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("queued")
+        );
 
         // Done → no-op; must NOT be resurrected to queued.
         let mut store = Store::open_in_memory().unwrap();
         let done = job_with_deadline(60);
         store.enqueue(&done).unwrap();
         store.take_next(|j| j.id == done.id).unwrap();
-        store.record_completed(&signed_result(done.id, "x")).unwrap();
+        store
+            .record_completed(&signed_result(done.id, "x"))
+            .unwrap();
         assert!(!store.requeue(&done, 5).unwrap());
         assert_eq!(
             store.job_status(&done.id).unwrap().as_deref(),
@@ -4005,8 +4781,14 @@ mod tests {
         let live = job_with_deadline(60);
         store.enqueue(&live).unwrap();
         store.take_next(|j| j.id == live.id).unwrap();
-        assert!(!store.requeue(&live, 5).unwrap(), "requeued (not dead-lettered) → false");
-        assert_eq!(store.job_status(&live.id).unwrap().as_deref(), Some("queued"));
+        assert!(
+            !store.requeue(&live, 5).unwrap(),
+            "requeued (not dead-lettered) → false"
+        );
+        assert_eq!(
+            store.job_status(&live.id).unwrap().as_deref(),
+            Some("queued")
+        );
     }
 
     /// The core of the earner-fault fix (FM1/FM3): an earner-fault requeue refunds
@@ -4032,17 +4814,32 @@ mod tests {
                 !store.requeue_earner_fault(&taken, 100).unwrap(),
                 "earner fault {i} must requeue, never dead-letter (faults < max_faults)"
             );
-            assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+            assert_eq!(
+                store.job_status(&job.id).unwrap().as_deref(),
+                Some("queued")
+            );
         }
 
         // The renderability budget is untouched: it still takes exactly
         // max_attempts=2 genuine charge requeues to dead-letter, despite 5 faults.
         let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
-        assert!(!store.requeue(&taken, 2).unwrap(), "1st charge: attempts 1 < 2 → queued");
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        assert!(
+            !store.requeue(&taken, 2).unwrap(),
+            "1st charge: attempts 1 < 2 → queued"
+        );
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued")
+        );
         let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
-        assert!(store.requeue(&taken, 2).unwrap(), "2nd charge: attempts 2 >= 2 → dead-letter");
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("failed"));
+        assert!(
+            store.requeue(&taken, 2).unwrap(),
+            "2nd charge: attempts 2 >= 2 → dead-letter"
+        );
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("failed")
+        );
     }
 
     /// FM1: a poison job (a spec no connected earner can satisfy → every earner
@@ -4060,10 +4857,16 @@ mod tests {
             let dead = store.requeue_earner_fault(&taken, 3).unwrap();
             if fault < 3 {
                 assert!(!dead, "fault {fault} < max_faults 3 → requeued");
-                assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+                assert_eq!(
+                    store.job_status(&job.id).unwrap().as_deref(),
+                    Some("queued")
+                );
             } else {
                 assert!(dead, "fault 3 == max_faults → dead-lettered");
-                assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("failed"));
+                assert_eq!(
+                    store.job_status(&job.id).unwrap().as_deref(),
+                    Some("failed")
+                );
             }
         }
     }
@@ -4084,13 +4887,18 @@ mod tests {
         let queued = job_with_deadline(60);
         store.enqueue(&queued).unwrap();
         assert!(!store.requeue_earner_fault(&queued, 3).unwrap());
-        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("queued")
+        );
 
         // Done → no-op; must NOT be resurrected to queued.
         let done = job_with_deadline(60);
         store.enqueue(&done).unwrap();
         store.take_next(|j| j.id == done.id).unwrap();
-        store.record_completed(&signed_result(done.id, "x")).unwrap();
+        store
+            .record_completed(&signed_result(done.id, "x"))
+            .unwrap();
         assert!(!store.requeue_earner_fault(&done, 3).unwrap());
         assert_eq!(store.job_status(&done.id).unwrap().as_deref(), Some("done"));
     }
@@ -4107,25 +4915,44 @@ mod tests {
         let job = job_with_deadline(60);
         store.enqueue(&job).unwrap();
 
-        let anchor = store.job_created_at(&job.id).unwrap().expect("created_at set at enqueue");
+        let anchor = store
+            .job_created_at(&job.id)
+            .unwrap()
+            .expect("created_at set at enqueue");
 
         // Dispatch (started_at moves, created_at must not).
         store.take_next(|j| j.id == job.id).unwrap().unwrap();
-        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "dispatch must not slide created_at");
+        assert_eq!(
+            store.job_created_at(&job.id).unwrap(),
+            Some(anchor),
+            "dispatch must not slide created_at"
+        );
 
         // Deadline reap → requeue.
         store.reap_expired(now_secs() + 10_000, 5).unwrap();
-        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "reap/requeue must not slide created_at");
+        assert_eq!(
+            store.job_created_at(&job.id).unwrap(),
+            Some(anchor),
+            "reap/requeue must not slide created_at"
+        );
 
         // Earner fault → requeue.
         let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
         store.requeue_earner_fault(&taken, 100).unwrap();
-        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "fault/requeue must not slide created_at");
+        assert_eq!(
+            store.job_created_at(&job.id).unwrap(),
+            Some(anchor),
+            "fault/requeue must not slide created_at"
+        );
 
         // Re-enqueue the SAME id (operator re-submit) must preserve the anchor,
         // not reset it — otherwise a stuck job could be kept alive by re-submits.
         store.enqueue(&job).unwrap();
-        assert_eq!(store.job_created_at(&job.id).unwrap(), Some(anchor), "re-enqueue must preserve created_at");
+        assert_eq!(
+            store.job_created_at(&job.id).unwrap(),
+            Some(anchor),
+            "re-enqueue must preserve created_at"
+        );
     }
 
     /// A DB written before the `created_at` column existed must, after the
@@ -4159,8 +4986,14 @@ mod tests {
         // Opening through Store runs the idempotent migration + backfill.
         let store = Store::open(&db_path).unwrap();
         let backfilled = store.job_created_at(&job_id).unwrap();
-        assert!(backfilled.is_some(), "legacy row must be backfilled to a non-NULL created_at");
-        assert!(backfilled.unwrap() > 0, "backfilled created_at must be a real timestamp");
+        assert!(
+            backfilled.is_some(),
+            "legacy row must be backfilled to a non-NULL created_at"
+        );
+        assert!(
+            backfilled.unwrap() > 0,
+            "backfilled created_at must be a real timestamp"
+        );
     }
 
     // ---- absolute wall-clock TTL (reap_ttl_expired) ----
@@ -4188,21 +5021,46 @@ mod tests {
         // One earner faults: back to queued, one fault, NOT dead-lettered.
         let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
         assert!(!store.requeue_earner_fault(&taken, 10).unwrap());
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued")
+        );
 
         // The deadline reaper, even far past the TTL, leaves a *queued* job alone:
         // it only reaps in_flight dispatches. This is the gap the TTL closes.
-        assert!(store.reap_expired(anchor + ttl + 1, 5).unwrap().failed.is_empty());
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        assert!(store
+            .reap_expired(anchor + ttl + 1, 5)
+            .unwrap()
+            .failed
+            .is_empty());
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued")
+        );
 
         // Just inside the TTL: still spared.
-        assert!(store.reap_ttl_expired(anchor + ttl - 1, TEST_TTL_MULTIPLE).unwrap().is_empty());
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        assert!(store
+            .reap_ttl_expired(anchor + ttl - 1, TEST_TTL_MULTIPLE)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued")
+        );
 
         // At the TTL boundary (>=): dead-lettered to the terminal failed state.
-        let expired = store.reap_ttl_expired(anchor + ttl, TEST_TTL_MULTIPLE).unwrap();
-        assert_eq!(expired, vec![job.id], "the poison job is dead-lettered exactly at the TTL");
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("failed"));
+        let expired = store
+            .reap_ttl_expired(anchor + ttl, TEST_TTL_MULTIPLE)
+            .unwrap();
+        assert_eq!(
+            expired,
+            vec![job.id],
+            "the poison job is dead-lettered exactly at the TTL"
+        );
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("failed")
+        );
         assert_eq!(store.failed_count().unwrap(), 1);
     }
 
@@ -4221,19 +5079,40 @@ mod tests {
         let ttl = 60 * TEST_TTL_MULTIPLE as i64;
 
         // Both within window: nothing reaped, statuses intact.
-        assert!(store.reap_ttl_expired(anchor + ttl - 1, TEST_TTL_MULTIPLE).unwrap().is_empty());
-        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
-        assert_eq!(store.job_status(&inflight.id).unwrap().as_deref(), Some("in_flight"));
+        assert!(store
+            .reap_ttl_expired(anchor + ttl - 1, TEST_TTL_MULTIPLE)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store.job_status(&inflight.id).unwrap().as_deref(),
+            Some("in_flight")
+        );
 
         // Past window: both dead-lettered (queued and in_flight alike).
-        let mut expired = store.reap_ttl_expired(anchor + ttl, TEST_TTL_MULTIPLE).unwrap();
+        let mut expired = store
+            .reap_ttl_expired(anchor + ttl, TEST_TTL_MULTIPLE)
+            .unwrap();
         expired.sort();
         let mut want = vec![queued.id, inflight.id];
         want.sort();
         assert_eq!(expired, want);
-        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("failed"));
-        assert_eq!(store.job_status(&inflight.id).unwrap().as_deref(), Some("failed"));
-        assert_eq!(store.in_flight_count().unwrap(), 0, "the reaped in_flight job left in_flight");
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store.job_status(&inflight.id).unwrap().as_deref(),
+            Some("failed")
+        );
+        assert_eq!(
+            store.in_flight_count().unwrap(),
+            0,
+            "the reaped in_flight job left in_flight"
+        );
     }
 
     /// `deadline_secs == 0` is the operator's "unbounded" signal: such a job has no
@@ -4250,9 +5129,18 @@ mod tests {
 
         // A decade past creation: still untouched, because deadline_secs == 0.
         let far_future = anchor + 10 * 365 * 24 * 3600;
-        assert!(store.reap_ttl_expired(far_future, TEST_TTL_MULTIPLE).unwrap().is_empty());
-        assert_eq!(store.job_status(&queued.id).unwrap().as_deref(), Some("queued"));
-        assert_eq!(store.job_status(&inflight.id).unwrap().as_deref(), Some("in_flight"));
+        assert!(store
+            .reap_ttl_expired(far_future, TEST_TTL_MULTIPLE)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store.job_status(&inflight.id).unwrap().as_deref(),
+            Some("in_flight")
+        );
     }
 
     /// FM3: a job that settled to `done` (or was already `failed`) since the scan
@@ -4268,13 +5156,21 @@ mod tests {
 
         // Dispatch and settle it before the TTL sweep runs.
         store.take_next(|j| j.id == job.id).unwrap().unwrap();
-        assert!(store.record_completed(&signed_result(job.id, "ok")).unwrap());
+        assert!(store
+            .record_completed(&signed_result(job.id, "ok"))
+            .unwrap());
         assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("done"));
 
         // Sweep far past the TTL: the done job is neither reaped nor reported.
-        let expired = store.reap_ttl_expired(anchor + ttl + 1_000, TEST_TTL_MULTIPLE).unwrap();
+        let expired = store
+            .reap_ttl_expired(anchor + ttl + 1_000, TEST_TTL_MULTIPLE)
+            .unwrap();
         assert!(expired.is_empty(), "a settled job must not be TTL-expired");
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("done"), "settle is preserved");
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("done"),
+            "settle is preserved"
+        );
         assert_eq!(store.failed_count().unwrap(), 0);
     }
 
@@ -4290,8 +5186,14 @@ mod tests {
         store.enqueue(&job).unwrap();
 
         let expired = store.reap_ttl_expired(i64::MAX, u32::MAX).unwrap();
-        assert!(expired.is_empty(), "a saturated TTL effectively never expires");
-        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+        assert!(
+            expired.is_empty(),
+            "a saturated TTL effectively never expires"
+        );
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued")
+        );
     }
 
     #[tokio::test]
@@ -4321,7 +5223,13 @@ mod tests {
         // Submit → job done.
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
-        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &uri,
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -4357,12 +5265,24 @@ mod tests {
     #[test]
     fn prune_removes_only_stale_earners() {
         let mut map: HashMap<String, EarnerInfo> = HashMap::new();
-        map.insert("fresh".into(), EarnerInfo {
-            gpu_model: "a".into(), vram_gb: 24, supported: vec![JobKind::Terrain], last_seen: 1000,
-        });
-        map.insert("stale".into(), EarnerInfo {
-            gpu_model: "b".into(), vram_gb: 16, supported: vec![JobKind::NpcTick], last_seen: 900,
-        });
+        map.insert(
+            "fresh".into(),
+            EarnerInfo {
+                gpu_model: "a".into(),
+                vram_gb: 24,
+                supported: vec![JobKind::Terrain],
+                last_seen: 1000,
+            },
+        );
+        map.insert(
+            "stale".into(),
+            EarnerInfo {
+                gpu_model: "b".into(),
+                vram_gb: 16,
+                supported: vec![JobKind::NpcTick],
+                last_seen: 900,
+            },
+        );
         // now=1000, ttl=60: fresh elapsed 0 (live); stale elapsed 100 (>60, dead).
         let removed = prune_stale_earners(&mut map, 1000, 60);
         assert_eq!(removed, 1);
@@ -4376,7 +5296,12 @@ mod tests {
         // Register via HTTP — freshly seen, so it counts.
         let addr = test_address("abc");
         let msg = hello(&addr, 24, vec![JobKind::Terrain]);
-        let resp = post_json(state.clone(), "/register", &serde_json::to_value(&msg).unwrap()).await;
+        let resp = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(&msg).unwrap(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["gpus_joined"], 1);
@@ -4388,8 +5313,14 @@ mod tests {
             earners.get_mut(&addr).unwrap().last_seen = 0;
         }
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["gpus_joined"], 0, "stale earner must drop out of gpus_joined");
-        assert_eq!(json["total_vram_gb"], 0, "stale earner's vram must not be counted");
+        assert_eq!(
+            json["gpus_joined"], 0,
+            "stale earner must drop out of gpus_joined"
+        );
+        assert_eq!(
+            json["total_vram_gb"], 0,
+            "stale earner's vram must not be counted"
+        );
         let terrain = &json["supported_breakdown"]["terrain"];
         assert!(
             terrain.is_null() || terrain == &serde_json::json!(0),
@@ -4418,8 +5349,13 @@ mod tests {
 
         // done after a valid submit
         let good = signed_result(job_id, "deadbeef");
-        let resp = post_submit(state.clone(), &format!("/jobs/{job_id}/submit"),
-            &serde_json::to_value(&good).unwrap(), 1).await;
+        let resp = post_submit(
+            state.clone(),
+            &format!("/jobs/{job_id}/submit"),
+            &serde_json::to_value(&good).unwrap(),
+            1,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(get(state.clone(), &format!("/jobs/{job_id}/status")).await).await;
         assert_eq!(json["status"], "done");
@@ -4456,7 +5392,10 @@ mod tests {
         let json = body_json(resp).await;
         assert_eq!(json["spec"]["id"], queued.id.to_string());
         assert_eq!(json["spec"]["kind"], "terrain");
-        assert!(json["result"].is_null(), "a queued job has no recorded result");
+        assert!(
+            json["result"].is_null(),
+            "a queued job has no recorded result"
+        );
 
         // A completed job: detail returns the spec plus the recorded result.
         let done = job_with_deadline(60);
@@ -4465,7 +5404,9 @@ mod tests {
         {
             let mut store = state.store.lock().await;
             store.take_next(|j| j.id == done_id).unwrap();
-            store.record_completed(&signed_result(done_id, "deadbeef")).unwrap();
+            store
+                .record_completed(&signed_result(done_id, "deadbeef"))
+                .unwrap();
         }
         let json = body_json(get(state.clone(), &format!("/jobs/{done_id}")).await).await;
         assert_eq!(json["spec"]["id"], done_id.to_string());
@@ -4493,7 +5434,11 @@ mod tests {
         let terrain_job = JobSpec {
             id: Uuid::new_v4(),
             kind: JobKind::Terrain,
-            region: RegionCoord { x: 1, y: 2, layer: 0 },
+            region: RegionCoord {
+                x: 1,
+                y: 2,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({"heightfield_seed": 1u64}),
@@ -4501,7 +5446,11 @@ mod tests {
         let foliage_job = JobSpec {
             id: Uuid::new_v4(),
             kind: JobKind::Foliage,
-            region: RegionCoord { x: 3, y: 4, layer: 0 },
+            region: RegionCoord {
+                x: 3,
+                y: 4,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({"density": 0.5}),
@@ -4554,7 +5503,11 @@ mod tests {
             let job = JobSpec {
                 id: Uuid::new_v4(),
                 kind: JobKind::Terrain,
-                region: RegionCoord { x: i as i32, y: 0, layer: 0 },
+                region: RegionCoord {
+                    x: i as i32,
+                    y: 0,
+                    layer: 0,
+                },
                 deadline_secs: 60,
                 max_payout_wei: "1000000000000000000".into(),
                 inputs: serde_json::json!({"heightfield_seed": i}),
@@ -4590,14 +5543,19 @@ mod tests {
         let done = job_with_deadline(60);
         store.enqueue(&done).unwrap();
         store.take_next(|j| j.id == done.id).unwrap();
-        store.record_completed(&signed_result(done.id, "deadbeef")).unwrap();
+        store
+            .record_completed(&signed_result(done.id, "deadbeef"))
+            .unwrap();
 
         // failed: enqueued, taken (attempts→1), requeued at max_attempts=1 →
         // dead-lettered to `failed`.
         let failed = job_with_deadline(60);
         store.enqueue(&failed).unwrap();
         store.take_next(|j| j.id == failed.id).unwrap();
-        assert!(store.requeue(&failed, 1).unwrap(), "attempts>=max must dead-letter");
+        assert!(
+            store.requeue(&failed, 1).unwrap(),
+            "attempts>=max must dead-letter"
+        );
 
         // Each filter returns exactly its one job.
         for (status, expected) in [
@@ -4632,7 +5590,12 @@ mod tests {
         enqueue(&state, &queued).await;
         let in_flight = job_with_deadline(60);
         enqueue(&state, &in_flight).await;
-        state.store.lock().await.take_next(|j| j.id == in_flight.id).unwrap();
+        state
+            .store
+            .lock()
+            .await
+            .take_next(|j| j.id == in_flight.id)
+            .unwrap();
 
         // ?status=queued → only the queued job.
         let json = body_json(get(state.clone(), "/jobs?status=queued").await).await;
@@ -4668,7 +5631,11 @@ mod tests {
         let terrain1 = JobSpec {
             id: Uuid::new_v4(),
             kind: JobKind::Terrain,
-            region: RegionCoord { x: 1, y: 2, layer: 0 },
+            region: RegionCoord {
+                x: 1,
+                y: 2,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({"heightfield_seed": 1u64}),
@@ -4676,7 +5643,11 @@ mod tests {
         let terrain2 = JobSpec {
             id: Uuid::new_v4(),
             kind: JobKind::Terrain,
-            region: RegionCoord { x: 3, y: 4, layer: 0 },
+            region: RegionCoord {
+                x: 3,
+                y: 4,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({"heightfield_seed": 2u64}),
@@ -4684,7 +5655,11 @@ mod tests {
         let foliage1 = JobSpec {
             id: Uuid::new_v4(),
             kind: JobKind::Foliage,
-            region: RegionCoord { x: 5, y: 6, layer: 0 },
+            region: RegionCoord {
+                x: 5,
+                y: 6,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({"density": 0.5}),
@@ -4717,7 +5692,11 @@ mod tests {
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
             kind,
-            region: RegionCoord { x: seed as i32, y: 0, layer: 0 },
+            region: RegionCoord {
+                x: seed as i32,
+                y: 0,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({ "seed": seed }),
@@ -4755,7 +5734,11 @@ mod tests {
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
             kind,
-            region: RegionCoord { x: seed as i32, y: 0, layer: 0 },
+            region: RegionCoord {
+                x: seed as i32,
+                y: 0,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({ "seed": seed }),
@@ -4773,8 +5756,12 @@ mod tests {
             store.take_next(|j| j.id == terrain1.id).unwrap();
             store.take_next(|j| j.id == terrain2.id).unwrap();
             store.take_next(|j| j.id == foliage1.id).unwrap();
-            store.record_completed(&signed_result(terrain1.id, "a")).unwrap();
-            store.record_completed(&signed_result(foliage1.id, "b")).unwrap();
+            store
+                .record_completed(&signed_result(terrain1.id, "a"))
+                .unwrap();
+            store
+                .record_completed(&signed_result(foliage1.id, "b"))
+                .unwrap();
         }
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -4802,20 +5789,31 @@ mod tests {
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
             kind,
-            region: RegionCoord { x: seed as i32, y: 0, layer: 0 },
+            region: RegionCoord {
+                x: seed as i32,
+                y: 0,
+                layer: 0,
+            },
             deadline_secs: 60,
             max_payout_wei: "1000000000000000000".into(),
             inputs: serde_json::json!({ "seed": seed }),
         };
         // 2 Terrain + 1 Foliage: take each once (attempts→1) then requeue at
         // max_attempts=1 → dead-lettered to `failed`.
-        let jobs = [mk(JobKind::Terrain, 1), mk(JobKind::Terrain, 2), mk(JobKind::Foliage, 3)];
+        let jobs = [
+            mk(JobKind::Terrain, 1),
+            mk(JobKind::Terrain, 2),
+            mk(JobKind::Foliage, 3),
+        ];
         {
             let store = state.store.lock().await;
             for job in &jobs {
                 store.enqueue(job).unwrap();
                 store.take_next(|j| j.id == job.id).unwrap();
-                assert!(store.requeue(job, 1).unwrap(), "attempts>=max must dead-letter");
+                assert!(
+                    store.requeue(job, 1).unwrap(),
+                    "attempts>=max must dead-letter"
+                );
             }
         }
 
@@ -4861,7 +5859,10 @@ mod tests {
         }
 
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["total_render_seconds"], 12, "sum of 5 + 7 render-seconds");
+        assert_eq!(
+            json["total_render_seconds"], 12,
+            "sum of 5 + 7 render-seconds"
+        );
         assert_eq!(json["jobs_completed"], 2);
     }
 
@@ -4935,7 +5936,12 @@ mod tests {
             &hello(&live, 24, vec![JobKind::Terrain, JobKind::Foliage]),
             &hello(&stale, 16, vec![JobKind::NpcTick]),
         ] {
-            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            let resp = post_json(
+                state.clone(),
+                "/register",
+                &serde_json::to_value(m).unwrap(),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
         {
@@ -4987,20 +5993,35 @@ mod tests {
             &hello(&busy, 24, vec![JobKind::Terrain]),
             &hello(&idle, 24, vec![JobKind::Terrain]),
         ] {
-            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            let resp = post_json(
+                state.clone(),
+                "/register",
+                &serde_json::to_value(m).unwrap(),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
         // busy completes 2 jobs, idle completes 1.
-        let jobs = [job_with_deadline(60), job_with_deadline(60), job_with_deadline(60)];
+        let jobs = [
+            job_with_deadline(60),
+            job_with_deadline(60),
+            job_with_deadline(60),
+        ];
         {
             let mut store = state.store.lock().await;
             for job in &jobs {
                 store.enqueue(job).unwrap();
                 store.take_next(|j| j.id == job.id).unwrap();
             }
-            store.record_completed(&result_for(jobs[0].id, &busy, 1)).unwrap();
-            store.record_completed(&result_for(jobs[1].id, &busy, 1)).unwrap();
-            store.record_completed(&result_for(jobs[2].id, &idle, 1)).unwrap();
+            store
+                .record_completed(&result_for(jobs[0].id, &busy, 1))
+                .unwrap();
+            store
+                .record_completed(&result_for(jobs[1].id, &busy, 1))
+                .unwrap();
+            store
+                .record_completed(&result_for(jobs[2].id, &idle, 1))
+                .unwrap();
         }
 
         let json = body_json(get(state.clone(), "/earners").await).await;

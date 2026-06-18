@@ -12,7 +12,7 @@
 use anyhow::Result;
 use proto::{JobKind, JobResult, JobSpec};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Job lifecycle in the `jobs` table.
 const STATUS_QUEUED: &str = "queued";
@@ -26,8 +26,7 @@ const STATUS_FAILED: &str = "failed";
 /// The full set of valid job lifecycle statuses, in lifecycle order. Single
 /// source of truth for callers that validate an incoming status string (e.g.
 /// the `GET /jobs?status=` filter validates against this before querying).
-pub const JOB_STATUSES: [&str; 4] =
-    [STATUS_QUEUED, STATUS_IN_FLIGHT, STATUS_DONE, STATUS_FAILED];
+pub const JOB_STATUSES: [&str; 4] = [STATUS_QUEUED, STATUS_IN_FLIGHT, STATUS_DONE, STATUS_FAILED];
 
 /// Outcome returned by `reap_expired`, split into jobs that were requeued for
 /// another attempt and jobs that have been dead-lettered into `failed`.
@@ -82,7 +81,8 @@ impl Store {
                  attempts     INTEGER NOT NULL DEFAULT 0,
                  faults       INTEGER NOT NULL DEFAULT 0,
                  dispatch_seq INTEGER NOT NULL DEFAULT 0,
-                 created_at   INTEGER
+                 created_at   INTEGER,
+                 dispatched_to TEXT
              );
              CREATE TABLE IF NOT EXISTS results (
                  job_id      TEXT NOT NULL,
@@ -131,29 +131,26 @@ impl Store {
         // Migrate pre-existing DBs (created before `attempts` was added). The
         // column already exists on a later boot, so we swallow only that one
         // error and let any other failure propagate.
-        ignore_duplicate_column(
-            conn.execute(
-                "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
-                [],
-            ),
-        )?;
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+            [],
+        ))?;
         // Migrate pre-existing DBs (created before `faults` was added). Earner-fault
         // rejects charge this counter instead of the dispatch `attempts` budget; an
         // existing job defaults to 0 faults, which is correct (none recorded yet).
         // Swallow only the duplicate-column error.
-        ignore_duplicate_column(
-            conn.execute("ALTER TABLE jobs ADD COLUMN faults INTEGER NOT NULL DEFAULT 0", []),
-        )?;
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE jobs ADD COLUMN faults INTEGER NOT NULL DEFAULT 0",
+            [],
+        ))?;
         // Migrate pre-existing DBs (created before `dispatch_seq` was added). The
         // per-dispatch fence defaults to 0; the first `take_next` after a restart
         // bumps it to 1, so a migrated in-flight job that is recovered and
         // re-dispatched gets a fresh seq. Swallow only the duplicate-column error.
-        ignore_duplicate_column(
-            conn.execute(
-                "ALTER TABLE jobs ADD COLUMN dispatch_seq INTEGER NOT NULL DEFAULT 0",
-                [],
-            ),
-        )?;
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE jobs ADD COLUMN dispatch_seq INTEGER NOT NULL DEFAULT 0",
+            [],
+        ))?;
         // Migrate pre-existing DBs (created before `created_at` — the immutable
         // wall-clock-TTL anchor — was added). The column lands NULL on every
         // existing row; backfill those to now so a job already in the queue gets
@@ -166,6 +163,15 @@ impl Store {
         conn.execute(
             "UPDATE jobs SET created_at = CAST(strftime('%s','now') AS INTEGER) WHERE created_at IS NULL",
             [],
+        )?;
+        // Migrate pre-existing DBs (created before `dispatched_to` — the WS-dispatch
+        // holder address the liveness reaper keys on — was added). The column lands
+        // NULL on every existing row, which is correct: a recovered/legacy in_flight
+        // job has no recorded holder, so the liveness reaper skips it (NULL = "not
+        // attributable, leave to the deadline reaper") and it falls back to the
+        // deadline/TTL reapers exactly as before. Swallow only the duplicate-column error.
+        ignore_duplicate_column(
+            conn.execute("ALTER TABLE jobs ADD COLUMN dispatched_to TEXT", []),
         )?;
         Ok(Self { conn })
     }
@@ -209,7 +215,39 @@ impl Store {
     ///
     /// "Most recent" mirrors the prior `Vec::pop` / `rposition` behavior:
     /// rowid is monotonic on insert, so highest rowid == most recent.
+    ///
+    /// The anonymous (HTTP) dispatch records no holder — see [`take_next_for`] for
+    /// the WS variant that stamps the earner address so the liveness reaper can
+    /// reclaim a stranded job.
+    ///
+    /// [`take_next_for`]: Self::take_next_for
     pub fn take_next<F>(&self, accept: F) -> Result<Option<(JobSpec, i64)>>
+    where
+        F: Fn(&JobSpec) -> bool,
+    {
+        self.take_next_inner(None, accept)
+    }
+
+    /// Like [`take_next`](Self::take_next), but records `holder` (the earner
+    /// address) as the job's `dispatched_to` in the SAME atomic dispatch UPDATE, so
+    /// the liveness reaper ([`reap_stale_holders`](Self::reap_stale_holders)) can
+    /// reclaim the job promptly if that earner goes stale — instead of waiting for
+    /// the full per-job deadline. The WS dispatcher uses this; the anonymous HTTP
+    /// poll uses `take_next` (holder stays NULL → reaped only on the deadline path).
+    pub fn take_next_for<F>(&self, holder: &str, accept: F) -> Result<Option<(JobSpec, i64)>>
+    where
+        F: Fn(&JobSpec) -> bool,
+    {
+        self.take_next_inner(Some(holder), accept)
+    }
+
+    /// Shared implementation of the two dispatch variants. `holder` is written to
+    /// `dispatched_to` on the in_flight transition — `Some(addr)` for a WS dispatch,
+    /// `None` (SQL NULL) for the anonymous HTTP poll. Because EVERY transition into
+    /// `in_flight` goes through here, an in_flight job's `dispatched_to` is always
+    /// the current holder (a prior value from an earlier dispatch is overwritten),
+    /// so the reaper never needs to clear it on requeue.
+    fn take_next_inner<F>(&self, holder: Option<&str>, accept: F) -> Result<Option<(JobSpec, i64)>>
     where
         F: Fn(&JobSpec) -> bool,
     {
@@ -230,12 +268,13 @@ impl Store {
                 let new_seq = dispatch_seq + 1;
                 self.conn.execute(
                     "UPDATE jobs
-                     SET status       = ?1,
-                         started_at   = CAST(strftime('%s','now') AS INTEGER),
-                         attempts     = attempts + 1,
-                         dispatch_seq = ?2
+                     SET status        = ?1,
+                         started_at    = CAST(strftime('%s','now') AS INTEGER),
+                         attempts      = attempts + 1,
+                         dispatch_seq  = ?2,
+                         dispatched_to = ?4
                      WHERE id = ?3",
-                    (STATUS_IN_FLIGHT, new_seq, &id),
+                    (STATUS_IN_FLIGHT, new_seq, &id, holder),
                 )?;
                 return Ok(Some((job, new_seq)));
             }
@@ -283,12 +322,18 @@ impl Store {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let Some((status, attempts)) = row else { return Ok(false) }; // unknown job
+        let Some((status, attempts)) = row else {
+            return Ok(false);
+        }; // unknown job
         if status != STATUS_IN_FLIGHT {
             return Ok(false); // already reaped or terminal — don't clobber
         }
 
-        let new_status = if attempts >= max_attempts { STATUS_FAILED } else { STATUS_QUEUED };
+        let new_status = if attempts >= max_attempts {
+            STATUS_FAILED
+        } else {
+            STATUS_QUEUED
+        };
         // Guard the transition on in_flight too, so it stays atomic with the read.
         self.conn.execute(
             "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2 AND status = ?3",
@@ -334,13 +379,19 @@ impl Store {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })?;
-        let Some((status, faults)) = row else { return Ok(false) }; // unknown job
+        let Some((status, faults)) = row else {
+            return Ok(false);
+        }; // unknown job
         if status != STATUS_IN_FLIGHT {
             return Ok(false); // already reaped or terminal — don't clobber
         }
 
         let new_faults = faults + 1;
-        let new_status = if new_faults >= max_faults { STATUS_FAILED } else { STATUS_QUEUED };
+        let new_status = if new_faults >= max_faults {
+            STATUS_FAILED
+        } else {
+            STATUS_QUEUED
+        };
         // Refund the dispatch attempt `take_next` charged (this dispatch was an
         // earner fault, not a real rendering attempt) and record the fault, in one
         // UPDATE guarded on in_flight so it stays atomic with the read above.
@@ -374,9 +425,11 @@ impl Store {
         // refused, leaving its state untouched. The spec is read alongside the
         // status (same row) to build the pending attestation below.
         let row: Option<(String, String)> = tx
-            .query_row("SELECT status, spec_json FROM jobs WHERE id = ?1", [&job_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+            .query_row(
+                "SELECT status, spec_json FROM jobs WHERE id = ?1",
+                [&job_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -569,6 +622,90 @@ impl Store {
         Ok(expired)
     }
 
+    /// Requeue (or dead-letter) in-flight jobs whose recorded WS holder is no
+    /// longer live, reclaiming a job stranded by a power-failed earner on the
+    /// earner-TTL timescale instead of waiting for the full per-job deadline.
+    ///
+    /// A job is reaped only when ALL hold:
+    /// * `dispatched_to IS NOT NULL` — it was dispatched over the WS path, which
+    ///   records the holder. An anonymous HTTP poll leaves `dispatched_to` NULL and
+    ///   is intentionally skipped here (it stays on the deadline reaper) — treating
+    ///   NULL as "no live holder" would requeue every HTTP-dispatched job every
+    ///   tick, an infinite churn.
+    /// * `dispatched_to NOT IN live` — the holder has dropped out of the in-memory
+    ///   registry's live set (silent past `earner_ttl_secs`). A still-heartbeating
+    ///   earner stays in `live` and is left alone.
+    /// * `now_secs - started_at >= grace_secs` — the job has been untouched (no
+    ///   dispatch/heartbeat) for at least the grace. `started_at` is bumped on every
+    ///   heartbeat (`touch`), so a healthy earner mid-render never trips this; the
+    ///   grace also stops a just-dispatched job from being reaped on a transient
+    ///   registry gap. Set `grace_secs == earner_ttl_secs` so both staleness signals
+    ///   align on the same timescale.
+    ///
+    /// Disposition mirrors [`reap_expired`](Self::reap_expired): the dispatch
+    /// attempt was already charged by `take_next`, so a holder at/over `max_attempts`
+    /// dead-letters to `failed`, otherwise the job returns to `queued`. The UPDATE is
+    /// guarded `WHERE status = in_flight`, so a settle that raced in since the scan
+    /// is a no-op (the original earner can never double-settle a reclaimed job) and a
+    /// job already requeued by the disconnect path is not double-requeued. The
+    /// dispatch_seq fence one layer up still blocks the reaped holder's late settle
+    /// after the job is reassigned to a new earner.
+    ///
+    /// `now_secs` is passed in (epoch seconds) so callers — and tests — control the
+    /// clock. The `live` set is snapshotted by the caller WITHOUT holding the store
+    /// lock (the registry and the store have separate locks; see the reaper).
+    pub fn reap_stale_holders(
+        &self,
+        live: &HashSet<String>,
+        now_secs: i64,
+        grace_secs: i64,
+        max_attempts: u32,
+    ) -> Result<ReapOutcome> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, spec_json, started_at, attempts, dispatched_to FROM jobs
+             WHERE status = ?1 AND dispatched_to IS NOT NULL AND started_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([STATUS_IN_FLIGHT], |row| {
+            let id: String = row.get(0)?;
+            let spec_json: String = row.get(1)?;
+            let started_at: i64 = row.get(2)?;
+            let attempts: u32 = row.get(3)?;
+            let holder: String = row.get(4)?;
+            Ok((id, spec_json, started_at, attempts, holder))
+        })?;
+
+        let mut outcome = ReapOutcome::default();
+        for row in rows {
+            let (id, spec_json, started_at, attempts, holder) = row?;
+            if live.contains(&holder) {
+                continue; // holder still heartbeating — leave its render alone
+            }
+            if now_secs - started_at < grace_secs {
+                continue; // within grace — tolerate a transient registry gap
+            }
+            let job: JobSpec = serde_json::from_str(&spec_json)?;
+            let new_status = if attempts >= max_attempts {
+                STATUS_FAILED
+            } else {
+                STATUS_QUEUED
+            };
+            // Guard on in_flight so a settle/reassign that landed since the scan is a
+            // no-op, exactly as in reap_expired/requeue.
+            let changed = self.conn.execute(
+                "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2 AND status = ?3",
+                (new_status, &id, STATUS_IN_FLIGHT),
+            )?;
+            if changed > 0 {
+                if new_status == STATUS_FAILED {
+                    outcome.failed.push(job.id);
+                } else {
+                    outcome.requeued.push(job.id);
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
     /// Bump an in-flight job's `started_at` to `now_secs` on an earner heartbeat,
     /// so the deadline reaper measures the deadline window from the last sign of
     /// life rather than from dispatch. A job that keeps heartbeating is making
@@ -601,6 +738,26 @@ impl Store {
                 other => Err(other),
             })?;
         Ok(created_at)
+    }
+
+    /// Recorded WS holder (`dispatched_to`) of a job, or `None` if the id is
+    /// unknown OR the column is NULL (an anonymous HTTP dispatch / never dispatched).
+    /// Test-only: lets the liveness-reap tests assert the holder is stamped by
+    /// `take_next_for` and left NULL by `take_next`.
+    #[cfg(test)]
+    pub fn job_dispatched_to(&self, id: &uuid::Uuid) -> Result<Option<String>> {
+        let holder = self
+            .conn
+            .query_row(
+                "SELECT dispatched_to FROM jobs WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(holder)
     }
 
     /// Current lifecycle status of a job, or `None` if the id is unknown.
@@ -812,15 +969,17 @@ impl Store {
     pub fn redispatched_count(&self) -> Result<usize> {
         let count: i64 =
             self.conn
-                .query_row("SELECT COUNT(*) FROM jobs WHERE attempts > 1", [], |row| row.get(0))?;
+                .query_row("SELECT COUNT(*) FROM jobs WHERE attempts > 1", [], |row| {
+                    row.get(0)
+                })?;
         Ok(count as usize)
     }
 
     /// Count of recorded results (for `/stats`).
     pub fn completed_count(&self) -> Result<usize> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM results", [], |row| row.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM results", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
@@ -978,7 +1137,9 @@ impl Store {
     /// `render_seconds` (widened to `u64`, mirroring `total_render_seconds`)
     /// under its `results.earner` key. Empty map when nothing has completed.
     pub fn render_seconds_by_earner(&self) -> Result<HashMap<String, u64>> {
-        let mut stmt = self.conn.prepare("SELECT earner, result_json FROM results")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT earner, result_json FROM results")?;
         let rows = stmt.query_map([], |row| {
             let earner: String = row.get(0)?;
             let result_json: String = row.get(1)?;
@@ -1000,15 +1161,16 @@ impl Store {
     /// with `checked_add` so an implausible overflow errors rather than wraps.
     /// Zero when nothing has completed.
     pub fn total_payout_wei(&self) -> Result<u128> {
-        let mut stmt = self.conn.prepare("SELECT spec_json FROM jobs WHERE status = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT spec_json FROM jobs WHERE status = ?1")?;
         let rows = stmt.query_map([STATUS_DONE], |row| row.get::<_, String>(0))?;
         let mut total: u128 = 0;
         for row in rows {
             let job: JobSpec = serde_json::from_str(&row?)?;
-            let wei: u128 = job
-                .max_payout_wei
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid max_payout_wei {:?}: {e}", job.max_payout_wei))?;
+            let wei: u128 = job.max_payout_wei.parse().map_err(|e| {
+                anyhow::anyhow!("invalid max_payout_wei {:?}: {e}", job.max_payout_wei)
+            })?;
             total = total
                 .checked_add(wei)
                 .ok_or_else(|| anyhow::anyhow!("total_payout_wei overflowed u128"))?;
@@ -1025,9 +1187,9 @@ impl Store {
     /// rather than wraps, mirroring `total_payout_wei`). Empty map when nothing
     /// has completed.
     pub fn payout_wei_by_earner(&self) -> Result<HashMap<String, u128>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT r.earner, j.spec_json FROM results r JOIN jobs j ON r.job_id = j.id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT r.earner, j.spec_json FROM results r JOIN jobs j ON r.job_id = j.id",
+        )?;
         let rows = stmt.query_map([], |row| {
             let earner: String = row.get(0)?;
             let spec_json: String = row.get(1)?;
@@ -1037,10 +1199,9 @@ impl Store {
         for row in rows {
             let (earner, spec_json) = row?;
             let job: JobSpec = serde_json::from_str(&spec_json)?;
-            let wei: u128 = job
-                .max_payout_wei
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid max_payout_wei {:?}: {e}", job.max_payout_wei))?;
+            let wei: u128 = job.max_payout_wei.parse().map_err(|e| {
+                anyhow::anyhow!("invalid max_payout_wei {:?}: {e}", job.max_payout_wei)
+            })?;
             let slot = totals.entry(earner).or_insert(0u128);
             *slot = slot
                 .checked_add(wei)
