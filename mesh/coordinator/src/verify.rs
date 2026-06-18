@@ -113,10 +113,11 @@ pub fn verify_hello_signature(
     gpu_model: &str,
     vram_gb: u32,
     supported: &[JobKind],
+    nonce: &[u8],
     signature_hex: &str,
 ) -> Result<(), VerifyError> {
     verify_recovered_address(
-        &hello_digest(earner_address, gpu_model, vram_gb, supported),
+        &hello_digest(earner_address, gpu_model, vram_gb, supported, nonce),
         earner_address,
         signature_hex,
     )
@@ -329,9 +330,10 @@ mod tests {
         let sk = dev_key();
         let addr = dev_address();
         let supported = [JobKind::Terrain, JobKind::DiffusionTile];
-        let sig = sign_digest_for_test(&sk, &hello_digest(&addr, "RTX 4090", 24, &supported));
+        let n: &[u8] = b"chal";
+        let sig = sign_digest_for_test(&sk, &hello_digest(&addr, "RTX 4090", 24, &supported, n));
         assert_eq!(
-            verify_hello_signature(&addr, "RTX 4090", 24, &supported, &sig),
+            verify_hello_signature(&addr, "RTX 4090", 24, &supported, n, &sig),
             Ok(())
         );
     }
@@ -346,35 +348,43 @@ mod tests {
         let attacker = other_key();
         let victim = dev_address();
         let supported = [JobKind::Terrain];
+        let n: &[u8] = b"chal";
         let sig =
-            sign_digest_for_test(&attacker, &hello_digest(&victim, "RTX 4090", 24, &supported));
+            sign_digest_for_test(&attacker, &hello_digest(&victim, "RTX 4090", 24, &supported, n));
         assert_eq!(
-            verify_hello_signature(&victim, "RTX 4090", 24, &supported, &sig),
+            verify_hello_signature(&victim, "RTX 4090", 24, &supported, n, &sig),
             Err(VerifyError::AddressMismatch)
         );
     }
 
     #[test]
-    fn tampered_hello_capabilities_rejected() {
-        // The signature binds the WHOLE advertised Hello, not just the address: a
-        // signature made over (vram=24, [Terrain]) fails when the registration
-        // claims an inflated vram or a swapped capability set, so a captured
-        // signature can't be reattached to a better-paying profile.
+    fn tampered_hello_capabilities_or_nonce_rejected() {
+        // The signature binds the WHOLE advertised Hello AND the challenge nonce:
+        // a signature over (vram=24, [Terrain], nonce="chal") fails against an
+        // inflated vram, a swapped capability set, OR a different nonce — so a
+        // captured signature can't be reattached to a better profile or replayed
+        // against a fresh challenge.
         let sk = dev_key();
         let addr = dev_address();
         let supported = [JobKind::Terrain];
-        let sig = sign_digest_for_test(&sk, &hello_digest(&addr, "RTX 4090", 24, &supported));
+        let n: &[u8] = b"chal";
+        let sig = sign_digest_for_test(&sk, &hello_digest(&addr, "RTX 4090", 24, &supported, n));
         assert!(
-            verify_hello_signature(&addr, "RTX 4090", 99, &supported, &sig).is_err(),
+            verify_hello_signature(&addr, "RTX 4090", 99, &supported, n, &sig).is_err(),
             "inflated vram must not verify against a vram=24 signature"
         );
         assert!(
-            verify_hello_signature(&addr, "RTX 4090", 24, &[JobKind::Optimization], &sig).is_err(),
+            verify_hello_signature(&addr, "RTX 4090", 24, &[JobKind::Optimization], n, &sig)
+                .is_err(),
             "swapped capability set must not verify"
         );
-        // Sanity: the untampered Hello still verifies.
+        assert!(
+            verify_hello_signature(&addr, "RTX 4090", 24, &supported, b"other", &sig).is_err(),
+            "a different challenge nonce must not verify (anti-replay)"
+        );
+        // Sanity: the untampered Hello over its own nonce still verifies.
         assert_eq!(
-            verify_hello_signature(&addr, "RTX 4090", 24, &supported, &sig),
+            verify_hello_signature(&addr, "RTX 4090", 24, &supported, n, &sig),
             Ok(())
         );
     }

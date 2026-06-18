@@ -137,10 +137,13 @@ impl Session {
         self.sign_digest(&signing_digest(job_id, output_hash))
     }
 
-    /// Sign the canonical `hello_digest` over our advertised capabilities,
-    /// proving possession of the key behind `self.address` at registration.
-    fn sign_hello(&self, gpu_model: &str, vram_gb: u32, supported: &[JobKind]) -> String {
-        self.sign_digest(&hello_digest(&self.address, gpu_model, vram_gb, supported))
+    /// Sign the canonical `hello_digest` over our advertised capabilities plus
+    /// the coordinator-issued challenge `nonce`, proving possession of the key
+    /// behind `self.address` at registration AND binding it to this connection
+    /// (anti-replay). The HTTP path, whose replay is a benign upsert, passes an
+    /// empty nonce.
+    fn sign_hello(&self, gpu_model: &str, vram_gb: u32, supported: &[JobKind], nonce: &[u8]) -> String {
+        self.sign_digest(&hello_digest(&self.address, gpu_model, vram_gb, supported, nonce))
     }
 }
 
@@ -266,7 +269,7 @@ where
         gpu_model: args.gpu_model.clone(),
         vram_gb: args.vram_gb,
         supported: supported.clone(),
-        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported),
+        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported, &[]),
     };
     ws.send(WsMessage::text(serde_json::to_string(&hello)?))
         .await
@@ -296,6 +299,12 @@ where
             }
         };
         match msg {
+            CoordinatorMsg::Challenge { .. } => {
+                // The challenge is consumed once during the opening handshake; a
+                // second one mid-session is a protocol anomaly — log and ignore
+                // (re-registration is not supported on a live connection).
+                tracing::warn!("unexpected mid-session challenge; ignoring");
+            }
             CoordinatorMsg::JobOffer(job) => {
                 if let Err(e) =
                     handle_offer(&mut ws, session, &supported, job, args.heartbeat_secs).await
@@ -443,7 +452,7 @@ async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> R
         earner_address: session.address.clone(),
         gpu_model: args.gpu_model.clone(),
         vram_gb: args.vram_gb,
-        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported),
+        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported, &[]),
         supported,
     };
     let url = format!("{}/register", args.coordinator);

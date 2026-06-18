@@ -32,21 +32,31 @@ pub fn signing_digest(job_id: &Uuid, output_hash: &str) -> [u8; 32] {
 /// matches the claimed `earner_address`.
 ///
 /// Bytes = `keccak256( DOMAIN || len(addr) || addr || len(gpu) || gpu ||
-/// vram_gb_be || len(supported) || Σ kind_as_u16_be )`, every `len` a big-endian
-/// `u32`. The `DOMAIN` tag separates it from [`signing_digest`], so a result
-/// attestation can never double as a registration signature; the length prefixes
-/// make the field boundaries unambiguous, so no two distinct Hellos collide on a
-/// digest (e.g. `addr="0xab",gpu="cd"` ≠ `addr="0xabcd",gpu=""`). The signature
-/// therefore binds the *whole* advertised capability set, not just the address.
-/// Both sides MUST build it identically, so the construction is fixed here.
+/// vram_gb_be || len(supported) || Σ kind_as_u16_be || len(nonce) || nonce )`,
+/// every `len` a big-endian `u32`. The `DOMAIN` tag separates it from
+/// [`signing_digest`], so a result attestation can never double as a registration
+/// signature; the length prefixes make the field boundaries unambiguous, so no
+/// two distinct Hellos collide on a digest (e.g. `addr="0xab",gpu="cd"` ≠
+/// `addr="0xabcd",gpu=""`). The signature therefore binds the *whole* advertised
+/// capability set, not just the address.
+///
+/// `nonce` is the coordinator-issued anti-replay challenge folded *into* the
+/// signed bytes (not merely sent alongside), so the signature and the freshness
+/// are inseparable: the coordinator reconstructs the digest with the nonce *it*
+/// chose and rejects a Hello whose signature was computed over any other nonce —
+/// defeating a captured-then-replayed Hello. The WS path passes the per-connection
+/// challenge; the HTTP path (whose replay is a benign idempotent upsert) passes an
+/// empty nonce. The `v2` tag retires the pre-nonce `v1` digest in lockstep so a
+/// stale `v1` signature can never validate. Both sides MUST build it identically.
 pub fn hello_digest(
     earner_address: &str,
     gpu_model: &str,
     vram_gb: u32,
     supported: &[JobKind],
+    nonce: &[u8],
 ) -> [u8; 32] {
     let mut hasher = Keccak256::new();
-    hasher.update(b"blackfield/hello/v1");
+    hasher.update(b"blackfield/hello/v2");
     hasher.update((earner_address.len() as u32).to_be_bytes());
     hasher.update(earner_address.as_bytes());
     hasher.update((gpu_model.len() as u32).to_be_bytes());
@@ -56,6 +66,8 @@ pub fn hello_digest(
     for kind in supported {
         hasher.update(kind.as_u16().to_be_bytes());
     }
+    hasher.update((nonce.len() as u32).to_be_bytes());
+    hasher.update(nonce);
     hasher.finalize().into()
 }
 
@@ -184,6 +196,13 @@ pub struct JobResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoordinatorMsg {
+    /// Coordinator → earner: the first frame on a WS connection — a single-use
+    /// random challenge the earner MUST fold into its [`hello_digest`] (hex of the
+    /// raw nonce bytes). Binds the registration to *this* connection so a captured
+    /// Hello replayed on a fresh connection — which gets a different challenge —
+    /// fails signature recovery. Connection-scoped: held only for the handshake,
+    /// never stored, so there is no nonce-store to exhaust.
+    Challenge { nonce: String },
     /// Coordinator → earner: a job is available.
     JobOffer(JobSpec),
     /// Coordinator → earner: result accepted, here's the EAS attestation UID.
@@ -275,7 +294,7 @@ mod tests {
         let expected = address_from_verifying_key(sk.verifying_key());
 
         let supported = [JobKind::Terrain, JobKind::DiffusionTile];
-        let digest = hello_digest(&expected, "RTX 4090", 24, &supported);
+        let digest = hello_digest(&expected, "RTX 4090", 24, &supported, b"challenge-nonce");
 
         let (sig, recid): (Signature, RecoveryId) =
             sk.sign_prehash_recoverable(&digest).unwrap();
@@ -287,26 +306,37 @@ mod tests {
 
     #[test]
     fn hello_digest_binds_every_field() {
-        // The signature commits to the whole advertised Hello, so changing any
-        // field changes the digest — a captured signature can't be reattached to
-        // an inflated vram / different capability set (full-Hello replay is the
-        // separate residual deferred to the nonce slice).
-        let base = hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain]);
-        assert_ne!(base, hello_digest("0xabd", "gpu", 24, &[JobKind::Terrain]), "address");
-        assert_ne!(base, hello_digest("0xabc", "gpx", 24, &[JobKind::Terrain]), "gpu_model");
-        assert_ne!(base, hello_digest("0xabc", "gpu", 25, &[JobKind::Terrain]), "vram_gb");
-        assert_ne!(base, hello_digest("0xabc", "gpu", 24, &[JobKind::Foliage]), "kind");
+        // The signature commits to the whole advertised Hello AND the challenge
+        // nonce, so changing any field changes the digest — a captured signature
+        // can't be reattached to an inflated vram / different capability set, nor
+        // replayed against a fresh challenge.
+        let n = b"nonce";
+        let base = hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain], n);
+        assert_ne!(base, hello_digest("0xabd", "gpu", 24, &[JobKind::Terrain], n), "address");
+        assert_ne!(base, hello_digest("0xabc", "gpx", 24, &[JobKind::Terrain], n), "gpu_model");
+        assert_ne!(base, hello_digest("0xabc", "gpu", 25, &[JobKind::Terrain], n), "vram_gb");
+        assert_ne!(base, hello_digest("0xabc", "gpu", 24, &[JobKind::Foliage], n), "kind");
         assert_ne!(
             base,
-            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain, JobKind::Foliage]),
+            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain, JobKind::Foliage], n),
             "supported length"
         );
-        // Length-delimited: shifting a byte across the address/gpu boundary must
-        // not alias to the same digest.
+        // The nonce binds freshness: a different (or absent) challenge yields a
+        // different digest, so a signature over one challenge can't be replayed
+        // against another.
+        assert_ne!(base, hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain], b"other"), "nonce");
+        assert_ne!(base, hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain], b""), "empty nonce");
+        // Length-delimited: shifting a byte across the address/gpu boundary — or
+        // across the supported/nonce boundary — must not alias to the same digest.
         assert_ne!(
-            hello_digest("0xab", "cgpu", 24, &[JobKind::Terrain]),
-            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain]),
+            hello_digest("0xab", "cgpu", 24, &[JobKind::Terrain], n),
+            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain], n),
             "field boundaries must be unambiguous"
+        );
+        assert_ne!(
+            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain], b"ab"),
+            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain], b"abcd"),
+            "nonce length prefix disambiguates"
         );
     }
 
@@ -446,6 +476,19 @@ mod tests {
         assert_eq!(
             reserialized_rejected, canonical_rejected,
             "CoordinatorMsg::Rejected wire shape drifted"
+        );
+
+        // Challenge — struct variant; the anti-replay nonce is a hex string.
+        let canonical_challenge = serde_json::json!({
+            "type": "challenge",
+            "nonce": "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+        });
+        let parsed_challenge: CoordinatorMsg =
+            serde_json::from_value(canonical_challenge.clone()).unwrap();
+        let reserialized_challenge = serde_json::to_value(&parsed_challenge).unwrap();
+        assert_eq!(
+            reserialized_challenge, canonical_challenge,
+            "CoordinatorMsg::Challenge wire shape drifted"
         );
     }
 

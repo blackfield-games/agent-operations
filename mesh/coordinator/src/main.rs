@@ -703,15 +703,18 @@ const MAX_VRAM_GB: u32 = 1024;
 /// pollute the registry the other guards.
 ///
 /// Finally it enforces key possession: `signature_hex` must recover to the
-/// claimed `earner_address` over [`proto::hello_digest`], so a client can only
-/// register an address it holds the key for (not spoof another earner's identity
-/// onto the leaderboard / fault ledger). Checked last — after the cheap
-/// structural gates — so a malformed Hello costs no curve recovery.
+/// claimed `earner_address` over [`proto::hello_digest`] (built with `nonce` —
+/// the WS per-connection challenge, or empty on the HTTP path), so a client can
+/// only register an address it holds the key for (not spoof another earner's
+/// identity onto the leaderboard / fault ledger), and on WS only against the
+/// challenge issued for *this* connection (anti-replay). Checked last — after the
+/// cheap structural gates — so a malformed Hello costs no curve recovery.
 fn validate_hello(
     earner_address: &str,
     gpu_model: &str,
     vram_gb: u32,
     supported: &[JobKind],
+    nonce: &[u8],
     signature_hex: &str,
 ) -> Result<(), &'static str> {
     if !is_evm_address(earner_address) {
@@ -738,9 +741,14 @@ fn validate_hello(
     // DoS triage). A signature that doesn't recover to the claimed address means
     // the registrant doesn't hold the key, so the identity the capability filter,
     // fault attribution, and `/stats` totals key on would be unauthenticated.
-    if let Err(e) =
-        verify::verify_hello_signature(earner_address, gpu_model, vram_gb, supported, signature_hex)
-    {
+    if let Err(e) = verify::verify_hello_signature(
+        earner_address,
+        gpu_model,
+        vram_gb,
+        supported,
+        nonce,
+        signature_hex,
+    ) {
         return Err(match e {
             verify::VerifyError::BadSignatureEncoding => "hello signature is malformed",
             verify::VerifyError::NonCanonicalSignature => {
@@ -772,7 +780,7 @@ async fn register(
     };
 
     if let Err(reason) =
-        validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &signature_hex)
+        validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &[], &signature_hex)
     {
         tracing::warn!(address = %earner_address, reason, "rejected malformed registration");
         return Err(StatusCode::BAD_REQUEST);
@@ -1568,7 +1576,7 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
             return None;
         };
         if let Err(reason) =
-            validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &signature_hex)
+            validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &[], &signature_hex)
         {
             tracing::warn!(address = %earner_address, reason, "ws: rejected malformed Hello; closing");
             return None;
@@ -1885,9 +1893,11 @@ mod tests {
         vram_gb: u32,
         supported: Vec<JobKind>,
     ) -> EarnerMsg {
+        // Registration test helpers exercise the HTTP/empty-nonce binding; the WS
+        // per-connection challenge is threaded explicitly by the ws handshake tests.
         let signature_hex = verify::sign_digest_for_test(
             sk,
-            &proto::hello_digest(claimed, gpu_model, vram_gb, &supported),
+            &proto::hello_digest(claimed, gpu_model, vram_gb, &supported, b""),
         );
         EarnerMsg::Hello {
             earner_address: claimed.into(),
