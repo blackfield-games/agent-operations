@@ -5394,6 +5394,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stats_reports_attempt_and_fault_totals() {
+        // Seeded jobs are all queued (attempts == 0), so a fresh mesh reports 0/0
+        // even with a non-empty backlog.
+        let state = test_state();
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["total_attempts"], 0, "fresh mesh reports 0 attempts");
+        assert_eq!(json["total_faults"], 0, "fresh mesh reports 0 faults");
+
+        // Drive ONE job (enqueued last → highest rowid → the one take_next pops,
+        // leaving the seeds untouched at attempts 0) through a redispatch and an
+        // earner fault, directly via the store the handler reads.
+        let job = job_with_deadline(100);
+        let id = job.id;
+        {
+            let store = state.store.lock().await;
+            store.enqueue(&job).unwrap();
+            store.take_next(|_| true).unwrap(); // attempts → 1
+            store.touch(&id, 1000).unwrap();
+            store.reap_expired(1100, 999).unwrap(); // requeue past deadline (attempts unchanged)
+            store.take_next(|_| true).unwrap(); // attempts → 2 (redispatched)
+            store.requeue_earner_fault(&job, 999).unwrap(); // attempts → 1, faults → 1
+            store.take_next(|_| true).unwrap(); // attempts → 2
+        }
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["total_attempts"], 2, "two net dispatches of one job");
+        assert_eq!(json["total_faults"], 1, "one earner fault charged");
+        // Additive + FM3: the gross attempt total (2) coexists on the same fixture
+        // with the pre-existing distinct-redispatched-jobs count (1) — they are
+        // different numbers by design, not a contradiction. Existing fields stay.
+        assert_eq!(json["jobs_redispatched"], 1, "one distinct job redispatched");
+        assert_eq!(json["jobs_failed"], 0, "nothing dead-lettered");
+    }
+
     #[test]
     fn earner_is_live_at_boundary_then_stale() {
         let info = EarnerInfo {
