@@ -542,6 +542,42 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// True if `s` is a `0x`-prefixed 40-hex-digit Ethereum-style address — the
+/// exact shape an earner derives (`keccak(pubkey)[12..]`) and the settle-time
+/// signature gate compares against case-insensitively (`verify::verify_signature`
+/// uses `eq_ignore_ascii_case`), so anything that registers can still produce a
+/// verifiable result. Mixed-case (EIP-55-checksummed) addresses are accepted.
+fn is_evm_address(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix("0x") else {
+        return false;
+    };
+    hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Reject a malformed `Hello` before it enters the registry so `/stats` and
+/// `/earners` only ever reflect well-formed earners: a blank/short address would
+/// surface as an unmatchable leaderboard row, an empty `supported` set is an
+/// earner that can never be offered a job, and a zero `vram_gb` pollutes the
+/// `total_vram_gb` total with a GPU that contributes nothing. `Err` carries the
+/// reason for the reject log. Shared by the HTTP `/register` and WS `Hello`
+/// paths so neither can pollute the registry the other guards.
+fn validate_hello(
+    earner_address: &str,
+    vram_gb: u32,
+    supported: &[JobKind],
+) -> Result<(), &'static str> {
+    if !is_evm_address(earner_address) {
+        return Err("earner_address is not a 0x-prefixed 20-byte hex address");
+    }
+    if supported.is_empty() {
+        return Err("supported is empty: earner advertises no renderable kinds");
+    }
+    if vram_gb == 0 {
+        return Err("vram_gb is zero");
+    }
+    Ok(())
+}
+
 /// Earner → coordinator registration. Accepts an `EarnerMsg::Hello` and
 /// upserts the earner keyed by address. Other `EarnerMsg` variants are
 /// rejected here (job dispatch lives on its own routes for now).
@@ -558,6 +594,11 @@ async fn register(
     else {
         return Err(StatusCode::BAD_REQUEST);
     };
+
+    if let Err(reason) = validate_hello(&earner_address, vram_gb, &supported) {
+        tracing::warn!(address = %earner_address, reason, "rejected malformed registration");
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered");
     state.earners.lock().await.insert(
@@ -1276,6 +1317,10 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
             tracing::warn!("ws: first message was not Hello; closing");
             return None;
         };
+        if let Err(reason) = validate_hello(&earner_address, vram_gb, &supported) {
+            tracing::warn!(address = %earner_address, reason, "ws: rejected malformed Hello; closing");
+            return None;
+        }
         tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered (ws)");
         state.earners.lock().await.insert(
             earner_address.clone(),
