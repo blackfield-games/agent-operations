@@ -284,6 +284,37 @@ impl Store {
         Ok(())
     }
 
+    /// Enqueue `job` as `queued` ONLY if the current queued backlog is below
+    /// `max_queued`; returns `true` if inserted, `false` if the cap was already
+    /// full (nothing inserted). The runtime-ingestion backstop against an unbounded
+    /// queued backlog (`POST /jobs`).
+    ///
+    /// The depth check and the insert are ONE statement (`INSERT ... SELECT ...
+    /// WHERE (SELECT COUNT(*) ...) < ?`), so the count-then-insert is atomic with no
+    /// TOCTOU window — two concurrent creators at `cap-1` can't both insert. The
+    /// COUNT over `status = queued` is served by `idx_jobs_status_created_at`, and
+    /// because this cap holds the backlog never exceeds `max_queued`, the count
+    /// visits at most `max_queued` index entries — bounded, so a flood can't make
+    /// each insert an O(table) scan and amplify the very DoS this guards.
+    ///
+    /// The count is derived from the live rows, never a side counter, so it tracks
+    /// reality across every lifecycle transition that leaves `queued` (dispatch to
+    /// in_flight, reap, dead-letter) with nothing to reconcile on restart. No
+    /// `ON CONFLICT` clause: ingestion mints a fresh v4 id, so a collision is a
+    /// genuine (astronomically unlikely) error, not a silent upsert. The boot-time
+    /// `seed_jobs` and crash-recovery requeue use the uncapped `enqueue`, so they
+    /// are exempt from this cap.
+    pub fn enqueue_within_cap(&self, job: &JobSpec, max_queued: usize) -> Result<bool> {
+        let spec_json = serde_json::to_string(job)?;
+        let inserted = self.conn.execute(
+            "INSERT INTO jobs (id, spec_json, status, created_at)
+             SELECT ?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER)
+             WHERE (SELECT COUNT(*) FROM jobs WHERE status = ?3) < ?4",
+            (job.id.to_string(), spec_json, STATUS_QUEUED, max_queued as i64),
+        )?;
+        Ok(inserted == 1)
+    }
+
     /// Pop the oldest-waiting queued job whose kind passes `accept`, marking it
     /// `in_flight` and stamping a fresh per-dispatch fence. Returns the job with
     /// its new `dispatch_seq`, or `None` if no queued job matches.

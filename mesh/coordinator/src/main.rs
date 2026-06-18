@@ -147,6 +147,15 @@ struct Args {
     /// operator credential supplied at deploy.
     #[arg(long, env = "COORDINATOR_INGEST_TOKEN")]
     ingest_token: Option<String>,
+    /// Maximum number of `queued` jobs the runtime ingestion endpoint
+    /// (`POST /jobs`) will admit. At the cap a new create is rejected `503` (a
+    /// retryable backpressure signal — a dispatched or reaped job frees a slot),
+    /// so a flood of cheap valid jobs can't grow the backlog without bound
+    /// (disk-fill, slower `take_next` scans, honest-job FIFO starvation). The
+    /// boot-time seed and crash-recovery requeue are exempt (they don't go through
+    /// this path). Must be >= 1. See [`DEFAULT_MAX_QUEUED_JOBS`].
+    #[arg(long, env = "COORDINATOR_MAX_QUEUED_JOBS", default_value_t = DEFAULT_MAX_QUEUED_JOBS)]
+    max_queued_jobs: usize,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -198,12 +207,21 @@ struct AppState {
     /// Validated non-blank in `with_store`. Mirrors `--ingest-token` /
     /// `COORDINATOR_INGEST_TOKEN`.
     ingest_token: Option<String>,
+    /// Cap on the `queued` backlog admitted via `POST /jobs`; a create at the cap
+    /// is rejected `503`. Validated >= 1 in `with_store`. Mirrors
+    /// `--max-queued-jobs` / `COORDINATOR_MAX_QUEUED_JOBS`.
+    max_queued_jobs: usize,
 }
 
 impl AppState {
     /// Build state backed by `store`. Seeds one job only when the DB has no
     /// jobs yet, so a fresh DB gives earners something to do while a restart
     /// with existing jobs does NOT double-seed.
+    // Config constructor: the knob count has grown past clippy's 7-arg threshold.
+    // A `StoreConfig` struct is the right fix (named fields kill the transposition
+    // risk of bare positional u32/Duration args) — tracked as a follow-up; kept
+    // positional here to keep this slice scoped to the queue cap.
+    #[allow(clippy::too_many_arguments)]
     fn with_store(
         store: Store,
         max_attempts: u32,
@@ -212,6 +230,7 @@ impl AppState {
         ttl_deadline_multiple: u32,
         handshake_timeout: Duration,
         ingest_token: Option<String>,
+        max_queued_jobs: usize,
     ) -> Result<Arc<Self>> {
         // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
         // dead-letters every non-terminal job on its first tick — the safety
@@ -240,6 +259,13 @@ impl AppState {
                 "ingest_token must be non-blank if set (an empty/whitespace token authenticates every caller — leave --ingest-token unset for the dev-open posture instead)"
             );
         }
+        // A zero queue cap would 503 every POST /jobs before the first job is ever
+        // enqueued — runtime ingestion becomes a total outage. Reject it at
+        // construction, mirroring the other zero-knob guards.
+        anyhow::ensure!(
+            max_queued_jobs > 0,
+            "max_queued_jobs must be >= 1 (0 would reject every job ingestion)"
+        );
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -260,6 +286,7 @@ impl AppState {
             ttl_deadline_multiple,
             handshake_timeout,
             ingest_token,
+            max_queued_jobs,
         }))
     }
 }
@@ -424,6 +451,7 @@ async fn main() -> Result<()> {
         args.ttl_deadline_multiple,
         Duration::from_secs(args.handshake_timeout_secs),
         args.ingest_token,
+        args.max_queued_jobs,
     )?;
     tracing::info!(db = %args.db, "store ready");
 
@@ -731,6 +759,13 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * validate::MAX_INPUTS_BYTES;
 /// OS FD limits; this only prevents unbounded growth. Backs
 /// `Args::max_connections` (`--max-connections` / `COORDINATOR_MAX_CONNECTIONS`).
 const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+
+/// Default cap on the number of `queued` jobs the runtime ingestion endpoint
+/// (`POST /jobs`) will admit. Sized far above any legitimate early backlog (the
+/// boot-time seed is a handful of jobs, exempt anyway) so it never bites honest
+/// load; an operator running a larger backlog raises it. The backstop against an
+/// unbounded queued backlog (disk-fill, slower dispatch scans, FIFO starvation).
+const DEFAULT_MAX_QUEUED_JOBS: usize = 10_000;
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
@@ -1164,9 +1199,10 @@ async fn register(
 /// `enqueue`'s `ON CONFLICT(id) DO UPDATE` overwrite — an existing job.
 ///
 /// Returns `201 Created` with the assigned id; `422` on a spec the ingestion
-/// gate rejects (bad deadline / payout / oversized inputs). A body that fails to
-/// deserialize (unknown `kind`, wrong types) is rejected by the `Json` extractor
-/// before this runs.
+/// gate rejects (bad deadline / payout / oversized inputs); `503` when the queued
+/// backlog is already at `--max-queued-jobs` (retryable backpressure). A body that
+/// fails to deserialize (unknown `kind`, wrong types) is rejected by the `Json`
+/// extractor before this runs.
 ///
 /// When the coordinator is started with an ingest token (`--ingest-token` /
 /// `COORDINATOR_INGEST_TOKEN`), a request must carry `Authorization: Bearer
@@ -1204,9 +1240,19 @@ async fn create_job(
     let id = spec.id;
     {
         let store = state.store.lock().await;
-        if let Err(e) = store.enqueue(&spec) {
-            tracing::error!(?id, ?e, "create_job: enqueue failed");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        match store.enqueue_within_cap(&spec, state.max_queued_jobs) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Backlog full: shed with a retryable 503 (NOT a 500) so a
+                // well-behaved producer backs off and retries rather than treating
+                // it as a hard failure. A dispatched or reaped job frees a slot.
+                tracing::warn!(cap = state.max_queued_jobs, "rejected: job queue at capacity");
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            Err(e) => {
+                tracing::error!(?id, ?e, "create_job: enqueue failed");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
         }
     }
     tracing::info!(?id, kind = ?spec.kind, "job enqueued");
@@ -2328,6 +2374,7 @@ mod tests {
             JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout,
             None,
+            DEFAULT_MAX_QUEUED_JOBS,
         )
         .unwrap()
     }
@@ -4280,6 +4327,7 @@ mod tests {
             JOB_TTL_DEADLINE_MULTIPLE,
             DEFAULT_HANDSHAKE_TIMEOUT,
             Some(token.to_string()),
+            DEFAULT_MAX_QUEUED_JOBS,
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -4405,6 +4453,7 @@ mod tests {
                 JOB_TTL_DEADLINE_MULTIPLE,
                 DEFAULT_HANDSHAKE_TIMEOUT,
                 Some(blank.to_string()),
+                DEFAULT_MAX_QUEUED_JOBS,
             );
             assert!(r.is_err(), "blank token {blank:?} must be rejected at construction");
         }
@@ -4416,6 +4465,7 @@ mod tests {
             JOB_TTL_DEADLINE_MULTIPLE,
             DEFAULT_HANDSHAKE_TIMEOUT,
             Some("real-token".to_string()),
+            DEFAULT_MAX_QUEUED_JOBS,
         )
         .is_ok());
     }
@@ -5778,7 +5828,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -5817,7 +5867,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -5871,7 +5921,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -5890,7 +5940,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -5990,7 +6040,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -6526,6 +6576,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -7489,7 +7540,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_deadline_multiple_knob_is_honored() {
         let state =
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS)
                 .unwrap();
         assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
 
@@ -7523,12 +7574,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_ttl_deadline_multiple() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS)
                 .is_err(),
             "multiple=0 must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS)
                 .is_ok(),
             "the smallest valid multiple (1) constructs"
         );
@@ -7541,12 +7592,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_handshake_timeout() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS)
                 .is_err(),
             "a zero handshake timeout must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS)
                 .is_ok(),
             "the smallest positive handshake timeout constructs"
         );
@@ -7628,6 +7679,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -7987,6 +8039,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -8037,6 +8090,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
 
         let terrain_job = JobSpec {
@@ -8092,6 +8146,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -8110,6 +8165,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
 
         let mut ids = Vec::new();
@@ -8201,6 +8257,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
 
         let queued = job_with_deadline(60);
@@ -8308,6 +8365,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8353,6 +8411,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8411,6 +8470,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8463,6 +8523,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -8506,6 +8567,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -8562,6 +8624,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -8624,6 +8687,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -8685,6 +8749,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
         });
         let pay = test_address("pay");
         let resp = post_json(
