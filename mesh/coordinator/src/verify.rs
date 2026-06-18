@@ -100,9 +100,14 @@ pub fn verify_signature(
 /// `earner_address` feeds the digest *and* is the recovery target, so a captured
 /// signature can't be reattached to a different claimed address — a forger would
 /// have to recover its own (different) address. The remaining gap is a verbatim
-/// replay of the *whole* Hello (same address, same capabilities, same signature)
-/// by a network observer; closing that needs a server nonce, deferred to
-/// `mesh-signed-hello-nonce`.
+/// replay of the *whole* Hello (same address, capabilities, and signature) by a
+/// network observer: harmless for the HTTP upsert (it re-inserts the victim's
+/// own data), but on the WS path it bootstraps a session keyed to the victim's
+/// address that the replayer holds no key for — it can occupy the victim's
+/// queued jobs and, because a failed `Submit` attributes an `EarnerFault` to the
+/// session address, smear the victim's reputation (capped at one fault/session,
+/// but sessions are unlimited). Closing this needs a server-issued challenge
+/// nonce so each Hello is single-use, deferred to `mesh-signed-hello-nonce`.
 pub fn verify_hello_signature(
     earner_address: &str,
     gpu_model: &str,
