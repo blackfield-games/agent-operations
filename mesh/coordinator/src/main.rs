@@ -78,6 +78,16 @@ struct Args {
     /// idle, and on an authenticated HTTP submit. Past it, the reaper prunes it.
     #[arg(long, env = "COORDINATOR_EARNER_TTL_SECS", default_value = "60")]
     earner_ttl_secs: u64,
+    /// Absolute wall-clock TTL as a multiple of each job's own `deadline_secs`: the
+    /// reaper dead-letters a non-terminal job older than `created_at` plus
+    /// `deadline_secs × this`. The poison-job backstop for a job a single earner
+    /// keeps faulting on (never reaching `max_faults`, which needs distinct
+    /// earners). Default 1440 (~24h at the 60s default deadline) is ~100× the
+    /// `max_attempts + max_faults` retry-churn budget, so a healthy job never trips
+    /// it. Must be >= 1; a small value collapses the TTL toward the bare deadline
+    /// (aggressive — a job a legitimate redispatch would finish may be reaped).
+    #[arg(long, env = "COORDINATOR_TTL_DEADLINE_MULTIPLE", default_value_t = JOB_TTL_DEADLINE_MULTIPLE)]
+    ttl_deadline_multiple: u32,
     /// How often (seconds) the attestation relayer drains pending EAS receipts to
     /// the chain. Only runs when a relay is configured (see `--relay-dev-mock`).
     #[arg(long, env = "COORDINATOR_RELAY_INTERVAL_SECS", default_value = "10")]
@@ -126,6 +136,11 @@ struct AppState {
     /// How long (seconds) an earner stays counted in `/stats` after its last
     /// sign of life. Mirrors `--earner-ttl-secs` / `COORDINATOR_EARNER_TTL_SECS`.
     earner_ttl_secs: i64,
+    /// Absolute wall-clock TTL as a multiple of each job's own `deadline_secs`:
+    /// the poison-job backstop dead-letters a non-terminal job older than
+    /// `created_at + deadline_secs * ttl_deadline_multiple`. Mirrors
+    /// `--ttl-deadline-multiple` / `COORDINATOR_TTL_DEADLINE_MULTIPLE`.
+    ttl_deadline_multiple: u32,
 }
 
 impl AppState {
@@ -137,7 +152,17 @@ impl AppState {
         max_attempts: u32,
         max_faults: u32,
         earner_ttl_secs: i64,
+        ttl_deadline_multiple: u32,
     ) -> Result<Arc<Self>> {
+        // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
+        // dead-letters every non-terminal job on its first tick — the safety
+        // backstop becomes a guillotine. Reject it at construction (FM1). A small
+        // value (1, 2) is allowed but aggressive: the TTL collapses toward the bare
+        // deadline, so a job a legitimate redispatch would finish may be reaped.
+        anyhow::ensure!(
+            ttl_deadline_multiple > 0,
+            "ttl_deadline_multiple must be >= 1 (0 would dead-letter every job on the first reap tick)"
+        );
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -155,6 +180,7 @@ impl AppState {
             max_attempts,
             max_faults,
             earner_ttl_secs,
+            ttl_deadline_multiple,
         }))
     }
 }
@@ -293,6 +319,7 @@ async fn main() -> Result<()> {
         args.max_attempts,
         args.max_faults,
         args.earner_ttl_secs as i64,
+        args.ttl_deadline_multiple,
     )?;
     tracing::info!(db = %args.db, "store ready");
 
@@ -389,6 +416,12 @@ fn prune_stale_earners(
 /// only catches a job that is genuinely stuck — a queued poison job a single
 /// connected earner keeps faulting on (which never accrues the *distinct*-earner
 /// faults `max_faults` needs), or a silently wedged in-flight dispatch.
+///
+/// This is the DEFAULT only: it backs `Args::ttl_deadline_multiple`
+/// (`--ttl-deadline-multiple` / `COORDINATOR_TTL_DEADLINE_MULTIPLE`), and the
+/// reaper reads the configured `AppState::ttl_deadline_multiple` at runtime, not
+/// this const directly. A dev can shrink it for fast-expiry testing; an operator
+/// with long-deadline jobs can tighten the bound — without a rebuild.
 const JOB_TTL_DEADLINE_MULTIPLE: u32 = 1440;
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
@@ -439,7 +472,7 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
                 // sweep. Catches the poison job the deadline reaper and the
                 // attempt/fault budgets cannot: one parked in `queued` by a single
                 // faulting earner, never re-dispatched, never reaching max_faults.
-                match store.reap_ttl_expired(now_secs(), JOB_TTL_DEADLINE_MULTIPLE) {
+                match store.reap_ttl_expired(now_secs(), state.ttl_deadline_multiple) {
                     Ok(expired) if !expired.is_empty() => {
                         tracing::warn!(
                             count = expired.len(),
@@ -1788,7 +1821,7 @@ mod tests {
     /// `JobKind` because the in-memory DB starts empty; tests that need an empty
     /// queue drain it first via `/jobs/next` or use `test_state_empty`.
     fn test_state() -> Arc<AppState> {
-        AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60).unwrap()
+        AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap()
     }
 
     /// In-memory state with every auto-seeded job removed, so the queue starts
@@ -4121,7 +4154,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -4155,7 +4188,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -4209,7 +4242,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -4228,7 +4261,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -4328,7 +4361,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -4861,6 +4894,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -5814,6 +5848,73 @@ mod tests {
         );
     }
 
+    /// The `ttl_deadline_multiple` knob is honored end-to-end: a small configured
+    /// multiple collapses the TTL to `deadline * multiple`, and the reaper (reading
+    /// `state.ttl_deadline_multiple`) dead-letters at exactly that boundary — NOT
+    /// the 1440 const. With the old hard-coded const a deadline-10 job would live
+    /// to anchor+14400, so reaping at anchor+20 here discriminates the knob (FM2).
+    #[tokio::test]
+    async fn ttl_deadline_multiple_knob_is_honored() {
+        let state =
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2).unwrap();
+        assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
+
+        let job = job_with_deadline(10);
+        let store = state.store.lock().await;
+        store.enqueue(&job).unwrap();
+        let anchor = store.job_created_at(&job.id).unwrap().unwrap();
+        // deadline 10 × multiple 2 = 20.
+        store
+            .reap_ttl_expired(anchor + 20 - 1, state.ttl_deadline_multiple)
+            .unwrap();
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("queued"),
+            "one second before the configured TTL: still alive"
+        );
+        store
+            .reap_ttl_expired(anchor + 20, state.ttl_deadline_multiple)
+            .unwrap();
+        assert_eq!(
+            store.job_status(&job.id).unwrap().as_deref(),
+            Some("failed"),
+            "at the configured TTL (deadline×2): dead-lettered"
+        );
+    }
+
+    /// A zero multiple is rejected at construction (FM1): TTL = `deadline * 0 == 0`
+    /// would dead-letter every non-terminal job on the first reap tick, turning the
+    /// safety backstop into a guillotine. `with_store` returns Err; a positive
+    /// multiple constructs fine.
+    #[test]
+    fn with_store_rejects_zero_ttl_deadline_multiple() {
+        assert!(
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0).is_err(),
+            "multiple=0 must be rejected"
+        );
+        assert!(
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1).is_ok(),
+            "the smallest valid multiple (1) constructs"
+        );
+    }
+
+    /// The CLI/env default reproduces the prior hard-coded behavior, and the flag
+    /// overrides it — so an unset deployment is unchanged and a dev/operator can
+    /// retune without a rebuild.
+    #[test]
+    fn args_ttl_deadline_multiple_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).ttl_deadline_multiple,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            "unset default == the prior const (no behavior change)"
+        );
+        assert_eq!(
+            Args::parse_from(["coordinator", "--ttl-deadline-multiple", "7"]).ttl_deadline_multiple,
+            7,
+            "the flag is honored"
+        );
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight() {
         // Build state on a non-seeded in-memory store so the queue truly starts
@@ -5825,6 +5926,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -6068,6 +6170,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -6115,6 +6218,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
 
         let terrain_job = JobSpec {
@@ -6167,6 +6271,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6182,6 +6287,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
 
         let mut ids = Vec::new();
@@ -6270,6 +6376,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
 
         let queued = job_with_deadline(60);
@@ -6374,6 +6481,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -6416,6 +6524,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -6471,6 +6580,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -6520,6 +6630,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -6560,6 +6671,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -6613,6 +6725,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -6672,6 +6785,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -6730,6 +6844,7 @@ mod tests {
             max_attempts: 5,
             max_faults: 10,
             earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
         });
         let pay = test_address("pay");
         let resp = post_json(
