@@ -428,6 +428,96 @@ def test_variant_nested_prims_conflict_at_their_real_path():
     assert "Material" in issues[0] and "Scope" in issues[0]
 
 
+# USDA treats newlines as token separators, so a declaration head may wrap across
+# lines. Pre-fix the [ \t]-only separators missed a wrapped `def`/`over` head and
+# the prim vanished (and `{` opened a phantom empty scope); the four below resolve
+# to the same paths a single-line head would. DISCRIMINATING vs the pre-fix scanner.
+def test_prim_specs_resolves_a_newline_split_declaration_head():
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\n'
+        'def Xform "World" {\n'
+        "    def\n    Mesh\n    \"Hub\" {}\n"
+        "    over\n    \"Patch\" {}\n"
+        "}\n"
+    )
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("def", "Mesh", "/World/Hub"),
+        ("over", "", "/World/Patch"),
+    ]
+
+
+def test_prim_specs_newline_split_decl_under_variant_attributes_to_parent():
+    # The wrapped child sits inside a variant: it must attribute to the enclosing
+    # PRIM (/World/Mat), not a phantom path and not dropped — composing the newline
+    # head with the transparent-variant-scope logic (FM3 brace/scope accounting).
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\n'
+        'def Xform "World" {\n'
+        '    variantSet "look" = {\n'
+        '        "red" {\n'
+        "            def\n            Material\n            \"Mat\" {}\n"
+        "        }\n"
+        "    }\n"
+        '    def Mesh "Rock" {}\n'
+        "}\n"
+    )
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("def", "Material", "/World/Mat"),
+        ("def", "Mesh", "/World/Rock"),
+    ]
+
+
+def test_prim_specs_bare_specifier_does_not_swallow_following_decl():
+    # A malformed bare `over` (no name) must not consume the following `def "Real"`
+    # as its type/name: the head's negative lookahead forbids a specifier keyword as
+    # a type, so Real resolves as a typeless def, not type="def" under `over` (FM2).
+    body = '#usda 1.0\ndef Xform "World" {\n    over\n    def "Real" {}\n}\n'
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("def", "", "/World/Real"),
+    ]
+
+
+def test_prim_specs_multiline_metadata_block_is_not_a_prim():
+    # A prim's ( ) metadata spanning lines — a nested dict brace, a list, and a
+    # string holding a fake `def` — opens no prim even with newlines now matchable
+    # (it sits at paren depth > 0, where a decl is never attempted). Guard for FM2.
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "World"\n)\n'
+        'def Xform "World" (\n'
+        '    kind = "group"\n'
+        "    customData = {\n"
+        '        string note = "def Fake \\"X\\""\n'
+        "    }\n"
+        '    prepend apiSchemas = [\n        "PhysicsCollisionAPI",\n    ]\n'
+        ")\n{\n"
+        '    def Mesh "Hub" {}\n'
+        "}\n"
+    )
+    assert validator._prim_specs(body) == [
+        ("def", "Xform", "/World"),
+        ("def", "Mesh", "/World/Hub"),
+    ]
+
+
+# End-to-end: two specialists define <World/Mat> with incompatible types, each via a
+# newline-split declaration head. Pre-fix neither head matched, so /World/Mat carried
+# only one type (or none) and no conflict surfaced — accept-when-broken. Post-fix the
+# conflict is detected at the real path and routes to biome (pipeline-earliest).
+def test_newline_split_decls_conflict_at_real_path_and_route_earliest():
+    a = '#usda 1.0\ndef Xform "World" {\n  def\n  Material\n  "Mat" {}\n}\n'
+    b = '#usda 1.0\ndef Xform "World" {\n  def Scope "Mat" {}\n}\n'
+    tagged = [("biome", *s) for s in validator._prim_specs(a)]
+    tagged += [("prop", *s) for s in validator._prim_specs(b)]
+    issues = validator._conflicts_from_specs(tagged)
+    assert len(issues) == 1
+    assert "</World/Mat>" in issues[0]
+    assert "Material" in issues[0] and "Scope" in issues[0]
+    assert _failing_specialist(issues) == "biome"
+
+
 def test_same_type_redefinition_is_not_a_conflict():
     # Two specialists defining the same path with the same type is a legal USD
     # opinion-merge, not a conflict (FM1: don't false-positive on layering).
