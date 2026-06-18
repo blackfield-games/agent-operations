@@ -196,11 +196,18 @@ pub enum CoordinatorMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EarnerMsg {
     /// Earner → coordinator: I'm online, here are my capabilities.
+    ///
+    /// `signature_hex` is a recoverable secp256k1 `[r||s||v]` over
+    /// [`hello_digest`] proving the earner controls the key behind
+    /// `earner_address`; the coordinator recovers the signer and rejects the
+    /// registration on mismatch. This authenticates the self-reported identity
+    /// the capability filter, fault attribution, and `/stats` totals key on.
     Hello {
         earner_address: String,
         gpu_model: String,
         vram_gb: u32,
         supported: Vec<JobKind>,
+        signature_hex: String,
     },
     /// Earner → coordinator: I accept this job offer.
     Accept { job_id: Uuid },
@@ -450,7 +457,8 @@ mod tests {
             "earner_address": "0xabcdef1234567890abcdef1234567890abcdef12",
             "gpu_model": "RTX 4090",
             "vram_gb": 24,
-            "supported": ["terrain", "foliage"]
+            "supported": ["terrain", "foliage"],
+            "signature_hex": "0xcafebabe"
         });
         let parsed_hello: EarnerMsg =
             serde_json::from_value(canonical_hello.clone()).unwrap();
