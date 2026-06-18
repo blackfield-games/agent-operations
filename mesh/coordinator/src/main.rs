@@ -558,9 +558,12 @@ fn is_evm_address(s: &str) -> bool {
 /// `/earners` only ever reflect well-formed earners: a blank/short address would
 /// surface as an unmatchable leaderboard row, an empty `supported` set is an
 /// earner that can never be offered a job, and a zero `vram_gb` pollutes the
-/// `total_vram_gb` total with a GPU that contributes nothing. `Err` carries the
-/// reason for the reject log. Shared by the HTTP `/register` and WS `Hello`
-/// paths so neither can pollute the registry the other guards.
+/// `total_vram_gb` total. Rejecting `vram_gb == 0` is a deliberate policy for a
+/// GPU mesh — it also excludes a CPU/iGPU earner that honestly reports no
+/// dedicated VRAM, which is acceptable here because the real earner defaults to
+/// 24 and no GPU operator reports 0. `Err` carries the reason for the reject
+/// log. Shared by the HTTP `/register` and WS `Hello` paths so neither can
+/// pollute the registry the other guards.
 fn validate_hello(
     earner_address: &str,
     vram_gb: u32,
@@ -1738,9 +1741,11 @@ mod tests {
     }
 
     /// A malformed re-`Hello` for an already-registered address is rejected
-    /// without evicting the existing live entry: the reject is a no-op on the
-    /// registry (no insert, no delete), so a transiently-empty re-Hello can't
-    /// drop a previously-valid earner mid-session (FM4).
+    /// without disturbing the existing live entry: the reject is a no-op on the
+    /// registry (no insert, no delete, no overwrite), so a transiently-empty
+    /// re-Hello can't drop or corrupt a previously-valid earner mid-session
+    /// (FM4). The re-Hello carries a DIFFERENT vram (99) so the assertions catch
+    /// an insert-before-validate overwrite, not just a deletion.
     #[tokio::test]
     async fn malformed_re_register_does_not_evict_existing_earner() {
         let state = test_state_empty().await;
@@ -1757,14 +1762,17 @@ mod tests {
         let bad = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&addr, 24, vec![])).unwrap(),
+            &serde_json::to_value(hello(&addr, 99, vec![])).unwrap(),
         )
         .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 
+        // The live entry is untouched: not evicted (count 1), not overwritten
+        // (vram stays 24 not 99, supported still advertises terrain not empty).
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["gpus_joined"], 1, "rejected re-Hello must not evict the live earner");
-        assert_eq!(json["total_vram_gb"], 24, "original registration preserved intact");
+        assert_eq!(json["total_vram_gb"], 24, "original vram preserved, not overwritten with 99");
+        assert_eq!(json["supported_breakdown"]["terrain"], 1, "original supported set preserved");
     }
 
     #[tokio::test]
