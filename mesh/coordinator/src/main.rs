@@ -640,6 +640,17 @@ fn is_evm_address(s: &str) -> bool {
     hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Upper bounds on self-reported `Hello` fields, enforced by `validate_hello` so a
+/// malformed or oversized registration can't bloat the in-memory registry or
+/// poison the `/stats` aggregates. Both are generous headroom — hygiene, not
+/// exclusion (FM1), and documented policy like the `vram_gb > 0` floor:
+/// * a real GPU model string is ~25 chars (`"NVIDIA GeForce RTX 4090"`); 128 is
+///   ample slack for any official name without letting a client store kilobytes.
+/// * the largest single accelerator today is ~192 GB (B200); 1024 is far above any
+///   single GPU for the foreseeable future, so an honest card always passes.
+const MAX_GPU_MODEL_LEN: usize = 128;
+const MAX_VRAM_GB: u32 = 1024;
+
 /// Reject a malformed `Hello` before it enters the registry so `/stats` and
 /// `/earners` only ever reflect well-formed earners: a blank/short address would
 /// surface as an unmatchable leaderboard row, an empty `supported` set is an
@@ -647,22 +658,40 @@ fn is_evm_address(s: &str) -> bool {
 /// `total_vram_gb` total. Rejecting `vram_gb == 0` is a deliberate policy for a
 /// GPU mesh — it also excludes a CPU/iGPU earner that honestly reports no
 /// dedicated VRAM, which is acceptable here because the real earner defaults to
-/// 24 and no GPU operator reports 0. `Err` carries the reason for the reject
+/// 24 and no GPU operator reports 0.
+///
+/// Beyond the structural checks it also bounds the self-reported sizes (see
+/// [`MAX_GPU_MODEL_LEN`]/[`MAX_VRAM_GB`]) and rejects a `supported` set carrying
+/// DUPLICATE kinds — duplicates are rejected rather than silently de-duplicated so
+/// the stored set always equals the reported set (no surprise mutation), and the
+/// honest earner sends a clean set anyway; a dup would otherwise double-count its
+/// kind in `/stats supported_breakdown`. `Err` carries the reason for the reject
 /// log. Shared by the HTTP `/register` and WS `Hello` paths so neither can
 /// pollute the registry the other guards.
 fn validate_hello(
     earner_address: &str,
+    gpu_model: &str,
     vram_gb: u32,
     supported: &[JobKind],
 ) -> Result<(), &'static str> {
     if !is_evm_address(earner_address) {
         return Err("earner_address is not a 0x-prefixed 20-byte hex address");
     }
+    if gpu_model.len() > MAX_GPU_MODEL_LEN {
+        return Err("gpu_model exceeds the maximum length");
+    }
     if supported.is_empty() {
         return Err("supported is empty: earner advertises no renderable kinds");
     }
+    let mut seen = HashSet::new();
+    if !supported.iter().all(|k| seen.insert(*k)) {
+        return Err("supported contains duplicate kinds");
+    }
     if vram_gb == 0 {
         return Err("vram_gb is zero");
+    }
+    if vram_gb > MAX_VRAM_GB {
+        return Err("vram_gb exceeds the plausible maximum");
     }
     Ok(())
 }
@@ -684,7 +713,7 @@ async fn register(
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    if let Err(reason) = validate_hello(&earner_address, vram_gb, &supported) {
+    if let Err(reason) = validate_hello(&earner_address, &gpu_model, vram_gb, &supported) {
         tracing::warn!(address = %earner_address, reason, "rejected malformed registration");
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1477,7 +1506,7 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
             tracing::warn!("ws: first message was not Hello; closing");
             return None;
         };
-        if let Err(reason) = validate_hello(&earner_address, vram_gb, &supported) {
+        if let Err(reason) = validate_hello(&earner_address, &gpu_model, vram_gb, &supported) {
             tracing::warn!(address = %earner_address, reason, "ws: rejected malformed Hello; closing");
             return None;
         }
@@ -1781,13 +1810,17 @@ mod tests {
         state.store.lock().await.enqueue(job).unwrap();
     }
 
-    fn hello(address: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
+    fn hello_gpu(address: &str, gpu_model: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
         EarnerMsg::Hello {
             earner_address: address.into(),
-            gpu_model: "RTX 4090".into(),
+            gpu_model: gpu_model.into(),
             vram_gb,
             supported,
         }
+    }
+
+    fn hello(address: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
+        hello_gpu(address, "RTX 4090", vram_gb, supported)
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -1956,6 +1989,65 @@ mod tests {
             0,
             "leaderboard stays empty"
         );
+    }
+
+    /// The depth bounds reject at `/register` with 400 and insert nothing: an
+    /// oversized `gpu_model` (bloats the registry), a `supported` set with
+    /// duplicate kinds (would double-count in `supported_breakdown`), and a
+    /// `vram_gb` above the plausible ceiling (poisons `total_vram_gb`). A normal
+    /// earner — within every bound — still registers, proving the bounds are
+    /// hygiene, not exclusion (FM1).
+    #[tokio::test]
+    async fn register_rejects_oversized_gpu_dup_kinds_and_huge_vram() {
+        let state = test_state_empty().await;
+        let good = test_address("depth");
+        let long_gpu = "x".repeat(MAX_GPU_MODEL_LEN + 1);
+        let malformed = [
+            hello_gpu(&good, &long_gpu, 24, vec![JobKind::Terrain]), // gpu_model too long
+            hello(&good, 24, vec![JobKind::Terrain, JobKind::Terrain]), // duplicate kind
+            hello(&good, MAX_VRAM_GB + 1, vec![JobKind::Terrain]),   // vram over ceiling
+        ];
+        for m in &malformed {
+            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected 400 for {m:?}");
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 0, "no out-of-bounds earner may register");
+        assert_eq!(json["total_vram_gb"], 0);
+
+        // A normal earner — within every bound — still registers.
+        let ok = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello(&good, 24, vec![JobKind::Terrain, JobKind::Foliage])).unwrap(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 1);
+        // FM2: the two DISTINCT advertised kinds each count once in the breakdown.
+        assert_eq!(json["supported_breakdown"]["terrain"], 1);
+        assert_eq!(json["supported_breakdown"]["foliage"], 1);
+    }
+
+    /// Boundary values pass: a `gpu_model` of exactly `MAX_GPU_MODEL_LEN` and a
+    /// `vram_gb` of exactly `MAX_VRAM_GB` are accepted (the bounds are inclusive),
+    /// so a future big-VRAM card / long official name isn't locked out (FM1).
+    #[tokio::test]
+    async fn register_accepts_boundary_gpu_len_and_vram() {
+        let state = test_state_empty().await;
+        let addr = test_address("boundary");
+        let max_gpu = "x".repeat(MAX_GPU_MODEL_LEN);
+        let resp = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello_gpu(&addr, &max_gpu, MAX_VRAM_GB, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 1);
+        assert_eq!(json["total_vram_gb"], MAX_VRAM_GB as u64);
     }
 
     /// A mixed-case (EIP-55-checksummed) address must register: the settle-time
@@ -2876,6 +2968,36 @@ mod tests {
             body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
             0,
             "no malformed Hello may register via ws",
+        );
+    }
+
+    /// The same depth bounds (oversized gpu_model, duplicate kinds, over-ceiling
+    /// vram) close the ws socket and register nothing — the shared validator gates
+    /// both transports, so ws can't pollute the registry http guards.
+    #[tokio::test]
+    async fn ws_rejects_oversized_gpu_dup_kinds_and_huge_vram() {
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let good = test_address("wsdepth");
+        let long_gpu = "x".repeat(MAX_GPU_MODEL_LEN + 1);
+        let malformed = [
+            hello_gpu(&good, &long_gpu, 24, vec![JobKind::Terrain]),
+            hello(&good, 24, vec![JobKind::Terrain, JobKind::Terrain]),
+            hello(&good, MAX_VRAM_GB + 1, vec![JobKind::Terrain]),
+        ];
+        for m in &malformed {
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            ws.send(WsMessage::text(serde_json::to_string(m).unwrap()))
+                .await
+                .unwrap();
+            expect_ws_closed(&mut ws).await;
+        }
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "no out-of-bounds Hello may register via ws",
         );
     }
 
