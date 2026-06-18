@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tower::ServiceBuilder;
 use tower_http::timeout::TimeoutLayer;
@@ -136,6 +137,16 @@ struct Args {
     /// `/stats pending_attestations`.
     #[arg(long, env = "COORDINATOR_RELAY_DEV_MOCK", default_value = "false")]
     relay_dev_mock: bool,
+    /// Shared-secret bearer token gating `POST /jobs` ingestion. When SET, a
+    /// job-creation request must carry `Authorization: Bearer <token>` (compared
+    /// in constant time); a request that is absent, malformed, or carries the
+    /// wrong token is rejected `401`. When UNSET the endpoint stays open (dev
+    /// default) and `main` logs a loud startup warning, mirroring the
+    /// `--relay-dev-mock` posture. A blank/whitespace value is rejected at startup
+    /// (an empty secret would authenticate every caller). The real token is an
+    /// operator credential supplied at deploy.
+    #[arg(long, env = "COORDINATOR_INGEST_TOKEN")]
+    ingest_token: Option<String>,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -181,6 +192,12 @@ struct AppState {
     /// gate that closes a slowloris connection; read by `recv_hello`. Mirrors
     /// `--handshake-timeout-secs` / `COORDINATOR_HANDSHAKE_TIMEOUT_SECS`.
     handshake_timeout: Duration,
+    /// Optional shared-secret bearer token gating `POST /jobs`. `Some` → ingestion
+    /// requires `Authorization: Bearer <token>` (constant-time compared in
+    /// `create_job`); `None` → the endpoint is open (dev), warned at startup.
+    /// Validated non-blank in `with_store`. Mirrors `--ingest-token` /
+    /// `COORDINATOR_INGEST_TOKEN`.
+    ingest_token: Option<String>,
 }
 
 impl AppState {
@@ -194,6 +211,7 @@ impl AppState {
         earner_ttl_secs: i64,
         ttl_deadline_multiple: u32,
         handshake_timeout: Duration,
+        ingest_token: Option<String>,
     ) -> Result<Arc<Self>> {
         // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
         // dead-letters every non-terminal job on its first tick — the safety
@@ -211,6 +229,17 @@ impl AppState {
             !handshake_timeout.is_zero(),
             "handshake_timeout must be > 0 (0 would reject every registration before its Hello)"
         );
+        // A blank ingest token is the wide-open posture wearing a configured
+        // disguise: an empty secret matches `Authorization: Bearer ` (and a
+        // whitespace-only one is almost certainly a misconfiguration), so a deploy
+        // that "set the token" would still authenticate every caller. Reject it at
+        // construction (FM4); leave it UNSET for the intentional dev-open posture.
+        if let Some(token) = ingest_token.as_deref() {
+            anyhow::ensure!(
+                !token.trim().is_empty(),
+                "ingest_token must be non-blank if set (an empty/whitespace token authenticates every caller — leave --ingest-token unset for the dev-open posture instead)"
+            );
+        }
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -230,6 +259,7 @@ impl AppState {
             earner_ttl_secs,
             ttl_deadline_multiple,
             handshake_timeout,
+            ingest_token,
         }))
     }
 }
@@ -393,8 +423,21 @@ async fn main() -> Result<()> {
         args.earner_ttl_secs as i64,
         args.ttl_deadline_multiple,
         Duration::from_secs(args.handshake_timeout_secs),
+        args.ingest_token,
     )?;
     tracing::info!(db = %args.db, "store ready");
+
+    // Ingestion auth posture (FM2): an open `POST /jobs` is fine for local dev but
+    // a silent wide-open write surface in production is how a deploy ships
+    // unauthenticated. Make the open case loud at startup, mirroring the
+    // `--relay-dev-mock` warning; a configured token logs a quiet confirmation.
+    if state.ingest_token.is_some() {
+        tracing::info!("POST /jobs ingestion requires a bearer token (COORDINATOR_INGEST_TOKEN)");
+    } else {
+        tracing::warn!(
+            "POST /jobs ingestion is UNAUTHENTICATED — anyone who can reach the coordinator can enqueue render jobs. Set --ingest-token / COORDINATOR_INGEST_TOKEN before production."
+        );
+    }
 
     // Background reaper: periodically requeue in-flight jobs past their
     // deadline so a stalled/vanished earner doesn't strand a job forever. The
@@ -970,6 +1013,25 @@ fn is_evm_address(s: &str) -> bool {
     hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// True iff `headers` carries `Authorization: Bearer <token>` whose token equals
+/// `expected`. The token bytes are compared in CONSTANT TIME (`subtle::ct_eq`): a
+/// normal `==` would early-exit at the first differing byte, leaking — over many
+/// timed requests — the secret one byte at a time. A missing header, a value that
+/// isn't valid visible-ASCII (`to_str` returns `Err`, never panics — FM3), a
+/// non-`Bearer` scheme, or a wrong token all return `false`, which the caller maps
+/// to a single uniform `401` so an attacker can't distinguish the cases. `ct_eq`
+/// on byte slices is constant-time for equal lengths and short-circuits only on a
+/// length mismatch — the token's length is not the secret, its content is, so a
+/// wrong token of the SAME length (the byte-recovery attack) is the constant-time
+/// path (pinned by a test).
+fn ingest_authorized(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|presented| presented.as_bytes().ct_eq(expected.as_bytes()).into())
+}
+
 /// Upper bounds on self-reported `Hello` fields, enforced by `validate_hello` so a
 /// malformed or oversized registration can't bloat the in-memory registry or
 /// poison the `/stats` aggregates. Both are generous headroom — hygiene, not
@@ -1104,12 +1166,28 @@ async fn register(
 /// Returns `201 Created` with the assigned id; `422` on a spec the ingestion
 /// gate rejects (bad deadline / payout / oversized inputs). A body that fails to
 /// deserialize (unknown `kind`, wrong types) is rejected by the `Json` extractor
-/// before this runs. Unauthenticated by design at this stage, mirroring
-/// `/register`; gating ingestion behind an operator token is a tracked follow-up.
+/// before this runs.
+///
+/// When the coordinator is started with an ingest token (`--ingest-token` /
+/// `COORDINATOR_INGEST_TOKEN`), a request must carry `Authorization: Bearer
+/// <token>` or it is rejected `401` before any store work — no job is enqueued,
+/// no lock taken, for an unauthorized caller. With no token configured the
+/// endpoint is open (dev posture, warned at startup). The request body is parsed
+/// by the `Json` extractor before this gate runs (axum runs all extractors first),
+/// but it is bounded by the pre-parse size cap + body-read timeout, so the gate
+/// protects the queue, not the (already-capped) parse. `HeaderMap` precedes the
+/// body-consuming `Json` extractor, which must come last.
 async fn create_job(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<CreateJobResponse>), StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!("rejected: POST /jobs missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
     if let Err(e) = validate::validate_job_spec(req.deadline_secs, &req.max_payout_wei, &req.inputs)
     {
         tracing::warn!(reason = e.reason(), "rejected: malformed job spec");
@@ -2249,6 +2327,7 @@ mod tests {
             60,
             JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout,
+            None,
         )
         .unwrap()
     }
@@ -5545,7 +5624,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -5584,7 +5663,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -5638,7 +5717,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -5657,7 +5736,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -5757,7 +5836,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -6292,6 +6371,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -7255,7 +7335,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_deadline_multiple_knob_is_honored() {
         let state =
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None)
                 .unwrap();
         assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
 
@@ -7289,12 +7369,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_ttl_deadline_multiple() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None)
                 .is_err(),
             "multiple=0 must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None)
                 .is_ok(),
             "the smallest valid multiple (1) constructs"
         );
@@ -7307,12 +7387,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_handshake_timeout() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None)
                 .is_err(),
             "a zero handshake timeout must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1))
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None)
                 .is_ok(),
             "the smallest positive handshake timeout constructs"
         );
@@ -7393,6 +7473,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -7751,6 +7832,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -7800,6 +7882,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
 
         let terrain_job = JobSpec {
@@ -7854,6 +7937,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -7871,6 +7955,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
 
         let mut ids = Vec::new();
@@ -7961,6 +8046,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
 
         let queued = job_with_deadline(60);
@@ -8067,6 +8153,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8111,6 +8198,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8168,6 +8256,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8219,6 +8308,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -8261,6 +8351,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -8316,6 +8407,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -8377,6 +8469,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -8437,6 +8530,7 @@ mod tests {
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
         });
         let pay = test_address("pay");
         let resp = post_json(
