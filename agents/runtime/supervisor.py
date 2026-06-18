@@ -145,6 +145,29 @@ def _failing_specialist(issues: list[str]) -> str:
     return min(candidates, key=PIPELINE_ORDER.index)
 
 
+def _route_back_target(verdict: ValidatorVerdict) -> str:
+    """The earliest pipeline specialist to re-run for `verdict`.
+
+    Prefer the validator's STRUCTURED attribution (`verdict.failing_specialists`):
+    each issue is owned by the specialist the validator blamed at the point it was
+    raised, so a prim path segment that merely looks like — or is exactly equal to
+    — a specialist name can't misroute, the residual the word-boundary text scan
+    can't close. Keep only names that are real route-back targets (`PIPELINE_ORDER`)
+    and pick the pipeline-earliest; unknown names (a typo, `validator`, a composed
+    prim owner) are ignored. A field that is present but names ONLY unknowns routes
+    to `director` (the brief/style owner) rather than second-guessing from text.
+
+    Only when the field is empty/absent — an older validator, or a synthesized /
+    hand-built verdict that never set it — fall back to the word-boundary text scan
+    over `issues` (`_failing_specialist`), preserving back-compat.
+    """
+    attributed = verdict.failing_specialists or []
+    if attributed:
+        known = [name for name in attributed if name in PIPELINE_ORDER]
+        return min(known, key=PIPELINE_ORDER.index) if known else "director"
+    return _failing_specialist(verdict.issues)
+
+
 def _rounds(state: State) -> int:
     """Revision-round count, robust to a missing/None/negative `rounds`.
 
@@ -202,7 +225,7 @@ def _after_validator(state: State) -> str:
         return END
     if _rounds(state) >= MAX_ROUNDS:  # recursion guard, see MAX_ROUNDS
         return END
-    return _failing_specialist(verdict.issues)
+    return _route_back_target(verdict)
 
 
 def build_graph():
