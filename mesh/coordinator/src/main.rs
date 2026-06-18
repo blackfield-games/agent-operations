@@ -17,6 +17,9 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use proto::{CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec, RegionCoord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -95,6 +98,12 @@ struct Args {
     /// replies in milliseconds, so the default is generous; must be >= 1.
     #[arg(long, env = "COORDINATOR_HANDSHAKE_TIMEOUT_SECS", default_value_t = DEFAULT_HANDSHAKE_TIMEOUT.as_secs())]
     handshake_timeout_secs: u64,
+    /// Seconds the coordinator waits for a connection to send its complete HTTP
+    /// request headers before closing it. Bounds a pre-routing slow-headers
+    /// slowloris that parks an FD before any handler runs (one layer below the ws
+    /// handshake timeout). Applies to every endpoint; must be >= 1.
+    #[arg(long, env = "COORDINATOR_HTTP_HEADER_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_HEADER_TIMEOUT.as_secs())]
+    http_header_timeout_secs: u64,
     /// How often (seconds) the attestation relayer drains pending EAS receipts to
     /// the chain. Only runs when a relay is configured (see `--relay-dev-mock`).
     #[arg(long, env = "COORDINATOR_RELAY_INTERVAL_SECS", default_value = "10")]
@@ -373,16 +382,106 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     tracing::info!(bind = %args.bind, "coordinator up");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    serve(
+        listener,
+        app,
+        Duration::from_secs(args.http_header_timeout_secs),
+        shutdown_signal(),
+    )
+    .await
+}
+
+/// Serve `app` on `listener` until `shutdown` resolves, bounding the time a
+/// connection may take to send its HTTP request headers (`header_read_timeout`).
+/// We hand-roll the accept loop instead of `axum::serve` for two reasons:
+/// 1. `axum::serve` exposes no header-read timeout, so a slow-headers slowloris
+///    could park an FD at hyper's pre-routing read phase — before any handler,
+///    and before the ws upgrade arms the per-connection handshake timeout — on
+///    every endpoint. `header_read_timeout` (which needs an installed timer to
+///    fire) closes it.
+/// 2. `axum::serve` (like hyper-util's `auto::Builder`) sniffs the `PRI *
+///    HTTP/2.0` preface and serves HTTP/2 cleartext, where the h1 header-read
+///    bound does NOT apply and hyper installs no pre-SETTINGS read timeout — an
+///    h2c slowloris would bypass the fix entirely. Every real client is h1 (the
+///    ws upgrade is h1; the earner's `reqwest` over plaintext is h1), so we serve
+///    h1-only: an h2c preface is parsed as a (rejected) h1 request, leaving no
+///    unbounded protocol.
+///
+/// On `shutdown` we stop accepting and drain in-flight connections, so graceful
+/// shutdown is preserved (`with_upgrades` keeps the ws 101 upgrade working).
+async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_read_timeout: Duration,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    anyhow::ensure!(
+        !header_read_timeout.is_zero(),
+        "http_header_timeout must be > 0 (0 would close every request before its headers complete)"
+    );
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    // Graceful drain, by hand: hyper-util's `GracefulShutdown` doesn't implement
+    // `GracefulConnection` for h1's *upgradeable* connection (the one ws needs),
+    // so we track live connections in a `JoinSet` and broadcast a drain signal
+    // over a `watch`. On shutdown each task calls `graceful_shutdown()` and runs
+    // to completion, so in-flight requests and ws sessions finish instead of
+    // being dropped.
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let mut conns = tokio::task::JoinSet::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(conn) => conn,
+                    // A transient accept error (e.g. fd exhaustion) shouldn't kill
+                    // the listener; log and keep serving.
+                    Err(e) => {
+                        tracing::warn!(?e, "accept failed");
+                        continue;
+                    }
+                };
+                let io = TokioIo::new(stream);
+                let service = TowerToHyperService::new(app.clone());
+                let conn = builder.serve_connection(io, service).with_upgrades();
+                let mut drain = drain_rx.clone();
+                conns.spawn(async move {
+                    let mut conn = std::pin::pin!(conn);
+                    tokio::select! {
+                        res = conn.as_mut() => {
+                            if let Err(e) = res { tracing::debug!("connection ended: {e}"); }
+                        }
+                        // Wrapped so the borrowed `watch::Ref` is dropped here, not
+                        // held across the drain await below (which would make the
+                        // task non-`Send` and unspawnable).
+                        _ = async { let _ = drain.wait_for(|d| *d).await; } => {
+                            conn.as_mut().graceful_shutdown();
+                            if let Err(e) = conn.await { tracing::debug!("connection drained: {e}"); }
+                        }
+                    }
+                });
+            }
+            // Reap finished connections so the set doesn't grow while serving.
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received; draining in-flight connections");
+                break;
+            }
+        }
+    }
+    drop(listener);
+    let _ = drain_tx.send(true);
+    while conns.join_next().await.is_some() {}
     Ok(())
 }
 
 /// Resolve when the process receives a shutdown signal — `SIGINT` (Ctrl-C)
 /// on any platform, or `SIGTERM` on unix (Render sends SIGTERM on stop).
-/// Awaited by axum's graceful shutdown so in-flight requests and ws sessions
-/// drain before exit.
+/// Awaited by [`serve`]'s graceful shutdown so in-flight requests and ws
+/// sessions drain before exit.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -456,6 +555,17 @@ const JOB_TTL_DEADLINE_MULTIPLE: u32 = 1440;
 /// `AppState::handshake_timeout` at runtime, so a test can shrink it to a
 /// sub-second value without a slow suite.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default wall-clock bound on the pre-routing HTTP request-header read: the
+/// coordinator closes a connection that hasn't sent its complete request headers
+/// within this window. `axum::serve` installs no such bound, so a slow-headers
+/// slowloris (open a connection, send the request line, then dribble headers
+/// forever) would otherwise park an FD at hyper's read phase before any handler —
+/// including before the ws upgrade arms the per-connection handshake timeout —
+/// on EVERY endpoint. Honest clients send headers in well under a second, so 15s
+/// is generous. Backs `Args::http_header_timeout_secs`
+/// (`--http-header-timeout-secs` / `COORDINATOR_HTTP_HEADER_TIMEOUT_SECS`).
+const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
