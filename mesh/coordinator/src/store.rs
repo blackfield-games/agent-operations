@@ -71,6 +71,38 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Test-only: does an index named `name` exist (i.e. did schema init create it)?
+    #[cfg(test)]
+    pub fn has_index(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Test-only: the concatenated EXPLAIN QUERY PLAN `detail` rows for the TTL
+    /// reaper's exact predicate, so a test can assert the planner actually picks the
+    /// index (creation alone doesn't imply use — FM2). Mirrors `reap_ttl_expired`.
+    #[cfg(test)]
+    pub fn reap_ttl_query_plan(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id, spec_json, created_at FROM jobs
+             WHERE status IN (?1, ?2) AND created_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([STATUS_QUEUED, STATUS_IN_FLIGHT], |r| {
+            r.get::<_, String>(3) // EXPLAIN QUERY PLAN columns: id,parent,notused,detail
+        })?;
+        let mut plan = String::new();
+        for row in rows {
+            plan.push_str(&row?);
+            plan.push('\n');
+        }
+        Ok(plan)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
@@ -185,6 +217,20 @@ impl Store {
         // deadline/TTL reapers exactly as before. Swallow only the duplicate-column error.
         ignore_duplicate_column(
             conn.execute("ALTER TABLE jobs ADD COLUMN dispatched_to TEXT", []),
+        )?;
+        // Index the reaper's hot predicate. Every reap tick scans non-terminal jobs
+        // by (status, age): the TTL reaper filters `status IN (queued, in_flight)
+        // AND created_at IS NOT NULL`, the deadline/liveness reapers filter
+        // `status = in_flight`. Without an index each tick is a full table scan that
+        // grows with the never-archived terminal-row history; this turns it into an
+        // index seek over only the live rows. Created AFTER the `created_at`
+        // migration above so a legacy DB has the column before the index references
+        // it; `IF NOT EXISTS` makes it idempotent across restarts (it builds once at
+        // init on an existing DB, never per tick). `created_at` is immutable, so the
+        // only index-write cost is one entry move per status transition.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at)",
+            [],
         )?;
         Ok(Self { conn })
     }

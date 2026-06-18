@@ -5900,6 +5900,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ---- reaper index (idx_jobs_status_created_at) ----
+
+    /// Schema init creates the reaper's covering index, so the per-tick scan seeks
+    /// instead of full-scanning the never-archived jobs table. Idempotent: a second
+    /// init over the same DB (a restart) must not error.
+    #[test]
+    fn reaper_status_created_at_index_exists_after_init() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.has_index("idx_jobs_status_created_at").unwrap());
+    }
+
+    /// FM2: creation alone doesn't imply the planner uses it. The TTL reaper's exact
+    /// predicate (`status IN (queued, in_flight) AND created_at IS NOT NULL`) must
+    /// EXPLAIN to an index SEARCH on idx_jobs_status_created_at, not a full SCAN.
+    #[test]
+    fn reap_ttl_query_plan_uses_the_index() {
+        let store = Store::open_in_memory().unwrap();
+        // A couple of rows so the plan reflects a populated table (the planner is
+        // schema-driven without ANALYZE, but this keeps the test realistic).
+        store.enqueue(&job_with_deadline(60)).unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+
+        let plan = store.reap_ttl_query_plan().unwrap();
+        assert!(
+            plan.contains("idx_jobs_status_created_at"),
+            "TTL reap query must use the index, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN jobs"),
+            "TTL reap query must not full-scan jobs, got plan: {plan}"
+        );
+    }
+
     // ---- GET /jobs/{id} full detail ----
 
     /// `GET /jobs/{id}` returns the full spec; `result` is null while the job is
