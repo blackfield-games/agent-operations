@@ -455,7 +455,14 @@ async fn poll_once(
     supported: &[JobKind],
 ) -> Result<bool> {
     let url = format!("{}/jobs/next", args.coordinator);
-    let resp = client.get(&url).send().await?;
+    // Name ourselves so the coordinator filters the hand-out to the kinds we
+    // advertised at registration (capability match on the HTTP transport). The
+    // self-guard below stays as defense-in-depth for a coordinator that doesn't.
+    let resp = client
+        .get(&url)
+        .query(&[("earner", session.address.as_str())])
+        .send()
+        .await?;
     // The coordinator stamps the dispatch_seq for this hand-out in a header; we
     // must echo it on submit so a job reaped+reassigned to another earner can't
     // be settled by us (the fence). Read it before consuming the body.
