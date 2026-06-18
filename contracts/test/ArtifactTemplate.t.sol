@@ -2,7 +2,7 @@
 pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
-import {ArtifactTemplate, IComputeMeter} from "../src/ArtifactTemplate.sol";
+import {ArtifactTemplate, IComputeMeter, IRegionAuthority} from "../src/ArtifactTemplate.sol";
 import {ComputeMeter} from "../src/ComputeMeter.sol";
 import {RegionAuthority} from "../src/RegionAuthority.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -616,6 +616,34 @@ contract ArtifactTemplateTest is Test {
         art.setRoyaltyRate(123);
     }
 
+    function test_mint_hostileRoyaltyTokenCannotReenterMint() public {
+        // FM2: a hostile $BLCKFLD that tries to reenter mint() from its royalty
+        // transferFrom is blocked by the onlyMinter gate (the token is not the minter), so
+        // it can neither double-mint nor double-route. The reentry's NotMinter bubbles up
+        // and reverts the whole mint — a hostile fee token can break an honest mint but
+        // never exploit it. Access control, not just CEI, closes this vector.
+        ReentrantRoyaltyToken evil = new ReentrantRoyaltyToken();
+        ReentrantRegionAuthority rauth = new ReentrantRegionAuthority();
+        rauth.setToken(address(evil));
+        ArtifactTemplate art3 =
+            new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE, address(rauth), ROYALTY_RATE);
+        vm.startPrank(owner);
+        art3.setMinter(minter);
+        meter.setSpender(address(art3), true);
+        vm.stopPrank();
+
+        vm.prank(minter);
+        uint256 id = art3.registerTemplate(author, 1000, keccak256("evil"), 0);
+        evil.arm(art3, id, regionId, player, 3); // reentry attempt: 3 more to player
+
+        vm.expectRevert(ArtifactTemplate.NotMinter.selector); // reentry blocked by access control
+        vm.prank(minter);
+        art3.mint(player, id, 5, regionId, "");
+
+        assertEq(art3.totalMinted(), 0, "hostile-token reentry minted nothing");
+        assertEq(art3.balanceOf(player, id), 0);
+    }
+
     // --- supply cap ---
 
     function test_registerTemplate_storesMaxSupply() public {
@@ -952,5 +980,61 @@ contract ReentrantSpender is IComputeMeter {
         entered = true;
         observedTotalMintedAtSpend = art.totalMinted();
         art.mint(recipient, templateId, reentryAmount, regionId, "");
+    }
+}
+
+/// @notice A hostile $BLCKFLD that tries to reenter mint() once from the royalty
+///         transferFrom (the FM2 vector). It is NOT the minter, so the reentry hits the
+///         onlyMinter gate — proving access control, not just CEI, blocks a malicious fee
+///         token. Pairs with a no-op region so the only behavior under test is the reentry.
+contract ReentrantRoyaltyToken {
+    ArtifactTemplate art;
+    uint256 public templateId;
+    uint256 reentryAmount;
+    uint256 regionId;
+    address recipient;
+    bool entered;
+
+    function arm(
+        ArtifactTemplate art_,
+        uint256 templateId_,
+        uint256 regionId_,
+        address recipient_,
+        uint256 reentryAmount_
+    ) external {
+        art = art_;
+        templateId = templateId_;
+        regionId = regionId_;
+        recipient = recipient_;
+        reentryAmount = reentryAmount_;
+    }
+
+    function transferFrom(address, address, uint256) external returns (bool) {
+        if (!entered) {
+            entered = true;
+            art.mint(recipient, templateId, reentryAmount, regionId, "");
+        }
+        return true;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return true;
+    }
+}
+
+/// @notice RegionAuthority stand-in whose TOKEN() points at the hostile royalty token
+///         and whose depositFees is a sink, so the FM2 reentrancy test exercises only
+///         the token-reentrancy vector (no real region/staking needed).
+contract ReentrantRegionAuthority is IRegionAuthority {
+    address public token;
+
+    function setToken(address token_) external {
+        token = token_;
+    }
+
+    function depositFees(uint256, uint256) external {}
+
+    function TOKEN() external view returns (address) {
+        return token;
     }
 }
