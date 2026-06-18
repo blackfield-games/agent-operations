@@ -256,6 +256,14 @@ contract RenderReceipts is Ownable2Step {
         // Allowance is set to exactly `fee` and fully consumed by depositFees (no standing
         // allowance, no transient balance — feeToken nets zero across the call).
         //
+        // The reentrancy and skip-not-revert guarantees above rest on feeToken being the
+        // trusted, callback-free $BLCKFLD (read from RegionAuthority.TOKEN()): a token that
+        // ran code on transfer and was *also* an authorized coordinator could revoke
+        // mid-issue, and one that unstaked the region between regionExists and depositFees
+        // could turn the skip into a revert — but $BLCKFLD is a plain ERC-20 and is never a
+        // coordinator, so a malicious fee token could at worst DoS issuance, never exploit
+        // it (the same trust boundary RegionAuthority/ComputeMeter/ArtifactTemplate assume).
+        //
         // renderFeeRate * renderSeconds is checked arithmetic: it reverts only on the
         // astronomical overflow of an absurd owner-set rate times a uint64 render-seconds,
         // never for plausible values (mirrors ArtifactTemplate._scaledFee).
