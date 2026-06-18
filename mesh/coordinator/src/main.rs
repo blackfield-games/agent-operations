@@ -4266,6 +4266,160 @@ mod tests {
         );
     }
 
+    // -- POST /jobs ingestion auth (--ingest-token) -----------------------
+
+    const TEST_INGEST_TOKEN: &str = "s3cr3t-ingest-token-abcdef0123456789";
+
+    /// Empty-queue state configured with an ingest token, for the auth tests.
+    async fn test_state_empty_with_token(token: &str) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            Some(token.to_string()),
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
+    /// POST a JSON body with an optional `Authorization` header. `None` omits the
+    /// header entirely (the missing-header case); `Some(v)` sets it verbatim.
+    async fn post_json_auth(
+        state: Arc<AppState>,
+        uri: &str,
+        value: &serde_json::Value,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state)
+            .oneshot(builder.body(Body::from(serde_json::to_vec(value).unwrap())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_job_with_correct_token_returns_201() {
+        let state = test_state_empty_with_token(TEST_INGEST_TOKEN).await;
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_json_auth(state.clone(), "/jobs", &create_job_body(), Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 1);
+    }
+
+    /// FM1: a wrong token of the SAME LENGTH is rejected. This is the shape of the
+    /// byte-by-byte recovery attack — a length-only check would accept it, and it is
+    /// the case the constant-time `subtle::ct_eq` compare must reject on its
+    /// constant-time path. The timing property itself isn't asserted (it's
+    /// guaranteed by the primitive, not observable in a unit test); the functional
+    /// rejection of an equal-length wrong token is what's pinned here.
+    #[tokio::test]
+    async fn create_job_with_wrong_same_length_token_returns_401() {
+        let state = test_state_empty_with_token(TEST_INGEST_TOKEN).await;
+        let mut wrong = TEST_INGEST_TOKEN.to_string();
+        wrong.pop();
+        wrong.push('X'); // flip the last byte, preserve length
+        assert_eq!(wrong.len(), TEST_INGEST_TOKEN.len());
+        let auth = format!("Bearer {wrong}");
+        let resp = post_json_auth(state.clone(), "/jobs", &create_job_body(), Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // The gate ran before any store work — nothing was enqueued.
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
+    }
+
+    #[tokio::test]
+    async fn create_job_missing_auth_header_returns_401() {
+        let state = test_state_empty_with_token(TEST_INGEST_TOKEN).await;
+        let resp = post_json_auth(state.clone(), "/jobs", &create_job_body(), None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
+    }
+
+    /// FM3: a non-`Bearer` scheme AND a non-ASCII (opaque-byte) header value are both
+    /// a uniform 401 with no panic — the wrong scheme fails `strip_prefix`, and
+    /// `to_str()` returns `Err` on the non-ASCII value rather than unwinding.
+    #[tokio::test]
+    async fn create_job_malformed_auth_header_returns_401() {
+        let state = test_state_empty_with_token(TEST_INGEST_TOKEN).await;
+        // Wrong scheme: the correct token under `Basic`, not `Bearer`.
+        let resp = post_json_auth(
+            state.clone(),
+            "/jobs",
+            &create_job_body(),
+            Some(&format!("Basic {TEST_INGEST_TOKEN}")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Non-ASCII (0xFF) value: HeaderValue holds it as opaque bytes, but the
+        // handler's `to_str()` returns Err → 401, no panic. Built from raw bytes
+        // because `Request::builder().header(_, &str)` rejects non-ASCII at build
+        // time, so this handler path is only reachable with a byte-built value.
+        let mut bytes = b"Bearer ".to_vec();
+        bytes.push(0xFF);
+        let value = axum::http::HeaderValue::from_bytes(&bytes).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("content-type", "application/json")
+            .header("authorization", value)
+            .body(Body::from(serde_json::to_vec(&create_job_body()).unwrap()))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// FM2 (open branch): with NO token configured the endpoint stays open — a
+    /// create with no Authorization header succeeds. The loud startup warning lives
+    /// in `main`; the open-vs-closed behavior is what a router test can pin.
+    #[tokio::test]
+    async fn create_job_unconfigured_allows_without_auth() {
+        let state = test_state_empty().await; // no ingest token configured
+        assert!(state.ingest_token.is_none());
+        let resp = post_json_auth(state.clone(), "/jobs", &create_job_body(), None).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 1);
+    }
+
+    /// FM4: a blank/whitespace-only configured token is rejected at construction —
+    /// an empty secret would authenticate `Authorization: Bearer ` (every caller),
+    /// so it must fail like the other zero-knobs, not silently ship wide-open. A
+    /// real token constructs fine.
+    #[test]
+    fn with_store_rejects_blank_ingest_token() {
+        for blank in ["", "   ", "\t"] {
+            let r = AppState::with_store(
+                Store::open_in_memory().unwrap(),
+                5,
+                10,
+                60,
+                JOB_TTL_DEADLINE_MULTIPLE,
+                DEFAULT_HANDSHAKE_TIMEOUT,
+                Some(blank.to_string()),
+            );
+            assert!(r.is_err(), "blank token {blank:?} must be rejected at construction");
+        }
+        assert!(AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            Some("real-token".to_string()),
+        )
+        .is_ok());
+    }
+
     /// Graceful shutdown is preserved by the hand-rolled accept loop: firing the
     /// shutdown signal makes `serve()` stop accepting and return (drain), not hang
     /// — guards the FM that replacing `axum::serve`'s `with_graceful_shutdown`
