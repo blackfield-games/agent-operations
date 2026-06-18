@@ -3306,13 +3306,27 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     /// Bind the router on an ephemeral port and serve it on a spawned task.
-    /// Returns the bound `host:port` so tests can build ws/http URLs.
+    /// Returns the bound `host:port` so tests can build ws/http URLs. Routes
+    /// through the real `serve()` (not `axum::serve`) so every ws integration test
+    /// exercises the h1 accept loop + the 101-upgrade path; a generous header
+    /// timeout + a never-resolving shutdown match production-idle serving.
     async fn serve_ephemeral(state: Arc<AppState>) -> String {
+        serve_ephemeral_with_header_timeout(state, DEFAULT_HTTP_HEADER_TIMEOUT).await
+    }
+
+    /// `serve_ephemeral` with a caller-chosen header-read timeout, for the
+    /// slow-headers test that needs a sub-second bound.
+    async fn serve_ephemeral_with_header_timeout(
+        state: Arc<AppState>,
+        header_read_timeout: Duration,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state);
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            serve(listener, app, header_read_timeout, std::future::pending::<()>())
+                .await
+                .unwrap();
         });
         addr.to_string()
     }
@@ -3628,6 +3642,128 @@ mod tests {
             1,
             "a timed-out handshake must not evict the live earner",
         );
+    }
+
+    /// The pre-routing slow-headers slowloris is bounded: a connection that sends
+    /// the request line + a header then stalls (never the terminating blank line)
+    /// is closed within the header-read timeout. Discriminating: without the bound
+    /// (`axum::serve`) the server waits for the rest of the headers forever, so
+    /// `read_to_end` hangs and the outer test timeout fails the suite. The whole
+    /// ws integration suite already proves a COMPLETE request (the 101 upgrade)
+    /// still serves through this same loop.
+    #[tokio::test]
+    async fn http_header_read_times_out_on_dribbled_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral_with_header_timeout(state, Duration::from_millis(300)).await;
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(b"GET /stats HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        // The server must close the stalled connection (read_to_end resolves on the
+        // close — whether via a 408 then EOF or a reset). A regression that never
+        // bounds the read hangs here until the outer 5s timeout fails the test.
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+            .await
+            .expect("server closed the stalled-headers connection within the header-read timeout")
+            .ok();
+    }
+
+    /// An HTTP/2 cleartext (h2c) preface must not park the server unboundedly.
+    /// `auto::Builder` sniffs the `PRI * HTTP/2.0` preface and switches to h2,
+    /// where the h1 `header_read_timeout` does NOT apply and hyper installs no
+    /// pre-SETTINGS read bound — so an h2c slowloris (send the preface, never the
+    /// SETTINGS frame) would park an FD forever: FM3's protocol bypass. Serving
+    /// h1-only closes it — the h1 parser reads the preface as a (rejected) request
+    /// and the connection ends promptly. Discriminating: under `auto::Builder`
+    /// this hangs in h2 until the outer timeout fails the suite.
+    #[tokio::test]
+    async fn h2c_preface_does_not_park_the_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral_with_header_timeout(state, Duration::from_millis(300)).await;
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+            .await
+            .expect("server closed the h2c-preface connection instead of serving unbounded h2")
+            .ok();
+    }
+
+    /// Graceful shutdown is preserved by the hand-rolled accept loop: firing the
+    /// shutdown signal makes `serve()` stop accepting and return (drain), not hang
+    /// — guards the FM that replacing `axum::serve`'s `with_graceful_shutdown`
+    /// could leave the server unable to shut down.
+    #[tokio::test]
+    async fn serve_returns_on_shutdown_signal() {
+        let state = test_state_empty().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = router(state);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("serve() returned promptly after the shutdown signal")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// The other half of graceful shutdown (FM1): a connection that is LIVE in the
+    /// drain set when shutdown fires is drained and closed, and `serve()` still
+    /// returns. We first round-trip a request so the keep-alive connection is
+    /// provably accepted into the `JoinSet` (not still in the listener backlog),
+    /// then signal shutdown and assert both that `serve()` returns and that the
+    /// drained connection is closed (EOF), not left dangling. Discriminating: a
+    /// rewrite that drops live connections instead of `graceful_shutdown()`-ing
+    /// them, or that hangs the drain on the idle keep-alive conn, fails here.
+    #[tokio::test]
+    async fn serve_drains_a_live_connection_on_shutdown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = router(state);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(b"GET /stats HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 12];
+        stream.read_exact(&mut head).await.unwrap();
+        assert!(
+            head.starts_with(b"HTTP/1.1"),
+            "the live keep-alive connection was served before shutdown"
+        );
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("serve() drained the live connection and returned")
+            .unwrap()
+            .unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest))
+            .await
+            .expect("the drained connection was closed (EOF), not left open")
+            .ok();
     }
 
     #[tokio::test]
