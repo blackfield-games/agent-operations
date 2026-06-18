@@ -229,6 +229,21 @@ struct Stats {
     /// requeued them on a missed deadline and they were handed out again. A
     /// cumulative reaper-churn signal for the HUD; 0 on a healthy mesh.
     jobs_redispatched: usize,
+    /// Gross count of dispatch attempts across ALL jobs (Σ `attempts`): every
+    /// hand-out to an earner, including redispatches after a missed deadline or
+    /// disconnect, but NOT earner-fault rejects (a fault refunds the attempt and
+    /// charges `total_faults` instead). Distinct from `jobs_redispatched`, which
+    /// counts how many *jobs* were dispatched more than once: a single job
+    /// dispatched 5 times adds 5 here but 1 there. 0 on a fresh mesh. Additive
+    /// and optional — a strict client may ignore it.
+    total_attempts: u64,
+    /// Gross count of earner-fault result rejects across ALL jobs (Σ `faults`):
+    /// bad/forged/replayed signatures, malformed or implausible content, and
+    /// submit-protocol violations — the earner-quality signal, on a budget kept
+    /// separate from `total_attempts`. Together they let an operator tell
+    /// reaper/disconnect churn apart from earner-quality problems. 0 on a healthy
+    /// mesh. Additive and optional.
+    total_faults: u64,
     /// Settled jobs whose EAS render receipt has not yet been relayed on-chain —
     /// the attestation backlog depth. Each validated settle durably enqueues a
     /// pending receipt; this drains once the (operator-gated) on-chain relayer
@@ -772,6 +787,16 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    // Gross attempt + fault volume in one scan (cheaper than total_payout_wei
+    // above, which decodes every done spec); still under the held store lock so
+    // the `earners ⊃ store` order is preserved.
+    let (total_attempts, total_faults) = match store.attempt_fault_totals() {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(?e, "stats: attempt_fault_totals failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let pending_attestations = match store.pending_attestation_count() {
         Ok(n) => n,
         Err(e) => {
@@ -795,6 +820,8 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_payout_wei,
         oldest_in_flight_secs,
         jobs_redispatched,
+        total_attempts,
+        total_faults,
         pending_attestations,
     }))
 }
@@ -4487,6 +4514,52 @@ mod tests {
         assert_eq!(outcome.requeued, vec![id]);
         store.take_next(|_| true).unwrap();
         assert_eq!(store.redispatched_count().unwrap(), 1);
+    }
+
+    /// `attempt_fault_totals` sums the gross `attempts`/`faults` columns across
+    /// all jobs: dispatches accumulate attempts, a reaper requeue leaves them
+    /// untouched, and an earner fault refunds the attempt while charging a fault.
+    /// Pins FM3 — gross `total_attempts` (2) outpaces the count of distinct
+    /// redispatched jobs (`redispatched_count` == 1) — and the cross-row SUM.
+    #[test]
+    fn attempt_fault_totals_sums_gross_attempts_and_faults() {
+        const BIG: u32 = 999;
+        let store = Store::open_in_memory().unwrap();
+        // Fresh store: nothing dispatched, COALESCE turns the NULL SUM into 0/0.
+        assert_eq!(store.attempt_fault_totals().unwrap(), (0, 0));
+
+        let job = job_with_deadline(100);
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+
+        // Dispatch #1 (attempts → 1).
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.attempt_fault_totals().unwrap(), (1, 0));
+
+        // Reaper requeues past the deadline (attempts unchanged), then a second
+        // dispatch (attempts → 2). Gross attempts (2) now exceeds the number of
+        // distinct redispatched jobs (1): the contradiction FM3 warns about.
+        store.touch(&id, 1000).unwrap();
+        store.reap_expired(1100, BIG).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.attempt_fault_totals().unwrap(), (2, 0));
+        assert_eq!(store.redispatched_count().unwrap(), 1);
+
+        // An earner fault refunds the dispatch attempt (2 → 1) and charges a fault.
+        assert!(!store.requeue_earner_fault(&job, BIG).unwrap());
+        assert_eq!(store.attempt_fault_totals().unwrap(), (1, 1));
+
+        // Redispatch then a second distinct fault: attempts back to 1, faults → 2.
+        store.take_next(|_| true).unwrap();
+        assert!(!store.requeue_earner_fault(&job, BIG).unwrap());
+        assert_eq!(store.attempt_fault_totals().unwrap(), (1, 2));
+
+        // A second job dispatched once proves the SUM spans rows, not just the
+        // first job (take_next pops the most-recently-enqueued queued job).
+        let job2 = job_with_deadline(100);
+        store.enqueue(&job2).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert_eq!(store.attempt_fault_totals().unwrap(), (2, 2));
     }
 
     /// Repeated heartbeats keep extending the liveness window.

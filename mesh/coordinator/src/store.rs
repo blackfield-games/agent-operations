@@ -975,6 +975,28 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Gross `(total_attempts, total_faults)` across every job, summed in one
+    /// table scan for `/stats`. `total_attempts` is Σ`attempts` — every dispatch a
+    /// job ever received (each `take_next` bumps it; an earner-fault requeue
+    /// refunds it), so it is the gross redispatch volume, NOT the count of
+    /// distinct redispatched jobs (`redispatched_count`): one job dispatched five
+    /// times adds 5 here but 1 there. `total_faults` is Σ`faults` — every
+    /// earner-fault reject charged on the budget separate from attempts. Together
+    /// they let an operator separate reaper/disconnect churn (attempts) from
+    /// earner-quality problems (faults). `COALESCE(…, 0)` makes an empty table
+    /// report `(0, 0)` rather than NULL; widened to `u64` (mirroring
+    /// `total_render_seconds`) so a large mesh can't overflow the per-row `u32`.
+    /// Same cost class as the sibling `/stats` aggregates — a single scan, cheaper
+    /// than `total_payout_wei`, which JSON-decodes every done spec.
+    pub fn attempt_fault_totals(&self) -> Result<(u64, u64)> {
+        let (attempts, faults): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(attempts), 0), COALESCE(SUM(faults), 0) FROM jobs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((attempts as u64, faults as u64))
+    }
+
     /// Count of recorded results (for `/stats`).
     pub fn completed_count(&self) -> Result<usize> {
         let count: i64 = self
