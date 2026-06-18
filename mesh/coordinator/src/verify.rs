@@ -316,4 +316,61 @@ mod tests {
             Err(VerifyError::NonCanonicalSignature)
         );
     }
+
+    /// A `Hello` signed by the key whose address it claims verifies — the
+    /// registration analogue of `valid_signature_verifies`.
+    #[test]
+    fn valid_hello_signature_verifies() {
+        let sk = dev_key();
+        let addr = dev_address();
+        let supported = [JobKind::Terrain, JobKind::DiffusionTile];
+        let sig = sign_digest_for_test(&sk, &hello_digest(&addr, "RTX 4090", 24, &supported));
+        assert_eq!(
+            verify_hello_signature(&addr, "RTX 4090", 24, &supported, &sig),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn forged_hello_from_other_key_rejected() {
+        // An attacker signs a Hello *claiming* dev's address but with its own key.
+        // Recovery against the claimed-address digest yields the attacker's
+        // address, not dev's, so key possession fails — an identity the
+        // capability filter / fault ledger / `/stats` totals trust can't be
+        // spoofed onto by someone who doesn't hold its key.
+        let attacker = other_key();
+        let victim = dev_address();
+        let supported = [JobKind::Terrain];
+        let sig =
+            sign_digest_for_test(&attacker, &hello_digest(&victim, "RTX 4090", 24, &supported));
+        assert_eq!(
+            verify_hello_signature(&victim, "RTX 4090", 24, &supported, &sig),
+            Err(VerifyError::AddressMismatch)
+        );
+    }
+
+    #[test]
+    fn tampered_hello_capabilities_rejected() {
+        // The signature binds the WHOLE advertised Hello, not just the address: a
+        // signature made over (vram=24, [Terrain]) fails when the registration
+        // claims an inflated vram or a swapped capability set, so a captured
+        // signature can't be reattached to a better-paying profile.
+        let sk = dev_key();
+        let addr = dev_address();
+        let supported = [JobKind::Terrain];
+        let sig = sign_digest_for_test(&sk, &hello_digest(&addr, "RTX 4090", 24, &supported));
+        assert!(
+            verify_hello_signature(&addr, "RTX 4090", 99, &supported, &sig).is_err(),
+            "inflated vram must not verify against a vram=24 signature"
+        );
+        assert!(
+            verify_hello_signature(&addr, "RTX 4090", 24, &[JobKind::Optimization], &sig).is_err(),
+            "swapped capability set must not verify"
+        );
+        // Sanity: the untampered Hello still verifies.
+        assert_eq!(
+            verify_hello_signature(&addr, "RTX 4090", 24, &supported, &sig),
+            Ok(())
+        );
+    }
 }
