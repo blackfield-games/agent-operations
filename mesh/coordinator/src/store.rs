@@ -92,6 +92,19 @@ impl Store {
              );
              -- Idempotency: at most one recorded result per job.
              CREATE UNIQUE INDEX IF NOT EXISTS idx_results_job_id ON results(job_id);
+             -- Per-earner GENUINE quality faults (bad/forged/replayed signature,
+             -- malformed/implausible content, submit-before-accept, job_id
+             -- mismatch), for reputation attribution on /earners. One row per
+             -- fault event; an honest Decline of an unsupported kind is NEVER
+             -- recorded here (protocol-correct, not a fault). Distinct from the
+             -- per-JOB `jobs.faults` budget (which a Decline DOES bump, so a job
+             -- no live earner can serve still dead-letters): that counter has no
+             -- earner identity, which is exactly why this table exists.
+             CREATE TABLE IF NOT EXISTS earner_faults (
+                 earner     TEXT NOT NULL,
+                 job_id     TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
              -- Pending EAS render receipts: written atomically with the settle
              -- (see record_completed) so a crash before the on-chain
              -- RenderReceipts.issueReceipt cannot lose a validated job's receipt.
@@ -404,6 +417,27 @@ impl Store {
             (new_status, new_faults, job.id.to_string(), STATUS_IN_FLIGHT),
         )?;
         Ok(new_status == STATUS_FAILED)
+    }
+
+    /// Record one GENUINE earner quality fault for reputation attribution: the
+    /// dispatch holder `earner` returned a faulty result (bad/forged/replayed
+    /// signature, malformed/implausible content) or violated the submit protocol
+    /// (submit-before-accept, job_id mismatch) on `job`. Surfaced per earner on
+    /// the `/earners` leaderboard via [`faults_by_earner`](Self::faults_by_earner).
+    ///
+    /// Unlike the per-JOB `jobs.faults` budget that `requeue_earner_fault` bumps,
+    /// this is keyed by earner and is NEVER written for an honest
+    /// `EarnerMsg::Decline` of an unsupported kind — declining a kind you cannot
+    /// serve is correct, anti-hot-loop behavior, not a reputation fault. One row
+    /// per fault event (no dedup): the same earner faulting the same job across
+    /// reconnects is two genuine bad submissions and counts twice.
+    pub fn record_earner_fault(&self, earner: &str, job: &JobSpec) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO earner_faults (earner, job_id, created_at)
+             VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER))",
+            (earner, job.id.to_string()),
+        )?;
+        Ok(())
     }
 
     /// Settle a job with its validated result: insert into `results` and mark
@@ -1175,6 +1209,28 @@ impl Store {
             *totals.entry(earner).or_insert(0) += result.render_seconds as u64;
         }
         Ok(totals)
+    }
+
+    /// Genuine quality-fault count grouped by earner (`earner_faults.earner`), for
+    /// the `GET /earners` leaderboard `faults` field. Counts only attributed
+    /// quality faults (honest declines are never recorded), so an earner with a
+    /// clean record — or any earner on a fresh mesh — is simply absent from the
+    /// map (the caller defaults it to 0). Empty map when no faults recorded.
+    pub fn faults_by_earner(&self) -> Result<HashMap<String, usize>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT earner, COUNT(*) FROM earner_faults GROUP BY earner")?;
+        let rows = stmt.query_map([], |row| {
+            let earner: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((earner, count as usize))
+        })?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (earner, count) = row?;
+            counts.insert(earner, count);
+        }
+        Ok(counts)
     }
 
     /// Sum of `max_payout_wei` across all DONE jobs — the HUD "total $BLCKFLD

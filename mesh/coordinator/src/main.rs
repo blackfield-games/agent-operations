@@ -5048,6 +5048,40 @@ mod tests {
         assert_eq!(store.job_status(&done.id).unwrap().as_deref(), Some("done"));
     }
 
+    // ---- per-earner fault attribution (earner_faults table) ----
+
+    /// `record_earner_fault` attributes each genuine quality fault to the faulting
+    /// earner, and `faults_by_earner` groups the count per earner. One row per
+    /// fault event with NO dedup: the same earner faulting the same job twice
+    /// (across reconnects) counts twice — each is a distinct bad submission.
+    #[test]
+    fn faults_by_earner_groups_genuine_faults_per_earner() {
+        let store = Store::open_in_memory().unwrap();
+        let a = test_address("earner-a");
+        let b = test_address("earner-b");
+        let job1 = job_with_deadline(60);
+        let job2 = job_with_deadline(60);
+
+        // A faults job1 twice (no dedup) + job2 once → 3; B faults job1 once → 1.
+        store.record_earner_fault(&a, &job1).unwrap();
+        store.record_earner_fault(&a, &job1).unwrap();
+        store.record_earner_fault(&a, &job2).unwrap();
+        store.record_earner_fault(&b, &job1).unwrap();
+
+        let by_earner = store.faults_by_earner().unwrap();
+        assert_eq!(by_earner.get(&a).copied(), Some(3), "A: 2×job1 + 1×job2");
+        assert_eq!(by_earner.get(&b).copied(), Some(1), "B: 1×job1");
+        assert_eq!(by_earner.len(), 2, "only earners with faults appear");
+    }
+
+    /// A fresh mesh has attributed no faults: `faults_by_earner` is empty, so the
+    /// `/earners` handler defaults every earner's `faults` to 0.
+    #[test]
+    fn faults_by_earner_is_empty_on_a_fresh_store() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.faults_by_earner().unwrap().is_empty());
+    }
+
     // ---- created_at: the immutable wall-clock-TTL anchor ----
 
     /// `enqueue` stamps a creation time, and it is the anchor the TTL measures
