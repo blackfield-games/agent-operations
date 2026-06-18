@@ -269,6 +269,14 @@ struct EarnerEntry {
     /// Total $BLCKFLD payable to this earner across its DONE jobs, as a decimal
     /// wei string (the per-earner counterpart to `/stats` `total_payout_wei`).
     payout_wei: String,
+    /// Genuine quality faults attributed to this earner (bad/forged signature,
+    /// malformed/implausible content, submit-protocol violations) — the per-earner
+    /// breakdown of `/stats` `total_faults`. Additive/optional field; an honest
+    /// Decline of an unsupported kind is NOT counted, and a clean earner reports 0.
+    /// Does not affect leaderboard order (still completed → render_seconds →
+    /// address). ws-attributed only: an HTTP-submit fault is left for the reaper and
+    /// is unattributed, so this can undercount a mesh polled heavily over HTTP.
+    faults: usize,
 }
 
 #[tokio::main]
@@ -861,6 +869,13 @@ async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEn
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let faults = match store.faults_by_earner() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(?e, "earners: faults_by_earner failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let mut out: Vec<EarnerEntry> = earners
         .iter()
         .filter(|(_, info)| info.is_live(now, ttl))
@@ -873,6 +888,7 @@ async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEn
             completed: completed.get(address).copied().unwrap_or(0),
             render_seconds: render_seconds.get(address).copied().unwrap_or(0),
             payout_wei: payout_wei.get(address).copied().unwrap_or(0).to_string(),
+            faults: faults.get(address).copied().unwrap_or(0),
         })
         .collect();
     // Leaderboard order, with address as a final tiebreak so the array is stable
