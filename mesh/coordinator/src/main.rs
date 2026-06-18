@@ -3368,7 +3368,7 @@ mod tests {
     /// exercises the h1 accept loop + the 101-upgrade path; a generous header
     /// timeout + a never-resolving shutdown match production-idle serving.
     async fn serve_ephemeral(state: Arc<AppState>) -> String {
-        serve_ephemeral_with_header_timeout(state, DEFAULT_HTTP_HEADER_TIMEOUT).await
+        serve_ephemeral_cfg(state, DEFAULT_HTTP_HEADER_TIMEOUT, DEFAULT_HTTP_BODY_TIMEOUT).await
     }
 
     /// `serve_ephemeral` with a caller-chosen header-read timeout, for the
@@ -3377,9 +3377,30 @@ mod tests {
         state: Arc<AppState>,
         header_read_timeout: Duration,
     ) -> String {
+        serve_ephemeral_cfg(state, header_read_timeout, DEFAULT_HTTP_BODY_TIMEOUT).await
+    }
+
+    /// `serve_ephemeral` with a caller-chosen request-body timeout, for the
+    /// slow-body test that needs a sub-second bound on the POST routes.
+    async fn serve_ephemeral_with_body_timeout(
+        state: Arc<AppState>,
+        body_read_timeout: Duration,
+    ) -> String {
+        serve_ephemeral_cfg(state, DEFAULT_HTTP_HEADER_TIMEOUT, body_read_timeout).await
+    }
+
+    /// Bind an ephemeral port, build the router at `body_read_timeout`, and serve
+    /// it through the real `serve()` accept loop at `header_read_timeout` until the
+    /// test drops. The shared backing for the slowloris tests, which need to drive
+    /// the bound being exercised down to a sub-second value.
+    async fn serve_ephemeral_cfg(
+        state: Arc<AppState>,
+        header_read_timeout: Duration,
+        body_read_timeout: Duration,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(state);
+        let app = router_with_body_timeout(state, body_read_timeout);
         tokio::spawn(async move {
             serve(listener, app, header_read_timeout, std::future::pending::<()>())
                 .await
@@ -3751,6 +3772,69 @@ mod tests {
             .await
             .expect("server closed the h2c-preface connection instead of serving unbounded h2")
             .ok();
+    }
+
+    /// The post-headers slow-body slowloris is bounded on a mutating POST route: a
+    /// client that completes the headers + a `Content-Length` then dribbles a few
+    /// body bytes and stalls is closed within the body-read timeout. The header
+    /// timeout disarms the moment headers parse, so without the body `TimeoutLayer`
+    /// hyper waits for the full promised body forever — `read_to_end` hangs until
+    /// the outer 5s timeout fails the suite. Discriminating against no bound.
+    #[tokio::test]
+    async fn http_body_read_times_out_on_dribbled_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral_with_body_timeout(state, Duration::from_millis(300)).await;
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // Full request head promising a 1000-byte body, then 4 body bytes + stall.
+        stream
+            .write_all(
+                b"POST /register HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"ki",
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+            .await
+            .expect("server closed the stalled-body connection within the body-read timeout")
+            .ok();
+        // FM4: the bound surfaces as a legible 408 the earner's reqwest path treats
+        // as retryable, flushed before the close — not a silent reset.
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("408 Request Timeout"),
+            "expected a 408 before the close, got: {text:?}"
+        );
+    }
+
+    /// A complete request body is served even under a sub-second body timeout: the
+    /// bound fires only on a SLOW body, never on a fast complete one, so an honest
+    /// registration/submit is never falsely 408'd (FM2). We send a complete body
+    /// (semantically rejected, but delivered in full) and assert a normal HTTP
+    /// status comes back promptly — not a timeout.
+    #[tokio::test]
+    async fn http_complete_body_served_under_tiny_body_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral_with_body_timeout(state, Duration::from_millis(300)).await;
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let body = b"{}";
+        let req = format!(
+            "POST /register HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+            .await
+            .expect("a complete-body POST returns promptly, not a timeout-close")
+            .ok();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.starts_with("HTTP/1.1") && !text.contains("408"),
+            "the complete body reached the handler (a fast non-408 response), got: {text:?}"
+        );
     }
 
     /// Graceful shutdown is preserved by the hand-rolled accept loop: firing the
@@ -6790,6 +6874,20 @@ mod tests {
         assert_eq!(
             Args::parse_from(["coordinator", "--handshake-timeout-secs", "3"]).handshake_timeout_secs,
             3,
+            "the flag is honored"
+        );
+    }
+
+    #[test]
+    fn args_http_body_timeout_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).http_body_timeout_secs,
+            DEFAULT_HTTP_BODY_TIMEOUT.as_secs(),
+            "unset default == the const"
+        );
+        assert_eq!(
+            Args::parse_from(["coordinator", "--http-body-timeout-secs", "7"]).http_body_timeout_secs,
+            7,
             "the flag is honored"
         );
     }
