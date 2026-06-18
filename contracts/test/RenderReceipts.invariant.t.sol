@@ -3,10 +3,19 @@ pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
 import {RenderReceipts, IEAS, ISchemaRegistry} from "../src/RenderReceipts.sol";
+import {RegionAuthority} from "../src/RegionAuthority.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 // ---------------------------------------------------------------------------
 // Local mocks — same shape as RenderReceipts.t.sol
 // ---------------------------------------------------------------------------
+
+/// @dev Real $BLCKFLD stand-in for the region fee-share. The deployer holds the supply.
+contract MockToken is ERC20 {
+    constructor() ERC20("Mock", "MCK") {
+        _mint(msg.sender, 1_000_000 ether);
+    }
+}
 
 /// @dev Records the last attest request and returns a deterministic uid.
 contract MockEAS is IEAS {
@@ -198,6 +207,8 @@ contract RenderReceiptsInvariantTest is Test {
     RenderReceipts receipts;
     MockEAS eas;
     MockSchemaRegistry registry;
+    RegionAuthority region;
+    MockToken token;
     RenderReceiptsHandler handler;
 
     address owner = address(0xA11CE);
@@ -205,7 +216,9 @@ contract RenderReceiptsInvariantTest is Test {
     function setUp() public {
         eas = new MockEAS();
         registry = new MockSchemaRegistry();
-        receipts = new RenderReceipts(address(eas), owner);
+        token = new MockToken();
+        region = new RegionAuthority(address(token), 100 ether, owner);
+        receipts = new RenderReceipts(address(eas), owner, address(region), 1e12);
 
         // Build actor list: first two authorized, last two not.
         address[] memory actors = new address[](4);
@@ -298,6 +311,8 @@ contract RenderReceiptsFuzzTest is Test {
     RenderReceipts receipts;
     MockEAS eas;
     MockSchemaRegistry registry;
+    RegionAuthority region;
+    MockToken token;
 
     address owner = address(0xA11CE);
     address coordinator = address(0xC0DE);
@@ -305,7 +320,9 @@ contract RenderReceiptsFuzzTest is Test {
     function setUp() public {
         eas = new MockEAS();
         registry = new MockSchemaRegistry();
-        receipts = new RenderReceipts(address(eas), owner);
+        token = new MockToken();
+        region = new RegionAuthority(address(token), 100 ether, owner);
+        receipts = new RenderReceipts(address(eas), owner, address(region), 1e12);
 
         vm.startPrank(owner);
         receipts.registerSchema(address(registry));

@@ -3,7 +3,69 @@ pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
 import {RenderReceipts, IEAS, ISchemaRegistry} from "../src/RenderReceipts.sol";
+import {RegionAuthority} from "../src/RegionAuthority.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+
+/// @dev Real $BLCKFLD stand-in: the coordinator/treasury pays the region fee-share from
+///      this, and RegionAuthority stakes/pulls it. The test contract holds the supply.
+contract MockToken is ERC20 {
+    constructor() ERC20("Mock", "MCK") {
+        _mint(msg.sender, 1_000_000 ether);
+    }
+}
+
+/// @dev A RegionAuthority-shaped contract whose TOKEN() is the zero address — a misconfig
+///      the RenderReceipts constructor must reject (ZeroFeeToken) rather than binding a
+///      zero fee token. Only TOKEN() is reached during construction.
+contract ZeroTokenRegion {
+    function TOKEN() external pure returns (address) {
+        return address(0);
+    }
+}
+
+/// @dev Hostile fee token that reenters issueReceipt with the same jobId on the fee pull
+///      (transferFrom), to prove the receipt fence — set before the fee route — closes the
+///      double-issue window even when the fee token itself is malicious. The one-shot
+///      `reentered` latch also lets the outer route's second hop (RegionAuthority pulling
+///      from RenderReceipts) complete without recursing. Mirrors ReentrantEAS.
+contract ReentrantFeeToken is ERC20 {
+    RenderReceipts public target;
+    address public reEarner;
+    bytes32 public reJobId;
+    bool public armed;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    constructor() ERC20("Reentrant", "RE") {
+        _mint(msg.sender, 1_000_000 ether);
+    }
+
+    function arm(RenderReceipts target_, address earner_, bytes32 jobId_) external {
+        target = target_;
+        reEarner = earner_;
+        reJobId = jobId_;
+        armed = true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        if (armed && !reentered) {
+            reentered = true;
+            try target.issueReceipt(reEarner, reJobId, 1, 0, bytes32(0), bytes32(0)) returns (
+                bytes32
+            ) {
+            // reentry unexpectedly succeeded — reentryReverted stays false
+            }
+            catch (bytes memory err) {
+                reentryReverted = true;
+                reentryRevertSelector = bytes4(err);
+            }
+        }
+        return super.transferFrom(from, to, amount);
+    }
+}
 
 /// @dev Records the last attest request and returns a deterministic uid.
 contract MockEAS is IEAS {
@@ -218,11 +280,22 @@ contract RenderReceiptsTest is Test {
     RenderReceipts receipts;
     MockEAS eas;
     MockSchemaRegistry registry;
+    RegionAuthority region;
+    MockToken token;
 
     address owner = address(0xA11CE);
     address coordinator = address(0xC0DE);
     address earner = address(0xEA12);
     address stranger = address(0xBEEF);
+    // Region holder (an EOA so RegionAuthority's _safeMint receiver check passes) that
+    // earns the fee-share routed into `claimedRegion`.
+    address regionHolder = address(0x5E6104);
+
+    uint256 constant RENDER_FEE_RATE = 1e12; // per render-second, real $BLCKFLD
+    uint256 constant STAKE = 100 ether;
+    // A claimed region the fee-share routes into; its bytes32 form is the receipt field.
+    uint256 claimedRegion = uint256(keccak256("region-claimed"));
+    bytes32 claimedRegionId = keccak256("region-claimed");
 
     event ReceiptIssued(
         bytes32 indexed uid,
@@ -234,11 +307,34 @@ contract RenderReceiptsTest is Test {
     event ReceiptRevoked(bytes32 indexed uid, address indexed earner, bytes32 indexed jobId);
     event CoordinatorSet(address indexed coordinator, bool authorized);
     event SchemaRegistered(bytes32 indexed uid);
+    event RenderFeeRateSet(uint256 rate);
+    event RenderFeeRouted(bytes32 indexed jobId, uint256 indexed regionId, uint256 amount);
+    // RegionAuthority's intake event, re-declared for expectEmit against the region.
+    event FeesDeposited(uint256 indexed tokenId, address indexed from, uint256 amount);
 
     function setUp() public {
         eas = new MockEAS();
         registry = new MockSchemaRegistry();
-        receipts = new RenderReceipts(address(eas), owner);
+        token = new MockToken();
+        region = new RegionAuthority(address(token), STAKE, owner);
+        receipts = new RenderReceipts(address(eas), owner, address(region), RENDER_FEE_RATE);
+
+        // Claim a region (held by a dedicated EOA) so the fee-share has a live recipient.
+        // Existing tests pass arbitrary unclaimed regionIds, so their route is skipped and
+        // they need no fee funding; the fee-routing tests target `claimedRegion`.
+        token.transfer(regionHolder, STAKE);
+        vm.startPrank(regionHolder);
+        token.approve(address(region), STAKE);
+        region.claim(claimedRegion, STAKE);
+        vm.stopPrank();
+    }
+
+    /// @dev Fund the coordinator (the fee payer) with real $BLCKFLD and approve receipts
+    ///      to pull it, so a fee-routing receipt can transfer the region fee-share.
+    function _fundCoordinator(uint256 amount) internal {
+        token.transfer(coordinator, amount);
+        vm.prank(coordinator);
+        token.approve(address(receipts), type(uint256).max);
     }
 
     // --- construction ---
@@ -248,6 +344,56 @@ contract RenderReceiptsTest is Test {
         assertEq(receipts.owner(), owner);
         assertEq(receipts.schemaUid(), bytes32(0));
         assertEq(receipts.receiptCount(), 0);
+    }
+
+    function test_constructor_wiresRegionAuthorityAndFeeToken() public view {
+        assertEq(address(receipts.regionAuthority()), address(region));
+        assertEq(receipts.renderFeeRate(), RENDER_FEE_RATE);
+        // The fee token is derived from RegionAuthority.TOKEN(), never desyncing from what
+        // depositFees pulls (mirrors ArtifactTemplate.royaltyToken).
+        assertEq(address(receipts.feeToken()), address(token));
+    }
+
+    function test_constructor_revertsZeroRegionAuthority() public {
+        vm.expectRevert(RenderReceipts.ZeroRegionAuthority.selector);
+        new RenderReceipts(address(eas), owner, address(0), RENDER_FEE_RATE);
+    }
+
+    function test_constructor_revertsZeroFeeRate() public {
+        // A zero rate would silently disable the region fee gate — reject at construction
+        // (mirrors RegionAuthority's ZeroStake and ArtifactTemplate's ZeroRoyaltyRate).
+        vm.expectRevert(RenderReceipts.ZeroFeeRate.selector);
+        new RenderReceipts(address(eas), owner, address(region), 0);
+    }
+
+    function test_constructor_revertsZeroFeeToken() public {
+        // A RegionAuthority whose TOKEN() is zero is a misconfig; fail loudly at deploy
+        // rather than letting every fee-routing receipt revert opaquely at SafeERC20.
+        ZeroTokenRegion bad = new ZeroTokenRegion();
+        vm.expectRevert(RenderReceipts.ZeroFeeToken.selector);
+        new RenderReceipts(address(eas), owner, address(bad), RENDER_FEE_RATE);
+    }
+
+    // --- setRenderFeeRate ---
+
+    function test_setRenderFeeRate_updatesAndEmits() public {
+        vm.expectEmit(false, false, false, true);
+        emit RenderFeeRateSet(5e12);
+        vm.prank(owner);
+        receipts.setRenderFeeRate(5e12);
+        assertEq(receipts.renderFeeRate(), 5e12);
+    }
+
+    function test_setRenderFeeRate_revertsZero() public {
+        vm.expectRevert(RenderReceipts.ZeroFeeRate.selector);
+        vm.prank(owner);
+        receipts.setRenderFeeRate(0);
+    }
+
+    function test_setRenderFeeRate_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        vm.prank(stranger);
+        receipts.setRenderFeeRate(5e12);
     }
 
     // --- registerSchema ---
@@ -562,7 +708,7 @@ contract RenderReceiptsTest is Test {
     ///      (Would fail if the flag were written after the attest call.)
     function test_issueReceipt_reentrantAttestCannotDoubleIssue() public {
         ReentrantEAS reentrantEas = new ReentrantEAS();
-        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner);
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner, address(region), RENDER_FEE_RATE);
 
         bytes32 jobId = keccak256("reentrant-job");
         reentrantEas.arm(r, earner, jobId);
@@ -772,7 +918,7 @@ contract RenderReceiptsTest is Test {
     ///      decrement, counters consistent. (Fails if the flag moved after the call.)
     function test_revokeReceipt_reentrantRevokeCannotDoubleDecrement() public {
         ReentrantRevokeEAS reentrantEas = new ReentrantRevokeEAS();
-        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner);
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner, address(region), RENDER_FEE_RATE);
 
         bytes32 jobId = keccak256("reentrant-revoke-job");
         reentrantEas.arm(r, jobId);
@@ -811,7 +957,7 @@ contract RenderReceiptsTest is Test {
     ///      reentry would revert in EAS instead, with a different selector.)
     function test_issueReceipt_reentrantRevokeDuringAttestIsRejected() public {
         ReentrantIssueRevokeEAS reentrantEas = new ReentrantIssueRevokeEAS();
-        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner);
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner, address(region), RENDER_FEE_RATE);
 
         bytes32 jobId = keccak256("reentrant-revoke-during-attest");
         reentrantEas.arm(r, jobId);
@@ -837,6 +983,205 @@ contract RenderReceiptsTest is Test {
         assertFalse(r.receiptRevoked(jobId));
         assertTrue(r.receiptIssued(jobId));
         assertEq(r.receiptUid(jobId), uid);
+    }
+
+    // --- render fee-share routing ---
+
+    function test_issueReceipt_routesFeeToClaimedRegion() public {
+        _arm();
+        _fundCoordinator(1 ether);
+
+        uint64 renderSeconds = 1000;
+        uint256 expectedFee = RENDER_FEE_RATE * renderSeconds;
+        bytes32 jobId = keccak256("fee-job");
+        uint256 coordBefore = token.balanceOf(coordinator);
+
+        vm.expectEmit(true, true, false, true);
+        emit RenderFeeRouted(jobId, claimedRegion, expectedFee);
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, renderSeconds, 0, bytes32(0), claimedRegionId);
+
+        assertEq(region.accruedFees(claimedRegion), expectedFee);
+        assertEq(token.balanceOf(coordinator), coordBefore - expectedFee);
+        // RenderReceipts nets zero — the fee passed straight through, no standing balance
+        // and no standing allowance survive the deposit.
+        assertEq(token.balanceOf(address(receipts)), 0);
+        assertEq(token.allowance(address(receipts), address(region)), 0);
+        // The region holder can withdraw exactly the routed fee — end to end.
+        vm.prank(regionHolder);
+        region.claimFees(claimedRegion);
+        assertEq(token.balanceOf(regionHolder), expectedFee);
+    }
+
+    /// @dev The fee is `renderFeeRate * renderSeconds` per receipt; multiple receipts
+    ///      accrue additively into the region pool.
+    function test_issueReceipt_feeScalesWithRenderSecondsAndAccrues() public {
+        _arm();
+        _fundCoordinator(1 ether);
+
+        vm.startPrank(coordinator);
+        receipts.issueReceipt(earner, keccak256("s1"), 100, 0, bytes32(0), claimedRegionId);
+        receipts.issueReceipt(earner, keccak256("s2"), 250, 0, bytes32(0), claimedRegionId);
+        vm.stopPrank();
+
+        assertEq(region.accruedFees(claimedRegion), RENDER_FEE_RATE * (100 + 250));
+    }
+
+    /// @dev The fee routes to the RECEIPT'S OWN region (its regionId field), not a fixed
+    ///      one: a receipt naming region B accrues there, leaving the setUp region at zero.
+    function test_issueReceipt_routesToTheReceiptsOwnRegion() public {
+        _arm();
+        _fundCoordinator(1 ether);
+
+        uint256 regionB = uint256(keccak256("region-B"));
+        bytes32 regionBId = keccak256("region-B");
+        address holderB = address(0x5E6105);
+        token.transfer(holderB, STAKE);
+        vm.startPrank(holderB);
+        token.approve(address(region), STAKE);
+        region.claim(regionB, STAKE);
+        vm.stopPrank();
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, keccak256("jb"), 500, 0, bytes32(0), regionBId);
+
+        assertEq(region.accruedFees(regionB), RENDER_FEE_RATE * 500);
+        assertEq(region.accruedFees(claimedRegion), 0);
+    }
+
+    /// @dev THE divergence from ArtifactTemplate: an unclaimed/unknown region SKIPS the fee
+    ///      route but the attestation still issues. A render receipt is the canonical proof
+    ///      of validated work and must never be bricked by whether someone staked the
+    ///      region (depositFees would revert UnknownRegion); the coordinator pays nothing.
+    function test_issueReceipt_unknownRegionSkipsFeeButStillAttests() public {
+        _arm();
+        _fundCoordinator(1 ether);
+        uint256 coordBefore = token.balanceOf(coordinator);
+
+        bytes32 unknownRegion = keccak256("never-claimed");
+        bytes32 jobId = keccak256("unknown-region-job");
+
+        vm.prank(coordinator);
+        bytes32 uid = receipts.issueReceipt(earner, jobId, 1000, 3, keccak256("out"), unknownRegion);
+
+        assertTrue(receipts.receiptIssued(jobId));
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(eas.attestCalls(), 1);
+        assertEq(receipts.receiptUid(jobId), uid);
+        // No fee routed: coordinator untouched, the unknown region accrued nothing.
+        assertEq(token.balanceOf(coordinator), coordBefore);
+        assertEq(region.accruedFees(uint256(unknownRegion)), 0);
+    }
+
+    /// @dev A zero fee (renderSeconds == 0) skips the route even for a claimed region —
+    ///      mirrors ArtifactTemplate's rarity-0 skip. The receipt still issues.
+    function test_issueReceipt_zeroRenderSecondsSkipsFeeEvenForClaimedRegion() public {
+        _arm();
+        _fundCoordinator(1 ether);
+        uint256 coordBefore = token.balanceOf(coordinator);
+        bytes32 jobId = keccak256("zero-seconds");
+
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 0, 2, bytes32(0), claimedRegionId);
+
+        assertTrue(receipts.receiptIssued(jobId));
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(token.balanceOf(coordinator), coordBefore);
+        assertEq(region.accruedFees(claimedRegion), 0);
+    }
+
+    /// @dev A claimed region with the coordinator unable to COVER the fee reverts the whole
+    ///      issue (issues nothing) — full rollback, so an underfunded coordinator never
+    ///      attests without paying the region. Insufficient balance variant.
+    function test_issueReceipt_insufficientBalanceRevertsAndIssuesNothing() public {
+        _arm();
+        uint64 renderSeconds = 1000;
+        uint256 fee = RENDER_FEE_RATE * renderSeconds;
+        // Coordinator approves max but holds one wei less than the fee.
+        token.transfer(coordinator, fee - 1);
+        vm.prank(coordinator);
+        token.approve(address(receipts), type(uint256).max);
+
+        bytes32 jobId = keccak256("poor-coord");
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, coordinator, fee - 1, fee)
+        );
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, renderSeconds, 0, bytes32(0), claimedRegionId);
+
+        // Full rollback: never issued, never attested, region accrued nothing.
+        assertFalse(receipts.receiptIssued(jobId));
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(eas.attestCalls(), 0);
+        assertEq(region.accruedFees(claimedRegion), 0);
+    }
+
+    /// @dev Insufficient ALLOWANCE variant — the coordinator holds the funds but
+    ///      under-approves RenderReceipts; same full rollback.
+    function test_issueReceipt_insufficientAllowanceRevertsAndIssuesNothing() public {
+        _arm();
+        uint64 renderSeconds = 1000;
+        uint256 fee = RENDER_FEE_RATE * renderSeconds;
+        token.transfer(coordinator, 1 ether);
+        vm.prank(coordinator);
+        token.approve(address(receipts), fee - 1);
+
+        bytes32 jobId = keccak256("under-approved");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IERC20Errors.ERC20InsufficientAllowance.selector, address(receipts), fee - 1, fee
+            )
+        );
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, renderSeconds, 0, bytes32(0), claimedRegionId);
+
+        assertFalse(receipts.receiptIssued(jobId));
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(eas.attestCalls(), 0);
+    }
+
+    /// @dev CEI under a hostile fee token: the token reenters issueReceipt with the same
+    ///      jobId during the fee pull, but the receipt fence (set before the route) rejects
+    ///      it with DuplicateReceipt — exactly one receipt, one attest, one deposit. Proves
+    ///      the fee route's external call cannot reopen the double-issue window.
+    function test_issueReceipt_reentrantFeeTokenCannotDoubleIssue() public {
+        ReentrantFeeToken evil = new ReentrantFeeToken(); // this test holds the supply
+        MockEAS localEas = new MockEAS();
+        RegionAuthority evilRegion = new RegionAuthority(address(evil), STAKE, owner);
+        RenderReceipts r = new RenderReceipts(address(localEas), owner, address(evilRegion), RENDER_FEE_RATE);
+
+        // Claim the region BEFORE arming, so claim's own transferFrom doesn't reenter.
+        evil.transfer(regionHolder, STAKE);
+        vm.startPrank(regionHolder);
+        evil.approve(address(evilRegion), STAKE);
+        evilRegion.claim(claimedRegion, STAKE);
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(evil), true); // the reentry's msg.sender is the token
+        vm.stopPrank();
+
+        evil.transfer(coordinator, 1 ether);
+        vm.prank(coordinator);
+        evil.approve(address(r), type(uint256).max);
+
+        bytes32 jobId = keccak256("reentrant-fee-job");
+        evil.arm(r, earner, jobId);
+
+        vm.prank(coordinator);
+        r.issueReceipt(earner, jobId, 1, 0, bytes32(0), claimedRegionId);
+
+        assertTrue(evil.reentered());
+        assertTrue(evil.reentryReverted());
+        assertEq(evil.reentryRevertSelector(), RenderReceipts.DuplicateReceipt.selector);
+
+        // One receipt, one attestation, one deposit — the fence held under the hostile pull.
+        assertEq(localEas.attestCalls(), 1);
+        assertEq(r.receiptCount(), 1);
+        assertEq(evilRegion.accruedFees(claimedRegion), RENDER_FEE_RATE * 1);
     }
 
     // --- Ownable2Step ---

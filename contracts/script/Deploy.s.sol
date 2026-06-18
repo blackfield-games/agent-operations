@@ -21,6 +21,7 @@ contract Deploy is Script {
         address owner; // Ownable owner across all four contracts
         address coordinator; // authorized render-job coordinator + minter
         uint256 stakeRequired; // $BLCKFLD required to claim a region
+        uint256 renderFeeRate; // RenderReceipts per-render-second region fee-share
         string artifactBaseUri; // ERC-1155 base URI for artifact templates
         uint256 artifactMintFeeRate; // ArtifactTemplate per-unit full-rarity mint fee
         uint256 artifactRoyaltyRate; // ArtifactTemplate per-unit full-rarity region royalty
@@ -60,11 +61,19 @@ contract Deploy is Script {
         // 1. Compute budget meter — burns $BLCKFLD, credits buyers.
         ComputeMeter computeMeter = new ComputeMeter(cfg.token, deployer);
 
-        // 2. Render receipts — EAS attestations for validated render-jobs.
-        RenderReceipts renderReceipts = new RenderReceipts(cfg.eas, deployer);
-
-        // 3. Region authority — staked ERC-721 over world regions.
+        // 2. Region authority — staked ERC-721 over world regions. Deployed before
+        //    RenderReceipts because the latter routes a per-receipt fee-share into a
+        //    region via depositFees and reads its fee token from RegionAuthority.TOKEN().
         RegionAuthority regionAuthority = new RegionAuthority(cfg.token, cfg.stakeRequired, deployer);
+
+        // 3. Render receipts — EAS attestations for validated render-jobs; each validated
+        //    receipt routes a real-$BLCKFLD fee-share (renderFeeRate per render-second,
+        //    pulled from the issuing coordinator) into the receipt's region on the
+        //    RegionAuthority above. depositFees is permissionless, so no cross-contract
+        //    authorization is wired here; the fee token is derived from
+        //    RegionAuthority.TOKEN() (== cfg.token), never a separate arg that could desync.
+        RenderReceipts renderReceipts =
+            new RenderReceipts(cfg.eas, deployer, address(regionAuthority), cfg.renderFeeRate);
 
         // 4. Artifact templates — ERC-1155 player-authored artifacts; mints debit the
         //    rarity-scaled fee from the recipient's credit on this ComputeMeter and
@@ -124,6 +133,10 @@ contract Deploy is Script {
         cfg.owner = vm.envOr("OWNER_ADDRESS", msg.sender);
         cfg.coordinator = vm.envOr("COORDINATOR_ADDRESS", msg.sender);
         cfg.stakeRequired = vm.envOr("REGION_STAKE_REQUIRED", uint256(100_000 ether));
+        // Per-render-second region fee-share, in $BLCKFLD wei. A render job's fee is this
+        // times its render-seconds, so the rate is a micro-amount; the operator sets the
+        // real economic value via env before mainnet (placeholder default like the rates).
+        cfg.renderFeeRate = vm.envOr("RENDER_FEE_RATE", uint256(1e12));
         cfg.artifactBaseUri =
             vm.envOr("ARTIFACT_BASE_URI", string("https://artifacts.blackfield.xyz/{id}.json"));
         cfg.artifactMintFeeRate = vm.envOr("ARTIFACT_MINT_FEE_RATE", uint256(1 ether));

@@ -65,6 +65,7 @@ contract DeployTest is Test {
             owner: owner,
             coordinator: coordinator,
             stakeRequired: 50_000 ether,
+            renderFeeRate: 1e12,
             artifactBaseUri: "https://artifacts.test/{id}.json",
             artifactMintFeeRate: 1 ether,
             artifactRoyaltyRate: 1 ether
@@ -144,6 +145,23 @@ contract DeployTest is Test {
         assertEq(deployed.artifactTemplate.royaltyRate(), 1 ether, "artifact royalty rate not wired");
     }
 
+    function test_renderReceiptsWiredForRegionFee() public view {
+        // RenderReceipts routes a per-receipt fee-share into a region on the RegionAuthority
+        // deployed alongside, paying in the token RegionAuthority pulls — it derives the
+        // fee token from RegionAuthority.TOKEN() so the two can never desync.
+        assertEq(
+            address(deployed.renderReceipts.regionAuthority()),
+            address(deployed.regionAuthority),
+            "render receipts region authority not wired"
+        );
+        assertEq(
+            address(deployed.renderReceipts.feeToken()),
+            address(token),
+            "render fee token not bound to RegionAuthority.TOKEN()"
+        );
+        assertEq(deployed.renderReceipts.renderFeeRate(), 1e12, "render fee rate not wired");
+    }
+
     function test_ownershipHandoffIsTwoStep() public {
         // Fresh deploy so we observe the pre-acceptance pending state.
         Deploy.DeployConfig memory cfg = Deploy.DeployConfig({
@@ -153,6 +171,7 @@ contract DeployTest is Test {
             owner: owner,
             coordinator: coordinator,
             stakeRequired: 1 ether,
+            renderFeeRate: 1e12,
             artifactBaseUri: "ipfs://{id}",
             artifactMintFeeRate: 1 ether,
             artifactRoyaltyRate: 1 ether
