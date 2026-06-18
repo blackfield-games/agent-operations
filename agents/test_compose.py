@@ -13,7 +13,7 @@ import pytest
 
 from common.compose import compose_world, layer_summary, STRENGTH_ORDER
 from common.types import LayerSpec
-from runtime.supervisor import merge_layers
+from runtime.supervisor import SPECIALISTS, merge_layers
 
 
 def test_rerun_layer_replaces_stale_one():
@@ -86,6 +86,49 @@ def test_strength_order_is_exactly_locked():
     assert STRENGTH_ORDER[0] == "validator", "validator must be strongest (last word)"
     assert STRENGTH_ORDER[-1] == "director", "director must be weakest (base intent)"
     assert len(STRENGTH_ORDER) == len(set(STRENGTH_ORDER))
+
+
+def test_every_routed_specialist_has_a_strength_order_slot():
+    """Every specialist the supervisor routes emits a composed layer, so it MUST
+    have a STRENGTH_ORDER slot: without one, compose_world rejects its layer (the
+    unknown-specialist guard) and the world can't be composed — or, on a run where
+    that specialist happens to emit nothing, ships silently missing it. This lifts
+    compose_world's per-layer runtime guard to a set invariant caught in CI when
+    SPECIALISTS and STRENGTH_ORDER drift, not on a production run.
+    """
+    unranked = set(SPECIALISTS) - set(STRENGTH_ORDER)
+    assert unranked == set(), (
+        f"specialist(s) {sorted(unranked)} are routed by supervisor.SPECIALISTS "
+        f"but have no slot in common.compose.STRENGTH_ORDER — add them to "
+        f"STRENGTH_ORDER (do NOT remove them from SPECIALISTS to silence this)"
+    )
+
+
+def test_strength_order_extras_are_exactly_the_validator():
+    """STRENGTH_ORDER is the routed specialists PLUS exactly ``validator``. The
+    validator is the strongest slot (its "last word" on any prim), but its node
+    emits a verdict, not a LayerSpec, so it is intentionally absent from
+    SPECIALISTS. Pinning the exact difference catches a stale STRENGTH_ORDER entry
+    that is neither a routed specialist nor the validator (a rank for a removed
+    specialist), which the subset check above cannot see.
+    """
+    extras = set(STRENGTH_ORDER) - set(SPECIALISTS)
+    assert extras == {"validator"}, (
+        f"STRENGTH_ORDER ranks non-specialist entr(ies) {sorted(extras)}; only "
+        f"'validator' (router-only, emits no composed layer) may rank without "
+        f"being in supervisor.SPECIALISTS"
+    )
+
+
+def test_coverage_invariant_discriminates_an_unranked_specialist():
+    """The subset invariant is not vacuous: a specialist added to the routing set
+    without a STRENGTH_ORDER slot is reported as unranked. Without this, a future
+    refactor that weakened the check to always-pass would go unnoticed.
+    """
+    simulated = {*SPECIALISTS, "weather"}
+    assert simulated - set(STRENGTH_ORDER) == {"weather"}
+    # The real sets remain clean — the failing case above is purely simulated.
+    assert set(SPECIALISTS) - set(STRENGTH_ORDER) == set()
 
 
 def test_compose_orders_sublayers_strongest_first_regardless_of_input_order(tmp_path):
