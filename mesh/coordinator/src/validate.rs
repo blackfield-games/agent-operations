@@ -50,6 +50,96 @@ impl ValidationError {
     }
 }
 
+/// Why a `POST /jobs` creation request failed the ingestion gate. The job-result
+/// content gate ([`ValidationError`]) guards what an *earner* submits; this
+/// guards what a *job creator* submits, before the spec is ever enqueued.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JobSpecError {
+    /// `deadline_secs` is zero. A zero deadline is the operator-only unbounded
+    /// mode — the wall-clock TTL reaper exempts it (never reaped) and
+    /// [`validate_render_seconds`] skips the plausibility bound for it — so an
+    /// untrusted creator must not be able to mint one.
+    ZeroDeadline,
+    /// `deadline_secs` exceeds [`MAX_DEADLINE_SECS`]. Render jobs are seconds to
+    /// minutes; an absurd deadline is rejected as hygiene.
+    DeadlineTooLong,
+    /// `max_payout_wei` does not parse as a `u128` (empty, non-numeric, negative,
+    /// or above `u128::MAX`). The store sums it as `u128` for `/stats`, so an
+    /// unparseable value enqueued here is a deferred 500 the moment the job
+    /// completes.
+    MalformedPayout,
+    /// `max_payout_wei` parses but exceeds [`MAX_PAYOUT_WEI`]. Kept well under
+    /// `u128::MAX` so the `/stats total_payout_wei` sum cannot overflow.
+    PayoutTooLarge,
+    /// The serialized `inputs` JSON exceeds [`MAX_INPUTS_BYTES`] — a blob that
+    /// would bloat the SQLite row and amplify request memory.
+    InputsTooLarge,
+}
+
+impl JobSpecError {
+    /// Stable, low-cardinality reason string for the reject log.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            JobSpecError::ZeroDeadline => "deadline_secs is zero (the operator-only unbounded mode)",
+            JobSpecError::DeadlineTooLong => "deadline_secs exceeds the maximum",
+            JobSpecError::MalformedPayout => "max_payout_wei is not a non-negative integer (u128 wei)",
+            JobSpecError::PayoutTooLarge => "max_payout_wei exceeds the maximum",
+            JobSpecError::InputsTooLarge => "inputs exceeds the maximum serialized size",
+        }
+    }
+}
+
+/// Upper bound on a job's `deadline_secs` accepted at ingestion. 24h is generous
+/// for any single render job (terrain/diffusion-tile/optimization run in seconds
+/// to minutes), so an honest job always passes; `0` is rejected separately as
+/// the operator-only unbounded escape hatch.
+pub const MAX_DEADLINE_SECS: u32 = 86_400;
+
+/// Upper bound on `max_payout_wei` (1e30 wei = 1e12 $BLCKFLD). Astronomically
+/// above any plausible single-job payout, yet far below `u128::MAX` (~3.4e38), so
+/// even an unbounded backlog of max-payout jobs cannot overflow the `u128`
+/// `/stats total_payout_wei` sum.
+pub const MAX_PAYOUT_WEI: u128 = 10u128.pow(30);
+
+/// Upper bound on the serialized `inputs` JSON (16 KiB). Inputs are asset URLs +
+/// hashes (small); the cap stops a multi-megabyte blob from bloating the SQLite
+/// row or amplifying request memory.
+pub const MAX_INPUTS_BYTES: usize = 16 * 1024;
+
+/// Validate a job-creation request before it is enqueued. Pure function of the
+/// caller-supplied fields — no store, no network — so it runs before any lock.
+/// `kind` and `region` are type-checked by the JSON deserializer, so only the
+/// free-form scalars need gating here. The job `id` is deliberately NOT a
+/// parameter: the coordinator mints it, so a caller can never collide with (and
+/// overwrite, via `enqueue`'s `ON CONFLICT(id) DO UPDATE`) an existing job.
+pub fn validate_job_spec(
+    deadline_secs: u32,
+    max_payout_wei: &str,
+    inputs: &serde_json::Value,
+) -> Result<(), JobSpecError> {
+    if deadline_secs == 0 {
+        return Err(JobSpecError::ZeroDeadline);
+    }
+    if deadline_secs > MAX_DEADLINE_SECS {
+        return Err(JobSpecError::DeadlineTooLong);
+    }
+    // Must parse as the same u128 the store sums for `/stats`; this rejects
+    // empty, non-numeric, signed, and > u128::MAX before the value can be stored.
+    let wei: u128 = max_payout_wei
+        .parse()
+        .map_err(|_| JobSpecError::MalformedPayout)?;
+    if wei > MAX_PAYOUT_WEI {
+        return Err(JobSpecError::PayoutTooLarge);
+    }
+    // A `Value` always serializes; treat the unreachable error as oversized
+    // rather than unwrap so a pathological input fails closed.
+    let inputs_len = serde_json::to_vec(inputs).map(|v| v.len()).unwrap_or(usize::MAX);
+    if inputs_len > MAX_INPUTS_BYTES {
+        return Err(JobSpecError::InputsTooLarge);
+    }
+    Ok(())
+}
+
 /// 32-byte digest rendered as lowercase hex.
 const OUTPUT_HASH_LEN: usize = 64;
 
@@ -307,5 +397,116 @@ mod tests {
         // deadline * SLACK is computed in u64, so a large deadline can't wrap and
         // spuriously reject a plausible render.
         assert_eq!(validate_render_seconds(u32::MAX, u32::MAX), Ok(()));
+    }
+
+    // -- job-creation ingestion gate (validate_job_spec) -------------------
+
+    fn ok_inputs() -> serde_json::Value {
+        serde_json::json!({ "asset_url": "https://cdn.example.com/tile.usd", "lod": 2 })
+    }
+
+    #[test]
+    fn accepts_a_wellformed_job_spec() {
+        assert_eq!(
+            validate_job_spec(60, "1000000000000000000", &ok_inputs()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_zero_deadline() {
+        // The operator-only unbounded escape hatch must never come from a caller.
+        assert_eq!(
+            validate_job_spec(0, "1000000000000000000", &ok_inputs()),
+            Err(JobSpecError::ZeroDeadline)
+        );
+    }
+
+    #[test]
+    fn accepts_deadline_at_the_max() {
+        assert_eq!(
+            validate_job_spec(MAX_DEADLINE_SECS, "0", &ok_inputs()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_deadline_over_the_max() {
+        assert_eq!(
+            validate_job_spec(MAX_DEADLINE_SECS + 1, "0", &ok_inputs()),
+            Err(JobSpecError::DeadlineTooLong)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_payout() {
+        assert_eq!(
+            validate_job_spec(60, "", &ok_inputs()),
+            Err(JobSpecError::MalformedPayout)
+        );
+    }
+
+    #[test]
+    fn rejects_nonnumeric_payout() {
+        assert_eq!(
+            validate_job_spec(60, "1e18", &ok_inputs()),
+            Err(JobSpecError::MalformedPayout)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_payout() {
+        assert_eq!(
+            validate_job_spec(60, "-1", &ok_inputs()),
+            Err(JobSpecError::MalformedPayout)
+        );
+    }
+
+    #[test]
+    fn rejects_payout_above_u128_max() {
+        // u128::MAX is ~3.4e38; one more digit does not parse as u128 — the exact
+        // value the store's total_payout_wei sum would choke on if it were stored.
+        let over_u128 = "1000000000000000000000000000000000000000"; // 1e39
+        assert_eq!(
+            validate_job_spec(60, over_u128, &ok_inputs()),
+            Err(JobSpecError::MalformedPayout)
+        );
+    }
+
+    #[test]
+    fn rejects_payout_over_the_policy_cap() {
+        // Parses as u128 but exceeds MAX_PAYOUT_WEI — rejected before it can be
+        // summed, so the /stats u128 total can never approach overflow.
+        let over_cap = (MAX_PAYOUT_WEI + 1).to_string();
+        assert_eq!(
+            validate_job_spec(60, &over_cap, &ok_inputs()),
+            Err(JobSpecError::PayoutTooLarge)
+        );
+    }
+
+    #[test]
+    fn accepts_payout_at_the_policy_cap() {
+        let at_cap = MAX_PAYOUT_WEI.to_string();
+        assert_eq!(validate_job_spec(60, &at_cap, &ok_inputs()), Ok(()));
+    }
+
+    #[test]
+    fn rejects_oversized_inputs() {
+        // A blob past the cap is refused so it can't bloat the SQLite row.
+        let big = serde_json::json!({ "blob": "x".repeat(MAX_INPUTS_BYTES) });
+        assert_eq!(
+            validate_job_spec(60, "0", &big),
+            Err(JobSpecError::InputsTooLarge)
+        );
+    }
+
+    #[test]
+    fn accepts_inputs_at_the_cap() {
+        // Serialized length exactly at the cap is allowed (inclusive bound).
+        // {"blob":"x..x"} has 11 bytes of framing around the padded string.
+        let pad = MAX_INPUTS_BYTES - 11;
+        let at_cap = serde_json::json!({ "blob": "x".repeat(pad) });
+        assert_eq!(serde_json::to_vec(&at_cap).unwrap().len(), MAX_INPUTS_BYTES);
+        assert_eq!(validate_job_spec(60, "0", &at_cap), Ok(()));
     }
 }
