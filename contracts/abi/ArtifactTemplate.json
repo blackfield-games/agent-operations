@@ -20,6 +20,16 @@
         "internalType": "uint256",
         "name": "mintFeeRate_",
         "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "regionAuthority_",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "royaltyRate_",
+        "type": "uint256"
       }
     ],
     "stateMutability": "nonpayable",
@@ -148,6 +158,11 @@
         "type": "uint256"
       },
       {
+        "internalType": "uint256",
+        "name": "regionId",
+        "type": "uint256"
+      },
+      {
         "internalType": "bytes",
         "name": "data",
         "type": "bytes"
@@ -243,6 +258,19 @@
     "type": "function"
   },
   {
+    "inputs": [],
+    "name": "regionAuthority",
+    "outputs": [
+      {
+        "internalType": "contract IRegionAuthority",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [
       {
         "internalType": "address",
@@ -281,6 +309,32 @@
     "name": "renounceOwnership",
     "outputs": [],
     "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "royaltyRate",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "royaltyToken",
+    "outputs": [
+      {
+        "internalType": "contract IERC20",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "stateMutability": "view",
     "type": "function"
   },
   {
@@ -389,6 +443,19 @@
       }
     ],
     "name": "setMinter",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "rate",
+        "type": "uint256"
+      }
+    ],
+    "name": "setRoyaltyRate",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -649,6 +716,44 @@
       }
     ],
     "name": "OwnershipTransferred",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "rate",
+        "type": "uint256"
+      }
+    ],
+    "name": "RoyaltyRateSet",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "templateId",
+        "type": "uint256"
+      },
+      {
+        "indexed": true,
+        "internalType": "uint256",
+        "name": "regionId",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "RoyaltyRouted",
     "type": "event"
   },
   {
@@ -918,6 +1023,17 @@
   {
     "inputs": [
       {
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      }
+    ],
+    "name": "SafeERC20FailedOperation",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "uint256",
         "name": "templateId",
         "type": "uint256"
@@ -964,6 +1080,16 @@
   {
     "inputs": [],
     "name": "ZeroRecipient",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroRegionAuthority",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroRoyaltyRate",
     "type": "error"
   }
 ]
