@@ -46,6 +46,12 @@ class LayerSpec(BaseModel):
 class ValidatorVerdict(BaseModel):
     accepted: bool
     issues: list[str] = Field(default_factory=list)
+    # Specialists the validator blames for `issues`, attributed structurally at the
+    # point each issue is raised (not parsed back out of the text). The supervisor
+    # prefers this over scanning `issues` for names, so a prim path segment that
+    # merely looks like a specialist name can't misroute route-back. Empty/absent on
+    # an older or synthesized verdict, where the supervisor falls back to the scan.
+    failing_specialists: list[str] = Field(default_factory=list)
     fixes_applied: list[str] = Field(default_factory=list)
     layer_kept: bool = True
 
