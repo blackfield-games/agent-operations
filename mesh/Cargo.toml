@@ -24,6 +24,7 @@ sha2 = "0.10"
 sha3 = "0.10"
 getrandom = "0.2"
 k256 = { version = "0.13", features = ["ecdsa"] }
+subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
