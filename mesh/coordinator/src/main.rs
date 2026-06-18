@@ -1972,6 +1972,15 @@ mod tests {
         state
     }
 
+    /// Empty-queue state with a custom handshake timeout, for the ws handshake
+    /// timeout tests (which assert against `/stats` with no seeded-job noise and
+    /// need a sub-second bound so a fail-closed test can't slow the suite).
+    async fn test_state_empty_handshake(handshake_timeout: Duration) -> Arc<AppState> {
+        let state = test_state_handshake(handshake_timeout);
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
     /// Enqueue a job directly via the store (test helper replacing the old
     /// `state.queue.lock().await.push(job)`).
     async fn enqueue(state: &Arc<AppState>, job: &JobSpec) {
@@ -3216,13 +3225,17 @@ mod tests {
         )
     }
 
+    /// A ws read stream item — `next()` yields this from either the whole socket
+    /// or a split read-half.
+    type WsItem = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
+
     /// Read the coordinator's opening `Challenge` frame and return its nonce
     /// bytes. The coordinator now challenges on connect, so every ws test reads
     /// this before sending its Hello (and folds the nonce into the signature).
-    async fn recv_challenge(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
+    /// Generic over the read stream so the handshake-timeout tests can drive a
+    /// `split()` socket's read-half (pinging on the other half) through it.
+    async fn recv_challenge<S: futures_util::Stream<Item = WsItem> + Unpin>(
+        ws: &mut S,
     ) -> Vec<u8> {
         loop {
             match ws.next().await {
@@ -3239,13 +3252,9 @@ mod tests {
     }
 
     /// Assert the server closed the ws without first sending a frame — what a
-    /// rejected `Hello` produces (`recv_hello` returns `None`, the handler
-    /// returns, axum closes the socket).
-    async fn expect_ws_closed(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) {
+    /// rejected `Hello` (or an elapsed handshake timeout) produces (`recv_hello`
+    /// returns `None`, the handler returns, axum closes the socket).
+    async fn expect_ws_closed<S: futures_util::Stream<Item = WsItem> + Unpin>(ws: &mut S) {
         loop {
             match ws.next().await {
                 None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => return,
@@ -3407,6 +3416,102 @@ mod tests {
             body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
             0,
             "a Hello over an unissued nonce must not register",
+        );
+    }
+
+    /// THE slowloris bound: a client that upgrades, reads the challenge, and never
+    /// sends a Hello is closed by the coordinator within the handshake timeout — it
+    /// can't park a live `ws_session` task + FD forever. Bounded by an outer test
+    /// timeout so a regression (the old unbounded `recv_hello` that blocks on
+    /// `socket.recv()`) fails the suite instead of hanging it. Discriminating:
+    /// without the fix this connection never closes.
+    #[tokio::test]
+    async fn ws_handshake_times_out_when_no_hello_sent() {
+        let state = test_state_empty_handshake(Duration::from_millis(200)).await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        recv_challenge(&mut ws).await; // read the challenge, then send nothing
+        tokio::time::timeout(Duration::from_secs(5), expect_ws_closed(&mut ws))
+            .await
+            .expect("coordinator closed the silent handshake within the timeout");
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "a timed-out handshake registers nothing",
+        );
+    }
+
+    /// FM2: the bound is a SINGLE wall-clock deadline over the whole handshake, not
+    /// reset per frame — a client that drip-feeds pings (each landing on the
+    /// pre-Hello `_ => continue` arm) faster than the timeout cannot keep the
+    /// handshake loop alive indefinitely. Pinging continuously every 50ms (< the
+    /// 200ms bound), the connection must still close within a generous multiple of
+    /// the bound; a per-frame-reset implementation would never close while the
+    /// pings keep coming, so the outer assert-timeout fires and fails the test.
+    #[tokio::test]
+    async fn ws_handshake_deadline_is_not_reset_by_frames() {
+        let timeout = Duration::from_millis(200);
+        let state = test_state_empty_handshake(timeout).await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let (ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let (mut tx, mut rx) = ws.split();
+        recv_challenge(&mut rx).await;
+        let pinger = tokio::spawn(async move {
+            loop {
+                if tx.send(WsMessage::Ping(Vec::new())).await.is_err() {
+                    break; // coordinator closed the socket — stop pinging
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        tokio::time::timeout(timeout * 10, expect_ws_closed(&mut rx))
+            .await
+            .expect("the single handshake deadline fired despite the ping flood");
+        pinger.abort();
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "the ping-flooded handshake registers nothing",
+        );
+    }
+
+    /// FM4: a timed-out handshake is a plain fail-closed — it inserts nothing AND
+    /// evicts nothing (the no-evict-on-reject invariant the key-possession gate
+    /// relies on). A separate live earner already in the registry survives a
+    /// concurrent handshake that times out.
+    #[tokio::test]
+    async fn ws_handshake_timeout_does_not_evict_a_registered_earner() {
+        let state = test_state_empty_handshake(Duration::from_millis(200)).await;
+        state.earners.lock().await.insert(
+            test_address("liveearner"),
+            EarnerInfo {
+                gpu_model: "RTX 4090".into(),
+                vram_gb: 24,
+                supported: vec![JobKind::Terrain],
+                last_seen: now_secs(),
+            },
+        );
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            1,
+            "the live earner is registered up front",
+        );
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        recv_challenge(&mut ws).await; // read the challenge, send nothing -> times out
+        tokio::time::timeout(Duration::from_secs(5), expect_ws_closed(&mut ws))
+            .await
+            .expect("the silent handshake closed");
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            1,
+            "a timed-out handshake must not evict the live earner",
         );
     }
 
@@ -6295,6 +6400,24 @@ mod tests {
         );
     }
 
+    /// A zero handshake timeout is rejected at construction: `timeout(ZERO, …)`
+    /// fires immediately, so every connection would close before sending its
+    /// Hello — the slowloris bound becomes a total registration outage. Any
+    /// positive bound constructs fine.
+    #[test]
+    fn with_store_rejects_zero_handshake_timeout() {
+        assert!(
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO)
+                .is_err(),
+            "a zero handshake timeout must be rejected"
+        );
+        assert!(
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1))
+                .is_ok(),
+            "the smallest positive handshake timeout constructs"
+        );
+    }
+
     /// The CLI/env default reproduces the prior hard-coded behavior, and the flag
     /// overrides it — so an unset deployment is unchanged and a dev/operator can
     /// retune without a rebuild.
@@ -6308,6 +6431,23 @@ mod tests {
         assert_eq!(
             Args::parse_from(["coordinator", "--ttl-deadline-multiple", "7"]).ttl_deadline_multiple,
             7,
+            "the flag is honored"
+        );
+    }
+
+    /// The handshake-timeout knob defaults to the const (an unset deployment gets
+    /// the generous 10s headroom) and honors the flag — an operator can tighten or
+    /// loosen the slowloris bound without a rebuild.
+    #[test]
+    fn args_handshake_timeout_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).handshake_timeout_secs,
+            DEFAULT_HANDSHAKE_TIMEOUT.as_secs(),
+            "unset default == the const"
+        );
+        assert_eq!(
+            Args::parse_from(["coordinator", "--handshake-timeout-secs", "3"]).handshake_timeout_secs,
+            3,
             "the flag is honored"
         );
     }
