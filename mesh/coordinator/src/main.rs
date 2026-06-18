@@ -3992,6 +3992,143 @@ mod tests {
         );
     }
 
+    // -- POST /jobs runtime ingestion -------------------------------------
+
+    /// A valid `POST /jobs` body. Mutate one field per negative test.
+    fn create_job_body() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "terrain",
+            "region": { "x": 7, "y": -3, "layer": 1 },
+            "deadline_secs": 120,
+            "max_payout_wei": "1000000000000000000",
+            "inputs": { "asset_url": "https://cdn.example.com/tile.usd" }
+        })
+    }
+
+    #[tokio::test]
+    async fn create_job_enqueues_and_returns_id() {
+        let state = test_state_empty().await;
+        let resp = post_json(state.clone(), "/jobs", &create_job_body()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        // The job is queryable under the assigned id, queued, with the spec we sent.
+        let detail = body_json(get(state.clone(), &format!("/jobs/{id}")).await).await;
+        assert_eq!(detail["spec"]["kind"], "terrain");
+        assert_eq!(detail["spec"]["deadline_secs"], 120);
+        assert_eq!(detail["spec"]["region"]["x"], 7);
+        assert!(detail["result"].is_null());
+
+        let status = body_json(get(state.clone(), &format!("/jobs/{id}/status")).await).await;
+        assert_eq!(status["status"], "queued");
+    }
+
+    /// The id is minted server-side: a body that smuggles an `id` of an EXISTING
+    /// job must NOT overwrite it (enqueue upserts on id, `ON CONFLICT DO UPDATE`),
+    /// nor reset its lifecycle. We dispatch the existing job to `in_flight`, then
+    /// POST a create body carrying that id + a different kind, and assert the
+    /// existing job is untouched and a fresh queued job is created instead.
+    #[tokio::test]
+    async fn create_job_ignores_caller_id_and_never_overwrites() {
+        let state = test_state_empty().await;
+        let mut existing = seed_job(); // kind = Terrain
+        existing.id = Uuid::new_v4();
+        let victim = existing.id;
+        enqueue(&state, &existing).await;
+        // Move it in_flight so an overwrite-to-queued would be visible.
+        state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+
+        let mut body = create_job_body();
+        body["id"] = serde_json::json!(victim.to_string());
+        body["kind"] = serde_json::json!("foliage");
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let new_id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        assert_ne!(new_id, victim.to_string(), "the assigned id must be freshly minted");
+        // The victim is untouched: still in_flight, still Terrain (not Foliage).
+        let v_status = body_json(get(state.clone(), &format!("/jobs/{victim}/status")).await).await;
+        assert_eq!(v_status["status"], "in_flight", "caller id must not reset lifecycle");
+        let v_detail = body_json(get(state.clone(), &format!("/jobs/{victim}")).await).await;
+        assert_eq!(v_detail["spec"]["kind"], "terrain", "caller id must not overwrite spec");
+        // The new job exists and is queued.
+        let n_status = body_json(get(state.clone(), &format!("/jobs/{new_id}/status")).await).await;
+        assert_eq!(n_status["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn create_job_rejects_malformed_payout_and_leaves_stats_clean() {
+        let state = test_state_empty().await;
+        let mut body = create_job_body();
+        body["max_payout_wei"] = serde_json::json!("not-a-number");
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // Nothing was enqueued, so /stats stays well-formed (the deferred-poison FM).
+        let stats = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(stats["jobs_queued"], 0);
+        assert_eq!(stats["total_payout_wei"], "0");
+    }
+
+    #[tokio::test]
+    async fn create_job_rejects_zero_deadline() {
+        let state = test_state_empty().await;
+        let mut body = create_job_body();
+        body["deadline_secs"] = serde_json::json!(0);
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
+    }
+
+    #[tokio::test]
+    async fn create_job_rejects_oversized_inputs() {
+        let state = test_state_empty().await;
+        let mut body = create_job_body();
+        body["inputs"] = serde_json::json!({ "blob": "x".repeat(17 * 1024) });
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
+    }
+
+    /// An unknown `kind` is rejected by the `Json` extractor (valid JSON, invalid
+    /// enum) before the handler runs — a clean client error, not a panic or 500.
+    #[tokio::test]
+    async fn create_job_rejects_unknown_kind() {
+        let state = test_state_empty().await;
+        let mut body = create_job_body();
+        body["kind"] = serde_json::json!("not_a_kind");
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert!(resp.status().is_client_error(), "got {}", resp.status());
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
+    }
+
+    /// POST /jobs carries the body-read timeout (it is a body-bearing mutating
+    /// route like /register and /submit): a dribbled body is closed with a 408,
+    /// not parked forever. Discriminating — drop the `.layer(body_timeout)` on the
+    /// route and `read_to_end` hangs past the outer 5s, failing the suite.
+    #[tokio::test]
+    async fn create_job_body_read_times_out_on_dribbled_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral_with_body_timeout(state, Duration::from_millis(300)).await;
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(
+                b"POST /jobs HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"ki",
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+            .await
+            .expect("server closed the stalled-body POST /jobs within the body-read timeout")
+            .ok();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("408 Request Timeout"),
+            "expected a 408 before the close, got: {text:?}"
+        );
+    }
+
     /// Graceful shutdown is preserved by the hand-rolled accept loop: firing the
     /// shutdown signal makes `serve()` stop accepting and return (drain), not hang
     /// — guards the FM that replacing `axum::serve`'s `with_graceful_shutdown`
