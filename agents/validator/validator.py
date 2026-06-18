@@ -46,7 +46,16 @@ USDA_MAGIC = "#usda"
 
 # A USD prim declaration: a specifier, an optional type name, a quoted prim name.
 # Drives the structural composition-conflict scan when usd-core isn't installed.
-_PRIM_DECL = re.compile(r'(def|over|class)\b[ \t]+(?:([A-Za-z_]\w*)[ \t]+)?"([^"]+)"')
+# Inter-token whitespace spans newlines: USDA treats `\n` as an ordinary separator,
+# so a head wrapped across lines (`def\nMesh\n"Hub"`) is one declaration and must
+# still resolve. The type's negative lookahead keeps a specifier keyword from being
+# read as a type name, so a malformed bare `over`/`def` with no name never swallows
+# the following `def "X"` as its type (FM2 — no fabricated prim).
+_PRIM_DECL = re.compile(
+    r"(def|over|class)\b[ \t\r\n]+"
+    r"(?:(?!(?:def|over|class)\b)([A-Za-z_]\w*)[ \t\r\n]+)?"
+    r'"([^"]+)"'
+)
 # A variantSet / variant block opener. Its `{ }` is a composition scope, not a
 # prim scope, so it must not contribute a path segment — but prims nested inside
 # (a variant can legally hold prim children) still attribute to the enclosing
