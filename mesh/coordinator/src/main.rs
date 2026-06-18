@@ -3459,6 +3459,21 @@ mod tests {
         .await
     }
 
+    /// `serve_ephemeral` with a caller-chosen connection cap, for the
+    /// connection-flood test that needs a tiny cap.
+    async fn serve_ephemeral_with_max_connections(
+        state: Arc<AppState>,
+        max_connections: usize,
+    ) -> String {
+        serve_ephemeral_cfg(
+            state,
+            DEFAULT_HTTP_HEADER_TIMEOUT,
+            DEFAULT_HTTP_BODY_TIMEOUT,
+            max_connections,
+        )
+        .await
+    }
+
     /// Bind an ephemeral port, build the router at `body_read_timeout`, and serve
     /// it through the real `serve()` accept loop at `header_read_timeout` /
     /// `max_connections` until the test drops. The shared backing for the slowloris
@@ -4011,6 +4026,95 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(ws);
+    }
+
+    /// The concurrent-connection cap is enforced: with the cap at 1, a first
+    /// keep-alive connection holds the only permit and a second connection accepted
+    /// past the cap is dropped without serving (read returns EOF, no bytes), while
+    /// the first is unaffected. Discriminating: without the cap the second
+    /// connection is accepted and parks in the (generous-default) header-read
+    /// phase, so its `read_to_end` hangs past the outer bound and fails the suite.
+    #[tokio::test]
+    async fn serve_caps_concurrent_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral_with_max_connections(state, 1).await;
+        // Conn #1: complete a request and keep the socket open (idle keep-alive),
+        // so its connection task — and the single permit — stay live for the test.
+        let mut c1 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        c1.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut head = [0u8; 12];
+        c1.read_exact(&mut head).await.unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 200"), "conn #1 was served");
+        // Two more connections past the cap of 1: each is dropped without serving
+        // (read returns EOF, no bytes). The SECOND rejection also proves conn #1
+        // still holds its permit — i.e. the cap did NOT evict the existing
+        // connection (had it, the freed permit would let one of these be accepted
+        // and park in header-read, hanging read_to_end past the outer bound).
+        // Discriminating: without the cap these are accepted and park, not closed.
+        for label in ["#2", "#3"] {
+            let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            let mut buf = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), c.read_to_end(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("conn {label} past the cap was closed promptly, not parked"))
+                .ok();
+            assert!(buf.is_empty(), "conn {label} was closed without serving, got {buf:?}");
+        }
+    }
+
+    /// Shutdown returns even with the cap saturated (FM4): the cap is a
+    /// `try_acquire` that never blocks the accept/shutdown select, and the permit is
+    /// released when the drained task ends, so a full cap can't wedge shutdown. We
+    /// saturate a cap of 1 with a live keep-alive connection, signal shutdown, and
+    /// assert `serve()` returns and the held connection drains closed.
+    #[tokio::test]
+    async fn serve_returns_on_shutdown_when_cap_saturated() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = router(state);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, 1, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        let mut c1 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        c1.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut head = [0u8; 12];
+        c1.read_exact(&mut head).await.unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 200"), "the cap-saturating connection was served");
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("serve() returned on shutdown with the cap saturated")
+            .unwrap()
+            .unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c1.read_to_end(&mut rest))
+            .await
+            .expect("the drained connection was closed")
+            .ok();
+    }
+
+    /// A zero cap is rejected at construction: `Semaphore::new(0)` would reject
+    /// every connection (a total outage), so `serve()` returns `Err` before binding
+    /// the accept loop, mirroring the header-timeout zero guard.
+    #[tokio::test]
+    async fn serve_rejects_zero_max_connections() {
+        let state = test_state_empty().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = router(state);
+        let err = serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, 0, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("max_connections must be > 0"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -6960,6 +7064,20 @@ mod tests {
         assert_eq!(
             Args::parse_from(["coordinator", "--http-body-timeout-secs", "7"]).http_body_timeout_secs,
             7,
+            "the flag is honored"
+        );
+    }
+
+    #[test]
+    fn args_max_connections_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).max_connections,
+            DEFAULT_MAX_CONNECTIONS,
+            "unset default == the const"
+        );
+        assert_eq!(
+            Args::parse_from(["coordinator", "--max-connections", "9"]).max_connections,
+            9,
             "the flag is honored"
         );
     }
