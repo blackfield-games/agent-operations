@@ -6163,6 +6163,119 @@ mod tests {
         );
     }
 
+    // ---- FIFO dispatch fairness (oldest-queued-first) ----
+
+    /// Dispatch is oldest-first: two jobs enqueued in sequence are handed out in
+    /// enqueue order (A then B), the opposite of the LIFO `rowid DESC` the
+    /// coordinator used before. Within one wall-clock second the `rowid ASC`
+    /// tiebreaker keeps the order deterministic.
+    #[tokio::test]
+    async fn dispatch_is_oldest_first() {
+        let state = test_state_empty().await;
+        let a = job_with_deadline(60);
+        let b = job_with_deadline(60);
+        enqueue(&state, &a).await;
+        enqueue(&state, &b).await;
+
+        let store = state.store.lock().await;
+        let first = store.take_next(|_| true).unwrap().unwrap().0;
+        let second = store.take_next(|_| true).unwrap().unwrap().0;
+        assert_eq!(first.id, a.id, "oldest (first-enqueued) job dispatched first");
+        assert_eq!(second.id, b.id, "newer job dispatched second");
+    }
+
+    /// `created_at` is the PRIMARY sort key, `rowid` only the tiebreaker: with three
+    /// jobs whose age order (C, A, B) disagrees with both `rowid ASC` (A, B, C) and
+    /// `rowid DESC` (C, B, A), dispatch follows age. Discriminates the FIFO ordering
+    /// from any rowid-only ordering (the old `rowid DESC` and a naive `rowid ASC`).
+    #[tokio::test]
+    async fn dispatch_orders_by_created_at_over_rowid() {
+        let state = test_state_empty().await;
+        let a = job_with_deadline(60); // rowid 1
+        let b = job_with_deadline(60); // rowid 2
+        let c = job_with_deadline(60); // rowid 3
+        enqueue(&state, &a).await;
+        enqueue(&state, &b).await;
+        enqueue(&state, &c).await;
+
+        let store = state.store.lock().await;
+        // Ages disagree with rowid: C oldest, then A, then B newest.
+        assert!(store.set_created_at(&c.id, 1000).unwrap());
+        assert!(store.set_created_at(&a.id, 2000).unwrap());
+        assert!(store.set_created_at(&b.id, 3000).unwrap());
+
+        let order: Vec<_> = (0..3)
+            .map(|_| store.take_next(|_| true).unwrap().unwrap().0.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![c.id, a.id, b.id],
+            "dispatch follows created_at age, not rowid"
+        );
+    }
+
+    /// A requeue must not slide the immutable `created_at` anchor, so a requeued
+    /// (older) job stays ahead of a job enqueued later. If requeue reset the anchor
+    /// to "now", the older job would fall behind the newer one and be dispatched
+    /// second — this pins that the requeued job returns to the front of the queue.
+    #[tokio::test]
+    async fn requeued_job_returns_to_front() {
+        let state = test_state_empty().await;
+        let old = job_with_deadline(60);
+        let fresh = job_with_deadline(60);
+        enqueue(&state, &old).await;
+        enqueue(&state, &fresh).await;
+
+        let store = state.store.lock().await;
+        assert!(store.set_created_at(&old.id, 1000).unwrap());
+        assert!(store.set_created_at(&fresh.id, 2000).unwrap());
+
+        // Dispatch the older job, then requeue it on a deadline-miss (attempt-
+        // charging) path; it is renderable so it returns to the queue.
+        let taken = store.take_next(|j| j.id == old.id).unwrap().unwrap().0;
+        assert_eq!(taken.id, old.id);
+        // requeue() returns true only on dead-letter; a renderable requeue back to
+        // queued returns false (attempts 1 < max 5).
+        assert!(
+            !store.requeue(&old, 5).unwrap(),
+            "renderable job is requeued, not dead-lettered"
+        );
+
+        // It is still the oldest by created_at, so it is dispatched again before the
+        // job enqueued after it — the requeue did not slide its anchor to the back.
+        let next = store.take_next(|_| true).unwrap().unwrap().0;
+        assert_eq!(
+            next.id, old.id,
+            "requeued job keeps its age and returns to the front"
+        );
+    }
+
+    /// FM: the new oldest-first ordering must stay served by
+    /// `idx_jobs_status_created_at` — `status = queued ORDER BY created_at ASC,
+    /// rowid ASC` EXPLAINs to an index SEARCH with no full SCAN and no temp-b-tree
+    /// sort, so the per-dispatch cost doesn't regress on a large terminal-history
+    /// table.
+    #[test]
+    fn dispatch_query_plan_uses_the_index() {
+        let store = Store::open_in_memory().unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+
+        let plan = store.dispatch_query_plan().unwrap();
+        assert!(
+            plan.contains("idx_jobs_status_created_at"),
+            "dispatch query must use the index, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN jobs"),
+            "dispatch query must not full-scan jobs, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "dispatch ordering must be index-served, not a temp-b-tree sort, got plan: {plan}"
+        );
+    }
+
     // ---- GET /jobs/{id} full detail ----
 
     /// `GET /jobs/{id}` returns the full spec; `result` is null while the job is

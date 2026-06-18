@@ -103,6 +103,28 @@ impl Store {
         Ok(plan)
     }
 
+    /// Test-only: the concatenated EXPLAIN QUERY PLAN `detail` rows for the dispatch
+    /// SELECT in `take_next_inner`, so a test can assert the planner serves the
+    /// oldest-first ordering from `idx_jobs_status_created_at` with no temp-b-tree
+    /// sort. Mirrors the live query verbatim.
+    #[cfg(test)]
+    pub fn dispatch_query_plan(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id, spec_json, dispatch_seq FROM jobs WHERE status = ?1
+             ORDER BY created_at ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map([STATUS_QUEUED], |r| {
+            r.get::<_, String>(3) // EXPLAIN QUERY PLAN columns: id,parent,notused,detail
+        })?;
+        let mut plan = String::new();
+        for row in rows {
+            plan.push_str(&row?);
+            plan.push('\n');
+        }
+        Ok(plan)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
@@ -832,6 +854,19 @@ impl Store {
     /// id is unknown (or the row predates the column and was never backfilled).
     /// Test-only: lets the TTL tests assert the anchor is set at enqueue and is
     /// not slid by requeue/fault/reap.
+    /// Test-only: overwrite a job's `created_at` anchor so a test can build a
+    /// deterministic age ordering that disagrees with `rowid` (the live `enqueue`
+    /// stamps wall-clock seconds, which tie within a fast test). Returns whether a
+    /// row was updated.
+    #[cfg(test)]
+    pub fn set_created_at(&self, id: &uuid::Uuid, created_at: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE jobs SET created_at = ?2 WHERE id = ?1",
+            (id.to_string(), created_at),
+        )?;
+        Ok(n == 1)
+    }
+
     #[cfg(test)]
     pub fn job_created_at(&self, id: &uuid::Uuid) -> Result<Option<i64>> {
         let created_at = self
