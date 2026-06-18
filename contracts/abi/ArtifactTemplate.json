@@ -1091,5 +1091,10 @@
     "inputs": [],
     "name": "ZeroRoyaltyRate",
     "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroRoyaltyToken",
+    "type": "error"
   }
 ]
