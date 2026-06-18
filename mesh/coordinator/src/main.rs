@@ -4034,7 +4034,7 @@ mod tests {
     /// the first is unaffected. Discriminating: without the cap the second
     /// connection is accepted and parks in the (generous-default) header-read
     /// phase, so its `read_to_end` hangs past the outer bound and fails the suite.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_caps_concurrent_connections() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let state = test_state_empty().await;
@@ -4048,9 +4048,9 @@ mod tests {
         assert!(head.starts_with(b"HTTP/1.1 200"), "conn #1 was served");
         // Two more connections past the cap of 1: each is dropped without serving
         // (read returns EOF, no bytes). The SECOND rejection also proves conn #1
-        // still holds its permit — i.e. the cap did NOT evict the existing
-        // connection (had it, the freed permit would let one of these be accepted
-        // and park in header-read, hanging read_to_end past the outer bound).
+        // still occupies its permit slot — were its permit wrongly released early,
+        // the freed slot would let one of these be accepted and park in header-read,
+        // hanging read_to_end past the outer bound.
         // Discriminating: without the cap these are accepted and park, not closed.
         for label in ["#2", "#3"] {
             let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
@@ -4063,12 +4063,47 @@ mod tests {
         }
     }
 
+    /// The cap admits EXACTLY N: with the cap at 2, two keep-alive connections are
+    /// both served (holding both permits) and a third is dropped without serving.
+    /// Pins against an off-by-one in the permit↔connection mapping (a cap of
+    /// `max-1`, or two permits acquired per connection) that the cap-of-1 test
+    /// cannot distinguish from correct behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_cap_admits_exactly_n() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral_with_max_connections(state, 2).await;
+        // Two within-cap connections: each completes a request and stays open
+        // (keep-alive), so both permits are held for the rest of the test.
+        let mut held = Vec::new();
+        for n in 1..=2 {
+            let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+            c.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+            let mut head = [0u8; 12];
+            tokio::time::timeout(Duration::from_secs(3), c.read_exact(&mut head))
+                .await
+                .unwrap_or_else(|_| panic!("within-cap connection #{n} was served"))
+                .unwrap();
+            assert!(head.starts_with(b"HTTP/1.1 200"), "within-cap connection #{n} was served");
+            held.push(c);
+        }
+        // The third, past the cap of 2, is dropped without serving.
+        let mut c3 = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), c3.read_to_end(&mut buf))
+            .await
+            .expect("the over-cap connection was closed promptly, not parked")
+            .ok();
+        assert!(buf.is_empty(), "the over-cap connection was closed without serving, got {buf:?}");
+        drop(held);
+    }
+
     /// Shutdown returns even with the cap saturated (FM4): the cap is a
     /// `try_acquire` that never blocks the accept/shutdown select, and the permit is
     /// released when the drained task ends, so a full cap can't wedge shutdown. We
     /// saturate a cap of 1 with a live keep-alive connection, signal shutdown, and
     /// assert `serve()` returns and the held connection drains closed.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_returns_on_shutdown_when_cap_saturated() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let state = test_state_empty().await;
