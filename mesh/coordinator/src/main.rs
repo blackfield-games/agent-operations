@@ -1556,9 +1556,12 @@ enum RequeueKind {
 /// `kind` is `EarnerFault` and the fault is a GENUINE quality fault (the ws
 /// Submit-fault path passes `Some(session_address)`). An honest `Decline` routes
 /// through `EarnerFault` too but passes `None` — it refunds and requeues like a
-/// fault yet is never a reputation fault. `Charge` ignores it. The attribution
-/// write shares this same store lock and fence, so it is atomic with the job's
-/// own `faults` bump and never records for a since-reassigned dispatch.
+/// fault yet is never a reputation fault. `Charge` ignores it. The attribution is
+/// applied INSIDE `requeue_earner_fault`, behind that method's own `in_flight`
+/// guard — NOT here behind the seq-fence — because a reaper can park the job back
+/// to `queued` at this same `seq` (reapers don't bump `dispatch_seq`), which the
+/// fence can't see; gating attribution on the in_flight bump keeps the per-earner
+/// tally in lockstep with the per-job `faults` budget.
 async fn requeue(
     state: &Arc<AppState>,
     job: JobSpec,
@@ -1583,19 +1586,15 @@ async fn requeue(
             store.requeue(&job, state.max_attempts),
             "max attempts exhausted",
         ),
-        RequeueKind::EarnerFault => {
-            // A genuine quality fault is attributed to the dispatch holder; an
-            // honest Decline (attribute_to = None) reaches here too but is not.
-            if let Some(earner) = attribute_to {
-                if let Err(e) = store.record_earner_fault(earner, &job) {
-                    tracing::error!(job_id = %job.id, earner, ?e, "failed to record earner-fault attribution");
-                }
-            }
-            (
-                store.requeue_earner_fault(&job, state.max_faults),
-                "max earner faults exhausted",
-            )
-        }
+        RequeueKind::EarnerFault => (
+            // `attribute_to` is recorded INSIDE requeue_earner_fault, gated by the
+            // same in_flight check as the fault bump (a reaper can park the job to
+            // `queued` at this same seq, which the fence above can't see) — so a
+            // genuine quality fault attributes iff it actually charges. An honest
+            // Decline passes None and is never attributed.
+            store.requeue_earner_fault(&job, state.max_faults, attribute_to),
+            "max earner faults exhausted",
+        ),
     };
     match dead_lettered {
         Ok(true) => tracing::warn!(job_id = %job.id, ?kind, "job dead-lettered ({why})"),
@@ -3329,10 +3328,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Corrupt the signature (flip the last nibble) → genuine quality fault.
+        // Forge a result that CLAIMS a victim's address: the dev-key signature
+        // won't recover to it → AddressMismatch fault. This also pins the keying —
+        // attribution must charge THIS session (dev_address, the dispatch holder),
+        // never the self-reported `result.earner_address`, so a faulting earner
+        // can't smear a victim.
+        let victim = test_address("victim");
         let mut bad = signed_result(job_id, "deadbeef");
-        let last = bad.signature_hex.pop().unwrap();
-        bad.signature_hex.push(if last == 'f' { '0' } else { 'f' });
+        bad.earner_address = victim.clone();
         ws.send(WsMessage::text(
             serde_json::to_string(&EarnerMsg::Submit(bad)).unwrap(),
         ))
@@ -3343,9 +3346,14 @@ mod tests {
             other => panic!("expected Rejected for the faulty result, got {other:?}"),
         }
 
-        // Attributed to THIS session's registered address (dev_address), the
-        // dispatch holder — not the result's self-reported earner_address.
+        // Attributed to the session (dev_address); the claimed victim gets nothing
+        // (it never registered, so it is absent from the leaderboard entirely).
         await_earner_faults(&state, &dev_address(), 1).await;
+        assert_eq!(
+            earner_faults_now(&state, &victim).await,
+            None,
+            "a faulting earner must not smear the address it claims in the result"
+        );
     }
 
     /// End-to-end counterpart: an honest `Decline` of an offered job is requeued
@@ -4810,12 +4818,12 @@ mod tests {
         assert_eq!(store.redispatched_count().unwrap(), 1);
 
         // An earner fault refunds the dispatch attempt (2 → 1) and charges a fault.
-        assert!(!store.requeue_earner_fault(&job, BIG).unwrap());
+        assert!(!store.requeue_earner_fault(&job, BIG, None).unwrap());
         assert_eq!(store.attempt_fault_totals().unwrap(), (1, 1));
 
         // Redispatch then a second distinct fault: attempts back to 1, faults → 2.
         store.take_next(|_| true).unwrap();
-        assert!(!store.requeue_earner_fault(&job, BIG).unwrap());
+        assert!(!store.requeue_earner_fault(&job, BIG, None).unwrap());
         assert_eq!(store.attempt_fault_totals().unwrap(), (1, 2));
 
         // A second job dispatched once proves the SUM spans rows, not just the
@@ -5220,7 +5228,7 @@ mod tests {
         for i in 1..=5 {
             let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
             assert!(
-                !store.requeue_earner_fault(&taken, 100).unwrap(),
+                !store.requeue_earner_fault(&taken, 100, None).unwrap(),
                 "earner fault {i} must requeue, never dead-letter (faults < max_faults)"
             );
             assert_eq!(
@@ -5263,7 +5271,7 @@ mod tests {
 
         for fault in 1..=3 {
             let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
-            let dead = store.requeue_earner_fault(&taken, 3).unwrap();
+            let dead = store.requeue_earner_fault(&taken, 3, None).unwrap();
             if fault < 3 {
                 assert!(!dead, "fault {fault} < max_faults 3 → requeued");
                 assert_eq!(
@@ -5289,13 +5297,13 @@ mod tests {
 
         // Unknown → no-op; nothing created.
         let ghost = job_with_deadline(60);
-        assert!(!store.requeue_earner_fault(&ghost, 3).unwrap());
+        assert!(!store.requeue_earner_fault(&ghost, 3, None).unwrap());
         assert!(store.job_status(&ghost.id).unwrap().is_none());
 
         // Queued (not in_flight) → no-op; stays queued.
         let queued = job_with_deadline(60);
         store.enqueue(&queued).unwrap();
-        assert!(!store.requeue_earner_fault(&queued, 3).unwrap());
+        assert!(!store.requeue_earner_fault(&queued, 3, None).unwrap());
         assert_eq!(
             store.job_status(&queued.id).unwrap().as_deref(),
             Some("queued")
@@ -5308,7 +5316,7 @@ mod tests {
         store
             .record_completed(&signed_result(done.id, "x"))
             .unwrap();
-        assert!(!store.requeue_earner_fault(&done, 3).unwrap());
+        assert!(!store.requeue_earner_fault(&done, 3, None).unwrap());
         assert_eq!(store.job_status(&done.id).unwrap().as_deref(), Some("done"));
     }
 
@@ -5346,6 +5354,51 @@ mod tests {
         assert!(store.faults_by_earner().unwrap().is_empty());
     }
 
+    /// Reaper-race: a job a reaper parked back to `queued` (status no longer
+    /// in_flight, but `dispatch_seq` UNCHANGED — reapers don't bump it) must NOT be
+    /// attributed a fault. The coordinator's seq-fence one layer up still passes for
+    /// it (same seq), so attribution is co-gated with the per-job bump INSIDE
+    /// requeue_earner_fault: a `Some(earner)` call on a reaped job records nothing,
+    /// keeping `Σ(attributed) <= total_faults`. The in_flight contrast at the end
+    /// proves the gate isn't vacuously always-empty.
+    #[test]
+    fn requeue_earner_fault_does_not_attribute_a_reaper_parked_job() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(60);
+        store.enqueue(&job).unwrap();
+        let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+
+        // Simulate a deadline reap: back to `queued`, dispatch_seq intact.
+        store.reap_expired(now_secs() + 10_000, 5).unwrap();
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("queued"));
+
+        // A late forged-fault for that stale dispatch: attribute_to = Some, but the
+        // job is no longer in_flight → no budget bump AND no attribution.
+        let earner = test_address("flapper");
+        assert!(
+            !store
+                .requeue_earner_fault(&taken, 100, Some(&earner))
+                .unwrap(),
+            "reaper-parked job is a no-op (not in_flight)"
+        );
+        assert!(
+            store.faults_by_earner().unwrap().is_empty(),
+            "a no-op fault must not attribute — keeps Σ(attributed) <= total_faults"
+        );
+
+        // Contrast: a genuinely in_flight fault with the same Some(earner) DOES
+        // attribute exactly once.
+        let (taken2, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
+        store
+            .requeue_earner_fault(&taken2, 100, Some(&earner))
+            .unwrap();
+        assert_eq!(
+            store.faults_by_earner().unwrap().get(&earner).copied(),
+            Some(1),
+            "an in_flight fault attributes exactly once"
+        );
+    }
+
     // ---- created_at: the immutable wall-clock-TTL anchor ----
 
     /// `enqueue` stamps a creation time, and it is the anchor the TTL measures
@@ -5381,7 +5434,7 @@ mod tests {
 
         // Earner fault → requeue.
         let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
-        store.requeue_earner_fault(&taken, 100).unwrap();
+        store.requeue_earner_fault(&taken, 100, None).unwrap();
         assert_eq!(
             store.job_created_at(&job.id).unwrap(),
             Some(anchor),
@@ -5463,7 +5516,7 @@ mod tests {
 
         // One earner faults: back to queued, one fault, NOT dead-lettered.
         let (taken, _) = store.take_next(|j| j.id == job.id).unwrap().unwrap();
-        assert!(!store.requeue_earner_fault(&taken, 10).unwrap());
+        assert!(!store.requeue_earner_fault(&taken, 10, None).unwrap());
         assert_eq!(
             store.job_status(&job.id).unwrap().as_deref(),
             Some("queued")
@@ -5713,7 +5766,7 @@ mod tests {
             store.touch(&id, 1000).unwrap();
             store.reap_expired(1100, 999).unwrap(); // requeue past deadline (attempts unchanged)
             store.take_next(|_| true).unwrap(); // attempts → 2 (redispatched)
-            store.requeue_earner_fault(&job, 999).unwrap(); // attempts → 1, faults → 1
+            store.requeue_earner_fault(&job, 999, None).unwrap(); // attempts → 1, faults → 1
             store.take_next(|_| true).unwrap(); // attempts → 2
         }
 

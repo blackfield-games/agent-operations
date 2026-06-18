@@ -377,9 +377,24 @@ impl Store {
     /// hold the current dispatch — so the read+update here is atomic against any
     /// other dispatch, exactly as in `requeue`.
     ///
+    /// `attribute_to`, when `Some(earner)`, records a per-earner reputation fault
+    /// via [`record_earner_fault`](Self::record_earner_fault) — but ONLY past the
+    /// `in_flight` guard below, so it shares the EXACT condition under which the
+    /// `jobs.faults` budget is bumped. This is load-bearing: the seq-fence one
+    /// layer up passes for a job a reaper has parked back to `queued` at the SAME
+    /// seq (reapers don't bump `dispatch_seq`), so attributing in the caller would
+    /// over-count a fault the per-job budget no-ops on, breaking the
+    /// `Σ attributed <= total_faults` invariant. Co-gating here keeps the two in
+    /// lockstep. An honest `Decline` passes `None` and is never attributed.
+    ///
     /// Returns `true` iff the job was dead-lettered (moved to `failed`); `false`
     /// if it was requeued OR a no-op (not in_flight / unknown).
-    pub fn requeue_earner_fault(&self, job: &JobSpec, max_faults: u32) -> Result<bool> {
+    pub fn requeue_earner_fault(
+        &self,
+        job: &JobSpec,
+        max_faults: u32,
+        attribute_to: Option<&str>,
+    ) -> Result<bool> {
         let row: Option<(String, u32)> = self
             .conn
             .query_row(
@@ -396,7 +411,14 @@ impl Store {
             return Ok(false);
         }; // unknown job
         if status != STATUS_IN_FLIGHT {
-            return Ok(false); // already reaped or terminal — don't clobber
+            return Ok(false); // already reaped or terminal — don't clobber or attribute
+        }
+
+        // Past the in_flight guard, the fault IS charged — attribute it (if named)
+        // in the same locked, no-await path as the budget bump below so the
+        // per-earner tally can never diverge from the per-job faults counter.
+        if let Some(earner) = attribute_to {
+            self.record_earner_fault(earner, job)?;
         }
 
         let new_faults = faults + 1;
