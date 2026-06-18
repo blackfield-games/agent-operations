@@ -4023,6 +4023,29 @@ mod tests {
         assert_eq!(status["status"], "queued");
     }
 
+    /// Boundary region coords (i32 extremes, layer u8::MAX) are accepted and
+    /// round-trip intact. `RegionCoord::region_id` — which the dispatch and
+    /// attestation paths later feed — is pure formatting with no arithmetic, so
+    /// extreme coords can't overflow it; the ingestion front door must take them
+    /// without panicking rather than rejecting valid frontier tiles.
+    #[tokio::test]
+    async fn create_job_accepts_boundary_region_coords() {
+        let state = test_state_empty().await;
+        let mut body = create_job_body();
+        body["region"] = serde_json::json!({ "x": i32::MAX, "y": i32::MIN, "layer": u8::MAX });
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let detail = body_json(get(state.clone(), &format!("/jobs/{id}")).await).await;
+        assert_eq!(detail["spec"]["region"]["x"], i32::MAX);
+        assert_eq!(detail["spec"]["region"]["y"], i32::MIN);
+        assert_eq!(detail["spec"]["region"]["layer"], u8::MAX);
+        // The id the downstream paths derive from these coords formats, no overflow.
+        let region = RegionCoord { x: i32::MAX, y: i32::MIN, layer: u8::MAX };
+        assert!(region.region_id().starts_with('r'));
+    }
+
     /// The id is minted server-side: a body that smuggles an `id` of an EXISTING
     /// job must NOT overwrite it (enqueue upserts on id, `ON CONFLICT DO UPDATE`),
     /// nor reset its lifecycle. We dispatch the existing job to `in_flight`, then
