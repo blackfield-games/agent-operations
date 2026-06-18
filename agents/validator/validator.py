@@ -69,12 +69,19 @@ async def run(
     layers_root: Path = Path("layers"),
 ) -> ValidatorVerdict:
     issues: list[str] = []
+    # Specialists each issue is attributed to, recorded HERE at the point of
+    # rejection (not parsed back out of the text). The supervisor prefers this over
+    # scanning `issues` for names, so a prim path segment that merely looks like a
+    # specialist name can't misroute route-back. Surfaced as
+    # `ValidatorVerdict.failing_specialists`.
+    failing: set[str] = set()
 
     expected = {"director", "terrain", "biome", "prop", "lighting", "npc", "optimization"}
     got = {layer.specialist for layer in layers}
     missing = expected - got
     if missing:
         issues.append(f"missing specialist layers: {sorted(missing)}")
+        failing.update(missing)  # the missing specialists must each re-run
 
     # Per-role metrics contract: a specialist whose role must report a metric (the
     # optimizer's over_budget verdict, terrain's triangle count the optimizer sums)
@@ -84,7 +91,10 @@ async def run(
     # over_budget gate so a missing/garbage metric is reported as such, not masked
     # by the gate's `.get(..., 0.0)` default.
     for layer in layers:
-        issues.extend(_metrics_issues(layer))
+        layer_metrics = _metrics_issues(layer)
+        if layer_metrics:
+            issues.extend(layer_metrics)
+            failing.add(layer.specialist)
 
     # Read the gate only on a finite numeric value: a missing/garbage over_budget is
     # already reported by the metrics schema above, and comparing a non-number here
@@ -94,30 +104,34 @@ async def run(
     over_budget = opt.metrics.get("over_budget", 0.0) if opt else 0.0
     if _is_finite_number(over_budget) and over_budget > 0:
         issues.append("triangle budget exceeded — re-run optimization with stricter LODs")
+        failing.add("optimization")
 
     # Open every emitted layer and confirm the engine could too: a garbled header,
     # a missing defaultPrim, or a dangling file composes into a world.usda that
-    # fails silently at load. Each issue leads with the specialist name so the
-    # supervisor's _failing_specialist routes the fix back to the offending node.
+    # fails silently at load. Each issue is attributed to the layer's own specialist.
     wellformed: list[LayerSpec] = []
     for layer in layers:
         reason = _layer_wellformedness(layers_root / layer.path)
         if reason:
             issues.append(f"{layer.specialist} layer {layer.path} {reason}")
+            failing.add(layer.specialist)
         else:
             wellformed.append(layer)
 
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
     # one defines, and the layers still open individually while the composed stage
-    # is silently broken. Check the layers that passed the per-layer gate.
-    issues.extend(_composition_conflicts(wellformed, layers_root))
+    # is silently broken. Each conflict is attributed to the specialists that
+    # authored it (from the layer tags, not the prim-path text).
+    for specialists, message in _composition_attributions(wellformed, layers_root):
+        issues.append(message)
+        failing.update(specialists)
 
     # style check: TODO call sidecar with brief.style_anchors + rendered preview
     # for now, accept if no other issues
     accepted = len(issues) == 0
 
-    return ValidatorVerdict(accepted=accepted, issues=issues)
+    return ValidatorVerdict(accepted=accepted, issues=issues, failing_specialists=sorted(failing))
 
 
 def _is_finite_number(value: object) -> bool:
@@ -204,12 +218,16 @@ def _pxr_parse_issue(path: Path) -> str | None:
     return None
 
 
-def _composition_conflicts(layers: list[LayerSpec], layers_root: Path) -> list[str]:
-    """Cross-layer composition conflicts across the well-formed specialist layers.
+def _composition_attributions(
+    layers: list[LayerSpec], layers_root: Path
+) -> list[tuple[list[str], str]]:
+    """Cross-layer composition conflicts as ``(specialists, message)`` across the
+    well-formed specialist layers.
 
-    Structural scan of every layer's prim specs, fed to `_conflicts_from_specs`.
+    Structural scan of every layer's prim specs, fed to `_conflict_attributions`.
     A missing/unreadable layer is skipped — the well-formedness gate already
-    flagged it, so it isn't re-reported here.
+    flagged it, so it isn't re-reported here. The single source of truth behind
+    both the verdict's `issues` text and its structured `failing_specialists`.
     """
     tagged: list[tuple[str, str, str, str]] = []
     for layer in layers:
@@ -222,7 +240,13 @@ def _composition_conflicts(layers: list[LayerSpec], layers_root: Path) -> list[s
                 continue
         for specifier, type_name, path in specs:
             tagged.append((layer.specialist, specifier, type_name, path))
-    return _conflicts_from_specs(tagged)
+    return _conflict_attributions(tagged)
+
+
+def _composition_conflicts(layers: list[LayerSpec], layers_root: Path) -> list[str]:
+    """Composition-conflict messages only — the text view over
+    `_composition_attributions`."""
+    return [message for _, message in _composition_attributions(layers, layers_root)]
 
 
 def _prim_specs(text: str) -> list[tuple[str, str, str]]:
@@ -310,8 +334,11 @@ def _prim_specs(text: str) -> list[tuple[str, str, str]]:
     return specs
 
 
-def _conflicts_from_specs(tagged: list[tuple[str, str, str, str]]) -> list[str]:
-    """Composition conflicts from ``(specialist, specifier, type_name, prim_path)``.
+def _conflict_attributions(
+    tagged: list[tuple[str, str, str, str]],
+) -> list[tuple[list[str], str]]:
+    """Composition conflicts from ``(specialist, specifier, type_name, prim_path)``
+    as ``(specialists, message)`` pairs.
 
     Two classes — the ones provable without resolving full USD composition:
       - a prim path *defined* (``def``/``class``, not ``over``) with two or more
@@ -321,15 +348,12 @@ def _conflicts_from_specs(tagged: list[tuple[str, str, str, str]]) -> list[str]:
       - a *dangling override*: a path overridden by some specialist but defined by
         none, so the opinion composes onto nothing.
 
-    Each issue names the conflicting specialists (sorted, for stable output) so the
-    supervisor's ``_failing_specialist`` routes back to the pipeline-earliest. The
-    prim path is included for diagnostics; because ``_failing_specialist`` substring-
-    matches the whole issue, a path segment containing a pipeline-earlier specialist
-    name (e.g. ``terrain_lod`` → terrain) can over-trigger route-back to that
-    innocent node. That wastes its re-run but still replays the true culprits
-    downstream (so a non-deterministic specialist can converge), and is bounded by
-    the round cap. The clean fix — word-boundary matching in ``_failing_specialist``
-    — lives in the supervisor, outside this gate.
+    ``specialists`` is the sorted set the conflict implicates (the co-definers, or
+    the lone author of a dangling override) — drawn from the layer TAGS, not the
+    prim-path text. The supervisor routes back to the pipeline-earliest of them via
+    this structured attribution, so a prim path that merely embeds (or equals) a
+    specialist name can't pull route-back to an innocent node. The path is still
+    embedded in the message for diagnostics, but it no longer drives routing.
     """
     types_by_path: dict[str, dict[str, set[str]]] = {}
     overs_by_path: dict[str, set[str]] = {}
@@ -341,26 +365,34 @@ def _conflicts_from_specs(tagged: list[tuple[str, str, str, str]]) -> list[str]:
         if type_name:
             per_specialist.add(type_name)
 
-    issues: list[str] = []
+    out: list[tuple[list[str], str]] = []
     for path in sorted(types_by_path):
         by_specialist = types_by_path[path]
         all_types = {t for types in by_specialist.values() for t in types}
         if len(all_types) > 1:
-            who = ", ".join(sorted(by_specialist))
-            issues.append(
-                f"composition conflict: specialists {who} define the same prim "
-                f"<{path}> with incompatible types {sorted(all_types)}"
-            )
+            who = sorted(by_specialist)
+            out.append((
+                who,
+                f"composition conflict: specialists {', '.join(who)} define the same "
+                f"prim <{path}> with incompatible types {sorted(all_types)}",
+            ))
 
     defined = set(types_by_path)
     for path in sorted(overs_by_path):
         if path not in defined:
-            who = ", ".join(sorted(overs_by_path[path]))
-            issues.append(
-                f"composition conflict: specialist {who} overrides prim <{path}> "
-                f"but no specialist defines it (dangling override)"
-            )
-    return issues
+            who = sorted(overs_by_path[path])
+            out.append((
+                who,
+                f"composition conflict: specialist {', '.join(who)} overrides prim "
+                f"<{path}> but no specialist defines it (dangling override)",
+            ))
+    return out
+
+
+def _conflicts_from_specs(tagged: list[tuple[str, str, str, str]]) -> list[str]:
+    """Composition-conflict messages only — the text view over
+    `_conflict_attributions`."""
+    return [message for _, message in _conflict_attributions(tagged)]
 
 
 def _pxr_layer_specs(path: Path) -> list[tuple[str, str, str]] | None:
