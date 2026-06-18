@@ -3274,6 +3274,138 @@ mod tests {
         );
     }
 
+    /// The `faults` count for `earner` in the current `/earners` snapshot, or
+    /// `None` if the earner is absent (not live / never registered).
+    async fn earner_faults_now(state: &Arc<AppState>, earner: &str) -> Option<u64> {
+        let json = body_json(get(state.clone(), "/earners").await).await;
+        json.as_array()?
+            .iter()
+            .find(|e| e["address"] == earner)
+            .and_then(|e| e["faults"].as_u64())
+    }
+
+    /// Poll `/earners` until `earner` reports `expected` faults. The ws task
+    /// records attribution AFTER sending its Rejected verdict, so the row can lag
+    /// the verdict by a scheduling tick. Panics with the last snapshot on timeout.
+    async fn await_earner_faults(state: &Arc<AppState>, earner: &str, expected: u64) {
+        for _ in 0..40 {
+            if earner_faults_now(state, earner).await == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let json = body_json(get(state.clone(), "/earners").await).await;
+        panic!("earner {earner} never reached {expected} faults on /earners: {json}");
+    }
+
+    /// End-to-end: a genuine quality fault (forged signature) over ws is attributed
+    /// to the submitting earner's REGISTERED address and surfaces as `faults: 1` on
+    /// its `/earners` row — the per-earner breakdown the gross `/stats total_faults`
+    /// could not give. Attribution runs in the ws task after the Rejected verdict,
+    /// so we poll the row until it reflects the fault.
+    #[tokio::test]
+    async fn ws_genuine_fault_is_attributed_on_earners() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Corrupt the signature (flip the last nibble) → genuine quality fault.
+        let mut bad = signed_result(job_id, "deadbeef");
+        let last = bad.signature_hex.pop().unwrap();
+        bad.signature_hex.push(if last == 'f' { '0' } else { 'f' });
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(bad)).unwrap(),
+        ))
+        .await
+        .unwrap();
+        match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::Rejected { job_id: jid, .. } => assert_eq!(jid, job_id),
+            other => panic!("expected Rejected for the faulty result, got {other:?}"),
+        }
+
+        // Attributed to THIS session's registered address (dev_address), the
+        // dispatch holder — not the result's self-reported earner_address.
+        await_earner_faults(&state, &dev_address(), 1).await;
+    }
+
+    /// End-to-end counterpart: an honest `Decline` of an offered job is requeued
+    /// like a fault (refund + return to queue) but is NOT a reputation fault — the
+    /// declining earner's `/earners` row stays at `faults: 0`. Both share the
+    /// EarnerFault requeue path; only the genuine fault attributes. Discriminating:
+    /// the faults==0 assertion fires only AFTER the job is back on the queue (the
+    /// decline's requeue ran), so a regression that attributed the decline would
+    /// show faults: 1 here.
+    #[tokio::test]
+    async fn ws_honest_decline_is_not_attributed_on_earners() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Decline {
+                job_id,
+                reason: "unsupported job kind: terrain".into(),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Wait until the decline is processed: the job is back on the queue (its
+        // EarnerFault requeue ran). Only then is faults==0 meaningful — it proves
+        // the requeue happened yet recorded no attribution.
+        let mut requeued = false;
+        for _ in 0..40 {
+            if state.store.lock().await.job_status(&job_id).unwrap().as_deref() == Some("queued") {
+                requeued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(requeued, "decline must requeue the job");
+
+        assert_eq!(
+            earner_faults_now(&state, &dev_address()).await,
+            Some(0),
+            "an honest decline must NOT count as a reputation fault"
+        );
+    }
+
     /// A `JobResult` validly signed by an arbitrary key (distinct from the dev
     /// key `signed_result` uses), credited to that key's derived address — lets a
     /// test assert credit lands on a SPECIFIC earner, not just "someone".
