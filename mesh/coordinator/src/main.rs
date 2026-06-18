@@ -3479,10 +3479,15 @@ mod tests {
         );
     }
 
-    /// FM4: a timed-out handshake is a plain fail-closed — it inserts nothing AND
-    /// evicts nothing (the no-evict-on-reject invariant the key-possession gate
-    /// relies on). A separate live earner already in the registry survives a
-    /// concurrent handshake that times out.
+    /// FM4: the timeout fail-path is connection-scoped — it has no global side
+    /// effect on the registry, so a separately-registered earner survives another
+    /// connection's timed-out handshake. Catches a regression test #1 cannot (a
+    /// handler that clobbered the whole map would still leave an *empty* registry
+    /// empty there, but would evict `liveearner` here). The cancel-safety of the
+    /// sole insert itself is structural, not exercised here: a silent client never
+    /// reaches the insert (it dies at `socket.recv()`), and the only mutation is a
+    /// single await-free statement after the lock acquire, so the timeout can't
+    /// fire between lock-acquire and insert-complete.
     #[tokio::test]
     async fn ws_handshake_timeout_does_not_evict_a_registered_earner() {
         let state = test_state_empty_handshake(Duration::from_millis(200)).await;
