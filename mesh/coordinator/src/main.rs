@@ -3585,6 +3585,33 @@ mod tests {
         );
     }
 
+    /// The WS dispatch path records the offering earner as the job's holder
+    /// (`dispatched_to`), so the liveness reaper can later reclaim it if that earner
+    /// goes stale — the integration of `take_supported_job` → `take_next_for`.
+    #[tokio::test]
+    async fn take_supported_job_records_the_earner_as_holder() {
+        let state = test_state_empty().await;
+        let job = job_with_deadline(60);
+        enqueue(&state, &job).await;
+
+        let (taken, _) =
+            take_supported_job(&state, "0xwsearner", &[JobKind::Terrain], &HashSet::new())
+                .await
+                .unwrap();
+        assert_eq!(taken.id, job.id);
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .await
+                .job_dispatched_to(&job.id)
+                .unwrap()
+                .as_deref(),
+            Some("0xwsearner"),
+            "the WS dispatcher stamps the earner as the holder"
+        );
+    }
+
     /// HTTP-poll fence (FM3): `/jobs/next` stamps `dispatch_seq` in a header, and
     /// `/jobs/{id}/submit` must echo the CURRENT seq. A submit with no header is
     /// refused (can't be tied to a dispatch); one echoing a seq from a since-
@@ -3962,6 +3989,44 @@ mod tests {
             store.redispatched_count().unwrap(),
             0,
             "migrated attempts default to 0"
+        );
+    }
+
+    /// A DB created before the `dispatched_to` column boots through its migration,
+    /// the migrated row reads back a NULL holder (so the liveness reaper skips it —
+    /// a legacy in_flight job falls back to the deadline reaper), and a subsequent
+    /// WS dispatch stamps the holder.
+    #[test]
+    fn open_migrates_db_without_dispatched_to() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+        let job = job_with_deadline(60);
+        let spec_json = serde_json::to_string(&job).unwrap();
+        {
+            // Old schema: a jobs table without the dispatched_to column, one queued row.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE jobs (id TEXT PRIMARY KEY, spec_json TEXT NOT NULL, status TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO jobs (id, spec_json, status) VALUES (?1, ?2, 'queued')",
+                (job.id.to_string(), &spec_json),
+            )
+            .unwrap();
+        }
+        // Boots through the dispatched_to ALTER without erroring.
+        let store = Store::open(&db_path).unwrap();
+        assert_eq!(
+            store.job_dispatched_to(&job.id).unwrap(),
+            None,
+            "migrated row has no holder"
+        );
+        // A WS dispatch now stamps the holder on the migrated row.
+        store.take_next_for("0xnew", |_| true).unwrap();
+        assert_eq!(
+            store.job_dispatched_to(&job.id).unwrap().as_deref(),
+            Some("0xnew")
         );
     }
 
