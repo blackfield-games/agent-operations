@@ -1265,8 +1265,16 @@ async fn submit(
 
 /// Websocket job dispatch (the v1 upgrade). Protocol, all JSON text frames:
 ///
-///   1. earner → `EarnerMsg::Hello` (required first message; registers like
-///      `/register`). Any other first message closes the socket.
+///   0. coordinator → `CoordinatorMsg::Challenge { nonce }` (the FIRST frame): a
+///      fresh single-use random nonce the earner must fold into its signed
+///      `hello_digest`. Connection-scoped (held only for the handshake, never
+///      stored), so a Hello captured off the wire and replayed on a new
+///      connection — which gets a different challenge — fails recovery.
+///   1. earner → `EarnerMsg::Hello` (required first earner message; registers
+///      like `/register`, but its signature must additionally cover the
+///      challenge). Any other first message, or a Hello whose signature doesn't
+///      recover to the claimed address over the issued challenge, closes the
+///      socket.
 ///   2. coordinator polls the queue; when a job whose `kind` the earner
 ///      advertised in `supported` is available, it pops it (stamping a fresh
 ///      `dispatch_seq`, which the session remembers) and sends
