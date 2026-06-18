@@ -976,11 +976,12 @@ impl Store {
     }
 
     /// Gross `(total_attempts, total_faults)` across every job, summed in one
-    /// table scan for `/stats`. `total_attempts` is Σ`attempts` — every dispatch a
-    /// job ever received (each `take_next` bumps it; an earner-fault requeue
-    /// refunds it), so it is the gross redispatch volume, NOT the count of
-    /// distinct redispatched jobs (`redispatched_count`): one job dispatched five
-    /// times adds 5 here but 1 there. `total_faults` is Σ`faults` — every
+    /// table scan for `/stats`. `total_attempts` is Σ`attempts` — the dispatch
+    /// count currently charged to each job's renderability budget (each
+    /// `take_next` bumps it; an earner-fault requeue refunds it, so it is net of
+    /// earner faults), summed across jobs. It is the gross redispatch volume, NOT
+    /// the count of distinct redispatched jobs (`redispatched_count`): one job
+    /// dispatched five times adds 5 here but 1 there. `total_faults` is Σ`faults` — every
     /// earner-fault reject charged on the budget separate from attempts. Together
     /// they let an operator separate reaper/disconnect churn (attempts) from
     /// earner-quality problems (faults). `COALESCE(…, 0)` makes an empty table
