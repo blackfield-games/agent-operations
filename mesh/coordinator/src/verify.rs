@@ -1,10 +1,13 @@
-//! Earner attestation verification.
+//! Earner signature verification — result attestations and registration.
 //!
-//! The earner signs the canonical `proto::signing_digest(job_id, output_hash)`
-//! with a recoverable secp256k1 ECDSA signature and ships the 65-byte
-//! `[r||s||v]` as `signature_hex`. We recover the signer's public key, derive
-//! its Ethereum-style address, and confirm it matches the claimed
-//! `earner_address`.
+//! Both gates share one mechanism: the earner signs a canonical 32-byte digest
+//! with a recoverable secp256k1 ECDSA signature and ships the 65-byte `[r||s||v]`
+//! as `signature_hex`; we recover the signer's public key, derive its
+//! Ethereum-style address, and confirm it matches the claimed `earner_address`.
+//! Only the digest differs: result attestations sign
+//! `proto::signing_digest(job_id, output_hash)` ([`verify_signature`]),
+//! registration signs `proto::hello_digest` over the advertised capabilities
+//! ([`verify_hello_signature`]).
 //!
 //! Signatures must be canonical (low-S, per EIP-2): for any valid `(r, s)` the
 //! malleated `(r, n - s)` with the flipped recovery bit recovers the same key,
@@ -13,7 +16,7 @@
 //! valid signature — the form the earner's signer already produces.
 
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
-use proto::signing_digest;
+use proto::{hello_digest, signing_digest, JobKind};
 use sha3::{Digest, Keccak256};
 use uuid::Uuid;
 
@@ -41,11 +44,11 @@ fn address_from_verifying_key(vk: &VerifyingKey) -> String {
 }
 
 /// Recover the signer address from a hex-encoded `[r||s||v]` signature over
-/// `signing_digest(job_id, output_hash)` and assert it equals
-/// `claimed_address` (case-insensitive).
-pub fn verify_signature(
-    job_id: &Uuid,
-    output_hash: &str,
+/// `digest` and assert it equals `claimed_address` (case-insensitive). The
+/// shared core of both gates: identical decoding, low-S enforcement, and
+/// recovery — only the digest the caller commits to differs.
+fn verify_recovered_address(
+    digest: &[u8; 32],
     claimed_address: &str,
     signature_hex: &str,
 ) -> Result<(), VerifyError> {
@@ -57,40 +60,83 @@ pub fn verify_signature(
     let sig =
         Signature::from_slice(&raw[..64]).map_err(|_| VerifyError::BadSignatureEncoding)?;
     // Enforce low-S (EIP-2): `normalize_s` yields `Some` only when `s` was high,
-    // i.e. the malleable half. Reject it so an attestation has one canonical form.
+    // i.e. the malleable half. Reject it so a signature has one canonical form.
     if sig.normalize_s().is_some() {
         return Err(VerifyError::NonCanonicalSignature);
     }
     let recid = RecoveryId::from_byte(raw[64]).ok_or(VerifyError::BadSignatureEncoding)?;
 
-    let digest = signing_digest(job_id, output_hash);
-    let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid)
+    let vk = VerifyingKey::recover_from_prehash(digest, &sig, recid)
         .map_err(|_| VerifyError::Unrecoverable)?;
-    let recovered = address_from_verifying_key(&vk);
-
-    if recovered.eq_ignore_ascii_case(claimed_address) {
+    if address_from_verifying_key(&vk).eq_ignore_ascii_case(claimed_address) {
         Ok(())
     } else {
         Err(VerifyError::AddressMismatch)
     }
 }
 
-/// Test-only: produce a valid hex `[r||s||v]` signature over
-/// `signing_digest(job_id, output_hash)`, mirroring the earner. Lives here so
-/// both the unit tests and the `submit` integration tests can build valid
-/// envelopes from the same code path.
+/// Recover the signer address from a hex-encoded `[r||s||v]` signature over
+/// `signing_digest(job_id, output_hash)` and assert it equals
+/// `claimed_address` (case-insensitive).
+pub fn verify_signature(
+    job_id: &Uuid,
+    output_hash: &str,
+    claimed_address: &str,
+    signature_hex: &str,
+) -> Result<(), VerifyError> {
+    verify_recovered_address(
+        &signing_digest(job_id, output_hash),
+        claimed_address,
+        signature_hex,
+    )
+}
+
+/// Recover the signer from a `Hello`'s `signature_hex` over `hello_digest` and
+/// assert it equals the claimed `earner_address` (case-insensitive). Proves the
+/// registrant controls the key behind the address the capability filter, fault
+/// attribution, and `/stats` totals key on, so the self-reported identity is
+/// authenticated rather than trusted on assertion.
+///
+/// `earner_address` feeds the digest *and* is the recovery target, so a captured
+/// signature can't be reattached to a different claimed address — a forger would
+/// have to recover its own (different) address. The remaining gap is a verbatim
+/// replay of the *whole* Hello (same address, same capabilities, same signature)
+/// by a network observer; closing that needs a server nonce, deferred to
+/// `mesh-signed-hello-nonce`.
+pub fn verify_hello_signature(
+    earner_address: &str,
+    gpu_model: &str,
+    vram_gb: u32,
+    supported: &[JobKind],
+    signature_hex: &str,
+) -> Result<(), VerifyError> {
+    verify_recovered_address(
+        &hello_digest(earner_address, gpu_model, vram_gb, supported),
+        earner_address,
+        signature_hex,
+    )
+}
+
+/// Test-only: produce a valid hex `[r||s||v]` signature over an arbitrary
+/// 32-byte prehash, mirroring the earner's signer. Lives here so the result and
+/// registration test helpers build envelopes from one code path.
+#[cfg(test)]
+pub(crate) fn sign_digest_for_test(sk: &k256::ecdsa::SigningKey, digest: &[u8; 32]) -> String {
+    let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash_recoverable(digest).unwrap();
+    let mut out = sig.to_bytes().to_vec();
+    out.push(recid.to_byte());
+    hex::encode(out)
+}
+
+/// Test-only: a valid signature over `signing_digest(job_id, output_hash)` — the
+/// result-attestation envelope the `submit` integration tests build.
 #[cfg(test)]
 pub(crate) fn sign_for_test(
     sk: &k256::ecdsa::SigningKey,
     job_id: &Uuid,
     output_hash: &str,
 ) -> String {
-    let digest = signing_digest(job_id, output_hash);
-    let (sig, recid): (Signature, RecoveryId) =
-        sk.sign_prehash_recoverable(&digest).unwrap();
-    let mut out = sig.to_bytes().to_vec();
-    out.push(recid.to_byte());
-    hex::encode(out)
+    sign_digest_for_test(sk, &signing_digest(job_id, output_hash))
 }
 
 #[cfg(test)]

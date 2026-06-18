@@ -701,11 +701,18 @@ const MAX_VRAM_GB: u32 = 1024;
 /// kind in `/stats supported_breakdown`. `Err` carries the reason for the reject
 /// log. Shared by the HTTP `/register` and WS `Hello` paths so neither can
 /// pollute the registry the other guards.
+///
+/// Finally it enforces key possession: `signature_hex` must recover to the
+/// claimed `earner_address` over [`proto::hello_digest`], so a client can only
+/// register an address it holds the key for (not spoof another earner's identity
+/// onto the leaderboard / fault ledger). Checked last — after the cheap
+/// structural gates — so a malformed Hello costs no curve recovery.
 fn validate_hello(
     earner_address: &str,
     gpu_model: &str,
     vram_gb: u32,
     supported: &[JobKind],
+    signature_hex: &str,
 ) -> Result<(), &'static str> {
     if !is_evm_address(earner_address) {
         return Err("earner_address is not a 0x-prefixed 20-byte hex address");
@@ -726,6 +733,23 @@ fn validate_hello(
     if vram_gb > MAX_VRAM_GB {
         return Err("vram_gb exceeds the plausible maximum");
     }
+    // Key-possession check last: the structural checks above are cheap, so a
+    // malformed Hello is rejected before the keccak + secp256k1 recovery (cheap
+    // DoS triage). A signature that doesn't recover to the claimed address means
+    // the registrant doesn't hold the key, so the identity the capability filter,
+    // fault attribution, and `/stats` totals key on would be unauthenticated.
+    if let Err(e) =
+        verify::verify_hello_signature(earner_address, gpu_model, vram_gb, supported, signature_hex)
+    {
+        return Err(match e {
+            verify::VerifyError::BadSignatureEncoding => "hello signature is malformed",
+            verify::VerifyError::NonCanonicalSignature => {
+                "hello signature is non-canonical (high-S)"
+            }
+            verify::VerifyError::Unrecoverable => "hello signature is unrecoverable",
+            verify::VerifyError::AddressMismatch => "hello signature does not match earner_address",
+        });
+    }
     Ok(())
 }
 
@@ -741,12 +765,15 @@ async fn register(
         gpu_model,
         vram_gb,
         supported,
+        signature_hex,
     } = msg
     else {
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    if let Err(reason) = validate_hello(&earner_address, &gpu_model, vram_gb, &supported) {
+    if let Err(reason) =
+        validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &signature_hex)
+    {
         tracing::warn!(address = %earner_address, reason, "rejected malformed registration");
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1534,12 +1561,15 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
             gpu_model,
             vram_gb,
             supported,
+            signature_hex,
         } = msg
         else {
             tracing::warn!("ws: first message was not Hello; closing");
             return None;
         };
-        if let Err(reason) = validate_hello(&earner_address, &gpu_model, vram_gb, &supported) {
+        if let Err(reason) =
+            validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &signature_hex)
+        {
             tracing::warn!(address = %earner_address, reason, "ws: rejected malformed Hello; closing");
             return None;
         }
@@ -1843,17 +1873,50 @@ mod tests {
         state.store.lock().await.enqueue(job).unwrap();
     }
 
-    fn hello_gpu(address: &str, gpu_model: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
+    /// Build a `Hello` that *claims* `claimed`, signed over its
+    /// `hello_digest(claimed, …)` by `sk`. Separating the claim from the signing
+    /// key lets a negative test forge a signature (sign with the wrong key) or
+    /// claim an address the key doesn't derive to; the happy path passes
+    /// `claimed == address_from_signing_key(sk)`.
+    fn signed_hello(
+        sk: &SigningKey,
+        claimed: &str,
+        gpu_model: &str,
+        vram_gb: u32,
+        supported: Vec<JobKind>,
+    ) -> EarnerMsg {
+        let signature_hex = verify::sign_digest_for_test(
+            sk,
+            &proto::hello_digest(claimed, gpu_model, vram_gb, &supported),
+        );
         EarnerMsg::Hello {
-            earner_address: address.into(),
+            earner_address: claimed.into(),
             gpu_model: gpu_model.into(),
             vram_gb,
             supported,
+            signature_hex,
         }
     }
 
-    fn hello(address: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
-        hello_gpu(address, "RTX 4090", vram_gb, supported)
+    /// A valid self-signed `Hello` from `label`'s deterministic key
+    /// ([`test_signing_key`]), claiming its own derived address with a custom
+    /// `gpu_model` — the honest registration the key-possession gate accepts.
+    fn hello_gpu(label: &str, gpu_model: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
+        let sk = test_signing_key(label);
+        signed_hello(&sk, &address_from_signing_key(&sk), gpu_model, vram_gb, supported)
+    }
+
+    /// A valid self-signed `Hello` from `label`'s key with the default GPU model.
+    fn hello(label: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
+        hello_gpu(label, "RTX 4090", vram_gb, supported)
+    }
+
+    /// A `Hello` *claiming* an arbitrary (possibly malformed) address string,
+    /// signed by a throwaway key. Used by the structural-reject tests where the
+    /// gate must reject on the claimed address's shape before key possession is
+    /// ever checked, so the signature is well-formed but never reached.
+    fn hello_claiming(claimed: &str, vram_gb: u32, supported: Vec<JobKind>) -> EarnerMsg {
+        signed_hello(&test_signing_key("throwaway"), claimed, "RTX 4090", vram_gb, supported)
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -1912,11 +1975,7 @@ mod tests {
     #[tokio::test]
     async fn register_then_stats_reflects_earner() {
         let state = test_state_empty().await;
-        let msg = hello(
-            &test_address("a"),
-            24,
-            vec![JobKind::Terrain, JobKind::Foliage],
-        );
+        let msg = hello("a", 24, vec![JobKind::Terrain, JobKind::Foliage]);
         let resp = post_json(
             state.clone(),
             "/register",
@@ -1939,12 +1998,10 @@ mod tests {
     #[tokio::test]
     async fn register_upserts_and_sums_vram() {
         let state = test_state();
-        // same address twice → upsert (count stays 1, vram updated)
-        let abc = test_address("abc");
-        let def = test_address("def");
-        let m1 = hello(&abc, 24, vec![JobKind::Terrain]);
-        let m2 = hello(&abc, 48, vec![JobKind::Terrain, JobKind::DiffusionTile]);
-        let m3 = hello(&def, 16, vec![JobKind::NpcTick]);
+        // same label → same key → same address twice → upsert (count stays 1, vram updated)
+        let m1 = hello("abc", 24, vec![JobKind::Terrain]);
+        let m2 = hello("abc", 48, vec![JobKind::Terrain, JobKind::DiffusionTile]);
+        let m3 = hello("def", 16, vec![JobKind::NpcTick]);
         for m in [&m1, &m2, &m3] {
             let resp = post_json(
                 state.clone(),
@@ -1985,16 +2042,18 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_malformed_fields_and_leaves_stats_clean() {
         let state = test_state_empty().await;
-        let good = test_address("good");
         let non_hex = format!("0x{}", "g".repeat(40));
         let no_prefix = "a".repeat(40);
+        // The address-shape rejects claim a malformed address (no key derives to
+        // it) so they use `hello_claiming`; the empty-supported / zero-vram cases
+        // claim a valid, self-signed address ("good") and reject on the other field.
         let malformed = [
-            hello("", 24, vec![JobKind::Terrain]),         // empty address
-            hello("0xabc", 24, vec![JobKind::Terrain]),    // too short
-            hello(&non_hex, 24, vec![JobKind::Terrain]),   // 40 chars but not hex
-            hello(&no_prefix, 24, vec![JobKind::Terrain]), // 40 hex but no 0x
-            hello(&good, 24, vec![]),                      // advertises no kinds
-            hello(&good, 0, vec![JobKind::Terrain]),       // zero vram
+            hello_claiming("", 24, vec![JobKind::Terrain]),         // empty address
+            hello_claiming("0xabc", 24, vec![JobKind::Terrain]),    // too short
+            hello_claiming(&non_hex, 24, vec![JobKind::Terrain]),   // 40 chars but not hex
+            hello_claiming(&no_prefix, 24, vec![JobKind::Terrain]), // 40 hex but no 0x
+            hello("good", 24, vec![]),                              // advertises no kinds
+            hello("good", 0, vec![JobKind::Terrain]),               // zero vram
         ];
         for m in &malformed {
             let resp = post_json(
@@ -2033,12 +2092,13 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_oversized_gpu_dup_kinds_and_huge_vram() {
         let state = test_state_empty().await;
-        let good = test_address("depth");
         let long_gpu = "x".repeat(MAX_GPU_MODEL_LEN + 1);
+        // All three claim the valid, self-signed "depth" address and reject on a
+        // bounded field, not on the address shape or signature.
         let malformed = [
-            hello_gpu(&good, &long_gpu, 24, vec![JobKind::Terrain]), // gpu_model too long
-            hello(&good, 24, vec![JobKind::Terrain, JobKind::Terrain]), // duplicate kind
-            hello(&good, MAX_VRAM_GB + 1, vec![JobKind::Terrain]),   // vram over ceiling
+            hello_gpu("depth", &long_gpu, 24, vec![JobKind::Terrain]), // gpu_model too long
+            hello("depth", 24, vec![JobKind::Terrain, JobKind::Terrain]), // duplicate kind
+            hello("depth", MAX_VRAM_GB + 1, vec![JobKind::Terrain]),   // vram over ceiling
         ];
         for m in &malformed {
             let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
@@ -2052,7 +2112,7 @@ mod tests {
         let ok = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&good, 24, vec![JobKind::Terrain, JobKind::Foliage])).unwrap(),
+            &serde_json::to_value(hello("depth", 24, vec![JobKind::Terrain, JobKind::Foliage])).unwrap(),
         )
         .await;
         assert_eq!(ok.status(), StatusCode::OK);
@@ -2069,12 +2129,11 @@ mod tests {
     #[tokio::test]
     async fn register_accepts_boundary_gpu_len_and_vram() {
         let state = test_state_empty().await;
-        let addr = test_address("boundary");
         let max_gpu = "x".repeat(MAX_GPU_MODEL_LEN);
         let resp = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello_gpu(&addr, &max_gpu, MAX_VRAM_GB, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(hello_gpu("boundary", &max_gpu, MAX_VRAM_GB, vec![JobKind::Terrain])).unwrap(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2083,17 +2142,23 @@ mod tests {
         assert_eq!(json["total_vram_gb"], MAX_VRAM_GB as u64);
     }
 
-    /// A mixed-case (EIP-55-checksummed) address must register: the settle-time
-    /// signature gate compares case-insensitively, so rejecting mixed case would
-    /// lock out a legitimate earner whose result would still verify (FM1).
+    /// A mixed-case (EIP-55-checksummed) address must register: both
+    /// `is_evm_address` and the key-possession comparison are case-insensitive, so
+    /// an earner that claims and signs over the checksummed form of an address it
+    /// controls still registers (and its result would settle, compared the same
+    /// way) (FM1). Constructed from a real key so the signature genuinely recovers.
     #[tokio::test]
     async fn register_accepts_checksummed_mixed_case_address() {
         let state = test_state_empty().await;
-        let mixed = "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa";
+        let sk = test_signing_key("mixedcase");
+        let lower = address_from_signing_key(&sk);
+        let mixed = format!("0x{}", lower[2..].to_uppercase());
+        assert_ne!(mixed, lower, "claim must differ in case from the recovered address");
         let resp = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(mixed, 24, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(signed_hello(&sk, &mixed, "RTX 4090", 24, vec![JobKind::Terrain]))
+                .unwrap(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2112,11 +2177,10 @@ mod tests {
     #[tokio::test]
     async fn malformed_re_register_does_not_evict_existing_earner() {
         let state = test_state_empty().await;
-        let addr = test_address("keep");
         let ok = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(hello("keep", 24, vec![JobKind::Terrain])).unwrap(),
         )
         .await;
         assert_eq!(ok.status(), StatusCode::OK);
@@ -2128,7 +2192,7 @@ mod tests {
         let bad = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&addr, 99, vec![])).unwrap(),
+            &serde_json::to_value(hello("keep", 99, vec![])).unwrap(),
         )
         .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
@@ -2195,7 +2259,7 @@ mod tests {
         let reg = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
         )
         .await;
         assert_eq!(reg.status(), StatusCode::OK);
@@ -2231,7 +2295,7 @@ mod tests {
         post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
         )
         .await;
 
@@ -2264,7 +2328,7 @@ mod tests {
         post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
         )
         .await;
         state.earners.lock().await.get_mut(&addr).unwrap().last_seen = 0;
@@ -2954,18 +3018,20 @@ mod tests {
     }
 
     fn ws_hello() -> EarnerMsg {
-        EarnerMsg::Hello {
-            earner_address: dev_address(),
-            gpu_model: "RTX 4090".into(),
-            vram_gb: 24,
-            supported: vec![
+        let sk = dev_signing_key();
+        signed_hello(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![
                 JobKind::Terrain,
                 JobKind::Foliage,
                 JobKind::NpcTick,
                 JobKind::DiffusionTile,
                 JobKind::Optimization,
             ],
-        }
+        )
     }
 
     /// Assert the server closed the ws without first sending a frame — what a
@@ -2992,11 +3058,10 @@ mod tests {
     async fn ws_rejects_malformed_hello_and_registers_nothing() {
         let state = test_state_empty().await;
         let addr = serve_ephemeral(state.clone()).await;
-        let good = test_address("wsgood");
         let malformed = [
-            hello("0xabc", 24, vec![JobKind::Terrain]), // short address
-            hello(&good, 24, vec![]),                   // advertises no kinds
-            hello(&good, 0, vec![JobKind::Terrain]),    // zero vram
+            hello_claiming("0xabc", 24, vec![JobKind::Terrain]), // short address
+            hello("wsgood", 24, vec![]),                         // advertises no kinds
+            hello("wsgood", 0, vec![JobKind::Terrain]),          // zero vram
         ];
         for m in &malformed {
             let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -3021,12 +3086,11 @@ mod tests {
     async fn ws_rejects_oversized_gpu_dup_kinds_and_huge_vram() {
         let state = test_state_empty().await;
         let addr = serve_ephemeral(state.clone()).await;
-        let good = test_address("wsdepth");
         let long_gpu = "x".repeat(MAX_GPU_MODEL_LEN + 1);
         let malformed = [
-            hello_gpu(&good, &long_gpu, 24, vec![JobKind::Terrain]),
-            hello(&good, 24, vec![JobKind::Terrain, JobKind::Terrain]),
-            hello(&good, MAX_VRAM_GB + 1, vec![JobKind::Terrain]),
+            hello_gpu("wsdepth", &long_gpu, 24, vec![JobKind::Terrain]),
+            hello("wsdepth", 24, vec![JobKind::Terrain, JobKind::Terrain]),
+            hello("wsdepth", MAX_VRAM_GB + 1, vec![JobKind::Terrain]),
         ];
         for m in &malformed {
             let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -6067,7 +6131,7 @@ mod tests {
         let state = test_state_empty().await;
         // Register via HTTP — freshly seen, so it counts.
         let addr = test_address("abc");
-        let msg = hello(&addr, 24, vec![JobKind::Terrain]);
+        let msg = hello("abc", 24, vec![JobKind::Terrain]);
         let resp = post_json(
             state.clone(),
             "/register",
@@ -6862,8 +6926,8 @@ mod tests {
         let live = test_address("live");
         let stale = test_address("stale");
         for m in [
-            &hello(&live, 24, vec![JobKind::Terrain, JobKind::Foliage]),
-            &hello(&stale, 16, vec![JobKind::NpcTick]),
+            &hello("live", 24, vec![JobKind::Terrain, JobKind::Foliage]),
+            &hello("stale", 16, vec![JobKind::NpcTick]),
         ] {
             let resp = post_json(
                 state.clone(),
@@ -6920,8 +6984,8 @@ mod tests {
         let busy = test_address("busy");
         let idle = test_address("idle");
         for m in [
-            &hello(&busy, 24, vec![JobKind::Terrain]),
-            &hello(&idle, 24, vec![JobKind::Terrain]),
+            &hello("busy", 24, vec![JobKind::Terrain]),
+            &hello("idle", 24, vec![JobKind::Terrain]),
         ] {
             let resp = post_json(
                 state.clone(),
@@ -6980,7 +7044,7 @@ mod tests {
         let resp = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello(&pay, 24, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(hello("pay", 24, vec![JobKind::Terrain])).unwrap(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
