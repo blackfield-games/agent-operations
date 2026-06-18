@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
-use proto::{signing_digest, CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec};
+use proto::{hello_digest, signing_digest, CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec};
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use std::time::Duration;
@@ -118,18 +118,29 @@ impl Session {
         Ok(Self { signing_key, address })
     }
 
-    /// Sign the canonical `signing_digest(job_id, output_hash)` with a
-    /// recoverable ECDSA signature and hex-encode the 65-byte [r||s||v].
-    fn sign_result(&self, job_id: &Uuid, output_hash: &str) -> String {
-        let digest = signing_digest(job_id, output_hash);
+    /// Sign a 32-byte prehash with a recoverable ECDSA signature and hex-encode
+    /// the 65-byte [r||s||v] the coordinator recovers from.
+    fn sign_digest(&self, digest: &[u8; 32]) -> String {
         let (sig, recid): (Signature, RecoveryId) = self
             .signing_key
-            .sign_prehash_recoverable(&digest)
+            .sign_prehash_recoverable(digest)
             .expect("signing a 32-byte prehash cannot fail");
         let mut out = Vec::with_capacity(65);
         out.extend_from_slice(&sig.to_bytes()); // 64 bytes r||s
         out.push(recid.to_byte()); // v (0/1)
         hex::encode(out)
+    }
+
+    /// Sign the canonical `signing_digest(job_id, output_hash)` — the result
+    /// attestation the coordinator validates before settle.
+    fn sign_result(&self, job_id: &Uuid, output_hash: &str) -> String {
+        self.sign_digest(&signing_digest(job_id, output_hash))
+    }
+
+    /// Sign the canonical `hello_digest` over our advertised capabilities,
+    /// proving possession of the key behind `self.address` at registration.
+    fn sign_hello(&self, gpu_model: &str, vram_gb: u32, supported: &[JobKind]) -> String {
+        self.sign_digest(&hello_digest(&self.address, gpu_model, vram_gb, supported))
     }
 }
 
@@ -255,6 +266,7 @@ where
         gpu_model: args.gpu_model.clone(),
         vram_gb: args.vram_gb,
         supported: supported.clone(),
+        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported),
     };
     ws.send(WsMessage::text(serde_json::to_string(&hello)?))
         .await
@@ -426,11 +438,13 @@ where
 }
 
 async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> Result<()> {
+    let supported = all_supported();
     let hello = EarnerMsg::Hello {
         earner_address: session.address.clone(),
         gpu_model: args.gpu_model.clone(),
         vram_gb: args.vram_gb,
-        supported: all_supported(),
+        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported),
+        supported,
     };
     let url = format!("{}/register", args.coordinator);
     let resp = client.post(&url).json(&hello).send().await?.error_for_status()?;
@@ -1190,7 +1204,7 @@ mod tests {
             .find(|r| r.url.path() == "/register")
             .expect("earner POSTed a Hello to /register");
         match serde_json::from_slice::<EarnerMsg>(&reg.body).unwrap() {
-            EarnerMsg::Hello { earner_address, gpu_model, vram_gb, supported } => {
+            EarnerMsg::Hello { earner_address, gpu_model, vram_gb, supported, .. } => {
                 assert_eq!(earner_address, session.address);
                 assert_eq!(gpu_model, args.gpu_model);
                 assert_eq!(vram_gb, args.vram_gb);
