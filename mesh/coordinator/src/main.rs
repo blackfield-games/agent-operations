@@ -813,7 +813,19 @@ async fn next_job(State(state): State<Arc<AppState>>, Query(q): Query<NextJobQue
     // kinds it supports. The earners lock is taken and the supported set cloned
     // out HERE, before the store lock, so the two locks never overlap.
     let supported = match q.earner.as_deref() {
-        Some(addr) => state.earners.lock().await.get(addr).map(|e| e.supported.clone()),
+        Some(addr) => {
+            // An identified poll is a sign of life: refresh last_seen (mirroring
+            // the submit path) so an actively-polling HTTP earner stays live in
+            // the registry — counted in /stats, and keeping THIS filter applicable
+            // instead of lapsing to unfiltered once the reaper prunes it. Clones
+            // the advertised kinds out; the earners lock drops at the block end,
+            // before the store lock.
+            let mut earners = state.earners.lock().await;
+            earners.get_mut(addr).map(|e| {
+                e.last_seen = now_secs();
+                e.supported.clone()
+            })
+        }
         None => None,
     };
     let store = state.store.lock().await;
@@ -1830,8 +1842,8 @@ mod tests {
 
     #[tokio::test]
     async fn next_job_filters_to_supported_kind_and_stamps_seq() {
-        // An earner advertising only Terrain must be handed the older Terrain job,
-        // NOT the most-recent DiffusionTile take_next returns first (rowid DESC).
+        // An earner advertising only Terrain must be handed the Terrain job, NOT
+        // the more-recent DiffusionTile that take_next returns first (rowid DESC).
         // Discriminating: the filter skips a non-matching most-recent job. The
         // supported hand-out still stamps the dispatch_seq fence header.
         let state = test_state_empty().await;
@@ -1896,6 +1908,28 @@ mod tests {
             diffusion.id.to_string(),
             "the skipped job stayed queued (no attempt burned)"
         );
+    }
+
+    #[tokio::test]
+    async fn next_job_poll_refreshes_earner_liveness() {
+        // An identified poll is a sign of life: it refreshes last_seen (mirroring
+        // submit) so an actively-polling HTTP earner isn't pruned and its filter
+        // keeps applying. Stale the earner to last_seen=0, poll, assert it advanced.
+        let state = test_state_empty().await;
+        enqueue(&state, &job_of(JobKind::Terrain)).await;
+        let addr = test_address("cap");
+        post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        state.earners.lock().await.get_mut(&addr).unwrap().last_seen = 0;
+
+        let _ = get(state.clone(), &format!("/jobs/next?earner={addr}")).await;
+
+        let last_seen = state.earners.lock().await.get(&addr).unwrap().last_seen;
+        assert!(last_seen > 0, "an identified poll refreshes the earner's last_seen");
     }
 
     #[tokio::test]
