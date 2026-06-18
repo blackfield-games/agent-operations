@@ -446,6 +446,176 @@ contract ArtifactTemplateTest is Test {
         assertEq(rs.observedTotalMintedAtSpend(), 5, "CEI: outer effects precede the spend");
     }
 
+    // --- mint royalty (RegionAuthority) ---
+
+    function test_mint_routesRoyaltyToRegionAndHolderClaims() public {
+        // Distinct fee and royalty rates so the two ledgers move by DIFFERENT amounts —
+        // proving they're independent flows (FM1), not the same value double-counted.
+        vm.startPrank(owner);
+        art.setMintFeeRate(2e15);
+        art.setRoyaltyRate(3e15);
+        vm.stopPrank();
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0); // 50% rarity
+
+        uint256 expectedFee = 4e15; // ceil(2e15 * 4 * 5000 / 10000)
+        uint256 expectedRoyalty = 6e15; // ceil(3e15 * 4 * 5000 / 10000)
+
+        uint256 creditBefore = meter.credit(player);
+        uint256 balBefore = token.balanceOf(player);
+        uint256 accruedBefore = region.accruedFees(regionId);
+
+        vm.expectEmit(true, true, false, true, address(art));
+        emit RoyaltyRouted(id, regionId, expectedRoyalty);
+
+        vm.prank(minter);
+        art.mint(player, id, 4, regionId, "");
+
+        // Both ledgers move, by their own rate: burned compute credit AND real $BLCKFLD.
+        assertEq(meter.credit(player), creditBefore - expectedFee, "compute credit debited by fee");
+        assertEq(token.balanceOf(player), balBefore - expectedRoyalty, "real token debited by royalty");
+        assertEq(region.accruedFees(regionId), accruedBefore + expectedRoyalty, "region accrued the royalty");
+        assertEq(art.balanceOf(player, id), 4, "units minted");
+
+        // The region holder withdraws exactly the routed royalty.
+        uint256 holderBefore = token.balanceOf(regionHolder);
+        vm.prank(regionHolder);
+        region.claimFees(regionId);
+        assertEq(token.balanceOf(regionHolder), holderBefore + expectedRoyalty, "holder claimed royalty");
+        assertEq(region.accruedFees(regionId), 0, "accrued zeroed after claim");
+    }
+
+    function test_mint_royaltyRoundsUp() public {
+        // rate=1, rarity=1, amount=1 -> raw 1/10000 < 1. Floor would route nothing; ceil
+        // charges exactly 1. Pins the rounding direction, mirroring the compute fee.
+        vm.prank(owner);
+        art.setRoyaltyRate(1);
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
+
+        uint256 balBefore = token.balanceOf(player);
+        vm.prank(minter);
+        art.mint(player, id, 1, regionId, "");
+
+        assertEq(token.balanceOf(player), balBefore - 1, "ceil charges 1, not 0");
+        assertEq(region.accruedFees(regionId), 1, "1 unit accrued to the region");
+    }
+
+    function test_mint_zeroRarityDepositsNoRoyalty() public {
+        // rarity-0 (the 0-bps common tier) skips the royalty entirely: no real token is
+        // pulled and the region accrues nothing, even with a claimed region named.
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 0, keccak256("m"), 0);
+
+        uint256 balBefore = token.balanceOf(player);
+        uint256 accruedBefore = region.accruedFees(regionId);
+        vm.prank(minter);
+        art.mint(player, id, 7, regionId, "");
+
+        assertEq(art.balanceOf(player, id), 7);
+        assertEq(token.balanceOf(player), balBefore, "no real token pulled for rarity-0");
+        assertEq(region.accruedFees(regionId), accruedBefore, "no royalty deposited for rarity-0");
+    }
+
+    function test_mint_revertsUnknownRegion() public {
+        // A royalty-charging mint naming an unclaimed region reverts (depositFees guards
+        // UnknownRegion) and unwinds the whole mint — including the royalty token pull.
+        uint256 ghostRegion = uint256(keccak256("never-claimed"));
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0);
+
+        uint256 balBefore = token.balanceOf(player);
+        vm.expectRevert(RegionAuthority.UnknownRegion.selector);
+        vm.prank(minter);
+        art.mint(player, id, 4, ghostRegion, "");
+
+        assertEq(art.balanceOf(player, id), 0, "no units minted");
+        assertEq(art.totalMinted(), 0, "counters rolled back");
+        assertEq(token.balanceOf(player), balBefore, "royalty token pull rolled back");
+    }
+
+    function test_mint_revertsOnInsufficientRoyaltyAllowance() public {
+        // The recipient holds real $BLCKFLD but never approved art, so the royalty pull
+        // reverts. The compute fee (charged first) is funded, so the revert is the
+        // royalty allowance — and the whole mint unwinds, minting nothing.
+        address payer = address(0xA110C);
+        _credit(payer, 1_000 ether); // compute credit (real tokens burned away)
+        token.transfer(payer, 1_000 ether); // real balance, but NO approval to art
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0);
+
+        vm.expectRevert(); // ERC20 insufficient allowance on the royalty transferFrom
+        vm.prank(minter);
+        art.mint(payer, id, 4, regionId, "");
+
+        assertEq(art.balanceOf(payer, id), 0, "no units minted");
+        assertEq(art.totalMinted(), 0, "counter rolled back");
+        assertEq(meter.spentByBuyer(payer), 0, "compute spend rolled back");
+        assertEq(region.accruedFees(regionId), 0, "no royalty routed");
+    }
+
+    function test_mint_revertsOnInsufficientRoyaltyBalance() public {
+        // The recipient approved art but holds no real $BLCKFLD (all burned into credit),
+        // so the royalty pull reverts on balance and the whole mint unwinds.
+        address payer = address(0xBA1A);
+        _credit(payer, 1_000 ether); // compute credit; leaves 0 real balance
+        vm.prank(payer);
+        token.approve(address(art), type(uint256).max);
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0);
+
+        vm.expectRevert(); // ERC20 insufficient balance on the royalty transferFrom
+        vm.prank(minter);
+        art.mint(payer, id, 4, regionId, "");
+
+        assertEq(art.balanceOf(payer, id), 0, "no units minted");
+        assertEq(art.totalMinted(), 0, "counter rolled back");
+        assertEq(region.accruedFees(regionId), 0, "no royalty routed");
+    }
+
+    function test_mint_royaltyCreditsAnyNamedClaimedRegion() public {
+        // Attribution is off-chain policy, NOT on-chain-enforced (FM3): the minter names
+        // the region and the royalty accrues there regardless of any artifact<->region
+        // link. A second claimed region receives a mint's royalty while region A gets none.
+        uint256 otherRegion = uint256(keccak256("region-B"));
+        address otherHolder = address(0x0EE2);
+        token.transfer(otherHolder, STAKE);
+        vm.startPrank(otherHolder);
+        token.approve(address(region), STAKE);
+        region.claim(otherRegion, STAKE);
+        vm.stopPrank();
+
+        vm.prank(minter);
+        uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0);
+        vm.prank(minter);
+        art.mint(player, id, 4, otherRegion, ""); // routed to region B, not setUp's region A
+
+        assertGt(region.accruedFees(otherRegion), 0, "royalty accrued to the named region");
+        assertEq(region.accruedFees(regionId), 0, "the unrelated region A got nothing");
+    }
+
+    // --- royalty-rate config ---
+
+    function test_setRoyaltyRate_updatesAndEmits() public {
+        vm.expectEmit(false, false, false, true);
+        emit RoyaltyRateSet(77e12);
+        vm.prank(owner);
+        art.setRoyaltyRate(77e12);
+        assertEq(art.royaltyRate(), 77e12);
+    }
+
+    function test_setRoyaltyRate_revertsZero() public {
+        vm.expectRevert(ArtifactTemplate.ZeroRoyaltyRate.selector);
+        vm.prank(owner);
+        art.setRoyaltyRate(0);
+    }
+
+    function test_setRoyaltyRate_onlyOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, stranger));
+        vm.prank(stranger);
+        art.setRoyaltyRate(123);
+    }
+
     // --- supply cap ---
 
     function test_registerTemplate_storesMaxSupply() public {
