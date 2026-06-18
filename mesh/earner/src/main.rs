@@ -243,15 +243,49 @@ async fn run_ws(args: &Args, session: &Session) -> Result<()> {
     }
 }
 
-/// Run a single websocket connection: send `Hello`, then handle `JobOffer` →
-/// render → sign → `Accept` + `Submit`, reading the `Accepted`/`Rejected`
-/// verdict, until the stream ends.
+/// How long to wait for the coordinator's opening `Challenge` before giving up
+/// and reconnecting — generous, since an honest coordinator challenges on connect.
+const CHALLENGE_TIMEOUT_SECS: u64 = 30;
+
+/// Read the coordinator's opening `Challenge` frame and return its decoded nonce
+/// bytes. Skips pre-handshake ping/pong/binary; errors (so `run_ws` reconnects)
+/// on a timeout, a closed/ended stream, a non-`Challenge` first message, or a
+/// non-hex nonce — failing closed rather than registering without a challenge.
+async fn recv_challenge<S>(ws: &mut S) -> Result<Vec<u8>>
+where
+    S: StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let wait = Duration::from_secs(CHALLENGE_TIMEOUT_SECS);
+    loop {
+        let frame = tokio::time::timeout(wait, ws.next())
+            .await
+            .context("timed out awaiting coordinator challenge")?
+            .context("connection closed before challenge")?
+            .context("ws recv")?;
+        let text = match frame {
+            WsMessage::Text(t) => t,
+            WsMessage::Close(_) => return Err(anyhow!("connection closed before challenge")),
+            _ => continue, // ping/pong/binary before the challenge
+        };
+        return match serde_json::from_str::<CoordinatorMsg>(&text) {
+            Ok(CoordinatorMsg::Challenge { nonce }) => {
+                hex::decode(&nonce).context("challenge nonce is not valid hex")
+            }
+            Ok(other) => Err(anyhow!("expected Challenge as first frame, got {other:?}")),
+            Err(e) => Err(anyhow!(e)).context("undecodable challenge frame"),
+        };
+    }
+}
+
+/// Run a single websocket connection: read the coordinator's `Challenge`, send a
+/// `Hello` signed over it, then handle `JobOffer` → render → sign → `Accept` +
+/// `Submit`, reading the `Accepted`/`Rejected` verdict, until the stream ends.
 ///
 /// Returns `Ok(())` on a clean `Close` or stream end and `Err` on a transport
-/// recv error — either way [`run_ws`] reconnects. In-session DECODE failures
-/// (one malformed frame) and `handle_offer` errors are non-fatal: log a `warn`
-/// and keep the session alive, mirroring how the coordinator tolerates
-/// undecodable earner messages.
+/// recv error or a missing/invalid challenge — either way [`run_ws`] reconnects.
+/// In-session DECODE failures (one malformed frame) and `handle_offer` errors are
+/// non-fatal: log a `warn` and keep the session alive, mirroring how the
+/// coordinator tolerates undecodable earner messages.
 async fn ws_session<S>(mut ws: S, args: &Args, session: &Session) -> Result<()>
 where
     S: SinkExt<WsMessage>
@@ -264,12 +298,18 @@ where
     // against exactly what we told the coordinator (no Hello/guard skew, and no
     // mid-session race: a single session never re-Hellos).
     let supported = all_supported();
+    // The coordinator opens with a single-use Challenge; fold its nonce into the
+    // signed Hello so a Hello captured off the wire and replayed on a fresh
+    // connection — which receives a different challenge — fails signature
+    // recovery. Bounded so a coordinator that upgrades the socket but never
+    // challenges can't wedge us: on timeout/miss we return and `run_ws` reconnects.
+    let nonce = recv_challenge(&mut ws).await?;
     let hello = EarnerMsg::Hello {
         earner_address: session.address.clone(),
         gpu_model: args.gpu_model.clone(),
         vram_gb: args.vram_gb,
         supported: supported.clone(),
-        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported, &[]),
+        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported, &nonce),
     };
     ws.send(WsMessage::text(serde_json::to_string(&hello)?))
         .await
@@ -906,6 +946,14 @@ mod tests {
         (WsMessage::text(serde_json::to_string(&offer).unwrap()), job_id)
     }
 
+    /// The coordinator's opening `Challenge` text frame carrying `nonce_hex`.
+    /// Seeded (wrapped in `Ok`) at the front of every `ws_session` mock stream so
+    /// the handshake can read it before the offer/close/error frames under test.
+    fn challenge_frame(nonce_hex: &str) -> WsMessage {
+        let msg = CoordinatorMsg::Challenge { nonce: nonce_hex.to_string() };
+        WsMessage::text(serde_json::to_string(&msg).unwrap())
+    }
+
     #[tokio::test]
     async fn ws_session_runs_hello_then_accept_then_signed_submit() {
         let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
@@ -914,6 +962,7 @@ mod tests {
         // The coordinator offers exactly one job, then the stream ends.
         let (offer, job_id) = job_offer_frame();
         let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(challenge_frame("0a1b2c3d4e5f60718293a4b5c6d7e8f9")));
         incoming.push_back(Ok(offer));
         let mut mock = MockSocket::new(incoming);
 
@@ -954,6 +1003,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_session_signs_hello_over_the_issued_challenge() {
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let args = Args::parse_from(["earner"]);
+        let nonce_hex = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+
+        // Only a challenge, then the stream ends — ws_session just registers.
+        let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(challenge_frame(nonce_hex)));
+        let mut mock = MockSocket::new(incoming);
+        ws_session(&mut mock, &args, &session).await.unwrap();
+
+        let EarnerMsg::Hello { earner_address, gpu_model, vram_gb, supported, signature_hex } =
+            decode_frame(&mock.sent[0])
+        else {
+            panic!("first frame must be Hello");
+        };
+        assert_eq!(earner_address, session.address);
+        let raw = hex::decode(&signature_hex).unwrap();
+        let sig = Signature::from_slice(&raw[..64]).unwrap();
+        let recid = RecoveryId::from_byte(raw[64]).unwrap();
+        // The Hello signature recovers to the earner's address over the digest
+        // built with the ISSUED nonce — proving the earner folded in the challenge.
+        let nonce = hex::decode(nonce_hex).unwrap();
+        let digest = hello_digest(&earner_address, &gpu_model, vram_gb, &supported, &nonce);
+        let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
+        assert_eq!(address_from_verifying_key(&vk), session.address);
+        // Over a DIFFERENT challenge the same signature recovers a different key,
+        // so a captured Hello can't be replayed against a fresh challenge.
+        let other = hello_digest(&earner_address, &gpu_model, vram_gb, &supported, b"other-nonce");
+        let vk2 = VerifyingKey::recover_from_prehash(&other, &sig, recid).unwrap();
+        assert_ne!(
+            address_from_verifying_key(&vk2),
+            session.address,
+            "the signature must not verify over a different challenge nonce"
+        );
+    }
+
+    #[tokio::test]
     async fn ws_session_skips_an_undecodable_frame_then_processes_the_offer() {
         let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
         let args = Args::parse_from(["earner"]);
@@ -963,6 +1050,7 @@ mod tests {
         // still process the following offer — one bad frame can't drop the session.
         let (offer, job_id) = job_offer_frame();
         let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(challenge_frame("0a1b2c3d4e5f60718293a4b5c6d7e8f9")));
         incoming.push_back(Ok(WsMessage::text("definitely not json {{{".to_string())));
         incoming.push_back(Ok(offer));
         let mut mock = MockSocket::new(incoming);
@@ -987,6 +1075,7 @@ mod tests {
         // never be processed — ws_session breaks on Close and returns Ok(()).
         let (offer, _job_id) = job_offer_frame();
         let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(challenge_frame("0a1b2c3d4e5f60718293a4b5c6d7e8f9")));
         incoming.push_back(Ok(WsMessage::Close(None)));
         incoming.push_back(Ok(offer));
         let mut mock = MockSocket::new(incoming);
@@ -1004,8 +1093,9 @@ mod tests {
         let args = Args::parse_from(["earner"]);
 
         // A transport recv error must surface as Err so run_ws logs it, backs off,
-        // and reconnects. Hello is already sent before the error is read.
+        // and reconnects. The challenge is read and Hello sent before the error.
         let mut incoming = VecDeque::new();
+        incoming.push_back(Ok(challenge_frame("0a1b2c3d4e5f60718293a4b5c6d7e8f9")));
         incoming.push_back(Err(tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(
             "simulated recv error",
         ))));
