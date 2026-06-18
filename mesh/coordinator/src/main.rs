@@ -4989,10 +4989,11 @@ mod tests {
         assert_eq!(store.attempt_fault_totals().unwrap(), (1, 2));
 
         // A second job dispatched once proves the SUM spans rows, not just the
-        // first job (take_next pops the most-recently-enqueued queued job).
+        // first job. Select job2 by id (FIFO would otherwise redispatch the older
+        // `job` and leave job2 at attempts 0, making the cross-row sum vacuous).
         let job2 = job_with_deadline(100);
         store.enqueue(&job2).unwrap();
-        store.take_next(|_| true).unwrap();
+        store.take_next(|j| j.id == job2.id).unwrap();
         assert_eq!(store.attempt_fault_totals().unwrap(), (2, 2));
     }
 
