@@ -4470,6 +4470,142 @@ mod tests {
         .is_ok());
     }
 
+    // -- POST /jobs queued-backlog cap (--max-queued-jobs) ----------------
+
+    /// Empty-queue state with a small queued-job cap, for the backlog-cap tests.
+    async fn test_state_empty_with_cap(max_queued: usize) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            max_queued,
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
+    /// FM5: at the cap, a create is shed with a retryable 503 and nothing is
+    /// enqueued past the cap. Mutation-proven discriminating: drop the cap (swap
+    /// `enqueue_within_cap` for `enqueue`) and the 3rd POST returns 201 with
+    /// `jobs_queued == 3`, failing both assertions.
+    #[tokio::test]
+    async fn create_job_rejects_when_queue_at_cap() {
+        let state = test_state_empty_with_cap(2).await;
+        for _ in 0..2 {
+            let resp = post_json(state.clone(), "/jobs", &create_job_body()).await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        let resp = post_json(state.clone(), "/jobs", &create_job_body()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 2);
+    }
+
+    /// FM3: the cap reads the TRUE queued depth — a live COUNT over the queued rows,
+    /// not a side counter that could drift — so a dispatch (queued→in_flight) frees
+    /// a slot and a create that was just shed is admitted again. The count is a
+    /// single `WHERE status = queued` query, so it tracks every transition both ways
+    /// (a requeue back INTO queued is counted identically); the uncapped paths that
+    /// can push the backlog over the cap are covered by `queue_cap_exempts_the_boot_seed`.
+    #[tokio::test]
+    async fn queue_cap_frees_a_slot_when_a_job_is_dispatched() {
+        let state = test_state_empty_with_cap(2).await;
+        for _ in 0..2 {
+            assert_eq!(
+                post_json(state.clone(), "/jobs", &create_job_body()).await.status(),
+                StatusCode::CREATED
+            );
+        }
+        // At the cap → shed.
+        assert_eq!(
+            post_json(state.clone(), "/jobs", &create_job_body()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Dispatch one (queued→in_flight): the cap counts only queued, so a slot frees.
+        state.store.lock().await.take_next(|_| true).unwrap().unwrap();
+        assert_eq!(
+            post_json(state.clone(), "/jobs", &create_job_body()).await.status(),
+            StatusCode::CREATED,
+            "a dispatched job frees a queued slot"
+        );
+        // queued is back at the cap (one dispatched out, one fresh in).
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 2);
+    }
+
+    /// FM4: the boot-time seed enqueues via the uncapped path, so it must NOT be
+    /// silently dropped by a low cap. Built with cap=1 and NOT drained: the seeded
+    /// backlog exceeds the cap.
+    #[tokio::test]
+    async fn queue_cap_exempts_the_boot_seed() {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            1,
+        )
+        .unwrap();
+        let queued = body_json(get(state, "/stats").await).await["jobs_queued"].as_u64().unwrap();
+        assert!(queued > 1, "the boot seed must bypass the cap, got {queued} queued");
+    }
+
+    /// FM2: concurrent creators against a cap of 3 admit EXACTLY 3 — no overshoot.
+    /// The atomic count-and-insert (one SQL statement under the store mutex) is what
+    /// makes this hold; a check-then-insert with the lock released between would let
+    /// several creators all observe `cap-1` and overshoot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_cap_no_overshoot_under_concurrent_creates() {
+        let state = test_state_empty_with_cap(3).await;
+        let futs: Vec<_> = (0..12)
+            .map(|_| {
+                let s = state.clone();
+                async move { post_json(s, "/jobs", &create_job_body()).await.status() }
+            })
+            .collect();
+        let statuses = futures_util::future::join_all(futs).await;
+        let created = statuses.iter().filter(|s| **s == StatusCode::CREATED).count();
+        let shed = statuses.iter().filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE).count();
+        assert_eq!(created, 3, "exactly cap jobs admitted");
+        assert_eq!(shed, 9, "the rest are shed, none lost to a 500");
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 3);
+    }
+
+    #[test]
+    fn with_store_rejects_zero_max_queued_jobs() {
+        let r = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            0,
+        );
+        assert!(r.is_err(), "zero max_queued_jobs must be rejected at construction");
+    }
+
+    #[test]
+    fn args_max_queued_jobs_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).max_queued_jobs,
+            DEFAULT_MAX_QUEUED_JOBS,
+            "unset default == the const"
+        );
+        assert_eq!(
+            Args::parse_from(["coordinator", "--max-queued-jobs", "42"]).max_queued_jobs,
+            42,
+            "the flag is honored"
+        );
+    }
+
     /// Graceful shutdown is preserved by the hand-rolled accept loop: firing the
     /// shutdown signal makes `serve()` stop accepting and return (drain), not hang
     /// — guards the FM that replacing `axum::serve`'s `with_graceful_shutdown`
