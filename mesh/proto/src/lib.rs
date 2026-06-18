@@ -25,6 +25,40 @@ pub fn signing_digest(job_id: &Uuid, output_hash: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Canonical digest the earner signs at registration to prove possession of the
+/// key behind `earner_address` — the registration analogue of [`signing_digest`].
+/// The coordinator recovers the signer from this digest plus the `Hello`'s
+/// `signature_hex` and rejects the registration unless the recovered address
+/// matches the claimed `earner_address`.
+///
+/// Bytes = `keccak256( DOMAIN || len(addr) || addr || len(gpu) || gpu ||
+/// vram_gb_be || len(supported) || Σ kind_as_u16_be )`, every `len` a big-endian
+/// `u32`. The `DOMAIN` tag separates it from [`signing_digest`], so a result
+/// attestation can never double as a registration signature; the length prefixes
+/// make the field boundaries unambiguous, so no two distinct Hellos collide on a
+/// digest (e.g. `addr="0xab",gpu="cd"` ≠ `addr="0xabcd",gpu=""`). The signature
+/// therefore binds the *whole* advertised capability set, not just the address.
+/// Both sides MUST build it identically, so the construction is fixed here.
+pub fn hello_digest(
+    earner_address: &str,
+    gpu_model: &str,
+    vram_gb: u32,
+    supported: &[JobKind],
+) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"blackfield/hello/v1");
+    hasher.update((earner_address.len() as u32).to_be_bytes());
+    hasher.update(earner_address.as_bytes());
+    hasher.update((gpu_model.len() as u32).to_be_bytes());
+    hasher.update(gpu_model.as_bytes());
+    hasher.update(vram_gb.to_be_bytes());
+    hasher.update((supported.len() as u32).to_be_bytes());
+    for kind in supported {
+        hasher.update(kind.as_u16().to_be_bytes());
+    }
+    hasher.finalize().into()
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
@@ -220,6 +254,53 @@ mod tests {
         let recovered = address_from_verifying_key(&recovered_vk);
 
         assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn hello_sign_then_recover_yields_claimed_address() {
+        // The registration analogue of the result-attestation recovery above:
+        // the earner signs `hello_digest` with its session key and the
+        // coordinator must recover exactly the claimed address.
+        let key_bytes =
+            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+                .unwrap();
+        let sk = SigningKey::from_slice(&key_bytes).unwrap();
+        let expected = address_from_verifying_key(sk.verifying_key());
+
+        let supported = [JobKind::Terrain, JobKind::DiffusionTile];
+        let digest = hello_digest(&expected, "RTX 4090", 24, &supported);
+
+        let (sig, recid): (Signature, RecoveryId) =
+            sk.sign_prehash_recoverable(&digest).unwrap();
+        let recovered_vk =
+            VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
+
+        assert_eq!(address_from_verifying_key(&recovered_vk), expected);
+    }
+
+    #[test]
+    fn hello_digest_binds_every_field() {
+        // The signature commits to the whole advertised Hello, so changing any
+        // field changes the digest — a captured signature can't be reattached to
+        // an inflated vram / different capability set (full-Hello replay is the
+        // separate residual deferred to the nonce slice).
+        let base = hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain]);
+        assert_ne!(base, hello_digest("0xabd", "gpu", 24, &[JobKind::Terrain]), "address");
+        assert_ne!(base, hello_digest("0xabc", "gpx", 24, &[JobKind::Terrain]), "gpu_model");
+        assert_ne!(base, hello_digest("0xabc", "gpu", 25, &[JobKind::Terrain]), "vram_gb");
+        assert_ne!(base, hello_digest("0xabc", "gpu", 24, &[JobKind::Foliage]), "kind");
+        assert_ne!(
+            base,
+            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain, JobKind::Foliage]),
+            "supported length"
+        );
+        // Length-delimited: shifting a byte across the address/gpu boundary must
+        // not alias to the same digest.
+        assert_ne!(
+            hello_digest("0xab", "cgpu", 24, &[JobKind::Terrain]),
+            hello_digest("0xabc", "gpu", 24, &[JobKind::Terrain]),
+            "field boundaries must be unambiguous"
+        );
     }
 
     // -----------------------------------------------------------------------
