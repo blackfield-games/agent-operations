@@ -1552,10 +1552,27 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     tracing::info!(earner = %earner_address, "ws session ended");
 }
 
-/// Block on the first frame, requiring an `EarnerMsg::Hello`. Registers the
-/// earner (shared with `/register`) and returns its address, or `None` if the
-/// socket closed / sent something other than a Hello.
+/// Number of random bytes in the per-connection registration challenge (128 bit).
+const HELLO_NONCE_BYTES: usize = 16;
+
+/// Issue a single-use challenge, then block on the first `EarnerMsg::Hello` and
+/// require its signature to cover that challenge. Registers the earner (shared
+/// with `/register`) and returns its address, or `None` if the socket closed /
+/// sent something other than a valid Hello.
+///
+/// The challenge is a fresh random nonce sent as the FIRST frame and held only
+/// for this handshake (never stored), so a Hello captured off the wire and
+/// replayed on a new connection — which receives a different challenge — fails
+/// signature recovery, and there is no nonce store for an attacker to exhaust.
 async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<String> {
+    let mut nonce = [0u8; HELLO_NONCE_BYTES];
+    if getrandom::getrandom(&mut nonce).is_err() {
+        tracing::error!("ws: failed to generate a registration challenge; closing");
+        return None;
+    }
+    if !send_msg(socket, &CoordinatorMsg::Challenge { nonce: hex::encode(nonce) }).await {
+        return None;
+    }
     loop {
         let frame = socket.recv().await?.ok()?;
         let text = match frame {
@@ -1575,9 +1592,14 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
             tracing::warn!("ws: first message was not Hello; closing");
             return None;
         };
-        if let Err(reason) =
-            validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &[], &signature_hex)
-        {
+        if let Err(reason) = validate_hello(
+            &earner_address,
+            &gpu_model,
+            vram_gb,
+            &supported,
+            &nonce,
+            &signature_hex,
+        ) {
             tracing::warn!(address = %earner_address, reason, "ws: rejected malformed Hello; closing");
             return None;
         }
@@ -1882,22 +1904,21 @@ mod tests {
     }
 
     /// Build a `Hello` that *claims* `claimed`, signed over its
-    /// `hello_digest(claimed, …)` by `sk`. Separating the claim from the signing
-    /// key lets a negative test forge a signature (sign with the wrong key) or
-    /// claim an address the key doesn't derive to; the happy path passes
-    /// `claimed == address_from_signing_key(sk)`.
-    fn signed_hello(
+    /// `hello_digest(claimed, …, nonce)` by `sk`. Separating the claim from the
+    /// signing key lets a negative test forge a signature (sign with the wrong
+    /// key) or claim an address the key doesn't derive to; separating the nonce
+    /// lets the ws handshake tests bind the issued challenge (or a stale one).
+    fn signed_hello_with_nonce(
         sk: &SigningKey,
         claimed: &str,
         gpu_model: &str,
         vram_gb: u32,
         supported: Vec<JobKind>,
+        nonce: &[u8],
     ) -> EarnerMsg {
-        // Registration test helpers exercise the HTTP/empty-nonce binding; the WS
-        // per-connection challenge is threaded explicitly by the ws handshake tests.
         let signature_hex = verify::sign_digest_for_test(
             sk,
-            &proto::hello_digest(claimed, gpu_model, vram_gb, &supported, b""),
+            &proto::hello_digest(claimed, gpu_model, vram_gb, &supported, nonce),
         );
         EarnerMsg::Hello {
             earner_address: claimed.into(),
@@ -1906,6 +1927,18 @@ mod tests {
             supported,
             signature_hex,
         }
+    }
+
+    /// The HTTP-path `Hello` builder: signs over the empty-nonce digest (the HTTP
+    /// `/register` path is not challenge-gated — its replay is a benign upsert).
+    fn signed_hello(
+        sk: &SigningKey,
+        claimed: &str,
+        gpu_model: &str,
+        vram_gb: u32,
+        supported: Vec<JobKind>,
+    ) -> EarnerMsg {
+        signed_hello_with_nonce(sk, claimed, gpu_model, vram_gb, supported, b"")
     }
 
     /// A valid self-signed `Hello` from `label`'s deterministic key
@@ -3090,9 +3123,9 @@ mod tests {
         addr.to_string()
     }
 
-    fn ws_hello() -> EarnerMsg {
+    fn ws_hello(nonce: &[u8]) -> EarnerMsg {
         let sk = dev_signing_key();
-        signed_hello(
+        signed_hello_with_nonce(
             &sk,
             &address_from_signing_key(&sk),
             "RTX 4090",
@@ -3104,7 +3137,30 @@ mod tests {
                 JobKind::DiffusionTile,
                 JobKind::Optimization,
             ],
+            nonce,
         )
+    }
+
+    /// Read the coordinator's opening `Challenge` frame and return its nonce
+    /// bytes. The coordinator now challenges on connect, so every ws test reads
+    /// this before sending its Hello (and folds the nonce into the signature).
+    async fn recv_challenge(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Vec<u8> {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(t))) => {
+                    match serde_json::from_str::<CoordinatorMsg>(&t).unwrap() {
+                        CoordinatorMsg::Challenge { nonce } => return hex::decode(nonce).unwrap(),
+                        other => panic!("expected Challenge as first frame, got {other:?}"),
+                    }
+                }
+                Some(Ok(_)) => continue, // ping/pong before the challenge
+                other => panic!("expected a Challenge frame, got {other:?}"),
+            }
+        }
     }
 
     /// Assert the server closed the ws without first sending a frame — what a
@@ -3140,6 +3196,7 @@ mod tests {
             let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
                 .await
                 .unwrap();
+            recv_challenge(&mut ws).await; // structural reject fires before the nonce check
             ws.send(WsMessage::text(serde_json::to_string(m).unwrap()))
                 .await
                 .unwrap();
@@ -3169,6 +3226,7 @@ mod tests {
             let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
                 .await
                 .unwrap();
+            recv_challenge(&mut ws).await; // structural reject fires before the nonce check
             ws.send(WsMessage::text(serde_json::to_string(m).unwrap()))
                 .await
                 .unwrap();
@@ -3189,16 +3247,19 @@ mod tests {
     async fn ws_rejects_forged_hello_signature() {
         let state = test_state_empty().await;
         let addr = serve_ephemeral(state.clone()).await;
-        let forged = signed_hello(
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        // Forge over the issued challenge with the wrong key — rejects on signature.
+        let forged = signed_hello_with_nonce(
             &test_signing_key("attacker"),
             &test_address("victim"),
             "RTX 4090",
             24,
             vec![JobKind::Terrain],
+            &nonce,
         );
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .unwrap();
         ws.send(WsMessage::text(serde_json::to_string(&forged).unwrap()))
             .await
             .unwrap();
@@ -3223,7 +3284,8 @@ mod tests {
             .unwrap();
 
         // 1. Hello
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
 
@@ -3280,7 +3342,8 @@ mod tests {
             .await
             .unwrap();
 
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
 
@@ -3334,7 +3397,8 @@ mod tests {
             .unwrap();
 
         // Hello → JobOffer → Accept: the job is now in_flight under us.
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
         let offer = next_coordinator_msg(&mut ws).await;
@@ -3414,7 +3478,8 @@ mod tests {
             .await
             .unwrap();
 
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
         let offer = next_coordinator_msg(&mut ws).await;
@@ -3492,7 +3557,8 @@ mod tests {
             .await
             .unwrap();
 
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
         let offer = next_coordinator_msg(&mut ws).await;
@@ -3559,7 +3625,8 @@ mod tests {
             .await
             .unwrap();
 
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
         let offer = next_coordinator_msg(&mut ws).await;
@@ -3645,7 +3712,8 @@ mod tests {
             .await
             .unwrap();
 
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
         let offer = next_coordinator_msg(&mut ws).await;
@@ -3706,7 +3774,8 @@ mod tests {
             .await
             .unwrap();
 
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
         let offer = next_coordinator_msg(&mut ws).await;
@@ -3764,7 +3833,8 @@ mod tests {
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
             .unwrap();
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
 
@@ -5266,7 +5336,8 @@ mod tests {
             .unwrap();
 
         // 1. Hello
-        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
             .await
             .unwrap();
 

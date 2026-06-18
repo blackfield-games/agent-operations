@@ -294,6 +294,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "getrandom 0.2.17",
  "hex",
  "k256",
  "proto",
