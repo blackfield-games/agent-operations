@@ -113,6 +113,16 @@ struct Args {
     /// unaffected. Must be >= 1.
     #[arg(long, env = "COORDINATOR_HTTP_BODY_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_BODY_TIMEOUT.as_secs())]
     http_body_timeout_secs: u64,
+    /// Maximum number of concurrently served connections. A backstop against a
+    /// connection flood that opens sockets faster than the header/body timeouts
+    /// close them (which would otherwise grow the task/FD count without bound).
+    /// When the cap is reached a newly accepted connection is closed immediately
+    /// (the accept loop is never blocked). Set WELL above peak concurrent earners
+    /// — a fan-in of many earners at once is the designed load, so a too-low cap
+    /// throttles honest traffic. The primary flood defense is still edge / OS FD
+    /// limits; this is a process-level backstop. Must be >= 1.
+    #[arg(long, env = "COORDINATOR_MAX_CONNECTIONS", default_value_t = DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
     /// How often (seconds) the attestation relayer drains pending EAS receipts to
     /// the chain. Only runs when a relay is configured (see `--relay-dev-mock`).
     #[arg(long, env = "COORDINATOR_RELAY_INTERVAL_SECS", default_value = "10")]
@@ -402,6 +412,7 @@ async fn main() -> Result<()> {
         listener,
         app,
         Duration::from_secs(args.http_header_timeout_secs),
+        args.max_connections,
         shutdown_signal(),
     )
     .await
@@ -425,16 +436,28 @@ async fn main() -> Result<()> {
 ///
 /// On `shutdown` we stop accepting and drain in-flight connections, so graceful
 /// shutdown is preserved (`with_upgrades` keeps the ws 101 upgrade working).
+///
+/// `max_connections` caps concurrently served connections: a `try_acquire` (never
+/// an await, so the accept/shutdown select is never blocked) gates each spawn, and
+/// a connection accepted past the cap is closed immediately. The permit is moved
+/// into the connection task, so it is released on every exit path (completion,
+/// error, graceful drain) by RAII. See [`DEFAULT_MAX_CONNECTIONS`].
 async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
     header_read_timeout: Duration,
+    max_connections: usize,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     anyhow::ensure!(
         !header_read_timeout.is_zero(),
         "http_header_timeout must be > 0 (0 would close every request before its headers complete)"
     );
+    anyhow::ensure!(
+        max_connections > 0,
+        "max_connections must be > 0 (0 would reject every connection)"
+    );
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
     let mut builder = http1::Builder::new();
     builder
         .timer(TokioTimer::new())
@@ -463,11 +486,25 @@ async fn serve(
                         continue;
                     }
                 };
+                // Connection-flood backstop: `try_acquire_owned` never blocks the
+                // accept loop (so the shutdown arm and existing connections are
+                // unaffected at the cap); past the cap we drop `stream` here, which
+                // closes the just-accepted socket immediately.
+                let permit = match conn_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(max_connections, "connection cap reached; dropping new connection");
+                        continue;
+                    }
+                };
                 let io = TokioIo::new(stream);
                 let service = TowerToHyperService::new(app.clone());
                 let conn = builder.serve_connection(io, service).with_upgrades();
                 let mut drain = drain_rx.clone();
                 conns.spawn(async move {
+                    // Held for the task's whole lifetime; dropped (released) on
+                    // every exit path below — completion, error, or drain.
+                    let _permit = permit;
                     let mut conn = std::pin::pin!(conn);
                     tokio::select! {
                         res = conn.as_mut() => {
@@ -605,6 +642,18 @@ const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// `Args::http_body_timeout_secs` (`--http-body-timeout-secs` /
 /// `COORDINATOR_HTTP_BODY_TIMEOUT_SECS`).
 const DEFAULT_HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default cap on concurrently served connections — a process-level backstop
+/// against a connection flood. The per-FD header/body timeouts bound how long
+/// each connection lingers, but a client that opens and recycles connections
+/// faster than they time out still grows the live task/FD count without a cap.
+/// 4096 is ~an order of magnitude above any plausible early-fleet peak of
+/// concurrent earners (each holds ~one ws connection plus transient HTTP polls),
+/// so it never throttles honest GPU fan-in at pre-production / early scale — a
+/// larger fleet raises it via the knob. The PRIMARY flood defense remains edge /
+/// OS FD limits; this only prevents unbounded growth. Backs
+/// `Args::max_connections` (`--max-connections` / `COORDINATOR_MAX_CONNECTIONS`).
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
@@ -3371,7 +3420,13 @@ mod tests {
     /// exercises the h1 accept loop + the 101-upgrade path; a generous header
     /// timeout + a never-resolving shutdown match production-idle serving.
     async fn serve_ephemeral(state: Arc<AppState>) -> String {
-        serve_ephemeral_cfg(state, DEFAULT_HTTP_HEADER_TIMEOUT, DEFAULT_HTTP_BODY_TIMEOUT).await
+        serve_ephemeral_cfg(
+            state,
+            DEFAULT_HTTP_HEADER_TIMEOUT,
+            DEFAULT_HTTP_BODY_TIMEOUT,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
     }
 
     /// `serve_ephemeral` with a caller-chosen header-read timeout, for the
@@ -3380,7 +3435,13 @@ mod tests {
         state: Arc<AppState>,
         header_read_timeout: Duration,
     ) -> String {
-        serve_ephemeral_cfg(state, header_read_timeout, DEFAULT_HTTP_BODY_TIMEOUT).await
+        serve_ephemeral_cfg(
+            state,
+            header_read_timeout,
+            DEFAULT_HTTP_BODY_TIMEOUT,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
     }
 
     /// `serve_ephemeral` with a caller-chosen request-body timeout, for the
@@ -3389,23 +3450,31 @@ mod tests {
         state: Arc<AppState>,
         body_read_timeout: Duration,
     ) -> String {
-        serve_ephemeral_cfg(state, DEFAULT_HTTP_HEADER_TIMEOUT, body_read_timeout).await
+        serve_ephemeral_cfg(
+            state,
+            DEFAULT_HTTP_HEADER_TIMEOUT,
+            body_read_timeout,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
     }
 
     /// Bind an ephemeral port, build the router at `body_read_timeout`, and serve
-    /// it through the real `serve()` accept loop at `header_read_timeout` until the
-    /// test drops. The shared backing for the slowloris tests, which need to drive
-    /// the bound being exercised down to a sub-second value.
+    /// it through the real `serve()` accept loop at `header_read_timeout` /
+    /// `max_connections` until the test drops. The shared backing for the slowloris
+    /// and connection-cap tests, which drive the bound under test down to a small
+    /// value.
     async fn serve_ephemeral_cfg(
         state: Arc<AppState>,
         header_read_timeout: Duration,
         body_read_timeout: Duration,
+        max_connections: usize,
     ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router_with_body_timeout(state, body_read_timeout);
         tokio::spawn(async move {
-            serve(listener, app, header_read_timeout, std::future::pending::<()>())
+            serve(listener, app, header_read_timeout, max_connections, std::future::pending::<()>())
                 .await
                 .unwrap();
         });
@@ -3851,7 +3920,7 @@ mod tests {
         let app = router(state);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, async {
+            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, DEFAULT_MAX_CONNECTIONS, async {
                 let _ = rx.await;
             })
             .await
@@ -3881,7 +3950,7 @@ mod tests {
         let app = router(state);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, async {
+            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, DEFAULT_MAX_CONNECTIONS, async {
                 let _ = rx.await;
             })
             .await
@@ -3925,7 +3994,7 @@ mod tests {
         let app = router(state);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, async {
+            serve(listener, app, DEFAULT_HTTP_HEADER_TIMEOUT, DEFAULT_MAX_CONNECTIONS, async {
                 let _ = rx.await;
             })
             .await
