@@ -1238,7 +1238,7 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
             {
                 if !send_msg(&mut socket, &CoordinatorMsg::JobOffer(job.clone())).await {
                     // Socket died delivering the offer — a disconnect, so charge.
-                    requeue(&state, job, seq, RequeueKind::Charge).await;
+                    requeue(&state, job, seq, RequeueKind::Charge, None).await;
                     return;
                 }
                 tracing::info!(earner = %earner_address, job_id = %job.id, "job offered");
@@ -1322,7 +1322,7 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                                 tracing::info!(earner = %earner_address, %job_id, %reason, "offer declined; requeueing for a capable earner");
                                 if let Some((job, seq)) = offered.take() {
                                     faulted.insert(job.id);
-                                    requeue(&state, job, seq, RequeueKind::EarnerFault).await;
+                                    requeue(&state, job, seq, RequeueKind::EarnerFault, None).await;
                                 }
                                 accepted = false;
                             }
@@ -1352,7 +1352,13 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
                                     if kind == RequeueKind::EarnerFault {
                                         faulted.insert(job.id);
                                     }
-                                    requeue(&state, job, seq, kind).await;
+                                    // Attribute a genuine quality fault to this
+                                    // session's registered address — the dispatch
+                                    // holder, so a faulting earner only ever smears
+                                    // its OWN reputation, never a claimed victim's
+                                    // result.earner_address. A Charge (transient)
+                                    // is ignored by `requeue`.
+                                    requeue(&state, job, seq, kind, Some(&earner_address)).await;
                                 }
                                 accepted = false;
                             }
@@ -1428,7 +1434,7 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
     // our dispatch seq, so a job already reaped+reassigned isn't yanked back). A
     // dropped socket is a disconnect, not an earner fault, so it charges.
     if let Some((job, seq)) = offered.take() {
-        requeue(&state, job, seq, RequeueKind::Charge).await;
+        requeue(&state, job, seq, RequeueKind::Charge, None).await;
     }
     tracing::info!(earner = %earner_address, "ws session ended");
 }
@@ -1529,7 +1535,21 @@ enum RequeueKind {
 /// skip: requeueing would preempt the new holder mid-render. The store method
 /// then applies its own `in_flight` guard (a reaper-parked `queued` job is a
 /// no-op). The fence lives here, in one place, for both kinds.
-async fn requeue(state: &Arc<AppState>, job: JobSpec, seq: i64, kind: RequeueKind) {
+///
+/// `attribute_to` names the earner to charge a `/earners` reputation fault when
+/// `kind` is `EarnerFault` and the fault is a GENUINE quality fault (the ws
+/// Submit-fault path passes `Some(session_address)`). An honest `Decline` routes
+/// through `EarnerFault` too but passes `None` — it refunds and requeues like a
+/// fault yet is never a reputation fault. `Charge` ignores it. The attribution
+/// write shares this same store lock and fence, so it is atomic with the job's
+/// own `faults` bump and never records for a since-reassigned dispatch.
+async fn requeue(
+    state: &Arc<AppState>,
+    job: JobSpec,
+    seq: i64,
+    kind: RequeueKind,
+    attribute_to: Option<&str>,
+) {
     let store = state.store.lock().await;
     match store.current_dispatch_seq(&job.id) {
         Ok(Some(cur)) if cur == seq => {}
@@ -1547,10 +1567,19 @@ async fn requeue(state: &Arc<AppState>, job: JobSpec, seq: i64, kind: RequeueKin
             store.requeue(&job, state.max_attempts),
             "max attempts exhausted",
         ),
-        RequeueKind::EarnerFault => (
-            store.requeue_earner_fault(&job, state.max_faults),
-            "max earner faults exhausted",
-        ),
+        RequeueKind::EarnerFault => {
+            // A genuine quality fault is attributed to the dispatch holder; an
+            // honest Decline (attribute_to = None) reaches here too but is not.
+            if let Some(earner) = attribute_to {
+                if let Err(e) = store.record_earner_fault(earner, &job) {
+                    tracing::error!(job_id = %job.id, earner, ?e, "failed to record earner-fault attribution");
+                }
+            }
+            (
+                store.requeue_earner_fault(&job, state.max_faults),
+                "max earner faults exhausted",
+            )
+        }
     };
     match dead_lettered {
         Ok(true) => tracing::warn!(job_id = %job.id, ?kind, "job dead-lettered ({why})"),
@@ -3326,7 +3355,7 @@ mod tests {
         }
 
         // FM1: A's socket drops → requeue with A's stale seq. Must not preempt B.
-        requeue(&state, job_a, seq_a, RequeueKind::Charge).await;
+        requeue(&state, job_a, seq_a, RequeueKind::Charge, None).await;
         assert_eq!(
             state
                 .store
@@ -3419,7 +3448,7 @@ mod tests {
         );
 
         // The caller's seq-fenced earner-fault requeue then returns it to queued.
-        requeue(&state, offered, seq, RequeueKind::EarnerFault).await;
+        requeue(&state, offered, seq, RequeueKind::EarnerFault, None).await;
         assert_eq!(
             state
                 .store
