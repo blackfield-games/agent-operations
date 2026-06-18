@@ -1690,6 +1690,83 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Every malformed `Hello` is rejected at `/register` with 400 and inserts
+    /// nothing, so `/stats` and `/earners` stay empty. Covers each guarded field:
+    /// the address shape (empty / short / non-hex / missing `0x`), an empty
+    /// supported set, and a zero `vram_gb`.
+    #[tokio::test]
+    async fn register_rejects_malformed_fields_and_leaves_stats_clean() {
+        let state = test_state_empty().await;
+        let good = test_address("good");
+        let non_hex = format!("0x{}", "g".repeat(40));
+        let no_prefix = "a".repeat(40);
+        let malformed = [
+            hello("", 24, vec![JobKind::Terrain]),         // empty address
+            hello("0xabc", 24, vec![JobKind::Terrain]),    // too short
+            hello(&non_hex, 24, vec![JobKind::Terrain]),   // 40 chars but not hex
+            hello(&no_prefix, 24, vec![JobKind::Terrain]), // 40 hex but no 0x
+            hello(&good, 24, vec![]),                      // advertises no kinds
+            hello(&good, 0, vec![JobKind::Terrain]),       // zero vram
+        ];
+        for m in &malformed {
+            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected 400 for {m:?}");
+        }
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 0, "no malformed earner may enter the registry");
+        assert_eq!(json["total_vram_gb"], 0);
+        let earners = body_json(get(state.clone(), "/earners").await).await;
+        assert_eq!(earners.as_array().unwrap().len(), 0, "leaderboard stays empty");
+    }
+
+    /// A mixed-case (EIP-55-checksummed) address must register: the settle-time
+    /// signature gate compares case-insensitively, so rejecting mixed case would
+    /// lock out a legitimate earner whose result would still verify (FM1).
+    #[tokio::test]
+    async fn register_accepts_checksummed_mixed_case_address() {
+        let state = test_state_empty().await;
+        let mixed = "0xAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAaAa";
+        let resp = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello(mixed, 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(get(state.clone(), "/stats").await).await["gpus_joined"], 1);
+    }
+
+    /// A malformed re-`Hello` for an already-registered address is rejected
+    /// without evicting the existing live entry: the reject is a no-op on the
+    /// registry (no insert, no delete), so a transiently-empty re-Hello can't
+    /// drop a previously-valid earner mid-session (FM4).
+    #[tokio::test]
+    async fn malformed_re_register_does_not_evict_existing_earner() {
+        let state = test_state_empty().await;
+        let addr = test_address("keep");
+        let ok = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello(&addr, 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_json(get(state.clone(), "/stats").await).await["gpus_joined"], 1);
+
+        let bad = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello(&addr, 24, vec![])).unwrap(),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 1, "rejected re-Hello must not evict the live earner");
+        assert_eq!(json["total_vram_gb"], 24, "original registration preserved intact");
+    }
+
     #[tokio::test]
     async fn next_job_drains_all_seeds_then_none() {
         // `test_state` auto-seeds one job per JobKind; that many polls each
@@ -2267,6 +2344,52 @@ mod tests {
                 JobKind::Optimization,
             ],
         }
+    }
+
+    /// Assert the server closed the ws without first sending a frame — what a
+    /// rejected `Hello` produces (`recv_hello` returns `None`, the handler
+    /// returns, axum closes the socket).
+    async fn expect_ws_closed(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        loop {
+            match ws.next().await {
+                None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => return,
+                Some(Ok(WsMessage::Text(t))) => panic!("expected ws close, got frame: {t}"),
+                Some(Ok(_)) => continue, // ping/pong before the close
+            }
+        }
+    }
+
+    /// Each malformed `Hello` on the ws path closes the socket and registers
+    /// nothing — the same gate as `/register`, applied before the offer loop, so
+    /// the ws transport can't pollute the registry the http path guards (FM2).
+    #[tokio::test]
+    async fn ws_rejects_malformed_hello_and_registers_nothing() {
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let good = test_address("wsgood");
+        let malformed = [
+            hello("0xabc", 24, vec![JobKind::Terrain]), // short address
+            hello(&good, 24, vec![]),                   // advertises no kinds
+            hello(&good, 0, vec![JobKind::Terrain]),    // zero vram
+        ];
+        for m in &malformed {
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            ws.send(WsMessage::text(serde_json::to_string(m).unwrap()))
+                .await
+                .unwrap();
+            expect_ws_closed(&mut ws).await;
+        }
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "no malformed Hello may register via ws",
+        );
     }
 
     #[tokio::test]
