@@ -2339,24 +2339,34 @@ mod tests {
         SigningKey::from_slice(&bytes).unwrap()
     }
 
-    fn dev_address() -> String {
-        let sk = dev_signing_key();
-        let vk = sk.verifying_key();
-        let point = vk.to_encoded_point(false);
-        let hash = Keccak256::digest(&point.as_bytes()[1..]);
-        format!("0x{}", hex::encode(&hash[12..]))
+    /// Derive the lowercase Ethereum-style address from a signing key — the same
+    /// derivation the earner and `verify.rs` use, so a test address matches what
+    /// the coordinator recovers from a signature produced by the same key.
+    fn address_from_signing_key(sk: &SigningKey) -> String {
+        let point = sk.verifying_key().to_encoded_point(false);
+        format!("0x{}", hex::encode(&Keccak256::digest(&point.as_bytes()[1..])[12..]))
     }
 
-    /// Expand a short, readable label into a valid `0x`+40-hex earner address —
-    /// the shape the registration gate requires (and the settle-time signature
-    /// gate accepts, case-insensitively). Distinct labels map to distinct
-    /// addresses, so tests keep using legible names (`"live"`, `"busy"`) while
-    /// every registered address is well-formed.
+    fn dev_address() -> String {
+        address_from_signing_key(&dev_signing_key())
+    }
+
+    /// Deterministic secp256k1 signing key from a readable label — distinct
+    /// labels yield distinct keys. Lets tests keep legible names while every
+    /// registration is backed by a real key able to produce the key-possession
+    /// `Hello` signature the coordinator verifies.
+    fn test_signing_key(label: &str) -> SigningKey {
+        SigningKey::from_slice(&Keccak256::digest(label.as_bytes()))
+            .expect("keccak digest is a valid secp256k1 scalar")
+    }
+
+    /// Expand a short, readable label into the `0x`+40-hex address of its
+    /// [`test_signing_key`] — the shape the registration gate requires (and the
+    /// settle-time gate accepts, case-insensitively). Distinct labels map to
+    /// distinct, real-key-backed addresses, so tests keep using legible names
+    /// (`"live"`, `"busy"`) while every registered address can sign for itself.
     fn test_address(label: &str) -> String {
-        format!(
-            "0x{}",
-            hex::encode(&Keccak256::digest(label.as_bytes())[..20])
-        )
+        address_from_signing_key(&test_signing_key(label))
     }
 
     /// Expand a short, readable test label into a valid 256-bit lowercase-hex
