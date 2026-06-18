@@ -792,9 +792,36 @@ async fn earners(State(state): State<Arc<AppState>>) -> Result<Json<Vec<EarnerEn
     Ok(Json(out))
 }
 
-async fn next_job(State(state): State<Arc<AppState>>) -> Response {
+/// Query string for `GET /jobs/next`. `earner`, when present and matching a
+/// registered earner's address, restricts the hand-out to the kinds that earner
+/// advertised in its `Hello`/`/register` — the capability match the websocket
+/// dispatcher already enforces. Absent (a legacy poller) or unknown (an
+/// unregistered/typo'd address) falls back to the unfiltered take, so a match
+/// miss never starves a poller; it only risks being handed a kind it will
+/// self-drop, exactly the pre-existing behavior.
+#[derive(Debug, Deserialize)]
+struct NextJobQuery {
+    earner: Option<String>,
+}
+
+async fn next_job(State(state): State<Arc<AppState>>, Query(q): Query<NextJobQuery>) -> Response {
+    // Capability match for the HTTP transport. The stateless `/jobs/next` used to
+    // hand out any kind; an earner that advertised a SUBSET then self-dropped the
+    // unsupported job (see the earner's poll_once guard) had already had an
+    // attempt charged, so a job only incapable earners polled burned its budget
+    // toward dead-letter. If the poll names a registered earner, hand out only
+    // kinds it supports. The earners lock is taken and the supported set cloned
+    // out HERE, before the store lock, so the two locks never overlap.
+    let supported = match q.earner.as_deref() {
+        Some(addr) => state.earners.lock().await.get(addr).map(|e| e.supported.clone()),
+        None => None,
+    };
     let store = state.store.lock().await;
-    match store.take_next(|_| true) {
+    let taken = match &supported {
+        Some(kinds) => store.take_next(|job| kinds.contains(&job.kind)),
+        None => store.take_next(|_| true),
+    };
+    match taken {
         // Return the job and stamp its dispatch_seq in a header so the poller can
         // echo it on submit (the HTTP fence).
         Ok(Some((job, seq))) => {
