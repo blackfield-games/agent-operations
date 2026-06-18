@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 
 /// Placeholder EAS attestation UID returned on acceptance until the real
@@ -104,6 +105,14 @@ struct Args {
     /// handshake timeout). Applies to every endpoint; must be >= 1.
     #[arg(long, env = "COORDINATOR_HTTP_HEADER_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_HEADER_TIMEOUT.as_secs())]
     http_header_timeout_secs: u64,
+    /// Seconds the coordinator waits for a body-bearing mutating request
+    /// (`POST /register`, `POST /jobs/{id}/submit`) to deliver its complete body
+    /// before responding `408 Request Timeout` and closing the connection. Bounds
+    /// a post-headers slow-body slowloris (the header timeout disarms once headers
+    /// parse). The `/ws` upgrade and the GET routes carry no request body and are
+    /// unaffected. Must be >= 1.
+    #[arg(long, env = "COORDINATOR_HTTP_BODY_TIMEOUT_SECS", default_value_t = DEFAULT_HTTP_BODY_TIMEOUT.as_secs())]
+    http_body_timeout_secs: u64,
     /// How often (seconds) the attestation relayer drains pending EAS receipts to
     /// the chain. Only runs when a relay is configured (see `--relay-dev-mock`).
     #[arg(long, env = "COORDINATOR_RELAY_INTERVAL_SECS", default_value = "10")]
@@ -378,7 +387,14 @@ async fn main() -> Result<()> {
         );
     }
 
-    let app = router(state);
+    // A zero body timeout makes `TimeoutLayer` respond 408 to every POST before
+    // its body can arrive — registration + submit over HTTP become a total
+    // outage. Reject it at startup, mirroring the header-timeout zero guard.
+    anyhow::ensure!(
+        args.http_body_timeout_secs > 0,
+        "http_body_timeout_secs must be > 0 (0 would 408 every POST before its body arrives)"
+    );
+    let app = router_with_body_timeout(state, Duration::from_secs(args.http_body_timeout_secs));
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
     tracing::info!(bind = %args.bind, "coordinator up");
@@ -569,6 +585,24 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// is generous. Backs `Args::http_header_timeout_secs`
 /// (`--http-header-timeout-secs` / `COORDINATOR_HTTP_HEADER_TIMEOUT_SECS`).
 const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Default bound on how long a body-bearing mutating request (`POST /register`,
+/// `POST /jobs/{id}/submit`) may take to deliver its complete body once its
+/// headers have parsed. `header_read_timeout` disarms the moment headers parse,
+/// so without this bound a slow-body slowloris (send full headers + a
+/// `Content-Length`, then dribble or stall the body) parks a post-routing task
+/// indefinitely. Applied as a total request `TimeoutLayer` (responds `408`) on
+/// the two POST routes only: these handlers do no network I/O (a signature
+/// verify and a local SQLite write; `validate::is_fetchable_url` is a string
+/// check, not a fetch), so the only thing that can consume the budget is a slow
+/// body — the
+/// total bound is a de-facto body-read bound with no false-positive risk on a
+/// legitimately slow handler. The `/ws` upgrade and the GET routes carry no
+/// request body and are deliberately left unwrapped. Honest earners send their
+/// small JSON body in well under a second, so 30s is generous. Backs
+/// `Args::http_body_timeout_secs` (`--http-body-timeout-secs` /
+/// `COORDINATOR_HTTP_BODY_TIMEOUT_SECS`).
+const DEFAULT_HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
@@ -788,16 +822,36 @@ fn seed_job() -> JobSpec {
     }
 }
 
+/// Default-timeout router. Production (`main`) builds the router with the
+/// configured timeout via [`router_with_body_timeout`]; this thin wrapper backs
+/// the test suite, which exercises the router at the default bound.
+#[cfg(test)]
 fn router(state: Arc<AppState>) -> Router {
+    router_with_body_timeout(state, DEFAULT_HTTP_BODY_TIMEOUT)
+}
+
+/// [`router`] with a caller-chosen request-body read timeout on the body-bearing
+/// mutating routes, so the slow-body test can shrink it to a sub-second value
+/// without a slow suite. The bound is a total request [`TimeoutLayer`] (responds
+/// `408`) applied per-route to `POST /register` and `POST /jobs/{id}/submit`
+/// only — the `/ws` upgrade and the GET routes carry no request body, so wrapping
+/// them would needlessly bound the (legitimately open-ended) ws session and the
+/// poll handlers. These two handlers do no network I/O, so the total bound can
+/// only be consumed by a slow body — see [`DEFAULT_HTTP_BODY_TIMEOUT`].
+fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -> Router {
+    // 408 Request Timeout (explicit, vs the deprecated `new`): a slow/stalled
+    // body on these routes is closed with a legible status the earner's reqwest
+    // path treats as a transient error to retry, not a hard fault.
+    let body_timeout = TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, body_read_timeout);
     Router::new()
         .route("/health", get(health))
-        .route("/register", post(register))
+        .route("/register", post(register).layer(body_timeout))
         .route("/stats", get(stats))
         .route("/earners", get(earners))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(job_detail))
         .route("/jobs/next", get(next_job))
-        .route("/jobs/{id}/submit", post(submit))
+        .route("/jobs/{id}/submit", post(submit).layer(body_timeout))
         .route("/jobs/{id}/status", get(job_status))
         .route("/ws", get(ws_handler))
         .with_state(state)
