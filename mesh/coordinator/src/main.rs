@@ -4592,6 +4592,28 @@ mod tests {
         assert!(r.is_err(), "zero max_queued_jobs must be rejected at construction");
     }
 
+    /// FM1: the queued-depth COUNT gating the cap must be served by
+    /// `idx_jobs_status_created_at`, never a full scan of the jobs table (which
+    /// carries unbounded terminal `completed`/`failed` history) — otherwise the very
+    /// flood the cap guards would make each cap check O(table) and amplify the DoS.
+    /// Since the cap holds, queued ≤ cap, so an index-served count visits ≤ cap
+    /// entries — bounded.
+    #[test]
+    fn queue_cap_count_query_plan_uses_the_index() {
+        let store = Store::open_in_memory().unwrap();
+        store.enqueue(&seed_job()).unwrap();
+        store.enqueue(&seed_job()).unwrap();
+        let plan = store.queued_count_query_plan().unwrap();
+        assert!(
+            plan.contains("idx_jobs_status_created_at"),
+            "the cap's queued COUNT must use the index, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN jobs\n") && !plan.ends_with("SCAN jobs"),
+            "the cap's queued COUNT must not full-scan jobs, got plan: {plan}"
+        );
+    }
+
     #[test]
     fn args_max_queued_jobs_default_and_override() {
         assert_eq!(

@@ -125,6 +125,25 @@ impl Store {
         Ok(plan)
     }
 
+    /// Test-only: the EXPLAIN QUERY PLAN for the queued-depth COUNT that gates
+    /// `enqueue_within_cap`, so a test can assert it is served by
+    /// `idx_jobs_status_created_at` and never full-scans the (unbounded, terminal-
+    /// row-bearing) jobs table — the FM1 that would let a flood turn each cap check
+    /// into an O(table) scan. Mirrors the subquery in `enqueue_within_cap` verbatim.
+    #[cfg(test)]
+    pub fn queued_count_query_plan(&self) -> Result<String> {
+        let mut stmt = self
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM jobs WHERE status = ?1")?;
+        let rows = stmt.query_map([STATUS_QUEUED], |r| r.get::<_, String>(3))?;
+        let mut plan = String::new();
+        for row in rows {
+            plan.push_str(&row?);
+            plan.push('\n');
+        }
+        Ok(plan)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
