@@ -145,6 +145,19 @@ def _failing_specialist(issues: list[str]) -> str:
     return min(candidates, key=PIPELINE_ORDER.index)
 
 
+def _rounds(state: State) -> int:
+    """Revision-round count, robust to a missing/None/negative `rounds`.
+
+    `state.get("rounds", 0)` defends only the missing key; a present-but-None
+    `rounds` (a partial state restore, an upstream node that nulled it, a
+    serialization round-trip) makes `None + 1` at the increment and
+    `None >= MAX_ROUNDS` at the cap raise TypeError and crash the graph. Treat
+    anything falsy or negative as 0 so the cap always holds; a real run's count
+    passes through unchanged, so the increment still advances toward MAX_ROUNDS.
+    """
+    return max(0, state.get("rounds") or 0)
+
+
 async def _validator_node(state: State) -> dict:
     try:
         verdict = await asyncio.wait_for(
@@ -161,7 +174,7 @@ async def _validator_node(state: State) -> dict:
         )
         return {
             "verdict": ValidatorVerdict(accepted=False, issues=["validator timed out"]),
-            "rounds": state.get("rounds", 0) + 1,
+            "rounds": _rounds(state) + 1,
             "validator_errored": True,
         }
     except Exception:
@@ -173,10 +186,10 @@ async def _validator_node(state: State) -> dict:
         logger.exception("validator failed; ending compose with a non-accepted verdict")
         return {
             "verdict": ValidatorVerdict(accepted=False, issues=["validator errored"]),
-            "rounds": state.get("rounds", 0) + 1,
+            "rounds": _rounds(state) + 1,
             "validator_errored": True,
         }
-    return {"verdict": verdict, "rounds": state.get("rounds", 0) + 1}
+    return {"verdict": verdict, "rounds": _rounds(state) + 1}
 
 
 def _after_validator(state: State) -> str:
@@ -187,7 +200,7 @@ def _after_validator(state: State) -> str:
         return END
     if verdict.accepted:
         return END
-    if state.get("rounds", 0) >= MAX_ROUNDS:  # recursion guard, see MAX_ROUNDS
+    if _rounds(state) >= MAX_ROUNDS:  # recursion guard, see MAX_ROUNDS
         return END
     return _failing_specialist(verdict.issues)
 
