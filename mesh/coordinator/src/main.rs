@@ -592,11 +592,13 @@ const DEFAULT_HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// so without this bound a slow-body slowloris (send full headers + a
 /// `Content-Length`, then dribble or stall the body) parks a post-routing task
 /// indefinitely. Applied as a total request `TimeoutLayer` (responds `408`) on
-/// the two POST routes only: these handlers do no network I/O (a signature
-/// verify and a local SQLite write; `validate::is_fetchable_url` is a string
-/// check, not a fetch), so the only thing that can consume the budget is a slow
-/// body — the
-/// total bound is a de-facto body-read bound with no false-positive risk on a
+/// the two POST routes only. A total bound (rather than a body-stream bound) is
+/// safe here because these handlers do no network I/O and no unbounded await: a
+/// signature verify, a fast indexed SQLite write under the shared store lock, and
+/// `validate::is_fetchable_url` (a string check, not a fetch). The store time is
+/// under the clock too, but it is sub-millisecond on the local DB, so in practice
+/// a slow body is the only thing that can approach the budget — the total bound
+/// acts as a de-facto body-read bound with no realistic false-positive on a
 /// legitimately slow handler. The `/ws` upgrade and the GET routes carry no
 /// request body and are deliberately left unwrapped. Honest earners send their
 /// small JSON body in well under a second, so 30s is generous. Backs
@@ -836,8 +838,9 @@ fn router(state: Arc<AppState>) -> Router {
 /// `408`) applied per-route to `POST /register` and `POST /jobs/{id}/submit`
 /// only — the `/ws` upgrade and the GET routes carry no request body, so wrapping
 /// them would needlessly bound the (legitimately open-ended) ws session and the
-/// poll handlers. These two handlers do no network I/O, so the total bound can
-/// only be consumed by a slow body — see [`DEFAULT_HTTP_BODY_TIMEOUT`].
+/// poll handlers. These two handlers do no network I/O and only fast local DB
+/// work, so a slow body is the only thing that realistically approaches the bound
+/// — see [`DEFAULT_HTTP_BODY_TIMEOUT`].
 fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -> Router {
     // 408 Request Timeout (explicit, vs the deprecated `new`): a slow/stalled
     // body on these routes is closed with a legible status the earner's reqwest
