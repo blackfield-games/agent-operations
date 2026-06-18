@@ -3271,6 +3271,70 @@ mod tests {
         );
     }
 
+    /// THE anti-replay property: a valid Hello captured off the wire and replayed
+    /// on a FRESH connection is rejected. The new connection issues a different
+    /// challenge, so the captured signature (bound to the first nonce) fails
+    /// recovery and the socket closes — the replayer never bootstraps a session
+    /// under the victim's address. Discriminating: the only thing wrong with the
+    /// replayed Hello is the challenge it was signed over (re-signing over the
+    /// second challenge would register — that is the happy path other ws tests
+    /// already cover).
+    #[tokio::test]
+    async fn ws_replayed_hello_with_stale_challenge_is_rejected() {
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral(state.clone()).await;
+
+        // Connection #1: capture the challenge + the valid Hello bound to it, then
+        // abandon the connection without completing registration.
+        let (mut ws1, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce1 = recv_challenge(&mut ws1).await;
+        let captured = ws_hello(&nonce1);
+        drop(ws1);
+
+        // Connection #2 gets a fresh, different challenge; replay the captured Hello.
+        let (mut ws2, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce2 = recv_challenge(&mut ws2).await;
+        assert_ne!(nonce1, nonce2, "each connection must get a fresh challenge");
+        ws2.send(WsMessage::text(serde_json::to_string(&captured).unwrap()))
+            .await
+            .unwrap();
+        expect_ws_closed(&mut ws2).await;
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "a Hello replayed against a fresh challenge must not register",
+        );
+    }
+
+    /// A Hello signed over a nonce the coordinator never issued is rejected: the
+    /// coordinator verifies the signature against the challenge IT chose, never a
+    /// nonce supplied on the wire, so an attacker can't pick its own freshness.
+    #[tokio::test]
+    async fn ws_hello_over_unissued_nonce_is_rejected() {
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let issued = recv_challenge(&mut ws).await;
+        // Sign over a nonce of our own invention, distinct from the issued one.
+        let invented = b"a-nonce-the-coordinator-never-issued".to_vec();
+        assert_ne!(invented, issued);
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&invented)).unwrap()))
+            .await
+            .unwrap();
+        expect_ws_closed(&mut ws).await;
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "a Hello over an unissued nonce must not register",
+        );
+    }
+
     #[tokio::test]
     async fn ws_offer_accept_submit_flows_to_completed() {
         let state = test_state_empty().await;
