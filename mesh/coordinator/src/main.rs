@@ -1600,7 +1600,7 @@ mod tests {
     #[tokio::test]
     async fn register_then_stats_reflects_earner() {
         let state = test_state_empty().await;
-        let msg = hello("0xabc", 24, vec![JobKind::Terrain, JobKind::Foliage]);
+        let msg = hello(&test_address("a"), 24, vec![JobKind::Terrain, JobKind::Foliage]);
         let resp = post_json(state.clone(), "/register", &serde_json::to_value(&msg).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
@@ -1619,16 +1619,18 @@ mod tests {
     async fn register_upserts_and_sums_vram() {
         let state = test_state();
         // same address twice → upsert (count stays 1, vram updated)
-        let m1 = hello("0xabc", 24, vec![JobKind::Terrain]);
-        let m2 = hello("0xabc", 48, vec![JobKind::Terrain, JobKind::DiffusionTile]);
-        let m3 = hello("0xdef", 16, vec![JobKind::NpcTick]);
+        let abc = test_address("abc");
+        let def = test_address("def");
+        let m1 = hello(&abc, 24, vec![JobKind::Terrain]);
+        let m2 = hello(&abc, 48, vec![JobKind::Terrain, JobKind::DiffusionTile]);
+        let m3 = hello(&def, 16, vec![JobKind::NpcTick]);
         for m in [&m1, &m2, &m3] {
             let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
         let json = body_json(get(state.clone(), "/stats").await).await;
-        assert_eq!(json["gpus_joined"], 2); // 0xabc upserted, 0xdef new
+        assert_eq!(json["gpus_joined"], 2); // abc upserted, def new
         assert_eq!(json["total_vram_gb"], 48 + 16);
         assert_eq!(json["supported_breakdown"]["terrain"], 1);
         assert_eq!(json["supported_breakdown"]["diffusion_tile"], 1);
@@ -1690,6 +1692,15 @@ mod tests {
         let point = vk.to_encoded_point(false);
         let hash = Keccak256::digest(&point.as_bytes()[1..]);
         format!("0x{}", hex::encode(&hash[12..]))
+    }
+
+    /// Expand a short, readable label into a valid `0x`+40-hex earner address —
+    /// the shape the registration gate requires (and the settle-time signature
+    /// gate accepts, case-insensitively). Distinct labels map to distinct
+    /// addresses, so tests keep using legible names (`"live"`, `"busy"`) while
+    /// every registered address is well-formed.
+    fn test_address(label: &str) -> String {
+        format!("0x{}", hex::encode(&Keccak256::digest(label.as_bytes())[..20]))
     }
 
     /// Expand a short, readable test label into a valid 256-bit lowercase-hex
@@ -4009,7 +4020,8 @@ mod tests {
     async fn stats_excludes_stale_earners() {
         let state = test_state_empty().await;
         // Register via HTTP — freshly seen, so it counts.
-        let msg = hello("0xabc", 24, vec![JobKind::Terrain]);
+        let addr = test_address("abc");
+        let msg = hello(&addr, 24, vec![JobKind::Terrain]);
         let resp = post_json(state.clone(), "/register", &serde_json::to_value(&msg).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -4019,7 +4031,7 @@ mod tests {
         // Force last_seen far into the past → stale (default ttl in test_state is 60).
         {
             let mut earners = state.earners.lock().await;
-            earners.get_mut("0xabc").unwrap().last_seen = 0;
+            earners.get_mut(&addr).unwrap().last_seen = 0;
         }
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["gpus_joined"], 0, "stale earner must drop out of gpus_joined");
@@ -4563,16 +4575,18 @@ mod tests {
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
+        let live = test_address("live");
+        let stale = test_address("stale");
         for m in [
-            &hello("0xlive", 24, vec![JobKind::Terrain, JobKind::Foliage]),
-            &hello("0xstale", 16, vec![JobKind::NpcTick]),
+            &hello(&live, 24, vec![JobKind::Terrain, JobKind::Foliage]),
+            &hello(&stale, 16, vec![JobKind::NpcTick]),
         ] {
             let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
         {
             let mut earners = state.earners.lock().await;
-            earners.get_mut("0xstale").unwrap().last_seen = 0;
+            earners.get_mut(&stale).unwrap().last_seen = 0;
         }
 
         // Complete two jobs credited to the live earner (render_seconds 5 + 7).
@@ -4584,8 +4598,8 @@ mod tests {
             store.enqueue(&b).unwrap();
             store.take_next(|j| j.id == a.id).unwrap();
             store.take_next(|j| j.id == b.id).unwrap();
-            store.record_completed(&result_for(a.id, "0xlive", 5)).unwrap();
-            store.record_completed(&result_for(b.id, "0xlive", 7)).unwrap();
+            store.record_completed(&result_for(a.id, &live, 5)).unwrap();
+            store.record_completed(&result_for(b.id, &live, 7)).unwrap();
         }
 
         let resp = get(state.clone(), "/earners").await;
@@ -4593,7 +4607,7 @@ mod tests {
         let json = body_json(resp).await;
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1, "only the live earner appears");
-        assert_eq!(arr[0]["address"], "0xlive");
+        assert_eq!(arr[0]["address"], live);
         assert_eq!(arr[0]["gpu_model"], "RTX 4090");
         assert_eq!(arr[0]["vram_gb"], 24);
         assert_eq!(arr[0]["completed"], 2);
@@ -4613,14 +4627,16 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
         });
+        let busy = test_address("busy");
+        let idle = test_address("idle");
         for m in [
-            &hello("0xbusy", 24, vec![JobKind::Terrain]),
-            &hello("0xidle", 24, vec![JobKind::Terrain]),
+            &hello(&busy, 24, vec![JobKind::Terrain]),
+            &hello(&idle, 24, vec![JobKind::Terrain]),
         ] {
             let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
-        // 0xbusy completes 2 jobs, 0xidle completes 1.
+        // busy completes 2 jobs, idle completes 1.
         let jobs = [job_with_deadline(60), job_with_deadline(60), job_with_deadline(60)];
         {
             let mut store = state.store.lock().await;
@@ -4628,17 +4644,17 @@ mod tests {
                 store.enqueue(job).unwrap();
                 store.take_next(|j| j.id == job.id).unwrap();
             }
-            store.record_completed(&result_for(jobs[0].id, "0xbusy", 1)).unwrap();
-            store.record_completed(&result_for(jobs[1].id, "0xbusy", 1)).unwrap();
-            store.record_completed(&result_for(jobs[2].id, "0xidle", 1)).unwrap();
+            store.record_completed(&result_for(jobs[0].id, &busy, 1)).unwrap();
+            store.record_completed(&result_for(jobs[1].id, &busy, 1)).unwrap();
+            store.record_completed(&result_for(jobs[2].id, &idle, 1)).unwrap();
         }
 
         let json = body_json(get(state.clone(), "/earners").await).await;
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["address"], "0xbusy", "busiest earner leads");
+        assert_eq!(arr[0]["address"], busy, "busiest earner leads");
         assert_eq!(arr[0]["completed"], 2);
-        assert_eq!(arr[1]["address"], "0xidle");
+        assert_eq!(arr[1]["address"], idle);
         assert_eq!(arr[1]["completed"], 1);
     }
 
@@ -4654,15 +4670,16 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
         });
+        let pay = test_address("pay");
         let resp = post_json(
             state.clone(),
             "/register",
-            &serde_json::to_value(hello("0xpay", 24, vec![JobKind::Terrain])).unwrap(),
+            &serde_json::to_value(hello(&pay, 24, vec![JobKind::Terrain])).unwrap(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Two DONE jobs credited to 0xpay with known payouts (1.5e18 + 2.5e18).
+        // Two DONE jobs credited to pay with known payouts (1.5e18 + 2.5e18).
         let mut a = job_with_deadline(60);
         a.max_payout_wei = "1500000000000000000".into();
         let mut b = job_with_deadline(60);
@@ -4673,14 +4690,14 @@ mod tests {
                 store.enqueue(job).unwrap();
                 store.take_next(|j| j.id == job.id).unwrap();
             }
-            store.record_completed(&result_for(a.id, "0xpay", 1)).unwrap();
-            store.record_completed(&result_for(b.id, "0xpay", 1)).unwrap();
+            store.record_completed(&result_for(a.id, &pay, 1)).unwrap();
+            store.record_completed(&result_for(b.id, &pay, 1)).unwrap();
         }
 
         let json = body_json(get(state.clone(), "/earners").await).await;
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["address"], "0xpay");
+        assert_eq!(arr[0]["address"], pay);
         // 1.5e18 + 2.5e18 = 4.0e18 wei, serialized as a decimal string.
         assert_eq!(arr[0]["payout_wei"], "4000000000000000000");
         assert_eq!(arr[0]["completed"], 2);
