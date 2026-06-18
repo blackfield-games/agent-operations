@@ -263,6 +263,29 @@ struct ListJobsQuery {
     status: Option<String>,
 }
 
+/// Request body for `POST /jobs` — the runtime job-ingestion front door (the
+/// agents pipeline / operator tooling turning a scene patch into a render job).
+/// There is deliberately NO `id` field: the coordinator mints it. `enqueue`
+/// upserts on `id` (`ON CONFLICT(id) DO UPDATE`), so a caller-supplied id could
+/// overwrite an existing in_flight/completed job's spec and reset it to queued.
+#[derive(Debug, Deserialize)]
+struct CreateJobRequest {
+    kind: JobKind,
+    region: RegionCoord,
+    deadline_secs: u32,
+    /// Max $BLCKFLD payable on acceptance, decimal wei. Validated to parse as a
+    /// bounded `u128` before enqueue (see [`validate::validate_job_spec`]).
+    max_payout_wei: String,
+    inputs: serde_json::Value,
+}
+
+/// Response for a successful `POST /jobs`: the coordinator-assigned job id the
+/// caller can then poll at `GET /jobs/{id}`.
+#[derive(Debug, Serialize)]
+struct CreateJobResponse {
+    id: Uuid,
+}
+
 /// Aggregate mesh stats. Backs the wedge requirement
 /// "Mesh GPUs joined count exposed at /stats".
 #[derive(Debug, Serialize)]
@@ -900,7 +923,13 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/register", post(register).layer(body_timeout))
         .route("/stats", get(stats))
         .route("/earners", get(earners))
-        .route("/jobs", get(list_jobs))
+        // POST carries the body timeout (a mutating, body-bearing route like
+        // /register and /submit); GET /jobs is a body-less listing left unwrapped,
+        // so .layer is applied to the post handler only, then the get added after.
+        .route(
+            "/jobs",
+            post(create_job).layer(body_timeout).get(list_jobs),
+        )
         .route("/jobs/{id}", get(job_detail))
         .route("/jobs/next", get(next_job))
         .route("/jobs/{id}/submit", post(submit).layer(body_timeout))
@@ -1049,6 +1078,45 @@ async fn register(
         },
     );
     Ok("registered")
+}
+
+/// `POST /jobs` — enqueue a new render job. Validates the request, mints a fresh
+/// server-side id, and persists the spec `queued`. The id is assigned here (not
+/// taken from the caller) so a client can never collide with — and via
+/// `enqueue`'s `ON CONFLICT(id) DO UPDATE` overwrite — an existing job.
+///
+/// Returns `201 Created` with the assigned id; `422` on a spec the ingestion
+/// gate rejects (bad deadline / payout / oversized inputs). A body that fails to
+/// deserialize (unknown `kind`, wrong types) is rejected by the `Json` extractor
+/// before this runs. Unauthenticated by design at this stage, mirroring
+/// `/register`; gating ingestion behind an operator token is a tracked follow-up.
+async fn create_job(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateJobRequest>,
+) -> Result<(StatusCode, Json<CreateJobResponse>), StatusCode> {
+    if let Err(e) = validate::validate_job_spec(req.deadline_secs, &req.max_payout_wei, &req.inputs)
+    {
+        tracing::warn!(reason = e.reason(), "rejected: malformed job spec");
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let spec = JobSpec {
+        id: Uuid::new_v4(),
+        kind: req.kind,
+        region: req.region,
+        deadline_secs: req.deadline_secs,
+        max_payout_wei: req.max_payout_wei,
+        inputs: req.inputs,
+    };
+    let id = spec.id;
+    {
+        let store = state.store.lock().await;
+        if let Err(e) = store.enqueue(&spec) {
+            tracing::error!(?id, ?e, "create_job: enqueue failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    tracing::info!(?id, kind = ?spec.kind, "job enqueued");
+    Ok((StatusCode::CREATED, Json(CreateJobResponse { id })))
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, StatusCode> {
