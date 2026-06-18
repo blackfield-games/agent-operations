@@ -2214,6 +2214,69 @@ mod tests {
         );
     }
 
+    /// A Hello that claims a victim's address but is signed by a DIFFERENT key is
+    /// rejected at `/register` with 400 and inserts nothing — key possession, not
+    /// just address shape, gates the registry. Structurally the Hello is perfect
+    /// (valid address, vram, supported), so only the signature check can reject it.
+    #[tokio::test]
+    async fn register_rejects_forged_hello_signature() {
+        let state = test_state_empty().await;
+        let victim = test_address("victim");
+        // Attacker signs over the victim's claimed Hello with its own key.
+        let forged = signed_hello(
+            &test_signing_key("attacker"),
+            &victim,
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+        );
+        let resp = post_json(state.clone(), "/register", &serde_json::to_value(&forged).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "forged signature must 400");
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 0, "a forged Hello must not enter the registry");
+        assert_eq!(
+            body_json(get(state.clone(), "/earners").await).await.as_array().unwrap().len(),
+            0,
+            "leaderboard stays empty"
+        );
+    }
+
+    /// A forged re-`Hello` for an already-registered address — structurally valid
+    /// but signed by the wrong key — is rejected without disturbing the live
+    /// entry, so an attacker can't overwrite (or evict) a victim's registration by
+    /// replaying a forged profile. The re-Hello carries a different vram (99) so an
+    /// insert-before-verify overwrite would show; the signature reject path is the
+    /// only thing that can stop it (the structural gates all pass).
+    #[tokio::test]
+    async fn forged_re_register_does_not_evict_existing_earner() {
+        let state = test_state_empty().await;
+        let victim = test_address("victim");
+        let ok = post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello("victim", 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let forged = signed_hello(
+            &test_signing_key("attacker"),
+            &victim,
+            "RTX 4090",
+            99,
+            vec![JobKind::Terrain],
+        );
+        let bad = post_json(state.clone(), "/register", &serde_json::to_value(&forged).unwrap()).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["gpus_joined"], 1, "forged re-Hello must not evict the live earner");
+        assert_eq!(
+            json["total_vram_gb"], 24,
+            "original vram preserved, not overwritten with the forged 99"
+        );
+    }
+
     #[tokio::test]
     async fn next_job_drains_all_seeds_then_none() {
         // `test_state` auto-seeds one job per JobKind; that many polls each
@@ -3105,6 +3168,35 @@ mod tests {
             body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
             0,
             "no out-of-bounds Hello may register via ws",
+        );
+    }
+
+    /// A forged Hello (claims a victim address, signed by another key) closes the
+    /// ws socket and registers nothing — the same key-possession gate as
+    /// `/register`, applied on the ws path before the offer loop, so neither
+    /// transport can spoof an identity onto the registry (FM2).
+    #[tokio::test]
+    async fn ws_rejects_forged_hello_signature() {
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let forged = signed_hello(
+            &test_signing_key("attacker"),
+            &test_address("victim"),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+        );
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        ws.send(WsMessage::text(serde_json::to_string(&forged).unwrap()))
+            .await
+            .unwrap();
+        expect_ws_closed(&mut ws).await;
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "a forged Hello must not register via ws",
         );
     }
 
