@@ -66,7 +66,8 @@ contract DeployTest is Test {
             coordinator: coordinator,
             stakeRequired: 50_000 ether,
             artifactBaseUri: "https://artifacts.test/{id}.json",
-            artifactMintFeeRate: 1 ether
+            artifactMintFeeRate: 1 ether,
+            artifactRoyaltyRate: 1 ether
         });
 
         // In the test path the script contract itself sends the CREATE + wiring calls,
@@ -126,6 +127,23 @@ contract DeployTest is Test {
         assertEq(deployed.artifactTemplate.mintFeeRate(), 1 ether, "artifact mint fee rate not wired");
     }
 
+    function test_artifactTemplateWiredForRegionRoyalty() public view {
+        // The region royalty deposits into the RegionAuthority deployed alongside, and
+        // pays in the token RegionAuthority pulls — ArtifactTemplate derives the royalty
+        // token from RegionAuthority.TOKEN() so the two can never desync.
+        assertEq(
+            address(deployed.artifactTemplate.regionAuthority()),
+            address(deployed.regionAuthority),
+            "artifact template region authority not wired"
+        );
+        assertEq(
+            address(deployed.artifactTemplate.royaltyToken()),
+            address(token),
+            "royalty token not bound to RegionAuthority.TOKEN()"
+        );
+        assertEq(deployed.artifactTemplate.royaltyRate(), 1 ether, "artifact royalty rate not wired");
+    }
+
     function test_ownershipHandoffIsTwoStep() public {
         // Fresh deploy so we observe the pre-acceptance pending state.
         Deploy.DeployConfig memory cfg = Deploy.DeployConfig({
@@ -136,7 +154,8 @@ contract DeployTest is Test {
             coordinator: coordinator,
             stakeRequired: 1 ether,
             artifactBaseUri: "ipfs://{id}",
-            artifactMintFeeRate: 1 ether
+            artifactMintFeeRate: 1 ether,
+            artifactRoyaltyRate: 1 ether
         });
         Deploy.Deployed memory fresh = script.deploy(cfg, address(script));
 

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
-import {ArtifactTemplate, IComputeMeter} from "../src/ArtifactTemplate.sol";
+import {ArtifactTemplate, IComputeMeter, IRegionAuthority} from "../src/ArtifactTemplate.sol";
 
 /// @notice No-op ComputeMeter. These suites exercise supply accounting (balances,
 ///         per-template/per-author counters), which is independent of the mint fee,
@@ -12,6 +12,33 @@ import {ArtifactTemplate, IComputeMeter} from "../src/ArtifactTemplate.sol";
 ///         the unit suite against a real ComputeMeter.
 contract NoopMeter is IComputeMeter {
     function spend(address, uint256, bytes32) external {}
+}
+
+/// @notice Permissive ERC-20 stand-in: every transferFrom/approve succeeds without
+///         moving balances, so the royalty pull never reverts for an unfunded fuzz
+///         actor. Same rationale as NoopMeter — royalty correctness is pinned in the
+///         unit suite against a real RegionAuthority + token.
+contract NoopToken {
+    function transferFrom(address, address, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return true;
+    }
+}
+
+/// @notice No-op RegionAuthority. depositFees is a sink and TOKEN() points at a
+///         permissive NoopToken, so the mint's royalty leg always clears and the
+///         supply-accounting properties are what's fuzzed — not royalty provisioning.
+contract NoopRegionAuthority is IRegionAuthority {
+    address public immutable token = address(new NoopToken());
+
+    function depositFees(uint256, uint256) external {}
+
+    function TOKEN() external view returns (address) {
+        return token;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,8 +103,9 @@ contract ArtifactTemplateHandler is Test {
         // pre-check + vm.expectRevert here: that would mask a regression — if the cap
         // check were deleted, the over-cap mint would commit (minted > cap), the ghost
         // would advance with it, and invariant_mintedNeverExceedsCap would catch it.
-        // The ghost only advances when the contract actually commits the mint.
-        art.mint(to, id, amount, "");
+        // The ghost only advances when the contract actually commits the mint. regionId
+        // is arbitrary here — the NoopRegionAuthority sinks the royalty leg.
+        art.mint(to, id, amount, 1, "");
         ghost_supply[id] += amount;
     }
 
@@ -110,7 +138,9 @@ contract ArtifactTemplateInvariantTest is Test {
     string constant BASE_URI = "ipfs://base/{id}.json";
 
     function setUp() public {
-        art = new ArtifactTemplate(owner, BASE_URI, address(new NoopMeter()), 1);
+        art = new ArtifactTemplate(
+            owner, BASE_URI, address(new NoopMeter()), 1, address(new NoopRegionAuthority()), 1
+        );
 
         address[] memory actors = new address[](3);
         actors[0] = address(0xA1);
@@ -200,7 +230,9 @@ contract ArtifactTemplateFuzzTest is Test {
     string constant BASE_URI = "ipfs://base/{id}.json";
 
     function setUp() public {
-        art = new ArtifactTemplate(owner, BASE_URI, address(new NoopMeter()), 1);
+        art = new ArtifactTemplate(
+            owner, BASE_URI, address(new NoopMeter()), 1, address(new NoopRegionAuthority()), 1
+        );
         vm.prank(owner);
         art.setMinter(minter);
     }
@@ -214,8 +246,8 @@ contract ArtifactTemplateFuzzTest is Test {
         uint256 id = art.registerTemplate(author, 1000, keccak256("manifest"), 0);
 
         vm.startPrank(minter);
-        art.mint(player, id, a, "");
-        art.mint(player, id, b, "");
+        art.mint(player, id, a, 1, "");
+        art.mint(player, id, b, 1, "");
         vm.stopPrank();
 
         assertEq(art.balanceOf(player, id), a + b);
@@ -242,6 +274,6 @@ contract ArtifactTemplateFuzzTest is Test {
         vm.assume(id > 0); // id==0 is also unknown; just keep the space interesting
         vm.expectRevert(ArtifactTemplate.UnknownTemplate.selector);
         vm.prank(minter);
-        art.mint(player, id, 1, "");
+        art.mint(player, id, 1, 1, "");
     }
 }

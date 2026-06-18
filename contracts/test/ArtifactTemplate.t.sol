@@ -4,6 +4,7 @@ pragma solidity ^0.8.27;
 import {Test} from "forge-std/Test.sol";
 import {ArtifactTemplate, IComputeMeter} from "../src/ArtifactTemplate.sol";
 import {ComputeMeter} from "../src/ComputeMeter.sol";
+import {RegionAuthority} from "../src/RegionAuthority.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC1155Receiver} from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -17,6 +18,7 @@ contract MockToken is ERC20 {
 contract ArtifactTemplateTest is Test {
     ArtifactTemplate art;
     ComputeMeter meter;
+    RegionAuthority region;
     MockToken token;
 
     address owner = address(0xA11CE);
@@ -24,9 +26,16 @@ contract ArtifactTemplateTest is Test {
     address author = address(0xA47403);
     address player = address(0xB0B);
     address stranger = address(0xBEEF);
+    // Region holder (an EOA so RegionAuthority's _safeMint receiver check passes) that
+    // earns and claims the royalties deposited against `regionId`.
+    address regionHolder = address(0x5E6104);
 
     string constant BASE_URI = "ipfs://base/{id}.json";
     uint256 constant FEE_RATE = 1e12;
+    uint256 constant ROYALTY_RATE = 1e12;
+    uint256 constant STAKE = 100 ether;
+    // A claimed region (held by this test contract) the royalty deposits into.
+    uint256 regionId = uint256(keccak256("region-A"));
 
     event TemplateRegistered(
         uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
@@ -34,22 +43,39 @@ contract ArtifactTemplateTest is Test {
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
     event MintFeeRateSet(uint256 rate);
+    event RoyaltyRateSet(uint256 rate);
+    event RoyaltyRouted(uint256 indexed templateId, uint256 indexed regionId, uint256 amount);
     // ComputeMeter's debit event, re-declared for expectEmit against the meter.
     event Spent(address indexed buyer, address indexed spender, uint256 amount, bytes32 jobId);
+    // RegionAuthority's intake event, re-declared for expectEmit against the region.
+    event FeesDeposited(uint256 indexed tokenId, address indexed from, uint256 amount);
 
     function setUp() public {
-        token = new MockToken();
+        token = new MockToken(); // this test contract holds the 1M supply
         meter = new ComputeMeter(address(token), owner);
-        art = new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE);
+        region = new RegionAuthority(address(token), STAKE, owner);
+        art = new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE, address(region), ROYALTY_RATE);
 
         vm.startPrank(owner);
         art.setMinter(minter);
         meter.setSpender(address(art), true);
         vm.stopPrank();
 
-        // Fund the recipients used across the mint tests; fees are tiny next to this.
+        // Claim the royalty region so depositFees won't revert UnknownRegion. A dedicated
+        // EOA holder stakes and becomes the region's fee earner for the claimFees
+        // assertions (an EOA passes RegionAuthority's _safeMint receiver check).
+        token.transfer(regionHolder, STAKE);
+        vm.startPrank(regionHolder);
+        token.approve(address(region), STAKE);
+        region.claim(regionId, STAKE);
+        vm.stopPrank();
+
+        // Fund the recipients: compute credit for the burned mint fee, AND real
+        // $BLCKFLD (approved to art) for the region royalty — two independent ledgers.
         _credit(player, 1_000 ether);
         _credit(stranger, 1_000 ether);
+        _fundRoyalty(player, 1_000 ether);
+        _fundRoyalty(stranger, 1_000 ether);
     }
 
     /// @dev Burn `amount` $TOKEN into `who`'s ComputeMeter credit so a fee-charging
@@ -62,6 +88,15 @@ contract ArtifactTemplateTest is Test {
         vm.stopPrank();
     }
 
+    /// @dev Give `who` real $BLCKFLD and approve `art` to pull it, so a royalty-charging
+    ///      mint to `who` can transfer the royalty. Distinct from `_credit`: that burns
+    ///      into compute credit, this leaves a spendable balance.
+    function _fundRoyalty(address who, uint256 amount) internal {
+        token.transfer(who, amount);
+        vm.prank(who);
+        token.approve(address(art), type(uint256).max);
+    }
+
     // --- construction ---
 
     function test_constructor() public view {
@@ -71,6 +106,11 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.nextTemplateId(), 0);
         assertEq(address(art.computeMeter()), address(meter));
         assertEq(art.mintFeeRate(), FEE_RATE);
+        assertEq(address(art.regionAuthority()), address(region));
+        assertEq(art.royaltyRate(), ROYALTY_RATE);
+        // The royalty token is derived from RegionAuthority.TOKEN(), never desyncing
+        // from what depositFees pulls.
+        assertEq(address(art.royaltyToken()), address(token));
     }
 
     // --- setMinter ---
@@ -192,7 +232,7 @@ contract ArtifactTemplateTest is Test {
         emit Minted(player, id, 5);
 
         vm.prank(minter);
-        art.mint(player, id, 5, "");
+        art.mint(player, id, 5, regionId, "");
 
         assertEq(art.balanceOf(player, id), 5);
     }
@@ -203,13 +243,13 @@ contract ArtifactTemplateTest is Test {
 
         vm.expectRevert(ArtifactTemplate.NotMinter.selector);
         vm.prank(stranger);
-        art.mint(player, id, 1, "");
+        art.mint(player, id, 1, regionId, "");
     }
 
     function test_mint_revertsUnknownTemplate() public {
         vm.expectRevert(ArtifactTemplate.UnknownTemplate.selector);
         vm.prank(minter);
-        art.mint(player, 999, 1, "");
+        art.mint(player, 999, 1, regionId, "");
     }
 
     function test_mint_revertsZeroRecipient() public {
@@ -218,7 +258,7 @@ contract ArtifactTemplateTest is Test {
 
         vm.expectRevert(ArtifactTemplate.ZeroRecipient.selector);
         vm.prank(minter);
-        art.mint(address(0), id, 1, "");
+        art.mint(address(0), id, 1, regionId, "");
 
         assertEq(art.totalMinted(), 0);
         assertEq(art.mintedByTemplate(id), 0);
@@ -232,7 +272,7 @@ contract ArtifactTemplateTest is Test {
         // the receiver hook for nothing; reject it instead.
         vm.expectRevert(ArtifactTemplate.ZeroAmount.selector);
         vm.prank(minter);
-        art.mint(player, id, 0, "");
+        art.mint(player, id, 0, regionId, "");
 
         assertEq(art.totalMinted(), 0);
         assertEq(art.balanceOf(player, id), 0);
@@ -252,12 +292,13 @@ contract ArtifactTemplateTest is Test {
         ReentrantMinter rm = new ReentrantMinter(art);
         vm.prank(owner);
         art.setMinter(address(rm));
-        // rm is both minter and recipient, so it pays the fee on the outer and the
-        // reentrant mint — fund it for both.
+        // rm is both minter and recipient, so it pays the compute fee AND the region
+        // royalty on the outer and the reentrant mint — fund + approve it for both.
         _credit(address(rm), 1_000 ether);
+        _fundRoyalty(address(rm), 1_000 ether);
 
         uint256 id = rm.register(author, 1000);
-        rm.fire(5, 3); // outer mint 5; the receiver hook reenters and mints 3 more
+        rm.fire(5, 3, regionId); // outer mint 5; the receiver hook reenters and mints 3 more
 
         assertEq(art.totalMinted(), 8); // commutativity sanity — holds under either ordering
         assertEq(art.mintedByTemplate(id), 8);
@@ -272,8 +313,8 @@ contract ArtifactTemplateTest is Test {
         uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
 
         vm.startPrank(minter);
-        art.mint(player, id, 3, "");
-        art.mint(player, id, 4, "");
+        art.mint(player, id, 3, regionId, "");
+        art.mint(player, id, 4, regionId, "");
         vm.stopPrank();
 
         assertEq(art.balanceOf(player, id), 7);
@@ -284,7 +325,7 @@ contract ArtifactTemplateTest is Test {
         uint256 id = art.registerTemplate(author, 1, keccak256("m"), 0);
         // Non-empty data must not revert for an EOA recipient.
         vm.prank(minter);
-        art.mint(player, id, 2, hex"deadbeef");
+        art.mint(player, id, 2, regionId, hex"deadbeef");
         assertEq(art.balanceOf(player, id), 2);
     }
 
@@ -306,7 +347,7 @@ contract ArtifactTemplateTest is Test {
         emit Spent(player, address(art), expectedFee, bytes32(id));
 
         vm.prank(minter);
-        art.mint(player, id, 4, "");
+        art.mint(player, id, 4, regionId, "");
 
         assertEq(meter.credit(player), creditBefore - expectedFee, "credit debited by fee");
         assertEq(meter.spentByBuyer(player), expectedFee, "spend recorded");
@@ -323,7 +364,7 @@ contract ArtifactTemplateTest is Test {
 
         uint256 creditBefore = meter.credit(player);
         vm.prank(minter);
-        art.mint(player, id, 1, "");
+        art.mint(player, id, 1, regionId, "");
 
         assertEq(meter.credit(player), creditBefore - 1, "ceil charges 1, not 0");
         assertEq(meter.spentByBuyer(player), 1);
@@ -339,7 +380,7 @@ contract ArtifactTemplateTest is Test {
 
         vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
         vm.prank(minter);
-        art.mint(poor, id, 1, "");
+        art.mint(poor, id, 1, regionId, "");
 
         assertEq(art.balanceOf(poor, id), 0, "no units minted");
         assertEq(art.totalMinted(), 0, "counter rolled back");
@@ -359,7 +400,7 @@ contract ArtifactTemplateTest is Test {
 
         vm.expectRevert(ComputeMeter.NotAuthorized.selector);
         vm.prank(minter);
-        art.mint(player, id, 4, "");
+        art.mint(player, id, 4, regionId, "");
 
         assertEq(art.balanceOf(player, id), 0, "no units minted");
         assertEq(art.totalMinted(), 0, "counter rolled back");
@@ -374,7 +415,7 @@ contract ArtifactTemplateTest is Test {
         uint256 id = art.registerTemplate(author, 0, keccak256("m"), 0);
 
         vm.prank(minter);
-        art.mint(poor, id, 7, "");
+        art.mint(poor, id, 7, regionId, "");
 
         assertEq(art.balanceOf(poor, id), 7);
         assertEq(meter.spentByBuyer(poor), 0, "no fee debited for rarity-0");
@@ -386,13 +427,17 @@ contract ArtifactTemplateTest is Test {
         // counters before that interaction, so the reentrant mint observes the outer
         // mint already counted and the quiescent totals stay exact.
         ReentrantSpender rs = new ReentrantSpender();
-        ArtifactTemplate art2 = new ArtifactTemplate(owner, BASE_URI, address(rs), FEE_RATE);
+        ArtifactTemplate art2 =
+            new ArtifactTemplate(owner, BASE_URI, address(rs), FEE_RATE, address(region), ROYALTY_RATE);
         vm.prank(owner);
         art2.setMinter(address(rs));
         rs.setArt(art2);
+        // player pays the royalty on art2 too (rarity 1000); approve it. Funded in setUp.
+        vm.prank(player);
+        token.approve(address(art2), type(uint256).max);
 
         uint256 id = rs.register(author, 1000);
-        rs.fire(player, 5, 3); // outer mint 5; spend reenters and mints 3 more
+        rs.fire(player, 5, 3, regionId); // outer mint 5; spend reenters and mints 3 more
 
         assertEq(art2.totalMinted(), 8, "totals exact under reentrancy");
         assertEq(art2.mintedByTemplate(id), 8);
@@ -419,7 +464,7 @@ contract ArtifactTemplateTest is Test {
 
         // The boundary mint that exactly fills the cap succeeds.
         vm.prank(minter);
-        art.mint(player, id, 10, "");
+        art.mint(player, id, 10, regionId, "");
         assertEq(art.balanceOf(player, id), 10);
         assertEq(art.mintedByTemplate(id), 10);
 
@@ -427,7 +472,7 @@ contract ArtifactTemplateTest is Test {
         // counters untouched (the check is effects-before-interaction).
         vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 11, 10));
         vm.prank(minter);
-        art.mint(player, id, 1, "");
+        art.mint(player, id, 1, regionId, "");
         assertEq(art.mintedByTemplate(id), 10, "a rejected mint must not bump the counter");
         assertEq(art.totalMinted(), 10);
     }
@@ -437,15 +482,15 @@ contract ArtifactTemplateTest is Test {
         uint256 id = art.registerTemplate(author, 0, keccak256("m"), 10);
 
         vm.startPrank(minter);
-        art.mint(player, id, 4, "");
-        art.mint(player, id, 4, "");
-        art.mint(player, id, 2, ""); // exact fill at the cap
+        art.mint(player, id, 4, regionId, "");
+        art.mint(player, id, 4, regionId, "");
+        art.mint(player, id, 2, regionId, ""); // exact fill at the cap
         vm.stopPrank();
         assertEq(art.mintedByTemplate(id), 10);
 
         vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 11, 10));
         vm.prank(minter);
-        art.mint(player, id, 1, "");
+        art.mint(player, id, 1, regionId, "");
     }
 
     function test_mint_cappedRejectsBatchExceedingCapInOneCall() public {
@@ -455,7 +500,7 @@ contract ArtifactTemplateTest is Test {
 
         vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 6, 5));
         vm.prank(minter);
-        art.mint(player, id, 6, "");
+        art.mint(player, id, 6, regionId, "");
         assertEq(art.mintedByTemplate(id), 0, "nothing minted past the cap");
         assertEq(art.totalMinted(), 0);
     }
@@ -466,7 +511,7 @@ contract ArtifactTemplateTest is Test {
         uint256 id = art.registerTemplate(author, 0, keccak256("m"), 0);
 
         vm.prank(minter);
-        art.mint(player, id, 1e30, "");
+        art.mint(player, id, 1e30, regionId, "");
         assertEq(art.balanceOf(player, id), 1e30);
         assertEq(art.mintedByTemplate(id), 1e30);
     }
@@ -484,10 +529,10 @@ contract ArtifactTemplateTest is Test {
         ReentrantMinter rm = new ReentrantMinter(art);
         vm.prank(owner);
         art.setMinter(address(rm));
-        uint256 id = rm.registerCapped(author, 0, 8); // rarity 0 = free mint
+        uint256 id = rm.registerCapped(author, 0, 8); // rarity 0 = free mint, no royalty
 
         vm.expectRevert(); // SupplyExceeded bubbles up through the receiver hook
-        rm.fire(5, 5);
+        rm.fire(5, 5, regionId);
 
         // The whole tx reverted: the cap was never breached, nothing minted.
         assertEq(art.mintedByTemplate(id), 0);
@@ -499,14 +544,26 @@ contract ArtifactTemplateTest is Test {
 
     function test_constructor_revertsZeroComputeMeter() public {
         vm.expectRevert(ArtifactTemplate.ZeroComputeMeter.selector);
-        new ArtifactTemplate(owner, BASE_URI, address(0), FEE_RATE);
+        new ArtifactTemplate(owner, BASE_URI, address(0), FEE_RATE, address(region), ROYALTY_RATE);
     }
 
     function test_constructor_revertsZeroFeeRate() public {
         // A zero rate would re-open free mints for every template (mirrors the
         // RegionAuthority zero-stake hole); reject it at construction.
         vm.expectRevert(ArtifactTemplate.ZeroFeeRate.selector);
-        new ArtifactTemplate(owner, BASE_URI, address(meter), 0);
+        new ArtifactTemplate(owner, BASE_URI, address(meter), 0, address(region), ROYALTY_RATE);
+    }
+
+    function test_constructor_revertsZeroRegionAuthority() public {
+        vm.expectRevert(ArtifactTemplate.ZeroRegionAuthority.selector);
+        new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE, address(0), ROYALTY_RATE);
+    }
+
+    function test_constructor_revertsZeroRoyaltyRate() public {
+        // Mirrors ZeroFeeRate: a zero royalty rate would globally disable the region
+        // fee-share intake from artifact mints; reject it at construction.
+        vm.expectRevert(ArtifactTemplate.ZeroRoyaltyRate.selector);
+        new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE, address(region), 0);
     }
 
     function test_setMintFeeRate_updatesAndEmits() public {
@@ -549,9 +606,9 @@ contract ArtifactTemplateTest is Test {
         vm.startPrank(minter);
         uint256 id1 = art.registerTemplate(author, 1, keccak256("a"), 0);
         uint256 id2 = art.registerTemplate(author, 2, keccak256("b"), 0);
-        art.mint(player, id1, 5, "");
-        art.mint(player, id1, 3, ""); // same template accumulates
-        art.mint(stranger, id2, 4, "");
+        art.mint(player, id1, 5, regionId, "");
+        art.mint(player, id1, 3, regionId, ""); // same template accumulates
+        art.mint(stranger, id2, 4, regionId, "");
         vm.stopPrank();
 
         assertEq(art.mintedByTemplate(id1), 8);
@@ -577,14 +634,14 @@ contract ArtifactTemplateTest is Test {
         // Unknown-template mint: mint counters must not move.
         vm.expectRevert(ArtifactTemplate.UnknownTemplate.selector);
         vm.prank(minter);
-        art.mint(player, 9999, 7, "");
+        art.mint(player, 9999, 7, regionId, "");
         assertEq(art.totalMinted(), 0);
         assertEq(art.mintedByTemplate(9999), 0);
 
         // Non-minter mint of a known template: likewise records nothing.
         vm.expectRevert(ArtifactTemplate.NotMinter.selector);
         vm.prank(stranger);
-        art.mint(player, id, 7, "");
+        art.mint(player, id, 7, regionId, "");
         assertEq(art.totalMinted(), 0);
         assertEq(art.mintedByTemplate(id), 0);
     }
@@ -601,11 +658,11 @@ contract ArtifactTemplateTest is Test {
         // Old minter loses rights.
         vm.expectRevert(ArtifactTemplate.NotMinter.selector);
         vm.prank(minter);
-        art.mint(player, id, 1, "");
+        art.mint(player, id, 1, regionId, "");
 
         // New minter works.
         vm.prank(stranger);
-        art.mint(player, id, 1, "");
+        art.mint(player, id, 1, regionId, "");
         assertEq(art.balanceOf(player, id), 1);
     }
 
@@ -643,6 +700,7 @@ contract ReentrantMinter is IERC1155Receiver {
     ArtifactTemplate immutable art;
     uint256 public templateId;
     uint256 reentryAmount;
+    uint256 regionId;
     bool entered;
     uint256 public observedTotalMintedAtHook;
 
@@ -660,16 +718,17 @@ contract ReentrantMinter is IERC1155Receiver {
         return templateId;
     }
 
-    function fire(uint256 outerAmount, uint256 reentryAmount_) external {
+    function fire(uint256 outerAmount, uint256 reentryAmount_, uint256 regionId_) external {
         reentryAmount = reentryAmount_;
-        art.mint(address(this), templateId, outerAmount, "");
+        regionId = regionId_;
+        art.mint(address(this), templateId, outerAmount, regionId_, "");
     }
 
     function onERC1155Received(address, address, uint256, uint256, bytes calldata) external returns (bytes4) {
         if (!entered) {
             entered = true;
             observedTotalMintedAtHook = art.totalMinted();
-            art.mint(address(this), templateId, reentryAmount, "");
+            art.mint(address(this), templateId, reentryAmount, regionId, "");
         }
         return this.onERC1155Received.selector;
     }
@@ -695,6 +754,7 @@ contract ReentrantSpender is IComputeMeter {
     ArtifactTemplate art;
     uint256 public templateId;
     uint256 reentryAmount;
+    uint256 regionId;
     address recipient;
     bool entered;
     uint256 public observedTotalMintedAtSpend;
@@ -708,16 +768,19 @@ contract ReentrantSpender is IComputeMeter {
         return templateId;
     }
 
-    function fire(address recipient_, uint256 outerAmount, uint256 reentryAmount_) external {
+    function fire(address recipient_, uint256 outerAmount, uint256 reentryAmount_, uint256 regionId_)
+        external
+    {
         recipient = recipient_;
         reentryAmount = reentryAmount_;
-        art.mint(recipient_, templateId, outerAmount, "");
+        regionId = regionId_;
+        art.mint(recipient_, templateId, outerAmount, regionId_, "");
     }
 
     function spend(address, uint256, bytes32) external {
         if (entered) return;
         entered = true;
         observedTotalMintedAtSpend = art.totalMinted();
-        art.mint(recipient, templateId, reentryAmount, "");
+        art.mint(recipient, templateId, reentryAmount, regionId, "");
     }
 }

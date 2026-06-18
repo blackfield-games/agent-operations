@@ -3,6 +3,8 @@ pragma solidity ^0.8.27;
 
 import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @notice The slice of ComputeMeter this contract depends on. Held as an interface
 ///         so the mint-fee debit is one external call against a fixed ABI and tests
@@ -11,13 +13,27 @@ interface IComputeMeter {
     function spend(address buyer, uint256 amount, bytes32 jobId) external;
 }
 
+/// @notice The slice of RegionAuthority this contract depends on: the fee-share
+///         intake (`depositFees`) and the staked $BLCKFLD token it pulls. Held as an
+///         interface so the royalty deposit is one external call against a fixed ABI,
+///         and the royalty token is read from `TOKEN()` at construction so the two can
+///         never desync.
+interface IRegionAuthority {
+    function depositFees(uint256 tokenId, uint256 amount) external;
+    function TOKEN() external view returns (address);
+}
+
 /// @notice Player-authored artifact templates (weapons, gear, structures).
 ///         Each mint debits a rarity-scaled $BLCKFLD fee from the recipient's
-///         ComputeMeter credit before the ERC-1155 units are minted; an
-///         insufficient balance reverts the mint. Each templateId points to an
-///         offchain USD artifact manifest committed in a Merkle root tied to the
-///         template URI.
+///         ComputeMeter credit AND routes a separate rarity-scaled real-$BLCKFLD
+///         royalty to the minted artifact's region fee pool (RegionAuthority), before
+///         the ERC-1155 units are minted; insufficient credit, insufficient royalty
+///         balance/allowance, or an unknown region all revert the whole mint. Each
+///         templateId points to an offchain USD artifact manifest committed in a
+///         Merkle root tied to the template URI.
 contract ArtifactTemplate is ERC1155, Ownable2Step {
+    using SafeERC20 for IERC20;
+
     address public minter;
 
     /// @notice ComputeMeter that holds buyer compute credit. This contract must be
@@ -30,6 +46,24 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     ///         Owner-set and kept strictly positive so the global fee gate cannot be
     ///         opened (mirrors RegionAuthority's non-zero stake floor).
     uint256 public mintFeeRate;
+
+    /// @notice RegionAuthority that receives the per-mint region royalty via
+    ///         `depositFees`. Wired at deploy and immutable; the region must be claimed
+    ///         (have a holder) or the deposit reverts `UnknownRegion`, unwinding the mint.
+    IRegionAuthority public immutable regionAuthority;
+
+    /// @notice The $BLCKFLD token the region royalty is paid in — real, transferable
+    ///         tokens, NOT the burned ComputeMeter credit the compute fee debits. Read
+    ///         from `regionAuthority.TOKEN()` at construction so it always matches the
+    ///         token `depositFees` pulls (the approve target can never desync).
+    IERC20 public immutable royaltyToken;
+
+    /// @notice Region royalty at full rarity, per ERC-1155 unit, in real $BLCKFLD. The
+    ///         charged royalty scales linearly with `rarity` (see `_scaledFee`) and is
+    ///         ADDITIVE to and independent of the burned compute fee. Owner-set and kept
+    ///         strictly positive (mirrors `mintFeeRate`) so the royalty gate can't be
+    ///         globally opened.
+    uint256 public royaltyRate;
 
     /// @notice Upper bound on `rarity`, in basis points (100%). The off-chain
     ///         rarity->fee calculation treats this as the full-scale value, so a
@@ -71,6 +105,8 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
     event MintFeeRateSet(uint256 rate);
+    event RoyaltyRateSet(uint256 rate);
+    event RoyaltyRouted(uint256 indexed templateId, uint256 indexed regionId, uint256 amount);
 
     error NotMinter();
     error UnknownTemplate();
@@ -80,16 +116,29 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     error ZeroAmount();
     error ZeroComputeMeter();
     error ZeroFeeRate();
+    error ZeroRegionAuthority();
+    error ZeroRoyaltyRate();
     error SupplyExceeded(uint256 templateId, uint256 wouldMint, uint256 maxSupply);
 
-    constructor(address owner_, string memory baseUri_, address computeMeter_, uint256 mintFeeRate_)
-        ERC1155(baseUri_)
-        Ownable(owner_)
-    {
+    constructor(
+        address owner_,
+        string memory baseUri_,
+        address computeMeter_,
+        uint256 mintFeeRate_,
+        address regionAuthority_,
+        uint256 royaltyRate_
+    ) ERC1155(baseUri_) Ownable(owner_) {
         if (computeMeter_ == address(0)) revert ZeroComputeMeter();
         if (mintFeeRate_ == 0) revert ZeroFeeRate();
+        if (regionAuthority_ == address(0)) revert ZeroRegionAuthority();
+        if (royaltyRate_ == 0) revert ZeroRoyaltyRate();
         computeMeter = IComputeMeter(computeMeter_);
         mintFeeRate = mintFeeRate_;
+        regionAuthority = IRegionAuthority(regionAuthority_);
+        // Bind the royalty token to exactly what RegionAuthority pulls in depositFees,
+        // so the approve target can never desync from the deposit target.
+        royaltyToken = IERC20(IRegionAuthority(regionAuthority_).TOKEN());
+        royaltyRate = royaltyRate_;
     }
 
     function setMinter(address minter_) external onlyOwner {
@@ -103,6 +152,14 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         if (rate == 0) revert ZeroFeeRate();
         mintFeeRate = rate;
         emit MintFeeRateSet(rate);
+    }
+
+    /// @notice Owner sets the per-unit full-rarity region royalty. Zero is rejected so
+    ///         the royalty gate can never be globally disabled (mirrors setMintFeeRate).
+    function setRoyaltyRate(uint256 rate) external onlyOwner {
+        if (rate == 0) revert ZeroRoyaltyRate();
+        royaltyRate = rate;
+        emit RoyaltyRateSet(rate);
     }
 
     function setURI(string calldata newURI) external onlyOwner {
@@ -129,7 +186,14 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         emit TemplateRegistered(templateId, author, rarity, manifest);
     }
 
-    function mint(address to, uint256 templateId, uint256 amount, bytes calldata data) external {
+    /// @param regionId RegionAuthority tokenId (region coordinate hash) the mint's
+    ///        royalty accrues to. Used only when a royalty is charged (rarity > 0); a
+    ///        rarity-0 mint ignores it. The region must be claimed or the deposit
+    ///        reverts `UnknownRegion`. The caller names the region — correct
+    ///        attribution is off-chain policy, not enforced on-chain (see depositFees).
+    function mint(address to, uint256 templateId, uint256 amount, uint256 regionId, bytes calldata data)
+        external
+    {
         if (msg.sender != minter) revert NotMinter();
         if (to == address(0)) revert ZeroRecipient();
         if (amount == 0) revert ZeroAmount();
@@ -145,36 +209,51 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         uint256 wouldMint = mintedByTemplate[templateId] + amount;
         if (cap != 0 && wouldMint > cap) revert SupplyExceeded(templateId, wouldMint, cap);
 
-        uint256 fee = _mintFee(amount, t.rarity);
+        uint256 fee = _scaledFee(mintFeeRate, amount, t.rarity);
+        uint256 royalty = _scaledFee(royaltyRate, amount, t.rarity);
 
-        // CEI: write the supply counters (effects) before the two external
-        // interactions below — the meter `spend` and `_mint`, either of which can
-        // reenter (a misbehaving meter during spend; a minter that is also the
-        // recipient via the ERC-1155 receiver hook during _mint). A reentrant call
-        // therefore sees counters that already include this mint.
+        // CEI: commit the supply counters (effects) before EVERY external interaction
+        // below — the meter `spend`, the royalty pull + deposit, and `_mint` — any of
+        // which can reenter (a misbehaving meter/token; a minter that is also the
+        // recipient via the ERC-1155 receiver hook). A reentrant call therefore sees
+        // counters that already include this mint, so the supply cap holds and the
+        // royalty is never double-routed.
         totalMinted += amount;
         mintedByTemplate[templateId] = wouldMint;
 
-        // Charge the recipient's compute credit before the units are minted, so an
-        // insufficient balance reverts the whole mint. The spend's jobId carries the
-        // templateId (these are artifact mints, not the render-job EAS UIDs the meter
-        // also serves). A rarity-0 template (the 0-bps common tier) yields a zero fee
-        // and skips the debit entirely.
+        // Charge the recipient's compute credit, so an insufficient balance reverts the
+        // whole mint. The spend's jobId carries the templateId (these are artifact
+        // mints, not the render-job EAS UIDs the meter also serves). A rarity-0 template
+        // (the 0-bps common tier) yields a zero fee and skips the debit entirely.
         if (fee != 0) computeMeter.spend(to, fee, bytes32(templateId));
+
+        // Route the region royalty: pull real $BLCKFLD from the recipient and deposit
+        // it into the artifact's region fee pool. Distinct from the burned compute fee
+        // above — its own rate, its own (transferable) token. rarity-0 skips it;
+        // otherwise an unknown/unclaimed regionId reverts inside depositFees, unwinding
+        // the whole mint. The allowance is set to exactly `royalty` and fully consumed
+        // by depositFees, so no standing allowance survives the call.
+        if (royalty != 0) {
+            royaltyToken.safeTransferFrom(to, address(this), royalty);
+            royaltyToken.forceApprove(address(regionAuthority), royalty);
+            regionAuthority.depositFees(regionId, royalty);
+            emit RoyaltyRouted(templateId, regionId, royalty);
+        }
 
         _mint(to, templateId, amount, data);
         emit Minted(to, templateId, amount);
     }
 
-    /// @dev Rarity-scaled mint fee in $BLCKFLD compute credit:
-    ///      ceil(mintFeeRate * amount * rarity / MAX_RARITY). Rounds UP so any
-    ///      positive rarity costs at least one unit — a low rarity must never round
-    ///      down to a free mint. rarity == 0 (the 0-bps common tier) yields exactly
-    ///      zero. The multiply is checked arithmetic: it reverts only on the
-    ///      astronomical overflow of mintFeeRate * amount * rarity, reachable solely
-    ///      from absurd owner-set rate / coordinator-set amount values.
-    function _mintFee(uint256 amount, uint16 rarity) internal view returns (uint256) {
-        uint256 numerator = mintFeeRate * amount * rarity;
+    /// @dev Rarity-scaled per-mint charge in `rate` units, shared by the compute fee
+    ///      (`mintFeeRate`, burned credit) and the region royalty (`royaltyRate`, real
+    ///      $BLCKFLD): ceil(rate * amount * rarity / MAX_RARITY). Rounds UP so any
+    ///      positive rarity costs at least one unit — a low rarity must never round down
+    ///      to a free mint. rarity == 0 (the 0-bps common tier) yields exactly zero. The
+    ///      multiply is checked arithmetic: it reverts only on the astronomical overflow
+    ///      of rate * amount * rarity, reachable solely from absurd owner-set rate /
+    ///      coordinator-set amount values.
+    function _scaledFee(uint256 rate, uint256 amount, uint16 rarity) internal pure returns (uint256) {
+        uint256 numerator = rate * amount * rarity;
         if (numerator == 0) return 0;
         return (numerator - 1) / MAX_RARITY + 1;
     }

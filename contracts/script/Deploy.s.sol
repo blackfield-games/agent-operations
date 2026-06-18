@@ -23,6 +23,7 @@ contract Deploy is Script {
         uint256 stakeRequired; // $BLCKFLD required to claim a region
         string artifactBaseUri; // ERC-1155 base URI for artifact templates
         uint256 artifactMintFeeRate; // ArtifactTemplate per-unit full-rarity mint fee
+        uint256 artifactRoyaltyRate; // ArtifactTemplate per-unit full-rarity region royalty
     }
 
     /// @dev Deployed contract handles, returned to callers (tests + run()).
@@ -66,9 +67,17 @@ contract Deploy is Script {
         RegionAuthority regionAuthority = new RegionAuthority(cfg.token, cfg.stakeRequired, deployer);
 
         // 4. Artifact templates — ERC-1155 player-authored artifacts; mints debit the
-        //    rarity-scaled fee from the recipient's credit on this ComputeMeter.
+        //    rarity-scaled fee from the recipient's credit on this ComputeMeter and
+        //    route a rarity-scaled real-$BLCKFLD royalty into the artifact's region fee
+        //    pool on the RegionAuthority deployed above (it reads the royalty token from
+        //    RegionAuthority.TOKEN(), which is cfg.token).
         ArtifactTemplate artifactTemplate = new ArtifactTemplate(
-            deployer, cfg.artifactBaseUri, address(computeMeter), cfg.artifactMintFeeRate
+            deployer,
+            cfg.artifactBaseUri,
+            address(computeMeter),
+            cfg.artifactMintFeeRate,
+            address(regionAuthority),
+            cfg.artifactRoyaltyRate
         );
 
         // --- post-deploy wiring (deployer is owner) ---
@@ -118,6 +127,7 @@ contract Deploy is Script {
         cfg.artifactBaseUri =
             vm.envOr("ARTIFACT_BASE_URI", string("https://artifacts.blackfield.xyz/{id}.json"));
         cfg.artifactMintFeeRate = vm.envOr("ARTIFACT_MINT_FEE_RATE", uint256(1 ether));
+        cfg.artifactRoyaltyRate = vm.envOr("ARTIFACT_ROYALTY_RATE", uint256(1 ether));
     }
 
     function _log(DeployConfig memory cfg, Deployed memory deployed) internal pure {
