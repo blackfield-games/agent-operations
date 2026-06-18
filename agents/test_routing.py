@@ -4,7 +4,8 @@ Run from the agents/ dir:
     .venv/bin/python -m pytest test_routing.py -v
 """
 
-from runtime.supervisor import _failing_specialist
+from common.types import ValidatorVerdict
+from runtime.supervisor import _failing_specialist, _route_back_target
 
 
 def test_missing_layers_routes_to_earliest_missing():
@@ -77,12 +78,88 @@ def test_embedded_substring_names_do_not_trigger_routeback():
 
 
 def test_exact_path_segment_equal_to_specialist_still_routes():
-    # documented residual (FM2): a prim path segment *exactly* equal to a specialist
-    # name still matches under word boundaries. A conflict named on biome + prop at a
-    # prim literally </World/terrain> still routes to terrain (earliest) — the narrow,
-    # accepted residual word boundaries do not eliminate.
+    # The text scan's documented residual: a prim path segment *exactly* equal to a
+    # specialist name still matches under word boundaries, so the pure text scan over
+    # a conflict named on biome + prop at a prim literally </World/terrain> routes to
+    # terrain (earliest). _route_back_target eliminates this end-to-end by preferring
+    # the structured attribution (see test_structured_attribution_* below); this pins
+    # that the FALLBACK scan still behaves as documented when no structured field.
     issue = (
         "composition conflict: specialists biome, prop define the same prim "
         "</World/terrain> with incompatible types ['Mesh', 'Xform']"
     )
     assert _failing_specialist([issue]) == "terrain"
+
+
+# ---- _route_back_target: structured attribution preferred over the text scan ----
+
+
+def _verdict(issues: list[str], failing: list[str] | None = None) -> ValidatorVerdict:
+    kwargs = {"accepted": False, "issues": issues}
+    if failing is not None:
+        kwargs["failing_specialists"] = failing
+    return ValidatorVerdict(**kwargs)
+
+
+def test_structured_attribution_overrides_text_scan_residual():
+    # FM1: the exact-path-segment residual, fixed. A conflict at a prim literally
+    # </World/terrain> authored by biome + prop. The text scan still misroutes to the
+    # innocent terrain; the structured attribution names the real authors, so route-
+    # back goes to biome (pipeline-earliest). The two assertions together prove the
+    # structured field is what flips the result.
+    issue = (
+        "composition conflict: specialists biome, prop define the same prim "
+        "</World/terrain> with incompatible types ['Mesh', 'Xform']"
+    )
+    verdict = _verdict([issue], failing=["biome", "prop"])
+    assert _failing_specialist(verdict.issues) == "terrain"  # residual, still present
+    assert _route_back_target(verdict) == "biome"  # structured kills it
+
+
+def test_structured_attribution_picks_pipeline_earliest():
+    # List order is irrelevant; the earliest in PIPELINE_ORDER wins.
+    verdict = _verdict(["whatever"], failing=["prop", "biome", "lighting"])
+    assert _route_back_target(verdict) == "biome"
+
+
+def test_fieldless_verdict_falls_back_to_text_scan():
+    # FM2: a verdict with no structured attribution (older/synthesized validator)
+    # routes via the word-boundary text scan exactly as before.
+    verdict = _verdict(["missing specialist layers: ['prop']"])  # field defaults to []
+    assert verdict.failing_specialists == []
+    assert _route_back_target(verdict) == "prop"
+
+
+def test_empty_structured_list_falls_back_to_text_scan():
+    # An explicitly-empty field is the same as absent → text scan.
+    verdict = _verdict(["biome layer layers/biome.usda declares no defaultPrim"], failing=[])
+    assert _route_back_target(verdict) == "biome"
+
+
+def test_unknown_attributed_name_falls_back_to_director():
+    # FM3: the field is present but names only non-route-back targets (the validator
+    # itself). Ignore the unknowns; with nothing known left, route to director — NOT
+    # the text-scan result, even though the text names a real specialist (terrain).
+    verdict = _verdict(
+        ["terrain layer layers/terrain.usda declares no defaultPrim"],
+        failing=["validator"],
+    )
+    assert _failing_specialist(verdict.issues) == "terrain"  # text would say terrain
+    assert _route_back_target(verdict) == "director"  # present-but-unknown → director
+
+
+def test_unknown_names_ignored_but_known_one_still_routes():
+    # A mix of known + unknown: drop the unknowns, route to the earliest known.
+    verdict = _verdict(["x"], failing=["validator", "prop"])
+    assert _route_back_target(verdict) == "prop"
+
+
+def test_structured_and_text_disagree_structured_wins():
+    # FM4: the text names biome, the structured field names prop. The contract is
+    # that structured wins, with no ambiguity.
+    verdict = _verdict(
+        ["biome layer layers/biome.usda declares no defaultPrim"],
+        failing=["prop"],
+    )
+    assert _failing_specialist(verdict.issues) == "biome"
+    assert _route_back_target(verdict) == "prop"

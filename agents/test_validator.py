@@ -16,7 +16,7 @@ Run from the agents/ dir:
 from pathlib import Path
 
 from common.types import LayerSpec, RegionCoord, WorldBrief
-from runtime.supervisor import _failing_specialist
+from runtime.supervisor import _failing_specialist, _route_back_target
 from validator import validator
 
 SPECIALISTS = ["director", "terrain", "biome", "prop", "lighting", "npc", "optimization"]
@@ -582,3 +582,70 @@ async def test_run_rejects_dangling_override_and_routes_to_offender(tmp_path):
     assert not verdict.accepted
     assert any("dangling override" in issue for issue in verdict.issues)
     assert _failing_specialist(verdict.issues) == "biome"
+
+
+# A prim literally named "terrain" under /World, defined with incompatible types by
+# two specialists — the exact-path-segment residual the text scan cannot resolve.
+TERRAIN_PRIM_AS_MESH = """#usda 1.0
+(
+    defaultPrim = "World"
+)
+def Xform "World" {
+    def Mesh "terrain" {}
+}
+"""
+TERRAIN_PRIM_AS_XFORM = """#usda 1.0
+(
+    defaultPrim = "World"
+)
+def Xform "World" {
+    def Xform "terrain" {}
+}
+"""
+
+
+# ---- structured failing-specialist attribution on the verdict (end to end) ----
+
+
+async def test_run_attributes_conflict_to_authors_not_path_segment(tmp_path):
+    # The headline fix, end to end: biome + prop both define </World/terrain> with
+    # incompatible types. The verdict's structured attribution names the AUTHORS
+    # (biome, prop), drawn from the layer tags — not the path segment "terrain" — so
+    # route-back repairs biome, while the legacy text scan over the same issues still
+    # misroutes to the innocent terrain. This is the residual the slice eliminates.
+    layers = _set_with(tmp_path, {"biome": TERRAIN_PRIM_AS_MESH, "prop": TERRAIN_PRIM_AS_XFORM})
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert verdict.failing_specialists == ["biome", "prop"]
+    assert _failing_specialist(verdict.issues) == "terrain"  # residual in the text
+    assert _route_back_target(verdict) == "biome"  # structured fixes it
+
+
+async def test_run_attributes_missing_layer_and_metric_to_their_specialists(tmp_path):
+    # A missing biome layer + optimization missing its required over_budget metric:
+    # each is attributed structurally to the owning specialist (missing-layer and
+    # metrics-schema sources), and route-back picks the pipeline-earliest (biome).
+    layers = [
+        _layer(tmp_path, "director"),
+        _layer(tmp_path, "terrain"),
+        # biome omitted → missing layer
+        _layer(tmp_path, "prop"),
+        _layer(tmp_path, "lighting"),
+        _layer(tmp_path, "npc"),
+        _layer(tmp_path, "optimization", metrics={}),  # drop the required over_budget
+    ]
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert "biome" in verdict.failing_specialists  # missing layer
+    assert "optimization" in verdict.failing_specialists  # missing required metric
+    assert _route_back_target(verdict) == "biome"
+
+
+async def test_run_attributes_malformed_layer_to_its_specialist(tmp_path):
+    # Well-formedness source: a malformed biome layer is attributed to biome and
+    # nothing else, so the structured field is exactly ["biome"].
+    layers = _set_with(tmp_path, {"biome": "not a usda file"})
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert verdict.failing_specialists == ["biome"]
+    assert _route_back_target(verdict) == "biome"
