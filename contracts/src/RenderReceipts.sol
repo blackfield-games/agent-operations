@@ -255,6 +255,10 @@ contract RenderReceipts is Ownable2Step {
         // nothing) so an underfunded coordinator never attests without paying the region.
         // Allowance is set to exactly `fee` and fully consumed by depositFees (no standing
         // allowance, no transient balance — feeToken nets zero across the call).
+        //
+        // renderFeeRate * renderSeconds is checked arithmetic: it reverts only on the
+        // astronomical overflow of an absurd owner-set rate times a uint64 render-seconds,
+        // never for plausible values (mirrors ArtifactTemplate._scaledFee).
         uint256 fee = renderFeeRate * renderSeconds;
         uint256 regionTokenId = uint256(regionId);
         if (fee != 0 && regionAuthority.regionExists(regionTokenId)) {
