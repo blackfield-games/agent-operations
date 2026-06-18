@@ -291,6 +291,38 @@ contract RegionAuthorityTest is Test {
         region.depositFees(TILE, FEE);
     }
 
+    /// @dev regionExists is the non-reverting twin of depositFees's UnknownRegion guard:
+    ///      false for an unclaimed region (so a fee source can skip rather than revert),
+    ///      true once claimed, and false again after the holder unstakes (burns) it. This
+    ///      is the exact predicate RenderReceipts reads to decide whether to route a fee.
+    function test_regionExists_tracksClaimAndUnstake() public {
+        assertFalse(region.regionExists(TILE));
+
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        assertTrue(region.regionExists(TILE));
+        // Agrees with depositFees: a claimed region accepts a deposit (no UnknownRegion).
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        vm.prank(alice);
+        region.unstake(TILE);
+        assertFalse(region.regionExists(TILE));
+    }
+
+    /// @dev regionExists survives a transfer — the region stays claimed under its new
+    ///      holder (ownership moved, not burned), so a fee route keyed on it keeps landing.
+    function test_regionExists_trueAfterTransfer() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+
+        vm.prank(alice);
+        region.transferFrom(alice, bob, TILE);
+
+        assertTrue(region.regionExists(TILE));
+        assertEq(region.ownerOf(TILE), bob);
+    }
+
     function test_claimFees_holderWithdrawsExact() public {
         vm.prank(alice);
         region.claim(TILE, STAKE);

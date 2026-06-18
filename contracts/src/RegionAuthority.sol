@@ -99,6 +99,14 @@ contract RegionAuthority is ERC721, Ownable2Step {
         emit FeesDeposited(tokenId, msg.sender, amount);
     }
 
+    /// @notice Whether `tokenId` is a currently-claimed region (has a holder). The exact,
+    ///         non-reverting counterpart to `depositFees`'s `UnknownRegion` guard
+    ///         (`_ownerOf(tokenId) != address(0)`): a fee source can check this first and
+    ///         skip the deposit for an unclaimed region rather than reverting its own call.
+    function regionExists(uint256 tokenId) external view returns (bool) {
+        return _ownerOf(tokenId) != address(0);
+    }
+
     /// @notice Current region holder withdraws the region's accrued fees. CEI: the
     ///         accrued balance is zeroed before the transfer, so a reentrant
     ///         token-recipient sees nothing left to claim (no double-withdraw).
