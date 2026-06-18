@@ -234,3 +234,65 @@ async def test_persistently_failing_validator_terminates_at_round_cap(tmp_path, 
     assert result["verdict"].accepted is False
     assert result["rounds"] == sup.MAX_ROUNDS
     assert calls["n"] == sup.MAX_ROUNDS, "validator runs exactly MAX_ROUNDS times, then the guard ENDs"
+
+
+# ---- rounds normalization (robust to a missing/None/negative counter) ----
+
+
+def test_rounds_normalizes_missing_none_and_negative():
+    # _rounds is the single normalizer behind all four round reads (3 increments
+    # + the cap check). It must keep None/missing/negative from crashing them
+    # while leaving a real count untouched: no reset of a live counter (FM1), no
+    # clamp of a legitimately-high value (FM3).
+    assert sup._rounds({}) == 0  # missing key
+    assert sup._rounds({"rounds": None}) == 0  # present-but-None: the crash case
+    assert sup._rounds({"rounds": 0}) == 0  # legitimate start, not "needs reset"
+    assert sup._rounds({"rounds": 2}) == 2  # mid-run count passes through, not reset
+    assert sup._rounds({"rounds": sup.MAX_ROUNDS}) == sup.MAX_ROUNDS  # at the cap, unchanged
+    assert sup._rounds({"rounds": -1}) == 0  # negative floored
+
+
+async def test_validator_node_increments_from_none_rounds(monkeypatch):
+    # _validator_node runs BEFORE _after_validator, so its `rounds + 1` is the
+    # FIRST site a None rounds reaches — guarding only the cap check would still
+    # crash here. Normalized, None becomes 0 and the round advances to 1.
+    async def accept(brief, layers):
+        return ValidatorVerdict(accepted=True)
+
+    monkeypatch.setattr(sup.validator, "run", accept)
+    brief = WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
+    out = await sup._validator_node({"brief": brief, "layers": [], "rounds": None})
+    assert out["rounds"] == 1
+
+
+def test_after_validator_handles_none_rounds():
+    # The cap check `None >= MAX_ROUNDS` is a TypeError; normalized to 0 it sits
+    # below the cap, so a fixable rejection still routes back to the culprit
+    # instead of crashing the conditional edge.
+    state = {
+        "verdict": ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"]),
+        "rounds": None,
+    }
+    assert sup._after_validator(state) == "biome"
+
+
+async def test_round_cap_holds_with_none_initial_rounds(tmp_path, monkeypatch):
+    # End-to-end: an initial state carrying rounds=None (a partial restore) must
+    # still terminate at the cap — not crash on the first validator pass
+    # (None + 1) and not recurse forever. Mirrors the rounds=0 cap test above.
+    monkeypatch.chdir(tmp_path)
+
+    calls = {"n": 0}
+
+    async def always_reject(brief, layers):
+        calls["n"] += 1
+        return ValidatorVerdict(accepted=False, issues=["missing specialist layers: ['biome']"])
+
+    monkeypatch.setattr(sup.validator, "run", always_reject)
+
+    brief = WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
+    result = await sup.build_graph().ainvoke({"brief": brief, "layers": [], "rounds": None})
+
+    assert result["verdict"].accepted is False
+    assert result["rounds"] == sup.MAX_ROUNDS
+    assert calls["n"] == sup.MAX_ROUNDS
