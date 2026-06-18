@@ -3406,6 +3406,93 @@ mod tests {
         );
     }
 
+    /// FM3: the per-earner `/earners` faults reconcile with the gross `/stats`
+    /// total_faults — Σ(attributed faults) <= total_faults, which ALSO counts the
+    /// non-attributable declines. One session genuinely faults one job (attributed)
+    /// then declines another (not attributed): both bump the per-job fault budget,
+    /// so `/stats total_faults` is 2, but only the genuine fault is attributed, so
+    /// the earner's `/earners faults` is 1. Catches a regression that double-counted
+    /// declines into the per-earner tally.
+    #[tokio::test]
+    async fn earner_faults_reconcile_with_stats_total_faults() {
+        let state = test_state_empty().await;
+        let a = seed_job();
+        let b = seed_job();
+        enqueue(&state, &a).await;
+        enqueue(&state, &b).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello()).unwrap()))
+            .await
+            .unwrap();
+
+        // First offer → accept → forged signature (genuine fault, attributed).
+        let first = match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::JobOffer(j) => j.id,
+            other => panic!("expected first JobOffer, got {other:?}"),
+        };
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id: first }).unwrap(),
+        ))
+        .await
+        .unwrap();
+        let mut bad = signed_result(first, "deadbeef");
+        let last = bad.signature_hex.pop().unwrap();
+        bad.signature_hex.push(if last == 'f' { '0' } else { 'f' });
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(bad)).unwrap(),
+        ))
+        .await
+        .unwrap();
+        match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::Rejected { job_id: jid, .. } => assert_eq!(jid, first),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // Next offer is the OTHER job (first is skip-set'd) → decline (not attributed).
+        let second = match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::JobOffer(j) => {
+                assert_ne!(j.id, first, "first is skip-set'd, must offer the other job");
+                j.id
+            }
+            other => panic!("expected second JobOffer, got {other:?}"),
+        };
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Decline {
+                job_id: second,
+                reason: "unsupported".into(),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // The genuine fault is attributed (poll until it lands); the decline is not.
+        await_earner_faults(&state, &dev_address(), 1).await;
+
+        // Both faults bumped the per-job budget → /stats total_faults == 2 (poll:
+        // the decline's bump runs in the ws task after we send Decline).
+        let mut total = 0;
+        for _ in 0..40 {
+            total = body_json(get(state.clone(), "/stats").await).await["total_faults"]
+                .as_u64()
+                .unwrap();
+            if total == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(total, 2, "fault + decline both bump the gross per-job fault budget");
+        assert_eq!(
+            earner_faults_now(&state, &dev_address()).await,
+            Some(1),
+            "only the genuine fault is attributed per earner (Σ attributed < total)"
+        );
+    }
+
     /// A `JobResult` validly signed by an arbitrary key (distinct from the dev
     /// key `signed_result` uses), credited to that key's derived address — lets a
     /// test assert credit lands on a SPECIFIC earner, not just "someone".
