@@ -8,6 +8,7 @@ import {RegionAuthority} from "../src/RegionAuthority.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC1155Receiver} from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 contract MockToken is ERC20 {
     constructor() ERC20("Mock", "MCK") {
@@ -544,7 +545,12 @@ contract ArtifactTemplateTest is Test {
         vm.prank(minter);
         uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0);
 
-        vm.expectRevert(); // ERC20 insufficient allowance on the royalty transferFrom
+        // royalty = ceil(ROYALTY_RATE * 4 * 5000 / 10000) = 2e12; art is the spender,
+        // its allowance from payer is 0. Exact match, so the revert can't be a different
+        // (earlier) failure.
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(art), 0, 2e12)
+        );
         vm.prank(minter);
         art.mint(payer, id, 4, regionId, "");
 
@@ -564,7 +570,11 @@ contract ArtifactTemplateTest is Test {
         vm.prank(minter);
         uint256 id = art.registerTemplate(author, 5000, keccak256("m"), 0);
 
-        vm.expectRevert(); // ERC20 insufficient balance on the royalty transferFrom
+        // royalty = 2e12 (as above); payer's real balance is 0 after _credit burned it.
+        // Exact match, so the revert is specifically the royalty pull, not an earlier one.
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, payer, 0, 2e12)
+        );
         vm.prank(minter);
         art.mint(payer, id, 4, regionId, "");
 
@@ -762,6 +772,16 @@ contract ArtifactTemplateTest is Test {
         // fee-share intake from artifact mints; reject it at construction.
         vm.expectRevert(ArtifactTemplate.ZeroRoyaltyRate.selector);
         new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE, address(region), 0);
+    }
+
+    function test_constructor_revertsZeroRoyaltyToken() public {
+        // A RegionAuthority whose TOKEN() is zero (a misconfigured region) would make
+        // every paid mint revert opaquely at the SafeERC20 call; reject it at construction.
+        ReentrantRegionAuthority zeroTokenRegion = new ReentrantRegionAuthority(); // TOKEN() == 0
+        vm.expectRevert(ArtifactTemplate.ZeroRoyaltyToken.selector);
+        new ArtifactTemplate(
+            owner, BASE_URI, address(meter), FEE_RATE, address(zeroTokenRegion), ROYALTY_RATE
+        );
     }
 
     function test_setMintFeeRate_updatesAndEmits() public {

@@ -118,6 +118,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     error ZeroFeeRate();
     error ZeroRegionAuthority();
     error ZeroRoyaltyRate();
+    error ZeroRoyaltyToken();
     error SupplyExceeded(uint256 templateId, uint256 wouldMint, uint256 maxSupply);
 
     constructor(
@@ -136,8 +137,13 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         mintFeeRate = mintFeeRate_;
         regionAuthority = IRegionAuthority(regionAuthority_);
         // Bind the royalty token to exactly what RegionAuthority pulls in depositFees,
-        // so the approve target can never desync from the deposit target.
-        royaltyToken = IERC20(IRegionAuthority(regionAuthority_).TOKEN());
+        // so the approve target can never desync from the deposit target. Reject a zero
+        // token (a misconfigured RegionAuthority) here rather than letting every paid
+        // mint revert opaquely at the SafeERC20 call — completes the non-zero contract
+        // on every constructor address.
+        IERC20 token = IERC20(IRegionAuthority(regionAuthority_).TOKEN());
+        if (address(token) == address(0)) revert ZeroRoyaltyToken();
+        royaltyToken = token;
         royaltyRate = royaltyRate_;
     }
 
