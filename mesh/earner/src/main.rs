@@ -176,7 +176,10 @@ async fn main() -> Result<()> {
 /// a `poll_once` forever, wedging the entire poll loop (it never returns to
 /// sleep+retry). This bounds the whole exchange, not just connect, so a
 /// post-connect slowloris stall still surfaces as an `Err` the poll loop logs +
-/// backs off on. Generous (45s) so a slow-but-live coordinator under load isn't
+/// backs off on. reqwest applies it PER-REQUEST, so the GET `/jobs/next` and the
+/// POST `/{id}/submit` in one poll cycle each get their own deadline (the local
+/// `runner::render` between them is not a network op and is unbounded here).
+/// Generous (45s) so a slow-but-live coordinator under load isn't
 /// sheared into a spurious error; the OS/edge TCP timeouts remain the primary
 /// liveness defense and this is the app-layer backstop — the HTTP twin of the ws
 /// path's `CHALLENGE_TIMEOUT_SECS`. A const, not a knob, to match the sibling
@@ -194,10 +197,15 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the earner's HTTP poll client with explicit connect + total request
 /// timeouts. Factored out of [`run_http`] so a test can build a small-timeout
-/// twin and prove a stalled coordinator surfaces as `Err` (not a hang) — and so
-/// dropping either `.timeout()` is caught. Only `run_http` builds an HTTP client;
-/// the ws path uses `tokio_tungstenite` and shares nothing here, so this timeout
-/// never bounds the persistent ws session.
+/// twin and prove a stalled coordinator surfaces as `Err` (not a hang); that test
+/// pins the TOTAL `.timeout` (dropping it makes the stall hang the full delay).
+/// The `.connect_timeout` is a production liveness guard for an unreachable host
+/// and is NOT separately unit-pinned — a hermetic connect-timeout test isn't
+/// cleanly constructible (a bound-but-unaccepted local socket still completes the
+/// TCP handshake, so connect succeeds; a non-routable address black-holes vs
+/// fast-rejects per the host's routing, so timing isn't deterministic). Only
+/// `run_http` builds an HTTP client; the ws path uses `tokio_tungstenite` and
+/// shares nothing here, so this timeout never bounds the persistent ws session.
 fn http_client(request_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(request_timeout)
