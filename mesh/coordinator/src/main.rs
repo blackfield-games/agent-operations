@@ -4805,6 +4805,75 @@ mod tests {
         assert_eq!(stats["total_payout_wei"], "0");
     }
 
+    /// A valid buyer on POST /jobs is validated and stored coordinator-side, so the
+    /// settle path can later debit it via ComputeMeter. The buyer is read back
+    /// through the same job_buyer accessor the metering seam uses.
+    #[tokio::test]
+    async fn create_job_attributes_a_valid_buyer() {
+        let state = test_state_empty().await;
+        let buyer = "0x00000000000000000000000000000000000000b1";
+        let mut body = create_job_body();
+        body["buyer"] = serde_json::json!(buyer);
+
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let id = Uuid::parse_str(body_json(resp).await["id"].as_str().unwrap()).unwrap();
+
+        let stored = state.store.lock().await.job_buyer(&id).unwrap();
+        assert_eq!(stored.as_deref(), Some(buyer), "the validated buyer must be stored for metering");
+    }
+
+    /// A malformed buyer (right length, non-hex — exercises the hex predicate, not
+    /// just length) is rejected 422 like any other bad field, before anything is
+    /// enqueued, so /stats stays clean.
+    #[tokio::test]
+    async fn create_job_rejects_a_malformed_buyer() {
+        let state = test_state_empty().await;
+        let mut body = create_job_body();
+        body["buyer"] = serde_json::json!("0x00000000000000000000000000000000000000zz");
+
+        let resp = post_json(state.clone(), "/jobs", &body).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 0);
+    }
+
+    /// An absent buyer is valid: the job enqueues unattributed (NULL), so the
+    /// existing job sources (the agents poster, seed) keep working unchanged. The
+    /// metering seam skips a NULL buyer (mirrors the unknown-region fee skip).
+    #[tokio::test]
+    async fn create_job_without_a_buyer_enqueues_unattributed() {
+        let state = test_state_empty().await;
+
+        let resp = post_json(state.clone(), "/jobs", &create_job_body()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let id = Uuid::parse_str(body_json(resp).await["id"].as_str().unwrap()).unwrap();
+
+        let stored = state.store.lock().await.job_buyer(&id).unwrap();
+        assert_eq!(stored, None, "an unattributed job stores no buyer (NULL → not metered)");
+    }
+
+    /// A stored buyer survives a coordinator restart: written through
+    /// enqueue_within_cap, it is still readable after the SAME db file is reopened
+    /// (the idempotent buyer ALTER on the second open must not error or wipe it).
+    #[test]
+    fn buyer_persists_across_reopen() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+        let job = job_with_deadline(60);
+        let buyer = "0x00000000000000000000000000000000000000b1";
+        {
+            let store = Store::open(&db_path).unwrap();
+            assert!(store.enqueue_within_cap(&job, 10, Some(buyer)).unwrap());
+            assert_eq!(store.job_buyer(&job.id).unwrap().as_deref(), Some(buyer));
+        } // close the first "process" before reopening
+        let store = Store::open(&db_path).unwrap();
+        assert_eq!(
+            store.job_buyer(&job.id).unwrap().as_deref(),
+            Some(buyer),
+            "buyer must survive a restart (idempotent migration, no data loss)"
+        );
+    }
+
     #[tokio::test]
     async fn create_job_rejects_zero_deadline() {
         let state = test_state_empty().await;
