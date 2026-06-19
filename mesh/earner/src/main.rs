@@ -18,6 +18,7 @@ use proto::{hello_digest, signing_digest, CoordinatorMsg, EarnerMsg, JobKind, Jo
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
@@ -205,6 +206,33 @@ fn ws_url(coordinator: &str) -> String {
     format!("{base}/ws")
 }
 
+/// Inbound WS frame/message ceiling for the coordinator → earner direction. The
+/// earner dials OUT to the coordinator, so without an explicit config it inherits
+/// tungstenite's 64 MiB message / 16 MiB frame defaults for what it ACCEPTS — a
+/// buggy, compromised, or on-path coordinator could make an operator's earner buffer
+/// multi-MiB per frame before serde ever sees it. The largest LEGITIMATE inbound
+/// `CoordinatorMsg` is a `JobOffer` carrying a `JobSpec` whose `inputs` is bounded to
+/// the coordinator's `MAX_INPUTS_BYTES` (16 KiB); `Challenge`/`Accepted`/`Rejected`
+/// are tiny. 64 KiB leaves generous headroom above a max `JobOffer` (4× the inputs
+/// cap plus the `CoordinatorMsg`/`JobSpec` framing) while shedding anything an honest
+/// coordinator would never send. In-process backstop, the client-side mirror of the
+/// coordinator's own inbound cap (`ws_handler` max_message_size/max_frame_size); the
+/// primary defense is still edge/OS (an earner largely controls who it dials).
+const MAX_INBOUND_FRAME_BYTES: usize = 64 * 1024;
+
+/// WebSocket config for the coordinator connection: bound the inbound message AND
+/// frame size to [`MAX_INBOUND_FRAME_BYTES`]. Both, deliberately — a per-frame cap
+/// alone still lets a message split across many frames grow to the message cap.
+/// tungstenite's `max_*_size` are RECEIVE limits, so the earner's own outbound
+/// `Submit` is unaffected (it is already coordinator-bounded on the submit route).
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
+        max_frame_size: Some(MAX_INBOUND_FRAME_BYTES),
+        ..Default::default()
+    }
+}
+
 /// Websocket job dispatch (v1), run as a durable daemon. Connects, runs one
 /// [`ws_session`], and on session end *or* connect failure logs, sleeps an
 /// exponential backoff, and reconnects — forever. The coordinator reclaims and
@@ -221,7 +249,7 @@ async fn run_ws(args: &Args, session: &Session) -> Result<()> {
 
     loop {
         tracing::info!(%url, "connecting websocket");
-        match tokio_tungstenite::connect_async(&url).await {
+        match tokio_tungstenite::connect_async_with_config(&url, Some(ws_config()), false).await {
             Ok((ws, _resp)) => {
                 // A successful connect resets the backoff: a transient drop
                 // reconnects fast.
