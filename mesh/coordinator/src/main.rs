@@ -2060,6 +2060,19 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Extension(PeerAddr(peer)): Extension<PeerAddr>,
 ) -> Response {
+    // Bound inbound frames/messages to the same ceiling the HTTP paths enforce, so a
+    // Hello — like any earner frame — is size-checked at the protocol layer BEFORE
+    // serde parses it. Without this the ws path inherits tungstenite's 64 MiB default,
+    // and the per-source registration rate check (which runs only once a Hello frame
+    // is decoded) would sit AFTER an unbounded parse — letting the ws Hello amplify the
+    // very flood the limiter exists to shed, where HTTP `/register` is already capped
+    // by `DefaultBodyLimit`. The largest legitimate inbound message is an
+    // `EarnerMsg::Submit`, already bounded to this ceiling on the HTTP `/jobs/{id}/submit`
+    // path, so this is transport parity, not a new limit. Inbound-only: outbound
+    // `JobOffer`s (a JobSpec, `inputs` bounded by `MAX_INPUTS_BYTES`) are unaffected.
+    let ws = ws
+        .max_message_size(MAX_REQUEST_BODY_BYTES)
+        .max_frame_size(MAX_REQUEST_BODY_BYTES);
     ws.on_upgrade(move |socket| ws_session(socket, state, peer))
 }
 
@@ -4134,6 +4147,58 @@ mod tests {
             body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
             0,
             "no malformed Hello may register via ws",
+        );
+    }
+
+    /// An inbound ws frame past `MAX_REQUEST_BODY_BYTES` is refused at the protocol
+    /// layer (tungstenite capacity error → closed socket) BEFORE `recv_hello_inner` can
+    /// UTF-8-validate, JSON-parse, or rate-check it. Without the `ws_handler` size cap
+    /// the path inherits tungstenite's 64 MiB default, so the per-source rate check
+    /// (which only fires once a Hello is decoded) would sit after an unbounded parse —
+    /// the ws Hello amplifying the flood the limiter sheds, where HTTP `/register` is
+    /// already `DefaultBodyLimit`-bounded.
+    ///
+    /// Discriminating: the frame is an OTHERWISE-VALID signed Hello, padded past the cap
+    /// with an unknown field (`EarnerMsg` is `tag = "type"` without `deny_unknown_fields`,
+    /// so serde ignores the pad, and the signature commits only to the real fields — an
+    /// unpadded copy registers). With the cap the frame never parses, so `gpus_joined`
+    /// stays 0; remove the cap and the 33 KiB frame is buffered, parsed, and REGISTERS
+    /// (the server then holds the session open rather than closing) — so the close
+    /// itself, time-bounded here, fails. Either signal flips on regression.
+    #[tokio::test]
+    async fn ws_oversized_frame_closes_before_parse_and_registers_nothing() {
+        let state = test_state_empty().await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        let sk = test_signing_key("wsbig");
+        let hello = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+            &nonce,
+        );
+        let mut obj = serde_json::to_value(&hello).unwrap();
+        obj.as_object_mut().unwrap().insert(
+            "pad".into(),
+            serde_json::Value::String("x".repeat(MAX_REQUEST_BODY_BYTES)),
+        );
+        let wire = serde_json::to_string(&obj).unwrap();
+        assert!(wire.len() > MAX_REQUEST_BODY_BYTES, "frame must exceed the inbound cap");
+        ws.send(WsMessage::text(wire)).await.unwrap();
+        // Time-bound the close: without the cap the Hello registers and the server keeps
+        // the socket open, so this would hang — turn that regression into a clean fail.
+        tokio::time::timeout(Duration::from_secs(5), expect_ws_closed(&mut ws))
+            .await
+            .expect("oversized frame must close the socket, not register");
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "an oversized ws frame registered nothing",
         );
     }
 
