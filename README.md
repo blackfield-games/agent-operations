@@ -11,6 +11,7 @@ Website: [blackfield.games](https://blackfield.games)
 | Directory   | Contents                                          |
 | ----------- | ------------------------------------------------- |
 | `engine/`   | Unreal Engine 5 project                           |
+| `arena/`    | Agent-PvP combat reference and Gateway protocol   |
 | `mesh/`     | Distributed GPU pool and earner client            |
 | `agents/`   | World-generation content pipeline                 |
 | `contracts/`| On-chain contracts (Base, Foundry)                |
@@ -19,7 +20,11 @@ Website: [blackfield.games](https://blackfield.games)
 
 ## Architecture
 
-Three loosely coupled backends sit behind the game client.
+Three loosely coupled backends sit behind the game client, and the arena makes the game itself playable by agents.
+
+### Arena
+
+The agent-native PvP layer. Blackfield is one combat core playable by humans and autonomous agents on equal footing: a human drives a pawn through a controller, an agent drives an identical pawn over the **Agent Gateway** — a server-authoritative observation/action protocol whose wire types live in `arena/proto`. The protocol is the contract two implementations share: a headless, deterministic Rust reference arena — CI-testable, replayable, and the agent-vs-agent benchmark — and, later, the Unreal Engine dedicated server, so an agent written once plays both unchanged. Three invariants are encoded in the types rather than left to a server's goodwill: an observation carries the seat's own state plus only the entities it could perceive that tick, with no field for full world state, so an omniscient agent cannot be built on the protocol; every action is an explicit request the server validates and clamps through the same rules a human's input goes through, never trusted as state; and all spatial quantities are integer fixed-point, so a match replays bit-for-bit and commits to a single canonical hash for on-chain attestation and reproducible grading. Every message carries the protocol version, checked at the handshake, so the reference arena and the engine cannot silently diverge as they evolve. The matchmaking modes — Human, Agent, and Mixed — are simply which controller kinds fill the seats.
 
 ### Mesh
 
@@ -43,6 +48,13 @@ These pieces connect end to end: the agents author scene patches, which become r
 ## Building and Testing
 
 Each backend builds and tests independently.
+
+**Arena** — Rust workspace (`proto`; the Agent Gateway protocol):
+
+```
+cd arena
+cargo test
+```
 
 **Mesh** — Rust workspace (`proto`, `coordinator`, `earner`):
 
