@@ -1334,6 +1334,20 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Number of settled jobs whose ComputeMeter debit has not yet been spent
+    /// on-chain — the debit backlog depth, surfaced at `/stats` (the metering twin
+    /// of [`pending_attestation_count`](Self::pending_attestation_count)). A row is
+    /// pending while its `tx_hash` is NULL; the relayer drains the backlog by
+    /// writing the spend `tx_hash`, so this count falls as debits land.
+    pub fn pending_debit_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_debits WHERE tx_hash IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// The oldest still-pending attestation (`uid IS NULL`), oldest-first by
     /// insert order, as `(job_id, PendingAttestation)` — or `None` when the
     /// backlog is empty. A pure read: it does NOT reserve or mutate the row, so

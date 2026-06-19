@@ -476,6 +476,12 @@ struct Stats {
     /// pending receipt; this drains once the (operator-gated) on-chain relayer
     /// submits them. Until then it tracks `jobs_completed`.
     pending_attestations: usize,
+    /// Settled jobs whose ComputeMeter debit has not yet been spent on-chain — the
+    /// debit backlog depth (the metering twin of `pending_attestations`). A debit is
+    /// enqueued only for a metered settle (a job with a buyer when `--compute-rate-wei`
+    /// is set), so this is 0 whenever metering is disabled. Drains once the
+    /// (operator-gated) on-chain relayer spends them. Additive and optional.
+    pending_debits: usize,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -1703,6 +1709,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let pending_debits = match store.pending_debit_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: pending_debit_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -1722,6 +1735,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_attempts,
         total_faults,
         pending_attestations,
+        pending_debits,
     }))
 }
 
