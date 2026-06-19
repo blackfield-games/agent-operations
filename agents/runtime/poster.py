@@ -18,6 +18,8 @@ Coordinator response contract (``create_job`` + ``ingest_authorized``):
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -29,6 +31,8 @@ from common.jobs import RenderJobSpec
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECS = 10.0
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_BACKOFF_BASE_SECS = 0.5
 
 
 class PostOutcome(str, Enum):
@@ -38,6 +42,11 @@ class PostOutcome(str, Enum):
     UNAVAILABLE = "unavailable"      # 503 — queue at capacity (retryable)
     NETWORK_ERROR = "network_error"  # transport failure (retryable)
     ERROR = "error"                  # other unexpected status (e.g. 500)
+
+
+# Transient outcomes worth a backed-off retry. 422 (producer bug) and 401 (bad
+# token) are terminal — retrying them only hammers the coordinator (FM2).
+RETRYABLE = frozenset({PostOutcome.UNAVAILABLE, PostOutcome.NETWORK_ERROR})
 
 
 @dataclass(frozen=True)
@@ -117,30 +126,51 @@ def post_jobs(
     token: str | None,
     client: HttpClient,
     timeout: float = DEFAULT_TIMEOUT_SECS,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    backoff_base_secs: float = DEFAULT_BACKOFF_BASE_SECS,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> list[PostResult]:
     """POST each job to ``{base_url}/jobs``; one result per job, in order.
 
     Never raises on an HTTP status or transport error — the region is already
     authored and composed, so a posting failure is reported, not fatal (FM3). The
     bearer token (when set) authenticates the request and is never echoed back.
+
+    Retryable outcomes (503, network error) are retried up to ``max_attempts``
+    with exponential backoff (``backoff_base_secs * 2**n``); 201/401/422 are
+    terminal and return on the first response. ``sleep`` is injected so tests
+    drive the backoff without real time.
     """
     url = f"{base_url.rstrip('/')}/jobs"
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    attempts = max(1, max_attempts)
 
     def attempt(job: RenderJobSpec) -> PostResult:
         region_id = job.region.region_id
         kind = job.kind.wire_name
-        try:
-            resp = client.post(url, json=job.to_request(), headers=headers, timeout=timeout)
-        except httpx.RequestError as e:
-            return PostResult(region_id, kind, PostOutcome.NETWORK_ERROR, detail=type(e).__name__)
-        outcome = _classify(resp.status_code)
-        if outcome is PostOutcome.CREATED:
-            return PostResult(region_id, kind, outcome, status_code=201, job_id=_job_id(resp))
-        result = PostResult(region_id, kind, outcome, status_code=resp.status_code)
-        _log_terminal(result)
+        body = job.to_request()
+        result = PostResult(region_id, kind, PostOutcome.NETWORK_ERROR)
+        for n in range(1, attempts + 1):
+            try:
+                resp = client.post(url, json=body, headers=headers, timeout=timeout)
+            except httpx.RequestError as e:
+                result = PostResult(region_id, kind, PostOutcome.NETWORK_ERROR, detail=type(e).__name__)
+            else:
+                outcome = _classify(resp.status_code)
+                if outcome is PostOutcome.CREATED:
+                    return PostResult(region_id, kind, outcome, status_code=201, job_id=_job_id(resp))
+                result = PostResult(region_id, kind, outcome, status_code=resp.status_code)
+                if outcome not in RETRYABLE:
+                    _log_terminal(result)
+                    return result
+            if n < attempts:
+                sleep(backoff_base_secs * 2 ** (n - 1))
+        logger.warning(
+            "POST /jobs for %s (%s) failed after %d attempt(s): %s",
+            region_id, kind, attempts, result.outcome.value,
+        )
         return result
 
     return [attempt(job) for job in jobs]

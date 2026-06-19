@@ -90,7 +90,7 @@ def test_rejected_is_terminal_producer_bug():
 
 def test_unavailable_classified():
     client = _Client(_Resp(503))
-    [result] = post_jobs([_job()], base_url="http://c", token="t", client=client)
+    [result] = post_jobs([_job()], base_url="http://c", token="t", client=client, max_attempts=1)
     assert result.outcome is PostOutcome.UNAVAILABLE
     assert result.status_code == 503
 
@@ -106,7 +106,7 @@ def test_unexpected_status_is_error():
 
 def test_network_error_is_non_fatal_result():
     client = _Client(httpx.ConnectError("connection refused"))
-    [result] = post_jobs([_job()], base_url="http://c", token="t", client=client)
+    [result] = post_jobs([_job()], base_url="http://c", token="t", client=client, max_attempts=1)
     assert result.outcome is PostOutcome.NETWORK_ERROR
     assert result.detail == "ConnectError"  # class name only, no message echo
 
@@ -153,3 +153,78 @@ def test_base_url_trailing_slash_normalized():
     client = _Client(_Resp(201, {"id": "x"}))
     post_jobs([_job()], base_url="http://c:8080/", token="t", client=client)
     assert client.calls[0]["url"] == "http://c:8080/jobs"  # no double slash
+
+
+# --- retry + backoff for retryable outcomes (FM2) ---
+
+def test_unavailable_retried_with_backoff_then_exhausted():
+    client = _Client(_Resp(503), _Resp(503), _Resp(503))
+    sleeps: list[float] = []
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=3, sleep=sleeps.append,
+    )
+    assert result.outcome is PostOutcome.UNAVAILABLE
+    assert len(client.calls) == 3  # all attempts used
+    assert sleeps == [0.5, 1.0]  # backed off between attempts, not after the last
+
+
+def test_unavailable_then_created_succeeds():
+    client = _Client(_Resp(503), _Resp(201, {"id": "late"}))
+    sleeps: list[float] = []
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=3, sleep=sleeps.append,
+    )
+    assert result.outcome is PostOutcome.CREATED
+    assert result.job_id == "late"
+    assert len(client.calls) == 2  # stopped as soon as it succeeded
+    assert sleeps == [0.5]
+
+
+def test_network_error_retried_then_succeeds():
+    client = _Client(httpx.ConnectError("refused"), _Resp(201, {"id": "ok"}))
+    sleeps: list[float] = []
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=3, sleep=sleeps.append,
+    )
+    assert result.outcome is PostOutcome.CREATED
+    assert len(client.calls) == 2
+    assert sleeps == [0.5]
+
+
+def test_network_error_exhausted_is_non_fatal():
+    client = _Client(*[httpx.TimeoutException("slow")] * 3)
+    sleeps: list[float] = []
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=3, sleep=sleeps.append,
+    )
+    assert result.outcome is PostOutcome.NETWORK_ERROR
+    assert result.detail == "TimeoutException"
+    assert len(client.calls) == 3
+    assert sleeps == [0.5, 1.0]
+
+
+def test_rejected_not_retried_even_with_attempts():
+    # A 422 is a producer bug — retrying it is pointless; it must short-circuit.
+    client = _Client(_Resp(422))
+    sleeps: list[float] = []
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=5, sleep=sleeps.append,
+    )
+    assert result.outcome is PostOutcome.REJECTED
+    assert len(client.calls) == 1  # not retried
+    assert sleeps == []
+
+
+def test_custom_backoff_base_scales_delays():
+    client = _Client(_Resp(503), _Resp(503), _Resp(503), _Resp(503))
+    sleeps: list[float] = []
+    post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=4, backoff_base_secs=0.1, sleep=sleeps.append,
+    )
+    assert sleeps == [0.1, 0.2, 0.4]  # 0.1 * 2**n for n in 0..2; none after the last
