@@ -15,7 +15,10 @@
 //! iteration over state, and no wall-clock anywhere in the tick path, because any
 //! one of those would make a replay diverge and break grading.
 
-use arena_proto::{Bam, MatchPhase, SeatId, TeamId, Vec2, POSITION_SCALE};
+use arena_proto::{
+    Action, ActionError, ActionIntent, Bam, MatchPhase, SeatId, TeamId, Vec2, VersionMismatch,
+    POSITION_SCALE,
+};
 use uuid::Uuid;
 
 /// East along +X — a seat on the left of the arena faces this way (toward
@@ -100,6 +103,47 @@ impl Default for Rules {
         }
     }
 }
+
+/// Why the server refused an [`Action`] envelope at the Gateway boundary. A
+/// refused action is not applied; the seat forfeits the tick exactly as if no
+/// action had arrived, so a malformed or spoofed action can never advance state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The action's protocol version is not this build's.
+    Version(VersionMismatch),
+    /// The action names a different match than this one.
+    WrongMatch { expected: Uuid, got: Uuid },
+    /// The action claims a seat other than the connection's own — an agent may
+    /// only act for itself.
+    WrongSeat { expected: SeatId, got: SeatId },
+    /// The action answers a tick that is not the current one (stale or ahead),
+    /// so it cannot be applied to this tick.
+    StaleTick { expected: u64, got: u64 },
+    /// The match is not in [`Live`], so no action is simulated.
+    ///
+    /// [`Live`]: MatchPhase::Live
+    NotLive,
+}
+
+impl std::fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RejectReason::Version(m) => write!(f, "action rejected: {m}"),
+            RejectReason::WrongMatch { expected, got } => {
+                write!(f, "action rejected: wrong match (expected {expected}, got {got})")
+            }
+            RejectReason::WrongSeat { expected, got } => {
+                write!(f, "action rejected: wrong seat (expected {expected}, got {got})")
+            }
+            RejectReason::StaleTick { expected, got } => {
+                write!(f, "action rejected: stale tick (expected {expected}, got {got})")
+            }
+            RejectReason::NotLive => write!(f, "action rejected: match is not live"),
+        }
+    }
+}
+
+impl std::error::Error for RejectReason {}
 
 /// One pawn's authoritative state. The agent never sees this struct — it sees a
 /// parity-bounded [`Observation`] derived from it.
@@ -273,6 +317,39 @@ impl Match {
             visible,
         }
     }
+
+    /// Validate a raw action envelope at the Gateway boundary and return the
+    /// accepted, **clamped** intent. This is the single server-authoritative gate
+    /// every seat's input passes through — the same path a human's input would
+    /// take — so a crafted action can never be trusted as sent:
+    ///
+    /// - the protocol version must match (an action framed under another version
+    ///   cannot be interpreted safely),
+    /// - the match id and seat must be the connection's own (no acting for
+    ///   another match or seat),
+    /// - the tick must be the current one (a stale or future action is dropped,
+    ///   not applied to the wrong tick),
+    /// - the move magnitude is clamped to the rules ([`ActionIntent::clamped`]),
+    ///   so no envelope can request god-mode speed.
+    ///
+    /// `seat` is the authoritative seat of the connection; `action.seat` is what
+    /// the envelope claims, and the two must agree.
+    pub fn ingest(&self, seat: SeatId, action: &Action) -> Result<ActionIntent, RejectReason> {
+        action.validate().map_err(|ActionError::Version(m)| RejectReason::Version(m))?;
+        if self.phase != MatchPhase::Live {
+            return Err(RejectReason::NotLive);
+        }
+        if action.match_id != self.match_id {
+            return Err(RejectReason::WrongMatch { expected: self.match_id, got: action.match_id });
+        }
+        if action.seat != seat {
+            return Err(RejectReason::WrongSeat { expected: seat, got: action.seat });
+        }
+        if action.tick != self.tick {
+            return Err(RejectReason::StaleTick { expected: self.tick, got: action.tick });
+        }
+        Ok(action.intent.clamped())
+    }
 }
 
 /// `true` if `b` is within `range` position units of `a` on the ground plane.
@@ -287,7 +364,7 @@ fn within(a: Vec2, b: Vec2, range: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena_proto::{MatchConfig, SeatInfo};
+    use arena_proto::{ActionButtons, MatchConfig, SeatInfo, PROTOCOL_VERSION};
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
     /// First SplitMix64 output for seed 1, verified against the reference
@@ -312,6 +389,18 @@ mod tests {
 
     fn new_match(seed: u64) -> Match {
         Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), seed)
+    }
+
+    fn intent(move_dir: Vec2, aim: Bam, fire: bool) -> ActionIntent {
+        ActionIntent {
+            move_dir,
+            aim,
+            buttons: ActionButtons { fire, jump: false, ability: false, reload: false },
+        }
+    }
+
+    fn action_at(m: &Match, seat: SeatId, intent: ActionIntent) -> Action {
+        Action { protocol_version: PROTOCOL_VERSION, match_id: m.match_id(), seat, tick: m.tick(), intent }
     }
 
     #[test]
@@ -373,5 +462,46 @@ mod tests {
         let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), 5);
         assert!(m.observe(0).visible.is_empty());
         assert!(m.observe(1).visible.is_empty());
+    }
+
+    #[test]
+    fn ingest_accepts_well_formed_and_clamps_overlong_move() {
+        let m = new_match(1);
+        // FM2: a crafted 3-4-5 vector of magnitude 5000 is accepted but clamped to
+        // the cap (600, 800) — no envelope buys god-mode speed.
+        let a = action_at(&m, 0, intent(Vec2 { x: 3000, y: 4000 }, 0x4000, false));
+        assert_eq!(m.ingest(0, &a).unwrap().move_dir, Vec2 { x: 600, y: 800 });
+    }
+
+    #[test]
+    fn ingest_rejects_version_drift() {
+        let m = new_match(1);
+        let mut a = action_at(&m, 0, intent(Vec2::ZERO, 0, false));
+        a.protocol_version = PROTOCOL_VERSION + 1;
+        assert!(matches!(m.ingest(0, &a), Err(RejectReason::Version(_))));
+    }
+
+    #[test]
+    fn ingest_rejects_acting_for_another_seat() {
+        let m = new_match(1);
+        // The envelope claims seat 1 but the connection is seat 0.
+        let a = action_at(&m, 1, intent(Vec2::ZERO, 0, false));
+        assert_eq!(m.ingest(0, &a), Err(RejectReason::WrongSeat { expected: 0, got: 1 }));
+    }
+
+    #[test]
+    fn ingest_rejects_stale_or_future_tick() {
+        let m = new_match(1);
+        let mut a = action_at(&m, 0, intent(Vec2::ZERO, 0, false));
+        a.tick = 99;
+        assert_eq!(m.ingest(0, &a), Err(RejectReason::StaleTick { expected: 0, got: 99 }));
+    }
+
+    #[test]
+    fn ingest_rejects_action_for_another_match() {
+        let m = new_match(1);
+        let mut a = action_at(&m, 0, intent(Vec2::ZERO, 0, false));
+        a.match_id = Uuid::nil();
+        assert!(matches!(m.ingest(0, &a), Err(RejectReason::WrongMatch { .. })));
     }
 }
