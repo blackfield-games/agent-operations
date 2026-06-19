@@ -416,6 +416,12 @@ mod tests {
         assert!(!v.verify("0xagent", ""), "an empty token is rejected");
         assert!(!v.verify("0xunknown", "goodsig"), "an unregistered agent is rejected");
         assert!(!v.verify("0xunknown", ""), "an unknown agent with no token is rejected");
+
+        // An empty token never authenticates even if an agent is (wrongly)
+        // allowlisted with one — the empty-token guard rejects, not just an
+        // allowlist miss, so an empty signature can never satisfy a ranked seat.
+        v.authorize("0xempty", "");
+        assert!(!v.verify("0xempty", ""), "an empty token is rejected even when allowlisted empty");
     }
 
     #[test]
@@ -682,5 +688,20 @@ mod tests {
         assert!(mm.join(MatchMode::Mixed, JoinRequest::ranked_agent("0xgood", "goodsig")).unwrap().is_queued());
         // Two agents, no human → no match formed; the forged join never queued.
         assert_eq!(mm.waiting(MatchMode::Mixed), 2);
+    }
+
+    #[test]
+    fn an_empty_token_string_is_a_casual_seat_not_a_ranked_claim() {
+        // The SDK sends an empty signature_hex for casual play. presented_token
+        // collapses Some("") to no-token, so it reads as casual — admitted in Mixed,
+        // rejected (ranked-required) in Agent mode — never verified as a ranked
+        // claim against an empty signature.
+        let empty = || JoinRequest { agent_id: "0xbot".into(), kind: ControllerKind::Agent, token: Some(String::new()) };
+        let mm = open_mm();
+        assert!(mm.join(MatchMode::Mixed, empty()).unwrap().is_queued(), "an empty token is a casual Mixed seat");
+        assert!(
+            matches!(mm.join(MatchMode::Agent, empty()), Err(JoinError::Unauthenticated { .. })),
+            "an empty token is not a ranked claim, so Agent mode rejects it"
+        );
     }
 }
