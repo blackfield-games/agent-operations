@@ -179,6 +179,29 @@
         "internalType": "address",
         "name": "buyer",
         "type": "address"
+      },
+      {
+        "internalType": "uint256",
+        "name": "amount",
+        "type": "uint256"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "jobId",
+        "type": "bytes32"
+      }
+    ],
+    "name": "spendOnce",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "buyer",
+        "type": "address"
       }
     ],
     "name": "spentByBuyer",
@@ -187,6 +210,25 @@
         "internalType": "uint256",
         "name": "spent",
         "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "jobId",
+        "type": "bytes32"
+      }
+    ],
+    "name": "spentJobs",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "spent",
+        "type": "bool"
       }
     ],
     "stateMutability": "view",
@@ -343,6 +385,11 @@
     ],
     "name": "Spent",
     "type": "event"
+  },
+  {
+    "inputs": [],
+    "name": "AlreadySpent",
+    "type": "error"
   },
   {
     "inputs": [],
