@@ -393,6 +393,11 @@ struct CreateJobRequest {
     /// bounded `u128` before enqueue (see [`validate::validate_job_spec`]).
     max_payout_wei: String,
     inputs: serde_json::Value,
+    /// Optional EVM address charged for this job's validated compute via
+    /// ComputeMeter. Absent → the job is ingested unattributed and simply isn't
+    /// metered. Stored coordinator-side (never on the proto wire to the earner).
+    #[serde(default)]
+    buyer: Option<String>,
 }
 
 /// Response for a successful `POST /jobs`: the coordinator-assigned job id the
@@ -1518,6 +1523,17 @@ async fn create_job(
         tracing::warn!(reason = e.reason(), "rejected: malformed job spec");
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
+    // An attributed buyer must be a well-formed EVM address — the SAME shape
+    // is_evm_address gates the earner address by, so a buyer accepted here is one
+    // ComputeMeter.spend can later debit. Rejected like any other malformed field
+    // (422), before anything is enqueued. Absent buyer is valid (unmetered).
+    let buyer = req.buyer;
+    if let Some(b) = &buyer {
+        if !is_evm_address(b) {
+            tracing::warn!("rejected: malformed job buyer address");
+            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
     let spec = JobSpec {
         id: Uuid::new_v4(),
         kind: req.kind,
@@ -1529,7 +1545,7 @@ async fn create_job(
     let id = spec.id;
     {
         let store = state.store.lock().await;
-        match store.enqueue_within_cap(&spec, state.max_queued_jobs) {
+        match store.enqueue_within_cap(&spec, state.max_queued_jobs, buyer.as_deref()) {
             Ok(true) => {}
             Ok(false) => {
                 // Backlog full: shed with a retryable 503 (NOT a 500) so a

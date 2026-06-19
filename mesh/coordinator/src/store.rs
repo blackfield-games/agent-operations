@@ -343,13 +343,23 @@ impl Store {
     /// genuine (astronomically unlikely) error, not a silent upsert. The boot-time
     /// `seed_jobs` and crash-recovery requeue use the uncapped `enqueue`, so they
     /// are exempt from this cap.
-    pub fn enqueue_within_cap(&self, job: &JobSpec, max_queued: usize) -> Result<bool> {
+    ///
+    /// `buyer` is the optional EVM address charged for the job's compute (NULL
+    /// when the caller ingests it unattributed); it is the only buyer source, so
+    /// the uncapped [`enqueue`](Self::enqueue) used by seed/recovery stays
+    /// buyerless by construction.
+    pub fn enqueue_within_cap(
+        &self,
+        job: &JobSpec,
+        max_queued: usize,
+        buyer: Option<&str>,
+    ) -> Result<bool> {
         let spec_json = serde_json::to_string(job)?;
         let inserted = self.conn.execute(
-            "INSERT INTO jobs (id, spec_json, status, created_at)
-             SELECT ?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER)
+            "INSERT INTO jobs (id, spec_json, status, created_at, buyer)
+             SELECT ?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER), ?5
              WHERE (SELECT COUNT(*) FROM jobs WHERE status = ?3) < ?4",
-            (job.id.to_string(), spec_json, STATUS_QUEUED, max_queued as i64),
+            (job.id.to_string(), spec_json, STATUS_QUEUED, max_queued as i64, buyer),
         )?;
         Ok(inserted == 1)
     }
