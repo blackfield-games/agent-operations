@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "arena-core"
+version = "0.0.1"
+dependencies = [
+ "arena-proto",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "arena-proto"
 version = "0.0.1"
 dependencies = [

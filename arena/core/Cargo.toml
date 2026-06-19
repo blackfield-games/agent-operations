@@ -1,0 +1,11 @@
+[package]
+name = "arena-core"
+version = "0.0.1"
+edition.workspace = true
+
+[dependencies]
+arena-proto = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
