@@ -229,6 +229,130 @@ pub struct Observation {
     pub visible: Vec<VisibleEntity>,
 }
 
+/// The length of a full-speed move request: a [`ActionIntent::move_dir`] whose
+/// magnitude is `MOVE_INTENT_SCALE` asks for full speed, and the server clamps
+/// anything longer. Integer fixed-point, so the clamp is exact and identical on
+/// every implementation.
+pub const MOVE_INTENT_SCALE: i32 = 1000;
+
+/// The buttons an agent may press this tick. Edge-vs-level semantics (a fresh
+/// press vs a held button) are the sim's to define; the protocol carries the
+/// booleans canonically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionButtons {
+    pub fire: bool,
+    pub jump: bool,
+    pub ability: bool,
+    pub reload: bool,
+}
+
+/// The control intent for a single tick: a planar move direction, an aim, and
+/// the buttons. Every continuous quantity is integer fixed-point, so the request
+/// is canonical and clamp-checkable with no float ambiguity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionIntent {
+    /// Desired planar move direction as a fixed-point vector; magnitude in
+    /// `0..=MOVE_INTENT_SCALE` expresses fraction of max speed. The server clamps
+    /// the magnitude — this is a request, never trusted as the resulting
+    /// velocity.
+    pub move_dir: Vec2,
+    pub aim: Bam,
+    pub buttons: ActionButtons,
+}
+
+impl ActionIntent {
+    /// The canonical anti-god-mode move clamp, shared by every implementation so
+    /// the Rust arena and the UE5 server apply the *same* rule a human's input
+    /// goes through. Returns a copy whose `move_dir` magnitude is at most
+    /// [`MOVE_INTENT_SCALE`]; an in-range request is returned unchanged. Pure
+    /// integer math (no float, integer sqrt), so the clamp is deterministic and
+    /// can never round *up* past the cap.
+    pub fn clamped(&self) -> ActionIntent {
+        let x = self.move_dir.x as i64;
+        let y = self.move_dir.y as i64;
+        let mag_sq = (x * x + y * y) as u64;
+        let max = MOVE_INTENT_SCALE as i64;
+        let max_sq = (max * max) as u64;
+        let move_dir = if mag_sq <= max_sq {
+            self.move_dir
+        } else {
+            let mag = isqrt_u64(mag_sq).max(1) as i64;
+            Vec2 {
+                x: (x * max / mag) as i32,
+                y: (y * max / mag) as i32,
+            }
+        };
+        ActionIntent {
+            move_dir,
+            aim: self.aim,
+            buttons: self.buttons,
+        }
+    }
+}
+
+/// Integer square root (floor) via Newton's method — deterministic on every
+/// platform, unlike `(n as f64).sqrt()`. Used by the move clamp so action
+/// normalization never depends on float behavior.
+fn isqrt_u64(n: u64) -> u64 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
+/// One agent action, bound to the tick it answers.
+///
+/// `tick` is the [`Observation`] tick this action responds to, so the server can
+/// discard a stale or late action rather than apply it to a newer tick. The
+/// action is a REQUEST: the server validates and clamps every field through the
+/// same rules a human's input goes through, and no field here is trusted as
+/// authoritative state. [`validate`](Action::validate) is the cheap structural
+/// gate at the Gateway boundary; semantic clamping (speed via
+/// [`ActionIntent::clamped`], fire rate, ability cooldowns) is the sim's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Action {
+    pub protocol_version: u32,
+    pub match_id: MatchId,
+    pub seat: SeatId,
+    /// The observation tick this action answers.
+    pub tick: u64,
+    pub intent: ActionIntent,
+}
+
+/// Why [`Action::validate`] rejected an action envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionError {
+    /// The action's [`PROTOCOL_VERSION`] does not match this build's.
+    Version(VersionMismatch),
+}
+
+impl std::fmt::Display for ActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActionError::Version(m) => write!(f, "invalid action: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ActionError {}
+
+impl Action {
+    /// Structural validation at the Gateway boundary: the protocol version must
+    /// match exactly, because an action framed under a different version cannot
+    /// be interpreted safely. A well-formed envelope is NOT a trusted action —
+    /// the sim still applies every semantic clamp (speed, fire rate, cooldowns)
+    /// before anything affects match state.
+    pub fn validate(&self) -> Result<(), ActionError> {
+        check_version(self.protocol_version).map_err(ActionError::Version)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +478,87 @@ mod tests {
         });
         let parsed: Observation = serde_json::from_value(canonical.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "Observation wire shape drifted");
+    }
+
+    #[test]
+    fn action_wire_shape_is_stable() {
+        let canonical = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "match_id": FIXED_MATCH,
+            "seat": 3,
+            "tick": 128,
+            "intent": {
+                "move_dir": { "x": 600, "y": 800 },
+                "aim": 16384,
+                "buttons": { "fire": true, "jump": false, "ability": false, "reload": false }
+            }
+        });
+        let parsed: Action = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), canonical, "Action wire shape drifted");
+    }
+
+    #[test]
+    fn action_validate_rejects_version_drift() {
+        let mut a = sample_action();
+        assert!(a.validate().is_ok());
+        a.protocol_version = PROTOCOL_VERSION + 1;
+        assert_eq!(
+            a.validate(),
+            Err(ActionError::Version(VersionMismatch { ours: PROTOCOL_VERSION, theirs: PROTOCOL_VERSION + 1 }))
+        );
+    }
+
+    #[test]
+    fn move_clamp_caps_overlong_and_leaves_inrange_untouched() {
+        let buttons = ActionButtons { fire: false, jump: false, ability: false, reload: false };
+        // A 3-4-5 vector of magnitude 5000 clamps to magnitude 1000: (600, 800).
+        let overlong = ActionIntent { move_dir: Vec2 { x: 3000, y: 4000 }, aim: 0, buttons };
+        assert_eq!(overlong.clamped().move_dir, Vec2 { x: 600, y: 800 });
+        // An at-cap request (magnitude exactly 1000) is returned unchanged.
+        let at_cap = ActionIntent { move_dir: Vec2 { x: 600, y: 800 }, aim: 0, buttons };
+        assert_eq!(at_cap.clamped().move_dir, Vec2 { x: 600, y: 800 });
+        // A short request is untouched.
+        let short = ActionIntent { move_dir: Vec2 { x: 300, y: -400 }, aim: 0, buttons };
+        assert_eq!(short.clamped().move_dir, Vec2 { x: 300, y: -400 });
+        // Aim and buttons pass through.
+        let a = ActionIntent { move_dir: Vec2 { x: 9999, y: 0 }, aim: 12345, buttons: ActionButtons { fire: true, ..buttons } };
+        assert_eq!(a.clamped().aim, 12345);
+        assert!(a.clamped().buttons.fire);
+    }
+
+    #[test]
+    fn move_clamp_never_exceeds_max() {
+        let buttons = ActionButtons { fire: false, jump: false, ability: false, reload: false };
+        let max_sq = (MOVE_INTENT_SCALE as i64).pow(2);
+        for (x, y) in [(i32::MAX, i32::MAX), (1001, 0), (1000, 1000), (-30000, 12000), (0, i32::MIN + 1)] {
+            let c = ActionIntent { move_dir: Vec2 { x, y }, aim: 0, buttons }.clamped();
+            let mag_sq = (c.move_dir.x as i64).pow(2) + (c.move_dir.y as i64).pow(2);
+            assert!(mag_sq <= max_sq, "clamp let ({x},{y}) through at mag^2={mag_sq} > {max_sq}");
+        }
+    }
+
+    #[test]
+    fn isqrt_is_floor() {
+        assert_eq!(isqrt_u64(0), 0);
+        assert_eq!(isqrt_u64(1), 1);
+        assert_eq!(isqrt_u64(24), 4);
+        assert_eq!(isqrt_u64(25), 5);
+        assert_eq!(isqrt_u64(26), 5);
+        assert_eq!(isqrt_u64(u64::MAX), 4294967295);
+    }
+
+    fn sample_action() -> Action {
+        Action {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: FIXED_MATCH.parse().unwrap(),
+            seat: 3,
+            tick: 128,
+            intent: ActionIntent {
+                move_dir: Vec2 { x: 600, y: 800 },
+                aim: 0x4000,
+                buttons: ActionButtons { fire: true, jump: false, ability: false, reload: false },
+            },
+        }
     }
 
     fn sample_observation() -> Observation {
