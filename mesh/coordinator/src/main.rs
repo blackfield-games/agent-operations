@@ -14,7 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use clap::Parser;
 use hyper::server::conn::http1;
@@ -23,6 +23,7 @@ use hyper_util::service::TowerToHyperService;
 use proto::{CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec, RegionCoord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -167,6 +168,18 @@ struct Args {
     /// fleet size — it is a backstop, not a tuned limit. Must be >= 1.
     #[arg(long, env = "COORDINATOR_MAX_EARNERS", default_value_t = DEFAULT_MAX_EARNERS)]
     max_earners: usize,
+    /// Maximum registrations a single source IP may make per
+    /// `REGISTRATION_WINDOW_SECS` (a token bucket, so the value is also the burst
+    /// ceiling). Checked BEFORE the signature verify on both the HTTP `/register` and
+    /// WS `Hello` paths, so an over-limit source is shed (`429` / socket close) before
+    /// any secp256k1 recovery — bounding the registry-cap sustained-lockout lever
+    /// without spending the expensive op on a flood. Keyed on the connection peer
+    /// address: behind a reverse proxy this is the proxy's IP (it throttles the fleet
+    /// as one source — edge/OS is the primary defense, a trusted-proxy XFF parse a
+    /// follow-up). Set WELL above honest per-source burst; must be >= 1. See
+    /// [`DEFAULT_MAX_REGISTRATIONS`].
+    #[arg(long, env = "COORDINATOR_MAX_REGISTRATIONS", default_value_t = DEFAULT_MAX_REGISTRATIONS)]
+    max_registrations: u32,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -227,6 +240,14 @@ struct AppState {
     /// the registration seam (`admit_earner`). Validated >= 1 in `with_store`.
     /// Mirrors `--max-earners` / `COORDINATOR_MAX_EARNERS`.
     max_earners: usize,
+    /// Per-source registration token buckets, keyed on the connection peer IP. The
+    /// rate-limit seam (`check_registration_rate`) refills + consumes under this lock
+    /// on both registration paths; bounded at [`MAX_REGISTRATION_BUCKETS`].
+    registration_buckets: Mutex<HashMap<IpAddr, RateBucket>>,
+    /// Per-source registrations allowed per [`REGISTRATION_WINDOW_SECS`]. Read by the
+    /// registration rate-limit seam. Validated >= 1 in `with_store`. Mirrors
+    /// `--max-registrations` / `COORDINATOR_MAX_REGISTRATIONS`.
+    max_registrations: u32,
 }
 
 impl AppState {
@@ -248,6 +269,7 @@ impl AppState {
         ingest_token: Option<String>,
         max_queued_jobs: usize,
         max_earners: usize,
+        max_registrations: u32,
     ) -> Result<Arc<Self>> {
         // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
         // dead-letters every non-terminal job on its first tick — the safety
@@ -291,6 +313,14 @@ impl AppState {
             max_earners > 0,
             "max_earners must be >= 1 (0 would reject every earner registration)"
         );
+        // A zero registration allowance would shed every registration the moment a
+        // source's bucket is created (it inserts full but `capacity * window == 0`,
+        // so `level < window` rejects immediately), starving the mesh of earners.
+        // Reject it at construction, mirroring the other zero-knob guards.
+        anyhow::ensure!(
+            max_registrations > 0,
+            "max_registrations must be >= 1 (0 would reject every earner registration)"
+        );
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -313,6 +343,8 @@ impl AppState {
             ingest_token,
             max_queued_jobs,
             max_earners,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations,
         }))
     }
 }
@@ -479,6 +511,7 @@ async fn main() -> Result<()> {
         args.ingest_token,
         args.max_queued_jobs,
         args.max_earners,
+        args.max_registrations,
     )?;
     tracing::info!(db = %args.db, "store ready");
 
@@ -599,7 +632,7 @@ async fn serve(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _peer) = match accepted {
+                let (stream, peer) = match accepted {
                     Ok(conn) => conn,
                     // A transient accept error (e.g. fd exhaustion) shouldn't kill
                     // the listener; log and keep serving.
@@ -620,7 +653,12 @@ async fn serve(
                     }
                 };
                 let io = TokioIo::new(stream);
-                let service = TowerToHyperService::new(app.clone());
+                // Inject the connection's peer address so the registration handlers
+                // can key the per-source rate limiter on it. Per-connection layer (the
+                // peer is known only at accept), mirroring axum's connect-info plumbing
+                // — cheap Arc clones over the shared router.
+                let service =
+                    TowerToHyperService::new(app.clone().layer(Extension(PeerAddr(peer))));
                 let conn = builder.serve_connection(io, service).with_upgrades();
                 let mut drain = drain_rx.clone();
                 conns.spawn(async move {
@@ -749,6 +787,106 @@ fn admit_earner(
     }
 }
 
+/// A per-source registration token bucket. `level` is the remaining allowance in
+/// SCALED units (whole tokens × `window_secs`), so refill is exact integer
+/// arithmetic with no division-floor loss: each elapsed second credits `capacity`
+/// units, the level saturates at `capacity × window_secs` (one full bucket), and a
+/// single registration costs `window_secs` units (one token). Scaling the level lets
+/// a bucket polled more often than once per `window_secs / capacity` seconds still
+/// accrue sub-token progress — a whole-token counter that reset its clock on every
+/// poll would silently drop the remainder and never refill under steady churn.
+#[derive(Debug, Clone, Copy)]
+struct RateBucket {
+    /// Remaining allowance, in `tokens × window_secs` units; in `[0, capacity × window_secs]`.
+    level: i64,
+    /// Epoch seconds of the last refill.
+    last_refill: i64,
+}
+
+/// Credit `bucket` for the time elapsed since its last refill, saturating at a full
+/// bucket (`cap_level`). A non-positive elapsed (the clock didn't advance, or stepped
+/// backward) is a no-op — the level and clock are left untouched — so a backward
+/// clock step can never fabricate or destroy allowance.
+fn refill_bucket(bucket: &mut RateBucket, now: i64, capacity: u32, cap_level: i64) {
+    let elapsed = now.saturating_sub(bucket.last_refill);
+    if elapsed <= 0 {
+        return;
+    }
+    let credit = elapsed.saturating_mul(capacity as i64);
+    bucket.level = bucket.level.saturating_add(credit).min(cap_level);
+    bucket.last_refill = now;
+}
+
+/// Per-source registration rate limit: refill `source`'s token bucket, consume one
+/// token if available, and return whether the registration is admitted. The caller
+/// holds the bucket-map lock, so refill + consume + eviction are atomic against a
+/// concurrent registration (the in-memory analogue of [`admit_earner`]'s atomic
+/// admission). Run BEFORE the secp256k1 verify on both registration paths
+/// (cheap-reject-first): an over-limit source is shed before any curve recovery, so
+/// the limiter mitigates the registration flood instead of amplifying it.
+///
+/// `capacity` (== `--max-registrations`, validated `> 0`) is the per-source allowance
+/// per `window_secs` and the burst ceiling. A NEW source enters with a full bucket,
+/// so a source's *first* registration is never blocked by the limiter; the bucket is
+/// keyed per source so an honest fleet's fan-in is not throttled as one global pool.
+///
+/// The bucket map is itself bounded at `max_buckets`, so the limiter cannot be turned
+/// into the memory-DoS it defends against (FM4): a new source at the cap first drops
+/// buckets that have fully refilled — an idle/full bucket carries no state, so
+/// forgetting it is lossless (a fresh source also starts full) — and, if the map is
+/// still full of actively-limited sources, evicts the stalest (oldest `last_refill`).
+/// Eviction only ever forgets a source's own *deficit* (it re-enters full, loosening
+/// its own limit, never bypassing another source's), and triggering it costs a
+/// distinct active source per slot, so `max_buckets` is sized far above any honest
+/// source count.
+fn check_registration_rate(
+    buckets: &mut HashMap<IpAddr, RateBucket>,
+    source: IpAddr,
+    now: i64,
+    capacity: u32,
+    window_secs: i64,
+    max_buckets: usize,
+) -> bool {
+    let cap_level = (capacity as i64).saturating_mul(window_secs);
+    if !buckets.contains_key(&source) {
+        if buckets.len() >= max_buckets {
+            // Drop buckets that WOULD refill to full as of `now` — they carry no
+            // state, so reclaiming them is lossless. Computed as a pure projection so
+            // it does NOT advance a survivor's `last_refill`; rewriting it here would
+            // tie every survivor's staleness and make the eviction below arbitrary.
+            buckets.retain(|_, b| {
+                let elapsed = now.saturating_sub(b.last_refill).max(0);
+                let projected = b.level.saturating_add(elapsed.saturating_mul(capacity as i64));
+                projected < cap_level
+            });
+        }
+        if buckets.len() >= max_buckets {
+            if let Some(stalest) =
+                buckets.iter().min_by_key(|(_, b)| b.last_refill).map(|(k, _)| *k)
+            {
+                buckets.remove(&stalest);
+            }
+        }
+        buckets.insert(source, RateBucket { level: cap_level, last_refill: now });
+    }
+    let bucket = buckets
+        .get_mut(&source)
+        .expect("source bucket present (pre-existing or just inserted)");
+    refill_bucket(bucket, now, capacity, cap_level);
+    if bucket.level < window_secs {
+        return false;
+    }
+    bucket.level -= window_secs;
+    true
+}
+
+/// The accepted connection's peer address, injected as a request extension by
+/// [`serve`] (per connection) and read by the registration handlers to key the
+/// per-source rate limiter. Behind a reverse proxy this is the proxy's address, not
+/// the earner's — see [`DEFAULT_MAX_REGISTRATIONS`] for the layering.
+#[derive(Debug, Clone, Copy)]
+struct PeerAddr(SocketAddr);
+
 /// Per-job absolute wall-clock TTL, as a multiple of the job's own
 /// `deadline_secs`: a job alive (queued or in_flight) past
 /// `created_at + deadline_secs * JOB_TTL_DEADLINE_MULTIPLE` is dead-lettered by
@@ -850,6 +988,37 @@ const DEFAULT_MAX_QUEUED_JOBS: usize = 10_000;
 /// growth, not a tuned fleet size — an operator runs a larger mesh by raising it.
 /// Backs `Args::max_earners` (`--max-earners` / `COORDINATOR_MAX_EARNERS`).
 const DEFAULT_MAX_EARNERS: usize = 65_536;
+
+/// Window (seconds) over which `--max-registrations` is allowed per source. A
+/// natural one-minute rate window; the token bucket refills `max_registrations`
+/// tokens across it (see [`check_registration_rate`]).
+const REGISTRATION_WINDOW_SECS: i64 = 60;
+
+/// Default per-source registration allowance per [`REGISTRATION_WINDOW_SECS`]. Bounds
+/// how fast any one source IP can churn registrations — the lever behind the
+/// earner-registry-cap's documented sustained-lockout residual (an attacker holding
+/// `max_earners` live slots by re-Helloing, or inflating the map with fresh
+/// keypairs). 4096/min (~68/s) is far above any honest source's burst — a single
+/// host brings up a handful of earners, and even a fleet behind one ingress
+/// reconnects in bursts well under this — while still capping a single direct source
+/// far below the rate needed to churn the registry. It is a backstop, not a tuned
+/// limit: the PRIMARY per-source defense is edge/OS (and, behind a reverse proxy,
+/// where the peer IP is the proxy's, a trusted-proxy `X-Forwarded-For` parse — left
+/// as a follow-up). An operator on a known-direct deployment tunes it DOWN to
+/// throttle a single source harder; one fronting a large fleet behind one ingress
+/// tunes it UP. Backs `Args::max_registrations`.
+const DEFAULT_MAX_REGISTRATIONS: u32 = 4096;
+
+/// Cap on the per-source registration-bucket map, so the rate limiter cannot itself
+/// be turned into the memory-DoS it defends against (FM4). One entry per distinct
+/// source IP seen recently; a new source past this many is admitted by pruning
+/// fully-refilled (idle) buckets, then evicting the stalest (see
+/// [`check_registration_rate`]). Sized at the earner-registry cap — an honest
+/// deployment has at most ~one source per earner (far fewer behind a proxy), so an
+/// honest fleet never reaches it; an attacker with a large real source range (e.g.
+/// an IPv6 /64) can force eviction, but each evicted source merely restarts full, and
+/// the map stays bounded. A const, not a knob: a backstop on a backstop.
+const MAX_REGISTRATION_BUCKETS: usize = 65_536;
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
@@ -1244,8 +1413,29 @@ fn validate_hello(
 /// rejected here (job dispatch lives on its own routes for now).
 async fn register(
     State(state): State<Arc<AppState>>,
+    Extension(PeerAddr(peer)): Extension<PeerAddr>,
     Json(msg): Json<EarnerMsg>,
 ) -> Result<&'static str, StatusCode> {
+    // Per-source registration rate limit FIRST — ahead of the secp256k1 verify in
+    // `validate_hello` (cheap-reject-first, FM2) — so an over-limit source is shed
+    // with 429 before any curve recovery or registry lock. Keyed on the connection
+    // peer IP; the bucket lock is held only for the check + consume.
+    {
+        let now = now_secs();
+        let mut buckets = state.registration_buckets.lock().await;
+        if !check_registration_rate(
+            &mut buckets,
+            peer.ip(),
+            now,
+            state.max_registrations,
+            REGISTRATION_WINDOW_SECS,
+            MAX_REGISTRATION_BUCKETS,
+        ) {
+            tracing::warn!(source = %peer.ip(), "rejected registration: per-source rate limit exceeded");
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
     let EarnerMsg::Hello {
         earner_address,
         gpu_model,
@@ -2491,6 +2681,7 @@ mod tests {
             None,
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
+            DEFAULT_MAX_REGISTRATIONS,
         )
         .unwrap()
     }
@@ -2596,12 +2787,20 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// Loopback peer for oneshot tests — the per-connection `PeerAddr` that `serve`
+    /// injects in production, supplied here so `/register`'s extractor and the
+    /// per-source rate limiter behave as on a real connection.
+    fn test_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+
     async fn post_json(
         state: Arc<AppState>,
         uri: &str,
         value: &serde_json::Value,
     ) -> axum::response::Response {
         router(state)
+            .layer(Extension(PeerAddr(test_peer())))
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4445,6 +4644,7 @@ mod tests {
             Some(token.to_string()),
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
+            DEFAULT_MAX_REGISTRATIONS,
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -4572,6 +4772,7 @@ mod tests {
                 Some(blank.to_string()),
                 DEFAULT_MAX_QUEUED_JOBS,
                 DEFAULT_MAX_EARNERS,
+                DEFAULT_MAX_REGISTRATIONS,
             );
             assert!(r.is_err(), "blank token {blank:?} must be rejected at construction");
         }
@@ -4585,6 +4786,7 @@ mod tests {
             Some("real-token".to_string()),
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
+            DEFAULT_MAX_REGISTRATIONS,
         )
         .is_ok());
     }
@@ -4603,6 +4805,7 @@ mod tests {
             None,
             max_queued,
             DEFAULT_MAX_EARNERS,
+            DEFAULT_MAX_REGISTRATIONS,
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -4671,6 +4874,7 @@ mod tests {
             None,
             1,
             DEFAULT_MAX_EARNERS,
+            DEFAULT_MAX_REGISTRATIONS,
         )
         .unwrap();
         let queued = body_json(get(state, "/stats").await).await["jobs_queued"].as_u64().unwrap();
@@ -4710,6 +4914,7 @@ mod tests {
             None,
             0,
             DEFAULT_MAX_EARNERS,
+            DEFAULT_MAX_REGISTRATIONS,
         );
         assert!(r.is_err(), "zero max_queued_jobs must be rejected at construction");
     }
@@ -4793,6 +4998,121 @@ mod tests {
         assert!(earners.contains_key("a") && earners.contains_key("c") && earners.contains_key("d"));
     }
 
+    /// Distinct loopback source IP for the rate-limit unit tests (`10.0.0.<n>`).
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::from([10, 0, 0, n])
+    }
+
+    /// A fresh source may register up to `capacity` times in one window; the next
+    /// attempt in the same window is shed.
+    #[test]
+    fn rate_under_limit_admits_over_limit_sheds() {
+        let mut buckets = HashMap::new();
+        for _ in 0..3 {
+            assert!(check_registration_rate(&mut buckets, ip(1), 0, 3, 60, 16));
+        }
+        assert!(
+            !check_registration_rate(&mut buckets, ip(1), 0, 3, 60, 16),
+            "the 4th registration in the same window is over the cap of 3"
+        );
+    }
+
+    /// The bucket refills at `capacity` tokens per window: a source drained at t=0 is
+    /// re-admitted one token per `window/capacity` seconds, and a full idle window
+    /// restores the entire burst.
+    #[test]
+    fn rate_refills_over_time() {
+        let mut buckets = HashMap::new();
+        // capacity 2 / 60s → one token every 30s.
+        assert!(check_registration_rate(&mut buckets, ip(1), 0, 2, 60, 16));
+        assert!(check_registration_rate(&mut buckets, ip(1), 0, 2, 60, 16));
+        assert!(!check_registration_rate(&mut buckets, ip(1), 0, 2, 60, 16), "drained at t=0");
+        assert!(!check_registration_rate(&mut buckets, ip(1), 29, 2, 60, 16), "29s < one token");
+        assert!(check_registration_rate(&mut buckets, ip(1), 30, 2, 60, 16), "30s → one token back");
+        assert!(!check_registration_rate(&mut buckets, ip(1), 30, 2, 60, 16), "and immediately drained");
+        // A full window idle restores the whole burst (capped at capacity, not more).
+        assert!(check_registration_rate(&mut buckets, ip(1), 90, 2, 60, 16));
+        assert!(check_registration_rate(&mut buckets, ip(1), 90, 2, 60, 16));
+        assert!(!check_registration_rate(&mut buckets, ip(1), 90, 2, 60, 16), "burst capped at capacity");
+    }
+
+    /// The limit is PER SOURCE: one source exhausting its bucket does not throttle a
+    /// different source (FM3 — a global pool would shed an honest fleet's fan-in).
+    #[test]
+    fn rate_is_per_source() {
+        let mut buckets = HashMap::new();
+        assert!(check_registration_rate(&mut buckets, ip(1), 0, 1, 60, 16));
+        assert!(!check_registration_rate(&mut buckets, ip(1), 0, 1, 60, 16), "source 1 exhausted");
+        assert!(
+            check_registration_rate(&mut buckets, ip(2), 0, 1, 60, 16),
+            "source 2 has its own bucket"
+        );
+    }
+
+    /// An idle bucket never accrues beyond `capacity`, even after an arbitrarily long
+    /// gap — the burst ceiling holds.
+    #[test]
+    fn rate_saturates_at_capacity() {
+        let mut buckets = HashMap::new();
+        assert!(check_registration_rate(&mut buckets, ip(1), 0, 2, 60, 16));
+        assert!(check_registration_rate(&mut buckets, ip(1), 0, 2, 60, 16));
+        // Idle for ~1e6s: refill credit is enormous but saturates at capacity (2).
+        assert!(check_registration_rate(&mut buckets, ip(1), 1_000_000, 2, 60, 16));
+        assert!(check_registration_rate(&mut buckets, ip(1), 1_000_000, 2, 60, 16));
+        assert!(
+            !check_registration_rate(&mut buckets, ip(1), 1_000_000, 2, 60, 16),
+            "no more than capacity even after a long idle"
+        );
+    }
+
+    /// A backward clock step neither grants nor destroys allowance: a drained bucket
+    /// stays drained when `now` jumps backward.
+    #[test]
+    fn rate_backward_clock_is_inert() {
+        let mut buckets = HashMap::new();
+        assert!(check_registration_rate(&mut buckets, ip(1), 100, 1, 60, 16));
+        assert!(!check_registration_rate(&mut buckets, ip(1), 100, 1, 60, 16), "drained at t=100");
+        assert!(
+            !check_registration_rate(&mut buckets, ip(1), 50, 1, 60, 16),
+            "clock stepped back → no refill, still drained"
+        );
+    }
+
+    /// FM4: the bucket map is bounded — a new source at the cap evicts the stalest, so
+    /// the map can never grow past `max_buckets` no matter how many distinct sources
+    /// register. The evicted source simply starts fresh (full) on its next attempt.
+    #[test]
+    fn rate_bucket_map_bounded_evicts_stalest() {
+        let mut buckets = HashMap::new();
+        // Two actively-limited sources (each drained, so neither is idle/full).
+        assert!(check_registration_rate(&mut buckets, ip(1), 0, 1, 60, 2));
+        assert!(check_registration_rate(&mut buckets, ip(2), 1, 1, 60, 2));
+        assert_eq!(buckets.len(), 2);
+        // A third distinct source at the cap evicts the stalest (ip(1), last_refill 0).
+        assert!(check_registration_rate(&mut buckets, ip(3), 2, 1, 60, 2));
+        assert_eq!(buckets.len(), 2, "map stays bounded at max_buckets");
+        assert!(!buckets.contains_key(&ip(1)), "the stalest source was evicted");
+        assert!(buckets.contains_key(&ip(2)) && buckets.contains_key(&ip(3)));
+    }
+
+    /// FM4: a new source at the cap drops fully-refilled (idle) buckets BEFORE
+    /// evicting the stalest — idle buckets carry no state, so reclaiming them is
+    /// lossless and preferable to evicting an actively-limited source. Both prior
+    /// sources have idled a full window back to full, so both are pruned and the map
+    /// shrinks rather than holding the stalest.
+    #[test]
+    fn rate_bucket_map_prunes_idle_before_evicting() {
+        let mut buckets = HashMap::new();
+        assert!(check_registration_rate(&mut buckets, ip(1), 0, 1, 10, 2));
+        assert!(check_registration_rate(&mut buckets, ip(2), 0, 1, 10, 2));
+        assert_eq!(buckets.len(), 2);
+        // At t=100 (≫ window 10), both prior buckets have refilled to full and are
+        // pruned; only the newcomer remains. Evict-only would have kept one (len 2).
+        assert!(check_registration_rate(&mut buckets, ip(3), 100, 1, 10, 2));
+        assert_eq!(buckets.len(), 1, "idle buckets pruned before any eviction");
+        assert!(buckets.contains_key(&ip(3)));
+    }
+
     /// Empty-queue state with a small earner-registry cap, for the cap tests.
     async fn test_state_empty_with_earner_cap(max_earners: usize) -> Arc<AppState> {
         let state = AppState::with_store(
@@ -4805,10 +5125,79 @@ mod tests {
             None,
             DEFAULT_MAX_QUEUED_JOBS,
             max_earners,
+            DEFAULT_MAX_REGISTRATIONS,
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
         state
+    }
+
+    /// Empty-queue state with a small per-source registration allowance, for the
+    /// rate-limit tests.
+    async fn test_state_empty_with_registrations(max_registrations: u32) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            DEFAULT_MAX_QUEUED_JOBS,
+            DEFAULT_MAX_EARNERS,
+            max_registrations,
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
+    /// Below the per-source allowance, registration is byte-identical to before — a
+    /// configured but un-reached limit is invisible (all oneshot calls share the one
+    /// loopback `test_peer`, so they draw on the same bucket).
+    #[tokio::test]
+    async fn register_below_rate_limit_is_unchanged() {
+        let state = test_state_empty_with_registrations(5).await;
+        for label in ["ra", "rb", "rc"] {
+            assert_eq!(
+                register_hello(&state, &hello(label, 24, vec![JobKind::Terrain])).await,
+                StatusCode::OK
+            );
+        }
+        let stats = body_json(get(state, "/stats").await).await;
+        assert_eq!(stats["gpus_joined"], 3);
+    }
+
+    /// Over the per-source allowance, a registration from the same source is shed with
+    /// `429 Too Many Requests` and admits nothing — the bucket is per source, so all
+    /// loopback oneshots share it and the 3rd attempt at a cap of 2 is rejected.
+    #[tokio::test]
+    async fn register_over_rate_limit_returns_429() {
+        let state = test_state_empty_with_registrations(2).await;
+        assert_eq!(register_hello(&state, &hello("ra", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, &hello("rb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(
+            register_hello(&state, &hello("rc", 24, vec![JobKind::Terrain])).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // The shed registration admitted nothing — only the two under the limit count.
+        let stats = body_json(get(state, "/stats").await).await;
+        assert_eq!(stats["gpus_joined"], 2);
+    }
+
+    /// FM2 (cheap-reject-first): the rate check precedes `validate_hello`, so an
+    /// over-limit attempt is `429` even when its Hello is malformed — it never reaches
+    /// the structural/`signature` validation that would otherwise return `400`.
+    #[tokio::test]
+    async fn register_rate_limit_precedes_validation() {
+        let state = test_state_empty_with_registrations(1).await;
+        assert_eq!(register_hello(&state, &hello("solo", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        // Same source, over the limit, AND malformed (claims an address it can't sign
+        // for). Rate-limited first → 429, not the 400 a reached validation would give.
+        assert_eq!(
+            register_hello(&state, &hello_claiming("0xnope", 24, vec![JobKind::Terrain])).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     /// Register `msg` over HTTP `/register`, returning the status.
@@ -4913,8 +5302,29 @@ mod tests {
             None,
             DEFAULT_MAX_QUEUED_JOBS,
             0,
+            DEFAULT_MAX_REGISTRATIONS,
         );
         assert!(r.is_err(), "zero max_earners must be rejected at construction");
+    }
+
+    /// A zero registration allowance is rejected at construction (it would shed every
+    /// registration the moment a source's bucket is created), mirroring the other
+    /// zero-knobs.
+    #[test]
+    fn with_store_rejects_zero_max_registrations() {
+        let r = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            DEFAULT_MAX_QUEUED_JOBS,
+            DEFAULT_MAX_EARNERS,
+            0,
+        );
+        assert!(r.is_err(), "zero max_registrations must be rejected at construction");
     }
 
     /// FM1: the queued-depth COUNT gating the cap must be served by
@@ -6313,7 +6723,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -6352,7 +6762,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -6406,7 +6816,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -6425,7 +6835,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -6525,7 +6935,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -7063,6 +7473,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -8026,7 +8438,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_deadline_multiple_knob_is_honored() {
         let state =
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
                 .unwrap();
         assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
 
@@ -8060,12 +8472,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_ttl_deadline_multiple() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
                 .is_err(),
             "multiple=0 must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
                 .is_ok(),
             "the smallest valid multiple (1) constructs"
         );
@@ -8078,12 +8490,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_handshake_timeout() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
                 .is_err(),
             "a zero handshake timeout must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
                 .is_ok(),
             "the smallest positive handshake timeout constructs"
         );
@@ -8167,6 +8579,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -8528,6 +8942,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -8580,6 +8996,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
 
         let terrain_job = JobSpec {
@@ -8637,6 +9055,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -8657,6 +9077,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
 
         let mut ids = Vec::new();
@@ -8750,6 +9172,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
 
         let queued = job_with_deadline(60);
@@ -8859,6 +9283,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8906,6 +9332,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8966,6 +9394,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -9020,6 +9450,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -9065,6 +9497,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -9123,6 +9557,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -9187,6 +9623,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -9250,6 +9688,8 @@ mod tests {
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
         });
         let pay = test_address("pay");
         let resp = post_json(
