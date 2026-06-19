@@ -147,6 +147,8 @@ pub enum RejectReason {
     /// The action answers a tick that is not the current one (stale or ahead),
     /// so it cannot be applied to this tick.
     StaleTick { expected: u64, got: u64 },
+    /// The seat is down (or not in the roster) — a corpse cannot act.
+    SeatDown { seat: SeatId },
     /// The match is not in [`Live`], so no action is simulated.
     ///
     /// [`Live`]: MatchPhase::Live
@@ -165,6 +167,9 @@ impl std::fmt::Display for RejectReason {
             }
             RejectReason::StaleTick { expected, got } => {
                 write!(f, "action rejected: stale tick (expected {expected}, got {got})")
+            }
+            RejectReason::SeatDown { seat } => {
+                write!(f, "action rejected: seat {seat} is down")
             }
             RejectReason::NotLive => write!(f, "action rejected: match is not live"),
         }
@@ -312,6 +317,12 @@ impl Match {
             .expect("seat is in the roster")
     }
 
+    /// `true` only if `seat` is in the roster AND still alive — also the guard
+    /// against an intent for an unknown seat.
+    fn pawn_alive(&self, seat: SeatId) -> bool {
+        self.pawns.iter().any(|p| p.seat == seat && p.alive)
+    }
+
     /// Build the parity-bounded observation for one seat: its own pawn in full,
     /// plus only the entities it can perceive this tick (alive pawns within
     /// `perception_range`, never itself), in ascending `entity_id` order so the
@@ -388,17 +399,22 @@ impl Match {
         if action.tick != self.tick {
             return Err(RejectReason::StaleTick { expected: self.tick, got: action.tick });
         }
+        if !self.pawn_alive(seat) {
+            return Err(RejectReason::SeatDown { seat });
+        }
         Ok(action.intent.clamped())
     }
 
-    /// Advance the match exactly one tick from the given accepted intents. A seat
-    /// absent from `intents` forfeited the tick — it holds position and does not
-    /// fire — so a slow or hung seat never stalls the match (the bounded-latency
-    /// invariant; the transport enforces the wall-clock deadline and a timeout
-    /// maps to an absent seat here). Intents are trusted post-clamp: the Gateway
-    /// boundary is [`ingest`](Match::ingest); a replay feeds the recorded
-    /// post-clamp stream, so the same seed + stream reproduces this tick exactly.
-    /// A no-op once the match has [`Ended`].
+    /// Advance the match exactly one tick from the given intents. A seat absent
+    /// from `intents` (or already down) forfeits the tick — it holds position and
+    /// does not fire — so a slow or hung seat never stalls the match (the
+    /// bounded-latency invariant; the transport enforces the wall-clock deadline
+    /// and a timeout maps to an absent seat here). step trusts NO caller: every
+    /// move is clamped here — idempotent on the already-clamped
+    /// [`ingest`](Match::ingest)ed live path — and intents from downed or unknown
+    /// seats are dropped, so the recorded stream is always canonical post-clamp
+    /// and a forged over-speed replay re-runs clamped, not god-mode. The same
+    /// seed + stream reproduces this tick exactly. A no-op once [`Ended`].
     ///
     /// [`Ended`]: MatchPhase::Ended
     pub fn step(&mut self, intents: &BTreeMap<SeatId, ActionIntent>) {
@@ -406,6 +422,16 @@ impl Match {
             return;
         }
         let current = self.tick;
+
+        // Accept only intents from seats alive at the start of the tick, each
+        // defensively clamped — this is what gets applied AND recorded, so no
+        // caller (driver, replay, or direct) can move a pawn faster than the
+        // rules or pad the replay with a corpse's action.
+        let accepted: BTreeMap<SeatId, ActionIntent> = intents
+            .iter()
+            .filter(|(&seat, _)| self.pawn_alive(seat))
+            .map(|(&seat, intent)| (seat, intent.clamped()))
+            .collect();
 
         for p in self.pawns.iter_mut().filter(|p| p.alive) {
             p.cooldown = p.cooldown.saturating_sub(1);
@@ -417,7 +443,7 @@ impl Match {
                 continue;
             }
             let seat = self.pawns[i].seat;
-            let Some(intent) = intents.get(&seat) else {
+            let Some(intent) = accepted.get(&seat) else {
                 self.pawns[i].vel = Vec2::ZERO;
                 continue;
             };
@@ -442,7 +468,7 @@ impl Match {
                 continue;
             }
             let seat = self.pawns[i].seat;
-            let Some(intent) = intents.get(&seat) else {
+            let Some(intent) = accepted.get(&seat) else {
                 continue;
             };
             if intent.buttons.reload {
@@ -457,7 +483,7 @@ impl Match {
             }
         }
 
-        let actions = intents.iter().map(|(&seat, &intent)| SeatAction { seat, intent }).collect();
+        let actions = accepted.iter().map(|(&seat, &intent)| SeatAction { seat, intent }).collect();
         self.ticks.push(TickRecord { tick: current, actions });
 
         self.tick += 1;
@@ -514,6 +540,8 @@ impl Match {
 
     /// End the match when at most one team still has an alive pawn (a winner, or
     /// everyone down) or the tick cap is reached, freezing the [`MatchResult`].
+    /// This makes a single-team roster end on its first tick — a co-op/PvE mode
+    /// needs enemy (e.g. NPC) teams or a different end rule.
     fn maybe_finish(&mut self) {
         let alive_teams: BTreeSet<TeamId> =
             self.pawns.iter().filter(|p| p.alive).map(|p| p.team).collect();
@@ -1013,5 +1041,71 @@ mod tests {
         let s1 = r.outcomes.iter().find(|o| o.seat == 1).unwrap();
         assert!(!s1.alive_at_end, "the active seat downed the hung one");
         assert_eq!(s1.score, 0, "the hung seat never acted");
+    }
+
+    #[test]
+    fn step_clamps_a_forged_overspeed_intent() {
+        // step trusts no caller: an unclamped intent that never passed ingest is
+        // still clamped before it moves a pawn — no direct caller buys speed.
+        let mut m = new_match(1);
+        let before = m.observe(0).own.position.x;
+        step_with(&mut m, &[(0, intent(Vec2 { x: 1_000_000, y: 0 }, EAST, false))]);
+        assert_eq!(m.observe(0).own.position.x - before, Rules::default().max_speed);
+    }
+
+    #[test]
+    fn a_forged_overspeed_replay_re_runs_clamped() {
+        // The cross-review exploit: a hand-forged ReplayRecord with a god-mode
+        // move_dir must NOT reproduce god-mode movement on replay. step clamps it,
+        // so a forged stream cannot be re-derived into a forged result.
+        let seed = 1;
+        let forged = ReplayRecord {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: MID.parse().unwrap(),
+            seed,
+            seats: two_seats(),
+            ticks: vec![TickRecord {
+                tick: 0,
+                actions: vec![SeatAction { seat: 0, intent: intent(Vec2 { x: 1_000_000, y: 0 }, EAST, false) }],
+            }],
+        };
+        let start = close_match(seed).observe(0).own.position.x;
+        let replayed = replay_match(close_match(seed), &forged);
+        assert_eq!(
+            replayed.observe(0).own.position.x - start,
+            Rules::default().max_speed,
+            "forged over-speed was clamped on replay"
+        );
+    }
+
+    #[test]
+    fn a_downed_seat_cannot_act() {
+        // 3-seat FFA so the match stays Live after one seat is downed.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "a".into() },
+            SeatInfo { seat: 1, team: 1, controller: "b".into() },
+            SeatInfo { seat: 2, team: 2, controller: "c".into() },
+        ];
+        let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        // Seat 0 (left) guns down seat 1 (centre); seats 1 and 2 forfeit.
+        while m.observe(1).own.alive && m.phase() == MatchPhase::Live {
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        }
+        assert_eq!(m.phase(), MatchPhase::Live, "seat 2 keeps the match alive");
+        assert!(!m.observe(1).own.alive, "seat 1 is down");
+        // ingest rejects an action from the downed seat.
+        let a = action_at(&m, 1, intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false));
+        assert_eq!(m.ingest(1, &a), Err(RejectReason::SeatDown { seat: 1 }));
+        // And a direct step with the downed seat's intent moves nothing and is
+        // not recorded — the replay carries no corpse actions.
+        let before = m.observe(1).own.position;
+        step_with(&mut m, &[(1, intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false))]);
+        assert_eq!(m.observe(1).own.position, before, "a downed pawn does not move");
+        let replay = m.into_replay();
+        assert!(
+            replay.ticks.last().unwrap().actions.iter().all(|sa| sa.seat != 1),
+            "a downed seat's intent is never recorded"
+        );
     }
 }

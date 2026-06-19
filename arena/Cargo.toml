@@ -21,3 +21,7 @@ hex = "0.4"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+# The match sim is determinism-critical: a silent integer wrap would corrupt a
+# replay rather than fail loud. Keep overflow checks on even in release so any
+# future narrowing of the widened math traps instead of wrapping.
+overflow-checks = true
