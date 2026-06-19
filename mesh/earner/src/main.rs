@@ -581,7 +581,8 @@ async fn poll_once(
     // chunk-by-chunk and error past the cap so the poll cycle logs + backs off
     // instead of OOMing on a hostile coordinator. The limit is on bytes ACTUALLY
     // READ — never the advertised Content-Length, which a chunked response can omit
-    // or under-report.
+    // or under-report. Peak transient memory is the cap plus one in-flight `chunk()`
+    // (hyper sizes a chunk to its socket read, not to the sender's framing).
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
         if body.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
