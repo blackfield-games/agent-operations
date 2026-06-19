@@ -16,6 +16,7 @@ from common.jobs import (
     MAX_DEADLINE_SECS,
     MAX_INPUTS_BYTES,
     MAX_PAYOUT_WEI,
+    SPECIALIST_RENDER_KIND,
     RenderJobSpec,
     render_jobs,
 )
@@ -78,6 +79,110 @@ def test_render_jobs_honors_overrides():
     )
     assert jobs[0].deadline_secs == 120
     assert jobs[0].max_payout_wei == "5000"
+
+
+# --- per-kind render-job fan-out (agents-render-job-emission-per-kind) ---
+
+_ALL_SPECIALISTS = ("director", "terrain", "biome", "prop", "lighting", "npc", "optimization", "validator")
+
+
+def _layer(specialist, region_id="r+0042_-0017_l0") -> LayerSpec:
+    return LayerSpec(specialist=specialist, region_id=region_id, path=f"{specialist}/a.usda", summary=specialist)
+
+
+def test_specialist_render_kind_is_the_renderable_bijection():
+    # Exactly the four renderable specialists -> the four non-diffusion kinds.
+    # director/lighting/prop/validator are intentionally absent (no render kind),
+    # and the whole-tile DIFFUSION_TILE is never a per-specialist target.
+    assert SPECIALIST_RENDER_KIND == {
+        "terrain": JobKind.TERRAIN,
+        "biome": JobKind.FOLIAGE,
+        "npc": JobKind.NPC_TICK,
+        "optimization": JobKind.OPTIMIZATION,
+    }
+    assert JobKind.DIFFUSION_TILE not in SPECIALIST_RENDER_KIND.values()
+    assert len(set(SPECIALIST_RENDER_KIND.values())) == 4
+
+
+def test_render_jobs_fans_out_one_job_per_renderable_specialist():
+    # A full eight-specialist run emits the whole-tile diffusion job plus one job
+    # for each of the four renderable specialists, in JobKind enum order.
+    layers = [_layer(s) for s in _ALL_SPECIALISTS]
+    jobs = render_jobs(_brief(), layers, ValidatorVerdict(accepted=True))
+    assert [job.kind for job in jobs] == [
+        JobKind.DIFFUSION_TILE, JobKind.TERRAIN, JobKind.FOLIAGE, JobKind.NPC_TICK, JobKind.OPTIMIZATION,
+    ]
+
+
+def test_render_jobs_per_kind_only_for_present_layers():
+    # FM1: only terrain + biome authored layers -> diffusion + TERRAIN + FOLIAGE;
+    # no NPC_TICK / OPTIMIZATION job for a specialist that produced nothing.
+    jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True))
+    assert [job.kind for job in jobs] == [JobKind.DIFFUSION_TILE, JobKind.TERRAIN, JobKind.FOLIAGE]
+
+
+def test_render_jobs_unmapped_specialist_emits_no_kind_job():
+    # FM2: director/lighting/prop/validator map to no render kind, so a run of only
+    # those emits the whole-tile diffusion job and nothing else.
+    layers = [_layer(s) for s in ("director", "lighting", "prop", "validator")]
+    jobs = render_jobs(_brief(), layers, ValidatorVerdict(accepted=True))
+    assert [job.kind for job in jobs] == [JobKind.DIFFUSION_TILE]
+
+
+def test_render_jobs_order_is_stable_regardless_of_layer_order():
+    # FM3: emission order is JobKind enum order, not layer input order — a shuffled
+    # layer list yields the identical job order.
+    shuffled = [_layer(s) for s in ("optimization", "npc", "terrain", "biome")]
+    jobs = render_jobs(_brief(), shuffled, ValidatorVerdict(accepted=True))
+    assert [job.kind for job in jobs] == [
+        JobKind.DIFFUSION_TILE, JobKind.TERRAIN, JobKind.FOLIAGE, JobKind.NPC_TICK, JobKind.OPTIMIZATION,
+    ]
+
+
+def test_render_jobs_per_kind_inputs_focus_their_single_layer():
+    # A per-kind job carries the singular `layer` it renders; the diffusion job keeps
+    # the plural `layers` manifest — the two input shapes are distinct.
+    jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True))
+    terrain = next(job for job in jobs if job.kind is JobKind.TERRAIN)
+    assert terrain.inputs["region_id"] == "r+0042_-0017_l0"
+    assert terrain.inputs["world"] == "world.usda"
+    assert terrain.inputs["layer"] == {"specialist": "terrain", "path": "terrain/a.usda"}
+    assert "layers" not in terrain.inputs
+    diffusion = jobs[0]
+    assert "layers" in diffusion.inputs and "layer" not in diffusion.inputs
+
+
+def test_render_jobs_rejected_emits_no_jobs_at_all():
+    # FM1 of the base slice still holds for the whole fan-out: a rejected region
+    # yields neither a diffusion job nor any per-kind job.
+    layers = [_layer(s) for s in _ALL_SPECIALISTS]
+    assert render_jobs(_brief(), layers, ValidatorVerdict(accepted=False, issues=["x"])) == []
+
+
+def test_render_jobs_every_emitted_spec_is_coordinator_valid():
+    # FM4: every job (not just the diffusion tile) carries a valid wire kind and
+    # validate_job_spec-bounded fields, so none is 422-rejectable.
+    layers = [_layer(s) for s in _ALL_SPECIALISTS]
+    jobs = render_jobs(_brief(), layers, ValidatorVerdict(accepted=True))
+    for job in jobs:
+        body = job.to_request()
+        assert isinstance(body["kind"], str)
+        assert body["kind"] in {"diffusion_tile", "terrain", "foliage", "npc_tick", "optimization"}
+        assert 0 < body["deadline_secs"] <= MAX_DEADLINE_SECS
+        assert 0 <= int(body["max_payout_wei"]) <= MAX_PAYOUT_WEI
+        assert set(body) == {"kind", "region", "deadline_secs", "max_payout_wei", "inputs"}
+
+
+def test_render_jobs_duplicate_specialist_layers_each_emit_a_job():
+    # Defensive: should a specialist contribute two layers, each renders (one job per
+    # mapped layer), preserving input order within the kind (stable sort).
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r+0042_-0017_l0", path="terrain/a.usda", summary="a"),
+        LayerSpec(specialist="terrain", region_id="r+0042_-0017_l0", path="terrain/b.usda", summary="b"),
+    ]
+    jobs = render_jobs(_brief(), layers, ValidatorVerdict(accepted=True))
+    assert [job.kind for job in jobs] == [JobKind.DIFFUSION_TILE, JobKind.TERRAIN, JobKind.TERRAIN]
+    assert [job.inputs["layer"]["path"] for job in jobs[1:]] == ["terrain/a.usda", "terrain/b.usda"]
 
 
 # --- to_request: the wire shape (FM1) ---
