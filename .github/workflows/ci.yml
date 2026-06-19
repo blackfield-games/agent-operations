@@ -29,6 +29,24 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --all-targets -- -D warnings
 
+  arena:
+    name: arena (rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arena
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: arena
+      - run: cargo build --all-targets --locked
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets -- -D warnings
+
   contracts:
     name: contracts (foundry)
     runs-on: ubuntu-latest
