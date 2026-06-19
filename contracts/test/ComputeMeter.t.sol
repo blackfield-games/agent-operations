@@ -213,6 +213,140 @@ contract ComputeMeterTest is Test {
         assertEq(meter.totalSpent(), 105 ether);
     }
 
+    // --- spendOnce per-job idempotency fence ---
+
+    function test_spendOnce_debitsAndEmitsLikeSpend() public {
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        bytes32 jobId = keccak256("render-1");
+        vm.expectEmit(true, true, false, true);
+        emit Spent(buyer, spender, 40 ether, jobId);
+        vm.prank(spender);
+        meter.spendOnce(buyer, 40 ether, jobId);
+
+        assertEq(meter.credit(buyer), 60 ether);
+        assertEq(meter.spentByBuyer(buyer), 40 ether);
+        assertTrue(meter.spentJobs(jobId), "jobId is fenced after the first spendOnce");
+    }
+
+    function test_spendOnce_duplicateJobIdRevertsAndDoesNotDoubleDebit() public {
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        bytes32 jobId = keccak256("render-1");
+        vm.prank(spender);
+        meter.spendOnce(buyer, 40 ether, jobId);
+
+        // A second spendOnce of the same jobId reverts — the crash-recovery seam.
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.AlreadySpent.selector);
+        meter.spendOnce(buyer, 40 ether, jobId);
+
+        // The revert left the first debit's accounting untouched (no double-debit).
+        assertEq(meter.credit(buyer), 60 ether);
+        assertEq(meter.totalSpent(), 40 ether);
+        assertEq(meter.spentByBuyer(buyer), 40 ether);
+    }
+
+    function test_spendOnce_alreadySpentPrecedesInsufficientCredit() public {
+        // A replay of an already-spent job reports AlreadySpent even when the amount
+        // now exceeds the buyer's remaining credit — the relay must see the
+        // idempotent-success signal, not a misleading InsufficientCredit.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        bytes32 jobId = keccak256("render-1");
+        vm.prank(spender);
+        meter.spendOnce(buyer, 100 ether, jobId); // drains credit to zero
+
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.AlreadySpent.selector); // NOT InsufficientCredit
+        meter.spendOnce(buyer, 100 ether, jobId);
+    }
+
+    function test_spendOnce_failedFirstCallLeavesJobRetryable() public {
+        // A first spendOnce that reverts (InsufficientCredit) must NOT consume the
+        // jobId — the fence is rolled back with the revert, so the relay can retry
+        // once the buyer funds. Otherwise an underfunded buyer would permanently
+        // brick the debit.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 10 ether);
+        meter.deposit(10 ether);
+        vm.stopPrank();
+
+        bytes32 jobId = keccak256("render-1");
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
+        meter.spendOnce(buyer, 50 ether, jobId);
+
+        assertFalse(meter.spentJobs(jobId), "a reverted first spendOnce does not consume the jobId");
+
+        // Fund and retry the SAME jobId — it now succeeds.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 40 ether);
+        meter.deposit(40 ether);
+        vm.stopPrank();
+
+        vm.prank(spender);
+        meter.spendOnce(buyer, 50 ether, jobId);
+        assertEq(meter.credit(buyer), 0);
+        assertTrue(meter.spentJobs(jobId));
+    }
+
+    function test_spendOnce_differentJobIdsBothDebit() public {
+        // The fence is PER jobId, not a global lock — distinct jobs each debit.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        vm.startPrank(spender);
+        meter.spendOnce(buyer, 30 ether, keccak256("render-1"));
+        meter.spendOnce(buyer, 20 ether, keccak256("render-2"));
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 50 ether);
+        assertEq(meter.spentByBuyer(buyer), 50 ether);
+    }
+
+    function test_spendOnce_revertsForUnauthorized() public {
+        // Auth is checked before the fence: an unauthorized caller reverts
+        // NotAuthorized and writes no spentJobs state.
+        bytes32 jobId = keccak256("render-1");
+        vm.expectRevert(ComputeMeter.NotAuthorized.selector);
+        meter.spendOnce(buyer, 10 ether, jobId);
+        assertFalse(meter.spentJobs(jobId));
+    }
+
+    function test_spend_remainsRepeatablePerJobId() public {
+        // The load-bearing ArtifactTemplate guarantee: spend() does NOT consult the
+        // fence, so the SAME jobId (a templateId, in ArtifactTemplate's case) debits
+        // on every call — a per-mint fee is charged for every mint of a template.
+        // Fencing spend() would brick the 2nd mint; this pins that it doesn't.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        bytes32 templateId = bytes32(uint256(7));
+        vm.startPrank(spender);
+        meter.spend(buyer, 10 ether, templateId);
+        meter.spend(buyer, 10 ether, templateId); // same jobId, charges again
+        meter.spend(buyer, 10 ether, templateId);
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 70 ether, "spend is repeatable per jobId");
+        assertEq(meter.spentByBuyer(buyer), 30 ether);
+        assertFalse(meter.spentJobs(templateId), "spend never writes the spendOnce fence");
+    }
+
     // --- setSpender access control + toggle ---
 
     function test_setSpender_onlyOwner() public {
