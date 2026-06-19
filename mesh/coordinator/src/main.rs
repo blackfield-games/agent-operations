@@ -156,6 +156,17 @@ struct Args {
     /// this path). Must be >= 1. See [`DEFAULT_MAX_QUEUED_JOBS`].
     #[arg(long, env = "COORDINATOR_MAX_QUEUED_JOBS", default_value_t = DEFAULT_MAX_QUEUED_JOBS)]
     max_queued_jobs: usize,
+    /// Maximum number of earners kept in the in-memory registry. Registration is
+    /// signature-gated for identity but a fresh keypair is free, so without a cap
+    /// cheap distinct signed Hellos inflate the map without bound (O(n) `/earners` +
+    /// `/stats` scans, an oversized `/earners` response). At the cap a NEW
+    /// registration evicts the stalest earner already past its TTL to make room; if
+    /// every entry is currently live (a genuinely full fleet) it is rejected `503`
+    /// (HTTP) / the socket is closed (WS). Re-registration of an already-known earner
+    /// is an in-place upsert and never counts against the cap. Set WELL above peak
+    /// fleet size — it is a backstop, not a tuned limit. Must be >= 1.
+    #[arg(long, env = "COORDINATOR_MAX_EARNERS", default_value_t = DEFAULT_MAX_EARNERS)]
+    max_earners: usize,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -211,6 +222,11 @@ struct AppState {
     /// is rejected `503`. Validated >= 1 in `with_store`. Mirrors
     /// `--max-queued-jobs` / `COORDINATOR_MAX_QUEUED_JOBS`.
     max_queued_jobs: usize,
+    /// Cap on the in-memory earner registry size; a new registration at the cap
+    /// evicts the stalest past-TTL earner or, if all are live, is rejected. Read by
+    /// the registration seam (`admit_earner`). Validated >= 1 in `with_store`.
+    /// Mirrors `--max-earners` / `COORDINATOR_MAX_EARNERS`.
+    max_earners: usize,
 }
 
 impl AppState {
@@ -231,6 +247,7 @@ impl AppState {
         handshake_timeout: Duration,
         ingest_token: Option<String>,
         max_queued_jobs: usize,
+        max_earners: usize,
     ) -> Result<Arc<Self>> {
         // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
         // dead-letters every non-terminal job on its first tick — the safety
@@ -266,6 +283,14 @@ impl AppState {
             max_queued_jobs > 0,
             "max_queued_jobs must be >= 1 (0 would reject every job ingestion)"
         );
+        // A zero earner cap would reject every registration the moment the map is
+        // non-empty (and admit exactly one earner only to evict it on the next),
+        // starving the whole mesh of earners. Reject it at construction, mirroring
+        // the other zero-knob guards.
+        anyhow::ensure!(
+            max_earners > 0,
+            "max_earners must be >= 1 (0 would reject every earner registration)"
+        );
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -287,6 +312,7 @@ impl AppState {
             handshake_timeout,
             ingest_token,
             max_queued_jobs,
+            max_earners,
         }))
     }
 }
@@ -452,6 +478,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.handshake_timeout_secs),
         args.ingest_token,
         args.max_queued_jobs,
+        args.max_earners,
     )?;
     tracing::info!(db = %args.db, "store ready");
 
@@ -677,6 +704,51 @@ fn prune_stale_earners(
     before - earners.len()
 }
 
+/// Admit an earner registration into the `earners` registry under the size cap
+/// `max_earners`, returning whether it was admitted. Shared by both registration
+/// paths (HTTP `register`, WS `recv_hello_inner`) so the bound is enforced
+/// identically; the caller runs it while holding the `earners` lock, so the
+/// size check, eviction, and insert are atomic against a concurrent registration
+/// (no TOCTOU over-fill).
+///
+/// Policy:
+/// - An UPSERT of an already-registered address overwrites in place and always
+///   succeeds — it doesn't grow the map, so a known earner (even one gone stale)
+///   re-registering / changing capabilities is never blocked by the cap.
+/// - A NEW address below the cap is inserted unconditionally.
+/// - A NEW address AT the cap is admitted only by evicting the stalest entry that
+///   is already past its TTL (`is_live == false`, smallest `last_seen`) — an entry
+///   the reaper would prune and `/stats`/`/earners` already filter out. A LIVE
+///   earner is never displaced; when every entry is live (a genuinely full fleet),
+///   the registration is rejected (`false`). The at-cap scan is O(n) but only runs
+///   when the backstop engages, and `n` is bounded by `max_earners`.
+fn admit_earner(
+    earners: &mut std::collections::HashMap<String, EarnerInfo>,
+    address: String,
+    info: EarnerInfo,
+    max_earners: usize,
+    now: i64,
+    ttl_secs: i64,
+) -> bool {
+    if earners.contains_key(&address) || earners.len() < max_earners {
+        earners.insert(address, info);
+        return true;
+    }
+    let stalest = earners
+        .iter()
+        .filter(|(_, e)| !e.is_live(now, ttl_secs))
+        .min_by_key(|(_, e)| e.last_seen)
+        .map(|(k, _)| k.clone());
+    match stalest {
+        Some(key) => {
+            earners.remove(&key);
+            earners.insert(address, info);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Per-job absolute wall-clock TTL, as a multiple of the job's own
 /// `deadline_secs`: a job alive (queued or in_flight) past
 /// `created_at + deadline_secs * JOB_TTL_DEADLINE_MULTIPLE` is dead-lettered by
@@ -766,6 +838,18 @@ const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 /// load; an operator running a larger backlog raises it. The backstop against an
 /// unbounded queued backlog (disk-fill, slower dispatch scans, FIFO starvation).
 const DEFAULT_MAX_QUEUED_JOBS: usize = 10_000;
+
+/// Default cap on the in-memory earner registry (`state.earners`). Registration is
+/// signature-gated for identity but fresh keypairs are free, so cheap distinct
+/// signed Hellos would otherwise inflate the map without bound — growing the O(n)
+/// `/earners` + `/stats` scans and the `/earners` response past the OS send buffer
+/// (the lever behind the OS/edge-gated slow-response-read residual). 65536 is ~16×
+/// the 4096 concurrent-connection cap, so it never throttles an honest fleet at
+/// pre-production / early scale (each earner is one registry entry, persisting past
+/// an HTTP earner's request until its TTL); it is a backstop against unbounded
+/// growth, not a tuned fleet size — an operator runs a larger mesh by raising it.
+/// Backs `Args::max_earners` (`--max-earners` / `COORDINATOR_MAX_EARNERS`).
+const DEFAULT_MAX_EARNERS: usize = 65_536;
 
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
@@ -1180,16 +1264,31 @@ async fn register(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered");
-    state.earners.lock().await.insert(
-        earner_address,
+    let now = now_secs();
+    let admitted = admit_earner(
+        &mut *state.earners.lock().await,
+        earner_address.clone(),
         EarnerInfo {
             gpu_model,
             vram_gb,
             supported,
-            last_seen: now_secs(),
+            last_seen: now,
         },
+        state.max_earners,
+        now,
+        state.earner_ttl_secs,
     );
+    if !admitted {
+        // Registry full of LIVE earners: shed with a retryable 503 (matches the
+        // queue-cap backpressure). A stale earner aging past its TTL frees a slot.
+        tracing::warn!(
+            address = %earner_address,
+            cap = state.max_earners,
+            "rejected registration: earner registry at capacity (all earners live)"
+        );
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    tracing::info!(address = %earner_address, vram_gb, "earner registered");
     Ok("registered")
 }
 
@@ -2089,16 +2188,32 @@ async fn recv_hello_inner(socket: &mut WebSocket, state: &Arc<AppState>) -> Opti
             tracing::warn!(address = %earner_address, reason, "ws: rejected malformed Hello; closing");
             return None;
         }
-        tracing::info!(address = %earner_address, gpu = %gpu_model, vram_gb, "earner registered (ws)");
-        state.earners.lock().await.insert(
+        let now = now_secs();
+        let admitted = admit_earner(
+            &mut *state.earners.lock().await,
             earner_address.clone(),
             EarnerInfo {
                 gpu_model,
                 vram_gb,
                 supported,
-                last_seen: now_secs(),
+                last_seen: now,
             },
+            state.max_earners,
+            now,
+            state.earner_ttl_secs,
         );
+        if !admitted {
+            // Same admission policy as HTTP /register (FM4 parity): a registry full
+            // of live earners can't make room, so close the socket instead of
+            // admitting (no live earner is ever displaced).
+            tracing::warn!(
+                address = %earner_address,
+                cap = state.max_earners,
+                "ws: rejected registration: earner registry at capacity (all earners live); closing"
+            );
+            return None;
+        }
+        tracing::info!(address = %earner_address, vram_gb, "earner registered (ws)");
         return Some(earner_address);
     }
 }
@@ -2375,6 +2490,7 @@ mod tests {
             handshake_timeout,
             None,
             DEFAULT_MAX_QUEUED_JOBS,
+            DEFAULT_MAX_EARNERS,
         )
         .unwrap()
     }
@@ -4328,6 +4444,7 @@ mod tests {
             DEFAULT_HANDSHAKE_TIMEOUT,
             Some(token.to_string()),
             DEFAULT_MAX_QUEUED_JOBS,
+            DEFAULT_MAX_EARNERS,
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -4454,6 +4571,7 @@ mod tests {
                 DEFAULT_HANDSHAKE_TIMEOUT,
                 Some(blank.to_string()),
                 DEFAULT_MAX_QUEUED_JOBS,
+                DEFAULT_MAX_EARNERS,
             );
             assert!(r.is_err(), "blank token {blank:?} must be rejected at construction");
         }
@@ -4466,6 +4584,7 @@ mod tests {
             DEFAULT_HANDSHAKE_TIMEOUT,
             Some("real-token".to_string()),
             DEFAULT_MAX_QUEUED_JOBS,
+            DEFAULT_MAX_EARNERS,
         )
         .is_ok());
     }
@@ -4483,6 +4602,7 @@ mod tests {
             DEFAULT_HANDSHAKE_TIMEOUT,
             None,
             max_queued,
+            DEFAULT_MAX_EARNERS,
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -4550,6 +4670,7 @@ mod tests {
             DEFAULT_HANDSHAKE_TIMEOUT,
             None,
             1,
+            DEFAULT_MAX_EARNERS,
         )
         .unwrap();
         let queued = body_json(get(state, "/stats").await).await["jobs_queued"].as_u64().unwrap();
@@ -4588,6 +4709,7 @@ mod tests {
             DEFAULT_HANDSHAKE_TIMEOUT,
             None,
             0,
+            DEFAULT_MAX_EARNERS,
         );
         assert!(r.is_err(), "zero max_queued_jobs must be rejected at construction");
     }
@@ -5988,7 +6110,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -6027,7 +6149,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -6081,7 +6203,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -6100,7 +6222,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -6200,7 +6322,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -6737,6 +6859,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -7700,7 +7823,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_deadline_multiple_knob_is_honored() {
         let state =
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
                 .unwrap();
         assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
 
@@ -7734,12 +7857,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_ttl_deadline_multiple() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
                 .is_err(),
             "multiple=0 must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
                 .is_ok(),
             "the smallest valid multiple (1) constructs"
         );
@@ -7752,12 +7875,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_handshake_timeout() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
                 .is_err(),
             "a zero handshake timeout must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS)
                 .is_ok(),
             "the smallest positive handshake timeout constructs"
         );
@@ -7840,6 +7963,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         let job = seed_job();
         let job_id = job.id;
@@ -8200,6 +8324,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -8251,6 +8376,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
 
         let terrain_job = JobSpec {
@@ -8307,6 +8433,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -8326,6 +8453,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
 
         let mut ids = Vec::new();
@@ -8418,6 +8546,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
 
         let queued = job_with_deadline(60);
@@ -8526,6 +8655,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8572,6 +8702,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8631,6 +8762,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -8684,6 +8816,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -8728,6 +8861,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -8785,6 +8919,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -8848,6 +8983,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -8910,6 +9046,7 @@ mod tests {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
         });
         let pay = test_address("pay");
         let resp = post_json(
