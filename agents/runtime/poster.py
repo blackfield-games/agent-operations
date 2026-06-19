@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 import httpx
 
@@ -34,19 +35,26 @@ DEFAULT_TIMEOUT_SECS = 10.0
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_BASE_SECS = 0.5
 
+# Cleartext-over-http warning is suppressed for loopback (local dev), where a
+# bearer token never crosses a network an adversary can observe.
+_LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
+
 
 class PostOutcome(str, Enum):
     CREATED = "created"              # 201 — enqueued, id assigned
     UNAUTHORIZED = "unauthorized"    # 401 — bad/missing ingest token (config error)
-    REJECTED = "rejected"            # 422 — malformed spec (producer bug; do not retry)
+    REJECTED = "rejected"            # 422/413 — bad/oversized spec (producer bug; do not retry)
     UNAVAILABLE = "unavailable"      # 503 — queue at capacity (retryable)
+    TIMEOUT = "timeout"              # 408 — coordinator stalled reading the body (retryable)
     NETWORK_ERROR = "network_error"  # transport failure (retryable)
     ERROR = "error"                  # other unexpected status (e.g. 500)
 
 
-# Transient outcomes worth a backed-off retry. 422 (producer bug) and 401 (bad
-# token) are terminal — retrying them only hammers the coordinator (FM2).
-RETRYABLE = frozenset({PostOutcome.UNAVAILABLE, PostOutcome.NETWORK_ERROR})
+# Transient outcomes worth a backed-off retry. The coordinator's own 503 (queue
+# full) and 408 (stalled body) are documented as retryable; a network error may
+# not have reached it at all. 422/413 (producer bug) and 401 (bad token) are
+# terminal — retrying them only hammers the coordinator (FM2).
+RETRYABLE = frozenset({PostOutcome.UNAVAILABLE, PostOutcome.TIMEOUT, PostOutcome.NETWORK_ERROR})
 
 
 @dataclass(frozen=True)
@@ -83,6 +91,8 @@ def _classify(status_code: int) -> PostOutcome:
     return {
         201: PostOutcome.CREATED,
         401: PostOutcome.UNAUTHORIZED,
+        408: PostOutcome.TIMEOUT,    # stalled-body timeout; coordinator says retry
+        413: PostOutcome.REJECTED,   # body over the request cap — a producer bug
         422: PostOutcome.REJECTED,
         503: PostOutcome.UNAVAILABLE,
     }.get(status_code, PostOutcome.ERROR)
@@ -102,9 +112,9 @@ def _log_terminal(result: PostResult) -> None:
     """Loud, actionable logging for the non-retryable failure outcomes (FM2)."""
     if result.outcome is PostOutcome.REJECTED:
         logger.error(
-            "POST /jobs rejected %s (%s) as a malformed spec (422) — a producer bug, "
+            "POST /jobs rejected %s (%s) as a bad spec (HTTP %s) — a producer bug, "
             "not retrying; check RenderJobSpec against validate_job_spec.",
-            result.region_id, result.kind,
+            result.region_id, result.kind, result.status_code,
         )
     elif result.outcome is PostOutcome.UNAUTHORIZED:
         logger.error(
@@ -136,15 +146,24 @@ def post_jobs(
     authored and composed, so a posting failure is reported, not fatal (FM3). The
     bearer token (when set) authenticates the request and is never echoed back.
 
-    Retryable outcomes (503, network error) are retried up to ``max_attempts``
-    with exponential backoff (``backoff_base_secs * 2**n``); 201/401/422 are
-    terminal and return on the first response. ``sleep`` is injected so tests
-    drive the backoff without real time.
+    Retryable outcomes (503, 408, network error) are retried up to
+    ``max_attempts`` with exponential backoff (``backoff_base_secs * 2**n``);
+    201/401/422/413 are terminal and return on the first response. ``sleep`` is
+    injected so tests drive the backoff without real time.
     """
     url = f"{base_url.rstrip('/')}/jobs"
     headers = {"Content-Type": "application/json"}
-    if token:
+    # A whitespace-only token is treated as no token (header omitted), not sent as
+    # a bogus `Bearer ` credential — the transport stays correct in isolation even
+    # if a caller forgets to sanitize (the CLI already strips).
+    if token and token.strip():
         headers["Authorization"] = f"Bearer {token}"
+        parsed = urlparse(base_url)
+        if parsed.scheme == "http" and parsed.hostname not in _LOOPBACK:
+            logger.warning(
+                "posting a bearer token over http to %s — it is sent in cleartext; "
+                "use https in production", parsed.hostname,
+            )
     attempts = max(1, max_attempts)
 
     def attempt(job: RenderJobSpec) -> PostResult:
@@ -160,7 +179,13 @@ def post_jobs(
             else:
                 outcome = _classify(resp.status_code)
                 if outcome is PostOutcome.CREATED:
-                    return PostResult(region_id, kind, outcome, status_code=201, job_id=_job_id(resp))
+                    job_id = _job_id(resp)
+                    if job_id is None:
+                        logger.warning(
+                            "POST /jobs returned 201 for %s with no job id in the body "
+                            "(job created but unpollable)", region_id,
+                        )
+                    return PostResult(region_id, kind, outcome, status_code=201, job_id=job_id)
                 result = PostResult(region_id, kind, outcome, status_code=resp.status_code)
                 if outcome not in RETRYABLE:
                     _log_terminal(result)

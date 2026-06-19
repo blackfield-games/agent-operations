@@ -228,3 +228,79 @@ def test_custom_backoff_base_scales_delays():
         max_attempts=4, backoff_base_secs=0.1, sleep=sleeps.append,
     )
     assert sleeps == [0.1, 0.2, 0.4]  # 0.1 * 2**n for n in 0..2; none after the last
+
+
+# --- 408 (stalled-body) is retryable; 413 (oversized) is a terminal producer bug ---
+
+def test_408_retried_then_succeeds():
+    client = _Client(_Resp(408), _Resp(201, {"id": "ok"}))
+    sleeps: list[float] = []
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=3, sleep=sleeps.append,
+    )
+    assert result.outcome is PostOutcome.CREATED
+    assert len(client.calls) == 2
+    assert sleeps == [0.5]
+
+
+def test_408_exhausted_is_timeout():
+    client = _Client(_Resp(408), _Resp(408))
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=2, sleep=lambda _: None,
+    )
+    assert result.outcome is PostOutcome.TIMEOUT
+    assert result.status_code == 408
+    assert len(client.calls) == 2
+
+
+def test_413_is_terminal_producer_bug():
+    client = _Client(_Resp(413))
+    sleeps: list[float] = []
+    [result] = post_jobs(
+        [_job()], base_url="http://c", token="t", client=client,
+        max_attempts=5, sleep=sleeps.append,
+    )
+    assert result.outcome is PostOutcome.REJECTED  # oversized body, not retried
+    assert result.status_code == 413
+    assert len(client.calls) == 1
+    assert sleeps == []
+
+
+def test_201_without_id_warns_but_is_created(caplog):
+    client = _Client(_Resp(201, {}))  # 201 with no "id" in the body
+    with caplog.at_level("WARNING"):
+        [result] = post_jobs([_job()], base_url="http://c", token="t", client=client, max_attempts=1)
+    assert result.outcome is PostOutcome.CREATED
+    assert result.job_id is None
+    assert "no job id" in caplog.text
+
+
+# --- security: whitespace token + cleartext-http warning ---
+
+def test_whitespace_only_token_omits_auth_header():
+    client = _Client(_Resp(201, {"id": "x"}))
+    post_jobs([_job()], base_url="http://c", token="   ", client=client, max_attempts=1)
+    assert "Authorization" not in client.calls[0]["headers"]  # not sent as `Bearer    `
+
+
+def test_bearer_over_http_to_remote_warns(caplog):
+    client = _Client(_Resp(201, {"id": "x"}))
+    with caplog.at_level("WARNING"):
+        post_jobs([_job()], base_url="http://remote-coord:8080", token="t", client=client, max_attempts=1)
+    assert "cleartext" in caplog.text
+
+
+def test_bearer_over_http_to_loopback_is_quiet(caplog):
+    client = _Client(_Resp(201, {"id": "x"}))
+    with caplog.at_level("WARNING"):
+        post_jobs([_job()], base_url="http://localhost:8080", token="t", client=client, max_attempts=1)
+    assert "cleartext" not in caplog.text  # loopback never crosses an observable network
+
+
+def test_bearer_over_https_is_quiet(caplog):
+    client = _Client(_Resp(201, {"id": "x"}))
+    with caplog.at_level("WARNING"):
+        post_jobs([_job()], base_url="https://remote-coord", token="t", client=client, max_attempts=1)
+    assert "cleartext" not in caplog.text
