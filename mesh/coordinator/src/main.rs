@@ -4334,6 +4334,81 @@ mod tests {
         );
     }
 
+    /// FM2 (cheap-reject-first) on the WS path, pinned DISCRIMINATINGLY: the rate
+    /// check precedes `validate_hello`, so a structurally-valid Hello whose signature
+    /// fails recovery still SPENDS its token when it is under the limit — the check ran
+    /// and consumed before the verify rejected it. With a cap of 1, that malformed
+    /// Hello drains the loopback source's only token, so a following VALID Hello from
+    /// the same source is rate-shed and registers nothing (`gpus_joined == 0`). Move the
+    /// ws rate-check block AFTER `validate_hello` and the malformed Hello is rejected at
+    /// recovery BEFORE the check, leaving the token intact — the valid Hello then
+    /// registers (`gpus_joined == 1`) and the server holds its session open, so the
+    /// second `expect_ws_closed` also hangs. Either signal flips on the reorder, where
+    /// `ws_over_rate_limit_*` (valid Hellos only) survives it. The HTTP analogue
+    /// (`register_rate_limit_precedes_validation`) discriminates via 429-vs-400; WS has
+    /// no status code, so the spent-token side effect is the discriminator.
+    #[tokio::test]
+    async fn ws_rate_limit_precedes_validation() {
+        let state = test_state_empty_with_registrations(1).await;
+        let addr = serve_ephemeral(state.clone()).await;
+        // A real key + its own valid address, so every structural gate in
+        // `validate_hello` passes and the Hello REACHES the secp256k1 recovery; signing
+        // over a nonce that is NOT this connection's challenge makes that recovery fail
+        // (address mismatch), so the socket closes either way — the only observable
+        // difference is whether the rate check spent the token first.
+        let sk = test_signing_key("wsorder");
+        let claimed = address_from_signing_key(&sk);
+        {
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            let _challenge = recv_challenge(&mut ws).await; // deliberately not signed over
+            let malformed = signed_hello_with_nonce(
+                &sk,
+                &claimed,
+                "RTX 4090",
+                24,
+                vec![JobKind::Terrain],
+                b"not-this-connections-challenge",
+            );
+            ws.send(WsMessage::text(serde_json::to_string(&malformed).unwrap()))
+                .await
+                .unwrap();
+            // The close is observable only after recv_hello_inner returns None, which
+            // (cheap-reject-first) is AFTER the rate check consumed the token — so this
+            // barrier guarantees the bucket is drained before the valid Hello below.
+            expect_ws_closed(&mut ws).await;
+        }
+        {
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            let nonce = recv_challenge(&mut ws).await;
+            let valid = signed_hello_with_nonce(
+                &sk,
+                &claimed,
+                "RTX 4090",
+                24,
+                vec![JobKind::Terrain],
+                &nonce,
+            );
+            ws.send(WsMessage::text(serde_json::to_string(&valid).unwrap()))
+                .await
+                .unwrap();
+            // Correct order: shed → prompt close. A reorder regression registers this
+            // Hello and holds the session open, so this would hang — time-bound it to
+            // turn that regression into a clean failure instead of a stuck test.
+            tokio::time::timeout(Duration::from_secs(5), expect_ws_closed(&mut ws))
+                .await
+                .expect("the valid Hello must be rate-shed: the malformed under-limit Hello spent the token");
+        }
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "cheap-reject-first holds on WS: the malformed under-limit Hello spent the source's token, so the valid Hello was shed",
+        );
+    }
+
     /// THE anti-replay property: a valid Hello captured off the wire and replayed
     /// on a FRESH connection is rejected. The new connection issues a different
     /// challenge, so the captured signature (bound to the first nonce) fails
