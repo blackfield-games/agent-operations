@@ -164,7 +164,8 @@ impl Store {
                  faults       INTEGER NOT NULL DEFAULT 0,
                  dispatch_seq INTEGER NOT NULL DEFAULT 0,
                  created_at   INTEGER,
-                 dispatched_to TEXT
+                 dispatched_to TEXT,
+                 buyer        TEXT
              );
              CREATE TABLE IF NOT EXISTS results (
                  job_id      TEXT NOT NULL,
@@ -268,6 +269,16 @@ impl Store {
         ignore_duplicate_column(
             conn.execute("ALTER TABLE jobs ADD COLUMN dispatched_to TEXT", []),
         )?;
+        // Migrate pre-existing DBs (created before `buyer` — the optional EVM
+        // address charged for the job's validated compute via ComputeMeter — was
+        // added). The column lands NULL on every existing row, which is correct: an
+        // unattributed job simply isn't metered (the metering seam skips a NULL
+        // buyer, mirroring the unknown-region render-fee skip). Set at enqueue for
+        // jobs ingested with a buyer; the boot-seed and crash-recovery requeue leave
+        // it NULL. Swallow only the duplicate-column error.
+        ignore_duplicate_column(
+            conn.execute("ALTER TABLE jobs ADD COLUMN buyer TEXT", []),
+        )?;
         // Index the reaper's hot predicate. Every reap tick scans non-terminal jobs
         // by (status, age): the TTL reaper filters `status IN (queued, in_flight)
         // AND created_at IS NOT NULL`, the deadline/liveness reapers filter
@@ -341,6 +352,25 @@ impl Store {
             (job.id.to_string(), spec_json, STATUS_QUEUED, max_queued as i64),
         )?;
         Ok(inserted == 1)
+    }
+
+    /// The EVM address charged for this job's validated compute, or `None` if the
+    /// job was ingested unattributed (or is unknown). Read at settle by the
+    /// ComputeMeter metering seam to build the pending debit; `None` means the job
+    /// is simply not metered. A NULL column or a missing row both map to `None`.
+    #[allow(dead_code)] // read by the ComputeMeter debit settle path (metering seam)
+    pub fn job_buyer(&self, id: &uuid::Uuid) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT buyer FROM jobs WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .map_err(Into::into)
     }
 
     /// Pop the oldest-waiting queued job whose kind passes `accept`, marking it
