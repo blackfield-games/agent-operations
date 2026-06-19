@@ -4289,6 +4289,224 @@ mod tests {
         );
     }
 
+    // ---- debit relayer (drain loop) ----
+
+    use meter::MockSpender;
+
+    const DRAIN_RATE: u128 = 1_000_000_000_000; // 1e12 wei / render-second
+
+    /// Enqueue (attributed to `TEST_BUYER`), dispatch, and settle `job` under a
+    /// nonzero compute rate, leaving it with one pending debit — the precondition
+    /// for every debit-drain test.
+    async fn settle_one_metered(state: &Arc<AppState>, job: &JobSpec) {
+        enqueue_with_buyer(state, job, TEST_BUYER).await;
+        state
+            .store
+            .lock()
+            .await
+            .take_next(|j| j.id == job.id)
+            .unwrap();
+        assert!(state
+            .store
+            .lock()
+            .await
+            .record_completed(&signed_result(job.id, "r"))
+            .unwrap());
+    }
+
+    async fn pending_debits(state: &Arc<AppState>) -> usize {
+        state.store.lock().await.pending_debit_count().unwrap()
+    }
+
+    #[tokio::test]
+    async fn drain_debits_spends_each_pending_once_and_marks_it() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let jobs = [seed_job(), seed_job()];
+        for job in &jobs {
+            settle_one_metered(&state, job).await;
+        }
+        assert_eq!(pending_debits(&state).await, 2);
+
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 0, "both debits drained");
+        assert_eq!(spender.calls(), 2);
+        let mut spent = spender.spent();
+        spent.sort();
+        let mut expected: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
+        expected.sort();
+        assert_eq!(spent, expected, "each pending debit spent exactly once");
+    }
+
+    #[tokio::test]
+    async fn drain_debits_a_second_pass_with_an_empty_backlog_is_a_noop() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender).await;
+        assert_eq!(pending_debits(&state).await, 0);
+        assert_eq!(spender.calls(), 1);
+
+        // Nothing pending → the spender is not called again.
+        drain_debits(&state, &spender).await;
+        assert_eq!(spender.calls(), 1, "an empty backlog spends nothing");
+    }
+
+    /// FM4: the drain submits the buyer + amount EXACTLY as persisted at settle
+    /// (read from the row), never re-derived from the rate at drain time.
+    #[tokio::test]
+    async fn drain_debits_submits_the_amount_persisted_at_settle() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender).await;
+
+        let spent = spender.spent_debits();
+        assert_eq!(spent.len(), 1);
+        assert_eq!(spent[0].buyer, TEST_BUYER);
+        assert_eq!(spent[0].amount_wei, "1000000000000"); // DRAIN_RATE * 1, as persisted
+        assert_eq!(spent[0].job_id, eas::job_id_hex(&job.id));
+    }
+
+    /// Crash recovery: a prior `spend` landed on-chain but the process died before
+    /// the local mark, so the row is still pending. The re-submit hits the
+    /// contract's (refiled) per-job fence (`AlreadySpent`) and the drain marks the
+    /// row rather than double-debiting the buyer.
+    #[tokio::test]
+    async fn drain_debits_marks_already_spent_without_respending() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        let spender = MockSpender::already_spent();
+        drain_debits(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 0, "already-on-chain debit is marked");
+        assert_eq!(spender.calls(), 1);
+        assert!(spender.spent().is_empty(), "AlreadySpent spends nothing new");
+    }
+
+    #[tokio::test]
+    async fn drain_debits_retries_a_transient_failure_on_the_next_tick() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        let spender = MockSpender::transient_then_ok(1);
+        // First tick: the transient failure leaves the debit pending, not dropped.
+        drain_debits(&state, &spender).await;
+        assert_eq!(pending_debits(&state).await, 1, "transient failure is not terminal");
+        assert_eq!(spender.calls(), 1);
+        assert!(spender.spent().is_empty());
+
+        // Next tick: it succeeds and drains.
+        drain_debits(&state, &spender).await;
+        assert_eq!(pending_debits(&state).await, 0);
+        assert_eq!(spender.calls(), 2);
+        assert_eq!(spender.spent(), vec![eas::job_id_hex(&job.id)]);
+    }
+
+    /// A transient error stops the batch (so a flaky RPC backs off to the next
+    /// tick) without dropping any debit or hot-looping.
+    #[tokio::test]
+    async fn drain_debits_stops_the_batch_at_a_transient_error() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        for job in [seed_job(), seed_job()] {
+            settle_one_metered(&state, &job).await;
+        }
+
+        let spender = MockSpender::transient_then_ok(usize::MAX); // never reaches ok
+        drain_debits(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 2, "nothing dropped");
+        assert_eq!(spender.calls(), 1, "batch stops at the first error — no hot loop");
+    }
+
+    #[tokio::test]
+    async fn drain_debits_does_not_drop_on_a_permanent_error() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        let spender = MockSpender::permanent();
+        drain_debits(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 1, "permanent error does not drop the debit");
+        assert_eq!(spender.calls(), 1, "no hot loop");
+        assert!(spender.spent().is_empty());
+    }
+
+    /// FM3: a `NotAuthorized` revert (the spender key isn't on
+    /// `ComputeMeter.authorizedSpenders`) is a distinct, loud, non-retrying error —
+    /// the backlog stalls visibly rather than silently looping like progress.
+    #[tokio::test]
+    async fn drain_debits_surfaces_not_authorized_without_dropping() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        let spender = MockSpender::not_authorized();
+        drain_debits(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 1, "unauthorized spender drops nothing");
+        assert_eq!(spender.calls(), 1, "no hot loop");
+        assert!(spender.spent().is_empty());
+    }
+
+    /// FM2: the drain must not hold the store mutex across the slow on-chain spend,
+    /// or every settle/stats stalls behind RPC latency. The gated spender holds the
+    /// spend in-flight while we prove the store lock is still acquirable.
+    #[tokio::test]
+    async fn drain_debits_holds_no_store_lock_across_the_spend() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let spender = MockSpender::gated(started.clone(), release.clone());
+
+        let drive = {
+            let state = state.clone();
+            tokio::spawn(async move { drain_debits(&state, &spender).await })
+        };
+
+        // The spend is now in-flight (claimed, lock dropped, awaiting release).
+        started.notified().await;
+
+        // If the drain held the lock across the await this deadlocks; the timeout
+        // turns that regression into a failure instead of a hang.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert_eq!(pending_debits(&state).await, 1, "claimed but not yet marked");
+        })
+        .await
+        .expect("store lock free during the in-flight spend");
+
+        release.notify_one();
+        drive.await.unwrap();
+        assert_eq!(pending_debits(&state).await, 0, "debit marked once the spend returns");
+    }
+
+    #[tokio::test]
+    async fn stats_pending_debits_drains_after_spender() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        for job in [seed_job(), seed_job()] {
+            settle_one_metered(&state, &job).await;
+        }
+        let before = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(before["pending_debits"], 2);
+
+        drain_debits(&state, &MockSpender::succeeding()).await;
+
+        let after = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(after["pending_debits"], 0, "the backlog drains as debits land");
+    }
+
     // ---- websocket dispatch integration tests ----
 
     use futures_util::{SinkExt, StreamExt};

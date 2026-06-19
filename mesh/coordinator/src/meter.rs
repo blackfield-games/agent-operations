@@ -147,8 +147,10 @@ struct MockSpenderInner {
     already_spent: bool,
     /// Total `spend` calls (successful or not).
     calls: usize,
-    /// `job_id` (bytes32 hex) of every debit that was freshly spent.
-    spent: Vec<String>,
+    /// Every debit freshly spent (excludes `AlreadySpent`), in submit order — the
+    /// full row so a test can assert the amount/buyer submitted are exactly what
+    /// was persisted at settle.
+    spent: Vec<PendingDebit>,
 }
 
 impl MockSpender {
@@ -201,6 +203,17 @@ impl MockSpender {
         m
     }
 
+    /// A succeeding spender that signals `started` then awaits `release` inside
+    /// `spend`, so a test can observe the in-flight window and assert the store
+    /// lock is free during it.
+    #[cfg(test)]
+    pub fn gated(started: Arc<Notify>, release: Arc<Notify>) -> Self {
+        let mut m = Self::succeeding();
+        m.started = Some(started);
+        m.release = Some(release);
+        m
+    }
+
     /// Total `spend` calls so far.
     #[cfg(test)]
     pub fn calls(&self) -> usize {
@@ -210,6 +223,19 @@ impl MockSpender {
     /// `job_id`s freshly spent (excludes `AlreadySpent`, which spends nothing new).
     #[cfg(test)]
     pub fn spent(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .spent
+            .iter()
+            .map(|d| d.job_id.clone())
+            .collect()
+    }
+
+    /// The full debits freshly spent — lets a test assert the amount + buyer
+    /// submitted are EXACTLY what was persisted at settle (never re-derived).
+    #[cfg(test)]
+    pub fn spent_debits(&self) -> Vec<PendingDebit> {
         self.inner.lock().unwrap().spent.clone()
     }
 }
@@ -243,7 +269,7 @@ impl Spender for MockSpender {
             inner.transient_remaining -= 1;
             return Err(SpendError::Transient("mock transient".into()));
         }
-        inner.spent.push(debit.job_id.clone());
+        inner.spent.push(debit.clone());
         Ok(mock_tx_hash(debit))
     }
 }
