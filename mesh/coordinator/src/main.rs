@@ -5031,6 +5031,83 @@ mod tests {
         );
     }
 
+    /// Connect a ws client carrying `xff` as `X-Forwarded-For`, complete the
+    /// challenge, and send a valid Hello (signed by `seed`'s key) advertising
+    /// `kind`. Returns true if the earner registered — observed by the coordinator
+    /// offering it a job — and false if the Hello was rate-shed (the socket closes
+    /// with no offer). The `X-Forwarded-For` header is exactly what `ws_handler`
+    /// feeds `resolve_source_ip`, so this drives the ws source resolution end-to-end.
+    async fn ws_register_xff(addr: &str, xff: &str, seed: &str, kind: JobKind) -> bool {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+        req.headers_mut().insert("x-forwarded-for", xff.parse().unwrap());
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        let sk = test_signing_key(seed);
+        let hello = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![kind],
+            &nonce,
+        );
+        ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(t))) => {
+                    match serde_json::from_str::<CoordinatorMsg>(&t).unwrap() {
+                        CoordinatorMsg::JobOffer(_) => return true,
+                        other => panic!("expected a JobOffer or close after Hello, got {other:?}"),
+                    }
+                }
+                None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => return false,
+                Some(Ok(_)) => continue, // ping/pong before the offer
+            }
+        }
+    }
+
+    /// The WS Hello path keys the per-source registration limiter on the SAME
+    /// trusted-proxy-resolved source the HTTP `/register` path does. This pins the
+    /// `ws_handler` wiring (`peer + headers -> resolve_source_ip -> ws_session ->
+    /// recv_hello`) that neither the `resolve_source_ip` unit tests nor the
+    /// `ws_session`/`recv_hello` helpers (which take an already-resolved `source`)
+    /// can reach: every other ws test connects over loopback with the default empty
+    /// allowlist, so the ws resolve only ever hits the untrusted-peer early return.
+    /// Here the loopback peer IS the trusted proxy, and two clients arrive behind it
+    /// under distinct `X-Forwarded-For` values. With a per-source allowance of 1, the
+    /// first client spends its bucket and its second attempt is shed — but a client
+    /// with a different XFF draws on its OWN bucket and registers. Were `ws_handler`
+    /// keying on the raw peer (`127.0.0.1`) instead of the resolved source, all three
+    /// would share one bucket and the third would be shed too. The three connections
+    /// are awaited in sequence so each outcome is observed before the next begins
+    /// (no inter-connection race on the shared bucket).
+    #[tokio::test]
+    async fn ws_trusted_proxy_separates_xff_clients() {
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        let state = test_state_registrations_trusted(1, trusted(&[loopback])).await;
+        // One job per client's advertised kind, so each registered earner is offered
+        // a job (the "registered" signal) without contending for the same queue entry.
+        enqueue(&state, &job_of(JobKind::Terrain)).await;
+        enqueue(&state, &job_of(JobKind::Foliage)).await;
+        let addr = serve_ephemeral(state.clone()).await;
+
+        assert!(
+            ws_register_xff(&addr, "203.0.113.10", "wsxff-a", JobKind::Terrain).await,
+            "first client behind the trusted proxy must register",
+        );
+        assert!(
+            !ws_register_xff(&addr, "203.0.113.10", "wsxff-a2", JobKind::Terrain).await,
+            "the same XFF client's second registration must be rate-shed",
+        );
+        assert!(
+            ws_register_xff(&addr, "203.0.113.20", "wsxff-b", JobKind::Foliage).await,
+            "a distinct XFF client gets its own bucket and registers — a raw-peer key would shed it",
+        );
+    }
+
     /// THE anti-replay property: a valid Hello captured off the wire and replayed
     /// on a FRESH connection is rejected. The new connection issues a different
     /// challenge, so the captured signature (bound to the first nonce) fails
