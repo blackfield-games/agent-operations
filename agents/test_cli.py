@@ -83,6 +83,15 @@ def test_json_output(tmp_path, monkeypatch, capsys):
 
     assert report["world"].endswith("out/world.usda")
 
+    # The seam: an accepted region surfaces one coordinator-ready render job in the
+    # exact POST /jobs body shape (kind as the snake_case wire string).
+    assert len(report["render_jobs"]) == 1
+    job = report["render_jobs"][0]
+    assert job["kind"] == "diffusion_tile"
+    assert job["region"] == {"x": 1, "y": 2, "layer": 0}
+    assert set(job) == {"kind", "region", "deadline_secs", "max_payout_wei", "inputs"}
+    assert job["inputs"]["region_id"] == "r+0001_+0002_l0"
+
 
 def _stub_run_graph(result: dict):
     """Replacement for cli._run_graph that yields a fixed graph result, so main()'s
@@ -141,6 +150,8 @@ def test_json_output_reflects_rejection(tmp_path, monkeypatch, capsys):
     assert report["issues"] == ["missing specialist layers: ['biome']"]
     assert report["rounds"] == 2
     assert report["region_id"] == "r+0001_+0002_l0"
+    # A rejected region emits no render jobs (it must not be dispatched for render).
+    assert report["render_jobs"] == []
 
 
 def test_missing_required_coord_exits_2():

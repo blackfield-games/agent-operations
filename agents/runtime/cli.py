@@ -18,6 +18,7 @@ from pathlib import Path
 import anyio
 
 from common.compose import compose_world, layer_summary
+from common.jobs import RenderJobSpec, render_jobs
 from common.types import LayerSpec, RegionCoord, ValidatorVerdict, WorldBrief
 from runtime.supervisor import build_graph
 
@@ -59,6 +60,7 @@ def _render_report(
     layers: list[LayerSpec],
     world_path: Path,
     rounds: int,
+    jobs: list[RenderJobSpec],
 ) -> str:
     """Concise human-readable summary of one runtime invocation."""
     status = "ACCEPTED" if verdict.accepted else "REJECTED"
@@ -74,6 +76,13 @@ def _render_report(
     for layer in layers:
         lines.append(f"  [{layer.specialist:>12}] {layer.summary}")
     lines.append(f"world:     {world_path}")
+    # Render jobs the coordinator would dispatch — empty when the region was rejected.
+    lines.append(f"jobs:      {len(jobs)} render job(s)")
+    for job in jobs:
+        lines.append(
+            f"  [{job.kind.wire_name}] {job.region.region_id} "
+            f"deadline={job.deadline_secs}s payout={job.max_payout_wei}wei"
+        )
     return "\n".join(lines)
 
 
@@ -83,11 +92,14 @@ def _render_report_json(
     layers: list[LayerSpec],
     world_path: Path,
     rounds: int,
+    jobs: list[RenderJobSpec],
 ) -> str:
     """Machine-readable JSON form of the runtime report (see `_render_report` for
     the human form). Stable keys for HUD/CI consumers; `layer_counts` is the
     per-specialist breakdown from `layer_summary`; `rounds` is the number of
-    validator passes (1 when accepted on the first round, more after route-backs)."""
+    validator passes (1 when accepted on the first round, more after route-backs);
+    `render_jobs` is each emitted job in the exact `POST /jobs` body shape (empty
+    when the region was rejected)."""
     report = {
         "region_id": region_id,
         "accepted": verdict.accepted,
@@ -98,6 +110,7 @@ def _render_report_json(
         ],
         "layer_counts": layer_summary(layers),
         "world": str(world_path),
+        "render_jobs": [job.to_request() for job in jobs],
     }
     return json.dumps(report, indent=2)
 
@@ -119,10 +132,11 @@ def main(argv: list[str] | None = None) -> int:
     rounds: int = result.get("rounds", 0)
 
     world_path = compose_world(layers, Path(args.out))
+    jobs = render_jobs(brief, layers, verdict)
     if args.json:
-        print(_render_report_json(brief.region.region_id, verdict, layers, world_path, rounds))
+        print(_render_report_json(brief.region.region_id, verdict, layers, world_path, rounds, jobs))
     else:
-        print(_render_report(brief.region.region_id, verdict, layers, world_path, rounds))
+        print(_render_report(brief.region.region_id, verdict, layers, world_path, rounds, jobs))
 
     return 0 if verdict.accepted else 1
 
