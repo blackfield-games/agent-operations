@@ -181,8 +181,10 @@ impl JoinOutcome {
 /// hand-started one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchParams {
-    /// Seats per formed match. A `Mixed` match needs at least 2 (one of each
-    /// kind); below that it can never form.
+    /// Seats per formed match — at least 2 (a PvP match needs two seats to be a
+    /// contest, and `Mixed` needs room for one of each kind). [`Matchmaker::new`]
+    /// rejects a smaller value rather than queue joins into a match that can never
+    /// form or ends the instant it starts.
     pub seats_per_match: u8,
     pub tick_hz: u16,
     pub max_ticks: u64,
@@ -255,6 +257,14 @@ pub struct Matchmaker<V> {
 
 impl<V: IdentityVerifier> Matchmaker<V> {
     pub fn new(verifier: V, params: MatchParams) -> Self {
+        // Fail fast on a degenerate config: a 0-seat matchmaker would queue every
+        // join forever, and a 1-seat match is a single-team match the core ends on
+        // its first tick. A match needs at least two seats.
+        assert!(
+            params.seats_per_match >= 2,
+            "a match needs at least 2 seats, got {}",
+            params.seats_per_match
+        );
         Self { queues: Mutex::new(Queues::default()), verifier, params }
     }
 
@@ -585,6 +595,17 @@ mod tests {
         assert_eq!(m.seats()[1].team, 1);
         assert_eq!(m.seed(), seed_for_match(m.match_id()), "the seed derives from the minted id");
         assert_eq!(m.observe(0).own.seat, 0, "the core yields a real parity-bounded observation");
+    }
+
+    #[test]
+    #[should_panic(expected = "at least 2 seats")]
+    fn a_matchmaker_rejects_a_sub_two_seat_config() {
+        // A 0-seat matchmaker would queue forever and a 1-seat match ends instantly;
+        // both are caller bugs, so construction fails loud rather than degrading.
+        Matchmaker::new(
+            StubIdentityVerifier::new(),
+            MatchParams { seats_per_match: 1, ..MatchParams::default() },
+        );
     }
 
     #[test]
