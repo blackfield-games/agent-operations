@@ -496,6 +496,13 @@ pub struct MatchConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayMsg {
+    /// The first frame on a connection: a single-use random challenge the agent
+    /// MUST fold into its [`join_digest`] (hex of the raw nonce bytes), binding
+    /// the identity proof to *this* connection so a captured [`AgentMsg::Join`]
+    /// replayed on a fresh connection — which gets a different challenge — fails
+    /// signature recovery. Connection-scoped: held only for the handshake, like
+    /// mesh's `CoordinatorMsg::Challenge`.
+    Challenge { nonce: String },
     /// Handshake accepted: the seat is admitted. Confirms the
     /// [`PROTOCOL_VERSION`] the server speaks — the agent MUST
     /// [`check_version`] it — and the seat it was assigned.
@@ -538,9 +545,81 @@ pub enum AgentMsg {
     Leave { reason: String },
 }
 
+/// Canonical digest an agent signs at [`AgentMsg::Join`] to prove control of the
+/// key behind `agent_id` — the arena analogue of mesh's hello digest. The server
+/// recovers the signer from this digest plus the Join's `signature_hex` and
+/// admits a *ranked* seat only if the recovered address matches the claimed
+/// `agent_id`, tying a ranked seat to a verified on-chain agent identity (and
+/// thus to reputation + settlement).
+///
+/// Bytes = `keccak256( DOMAIN || protocol_version_be || len(agent_id) ||
+/// agent_id || len(nonce) || nonce )`, every `len` a big-endian `u32`. The
+/// `DOMAIN` tag separates it from the replay digest and from mesh's hello digest
+/// (so no signature can cross protocols); the length prefixes make the field
+/// boundaries unambiguous; the server-issued challenge `nonce` is folded *in*
+/// (not merely sent alongside), so the signature and the freshness are
+/// inseparable and a captured Join cannot be replayed against a different
+/// challenge. The `protocol_version` binds the identity proof to the version it
+/// was made under. Both sides MUST build it identically.
+pub fn join_digest(protocol_version: u32, agent_id: &str, nonce: &[u8]) -> [u8; 32] {
+    let mut h = Keccak256::new();
+    h.update(b"blackfield/arena/join/v1");
+    h.update(protocol_version.to_be_bytes());
+    h.update((agent_id.len() as u32).to_be_bytes());
+    h.update(agent_id.as_bytes());
+    h.update((nonce.len() as u32).to_be_bytes());
+    h.update(nonce);
+    h.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
+
+    /// Ethereum-style address (0x-prefixed, lowercase) from a verifying key:
+    /// keccak256(uncompressed_pubkey[1..])[12..]. Same derivation as mesh/proto.
+    fn address_from_verifying_key(vk: &VerifyingKey) -> String {
+        let point = vk.to_encoded_point(false);
+        let hash = Keccak256::digest(&point.as_bytes()[1..]);
+        format!("0x{}", hex::encode(&hash[12..]))
+    }
+
+    #[test]
+    fn join_digest_sign_then_recover_yields_claimed_address() {
+        // The arena analogue of mesh's hello recovery: the agent signs
+        // join_digest with its session key and the Gateway must recover exactly
+        // the claimed agent_id (so a ranked seat is tied to a held key).
+        let key_bytes =
+            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318").unwrap();
+        let sk = SigningKey::from_slice(&key_bytes).unwrap();
+        let expected = address_from_verifying_key(sk.verifying_key());
+
+        let digest = join_digest(PROTOCOL_VERSION, &expected, b"arena-challenge-nonce");
+        let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let recovered = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
+        assert_eq!(address_from_verifying_key(&recovered), expected);
+    }
+
+    #[test]
+    fn join_digest_binds_every_field() {
+        // The signature commits to the whole Join AND the challenge nonce, so a
+        // captured signature can't be reattached to a different identity/version
+        // nor replayed against a fresh challenge.
+        let n = b"nonce";
+        let base = join_digest(PROTOCOL_VERSION, "0xabc", n);
+        assert_ne!(base, join_digest(PROTOCOL_VERSION + 1, "0xabc", n), "version");
+        assert_ne!(base, join_digest(PROTOCOL_VERSION, "0xabd", n), "agent_id");
+        assert_ne!(base, join_digest(PROTOCOL_VERSION, "0xabc", b"other"), "nonce");
+        assert_ne!(base, join_digest(PROTOCOL_VERSION, "0xabc", b""), "empty nonce");
+        // Length-delimited: shifting a byte across the agent_id/nonce boundary
+        // must not alias to the same digest.
+        assert_ne!(
+            join_digest(PROTOCOL_VERSION, "0xab", b"cd"),
+            join_digest(PROTOCOL_VERSION, "0xabc", b"d"),
+            "field boundaries must be unambiguous"
+        );
+    }
 
     #[test]
     fn version_handshake_accepts_match_and_rejects_drift() {
@@ -824,6 +903,10 @@ mod tests {
 
     #[test]
     fn gateway_msg_wire_shapes_are_stable() {
+        // Challenge — struct variant; the anti-replay nonce is a hex string.
+        let challenge = serde_json::json!({ "type": "challenge", "nonce": "0a1b2c3d4e5f60718293a4b5c6d7e8f9" });
+        assert_round::<GatewayMsg>(&challenge, "GatewayMsg::Challenge");
+
         // Welcome — struct variant.
         let welcome = serde_json::json!({
             "type": "welcome", "protocol_version": PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 2
