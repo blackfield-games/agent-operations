@@ -20,6 +20,11 @@ contract ComputeMeterHandler is Test {
     address[] public actors;
     uint256 public ghost_totalDeposited;
     uint256 public ghost_totalSpent;
+    bytes32[] internal spendOnceJobIds;
+    uint256 internal spendOnceNonce;
+    /// @notice Set true if a replay of an already-spent jobId ever debits again
+    ///         (the fence failed). The at-most-once invariant asserts it stays false.
+    bool public ghost_replayDoubleSpent;
 
     constructor(ComputeMeter meter_, MockToken token_, address[] memory actors_) {
         meter = meter_;
@@ -55,6 +60,36 @@ contract ComputeMeterHandler is Test {
         vm.prank(address(this));
         meter.spend(buyer, amount, keccak256(abi.encode(buyerSeed, amount)));
         ghost_totalSpent += amount;
+    }
+
+    /// @notice Debit via the idempotent path with a FRESH unique jobId, so the
+    ///         fence never trips on the happy path (every call is a new job).
+    function spendOnce(uint256 buyerSeed, uint256 amount) external {
+        address buyer = actors[buyerSeed % actors.length];
+        uint256 c = meter.credit(buyer);
+        if (c == 0) return;
+        amount = bound(amount, 0, c);
+        if (amount == 0) return;
+
+        bytes32 jobId = keccak256(abi.encode("spendOnce", spendOnceNonce++));
+        vm.prank(address(this));
+        meter.spendOnce(buyer, amount, jobId);
+        spendOnceJobIds.push(jobId);
+        ghost_totalSpent += amount;
+    }
+
+    /// @notice Replay a previously-spent jobId — it MUST revert AlreadySpent. If it
+    ///         ever debits again, the fence is broken: record it for the invariant.
+    function replaySpendOnce(uint256 seed, uint256 buyerSeed, uint256 amount) external {
+        if (spendOnceJobIds.length == 0) return;
+        bytes32 jobId = spendOnceJobIds[seed % spendOnceJobIds.length];
+        address buyer = actors[buyerSeed % actors.length];
+        amount = bound(amount, 0, 1000 ether);
+
+        vm.prank(address(this));
+        try meter.spendOnce(buyer, amount, jobId) {
+            ghost_replayDoubleSpent = true;
+        } catch {}
     }
 
     /// @notice Sum of credit over every tracked actor.
@@ -135,6 +170,12 @@ contract ComputeMeterInvariantTest is Test {
     function invariant_spentByBuyerSumsToTotalSpent() public view {
         assertEq(handler.sumSpent(), meter.totalSpent());
     }
+
+    /// @dev No jobId is ever debited twice via spendOnce: the handler replays
+    ///      already-spent jobIds and flags a leak if any debits a second time.
+    function invariant_noSpendOnceJobIdDebitedTwice() public view {
+        assertFalse(handler.ghost_replayDoubleSpent());
+    }
 }
 
 contract ComputeMeterFuzzTest is Test {
@@ -195,5 +236,22 @@ contract ComputeMeterFuzzTest is Test {
         vm.prank(spender);
         vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
         meter.spend(buyer, over, keccak256("job"));
+    }
+
+    function testFuzz_spendOnce_secondCallRevertsForAnyJobId(uint256 dep, uint256 spendAmt, bytes32 jobId)
+        public
+    {
+        dep = bound(dep, 1, token.balanceOf(buyer));
+        spendAmt = bound(spendAmt, 1, dep);
+
+        vm.prank(buyer);
+        meter.deposit(dep);
+
+        vm.startPrank(spender);
+        meter.spendOnce(buyer, spendAmt, jobId);
+        // For ANY jobId, a second spendOnce reverts — even a zero-amount one.
+        vm.expectRevert(ComputeMeter.AlreadySpent.selector);
+        meter.spendOnce(buyer, 0, jobId);
+        vm.stopPrank();
     }
 }
