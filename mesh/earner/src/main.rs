@@ -1466,6 +1466,86 @@ mod tests {
         );
     }
 
+    /// A coordinator that ACCEPTS the connection then stalls the response makes
+    /// `poll_once` return `Err` (the poll loop logs + backs off) instead of
+    /// hanging forever. The connect is instant (local server) and the stall is on
+    /// the RESPONSE — so this proves the TOTAL request timeout covers the
+    /// post-connect exchange, not just connect (FM1): a `connect_timeout`-only
+    /// client would sail past a fast connect and hang here. Deterministic, not a
+    /// race (FM3): the client timeout (200ms) fires far before the server's 10s
+    /// delay could elapse, so the assertion is the timeout FIRING, not two
+    /// durations racing. Without `.timeout()` on the client this hangs until the
+    /// 10s delay, then returns `Ok` — the discriminator against an untimed client.
+    #[tokio::test]
+    async fn poll_once_times_out_a_stalled_coordinator() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+
+        // Connection accepted, but the response is withheld for 10s — far past the
+        // 200ms client timeout below. A real slowloris coordinator, in miniature.
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(dev_job())
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        // A test-only small total timeout: the assertion is the timeout firing,
+        // not the production 45s elapsing. Connect timeout is irrelevant here (the
+        // local connect is instant); the TOTAL timeout is what trips on the stall.
+        let client = http_client(Duration::from_millis(200), Duration::from_secs(10)).unwrap();
+
+        let result = poll_once(&client, &args, &session, &all_supported()).await;
+        assert!(
+            result.is_err(),
+            "a stalled coordinator response must time out as Err, not hang: {result:?}"
+        );
+    }
+
+    /// A fast normal response dispatches byte-identically under the PRODUCTION
+    /// timeouts — the cap is a liveness backstop, not a functional limit (FM2). If
+    /// the timeout sheared honest traffic this would fail; it doesn't, because a
+    /// prompt `/jobs/next` completes in milliseconds, orders of magnitude under
+    /// the 45s ceiling. Exercises the real `HTTP_REQUEST_TIMEOUT`/`HTTP_CONNECT_TIMEOUT`
+    /// consts (the `.unwrap()` also proves they build a valid client).
+    #[tokio::test]
+    async fn poll_once_dispatches_a_fast_response_under_the_production_timeout() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let job = dev_job();
+        let job_id = job.id;
+
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-dispatch-seq", "5")
+                    .set_body_json(&job),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = http_client(HTTP_REQUEST_TIMEOUT, HTTP_CONNECT_TIMEOUT).unwrap();
+
+        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
+        assert!(keep, "a fast response under the production timeout must dispatch + keep polling");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().any(|r| r.url.path() == format!("/jobs/{job_id}/submit").as_str()),
+            "the earner must submit the rendered result for a fast normal response: {requests:?}"
+        );
+    }
+
     // ---- http register path: register over a wiremock coordinator ----
 
     #[tokio::test]
