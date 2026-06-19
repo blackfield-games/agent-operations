@@ -77,25 +77,25 @@ impl PendingDebit {
 // metering concern stays in one file. The live Base impl (an RPC provider + an
 // authorized spender key with gas) is operator-gated and not built here.
 //
-// IDEMPOTENCY — verified against `contracts/src/ComputeMeter.sol`: unlike
-// `RenderReceipts.issueReceipt` (which has a per-job `DuplicateReceipt` fence),
-// `spend` is NOT idempotent — it debits `credit[buyer]` on every call and only
-// emits `Spent(jobId)`; it tracks no spent jobIds. So a crash between an on-chain
-// `spend` and the local `mark_debit_submitted` would re-claim the row and
-// DOUBLE-DEBIT the buyer on restart. [`SpendError::AlreadySpent`] is the seam for
-// an on-chain jobId fence (refiled `contracts-computemeter-spend-idempotency`):
-// the live transport is safe to wire ONLY once that fence exists, so its go-live
-// is gated on BOTH credentials AND the fence (see BLOCKERS). `MockSpender` models
-// the post-fence contract.
+// IDEMPOTENCY — `ComputeMeter.spend` is NOT idempotent (it debits `credit[buyer]`
+// on every call, tracking no spent jobIds — ArtifactTemplate relies on this for its
+// per-mint fee), so the live transport MUST target `ComputeMeter.spendOnce`: the
+// idempotent entry point (built in `contracts-computemeter-spend-idempotency`) that
+// fences each `jobId` and reverts `AlreadySpent` on a crash-retried debit. The live
+// `Spender` impl maps that revert to [`SpendError::AlreadySpent`], so a crash
+// between an on-chain `spendOnce` and the local `mark_debit_submitted` is recovered
+// (the re-submit reverts, the row is marked) instead of double-debiting. With the
+// fence built, the live transport's go-live is now gated only on credentials (a
+// Base RPC + an authorized spender key; see BLOCKERS). `MockSpender` models
+// `spendOnce`.
 
 /// Why an on-chain `spend` failed — the drain loop reacts differently to each.
 #[derive(Debug)]
 pub enum SpendError {
     /// This `jobId` is already debited on-chain — an *idempotent success*: a crash
-    /// between a prior `spend` and its local mark left the row pending, and the
-    /// re-submit hit the contract's (refiled) per-job fence. The drain marks the
-    /// row and moves on rather than double-debiting. REQUIRES the on-chain jobId
-    /// fence to be real (see the module note above).
+    /// between a prior `spendOnce` and its local mark left the row pending, and the
+    /// re-submit hit `ComputeMeter.spendOnce`'s per-job fence. The drain marks the
+    /// row and moves on rather than double-debiting (see the module note above).
     AlreadySpent,
     /// The spender key is not in `ComputeMeter.authorizedSpenders` (the contract
     /// reverts `NotAuthorized`). Every spend reverts until the owner calls

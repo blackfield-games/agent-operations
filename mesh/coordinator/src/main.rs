@@ -147,10 +147,10 @@ struct Args {
     /// LOCAL DEV ONLY: drain pending debits to an in-process mock spender instead
     /// of the chain. Exercises the full drain path (claim → spend → mark) without
     /// an RPC, a signer, or gas. The live Base spender (an RPC provider + an
-    /// authorized ComputeMeter spender key) is operator-gated AND additionally
-    /// blocked on the on-chain jobId fence (`spend` is not idempotent — see
-    /// `meter.rs`); with this flag off (the default) pending debits accumulate,
-    /// surfaced at `/stats pending_debits`.
+    /// authorized ComputeMeter spender key) is operator-gated; it targets
+    /// `ComputeMeter.spendOnce` (the idempotent entry point — see `meter.rs`). With
+    /// this flag off (the default) pending debits accumulate, surfaced at
+    /// `/stats pending_debits`.
     #[arg(long, env = "COORDINATOR_SPENDER_DEV_MOCK", default_value = "false")]
     spender_dev_mock: bool,
     /// Shared-secret bearer token gating `POST /jobs` ingestion. When SET, a
@@ -601,11 +601,10 @@ async fn main() -> Result<()> {
 
     // Background debit relayer — the metering twin of the attestation relayer
     // above. The live Base spender (RPC + an authorized ComputeMeter spender key
-    // with gas) is operator-gated AND additionally blocked on the on-chain jobId
-    // fence (`ComputeMeter.spend` is not idempotent today — see meter.rs), so it is
-    // not wired here; `--spender-dev-mock` drives the same drain loop against an
-    // in-process mock. With neither configured the backlog accumulates (by design)
-    // and is visible at `/stats pending_debits`.
+    // with gas) targets `ComputeMeter.spendOnce` (the idempotent entry point — see
+    // meter.rs) and is operator-gated, so it is not wired here; `--spender-dev-mock`
+    // drives the same drain loop against an in-process mock. With neither configured
+    // the backlog accumulates (by design) and is visible at `/stats pending_debits`.
     if args.spender_dev_mock {
         tracing::warn!(
             "DEV: draining ComputeMeter debits to an in-process MOCK spender — nothing is spent on-chain. Never enable in production."
@@ -617,7 +616,7 @@ async fn main() -> Result<()> {
         );
     } else {
         tracing::info!(
-            "on-chain debit relayer disabled (operator-gated: needs a Base RPC + an authorized ComputeMeter spender key, and the on-chain jobId fence). Pending debits accumulate; see /stats pending_debits."
+            "on-chain debit relayer disabled (operator-gated: needs a Base RPC + an authorized ComputeMeter spender key; targets ComputeMeter.spendOnce). Pending debits accumulate; see /stats pending_debits."
         );
     }
 
@@ -1272,9 +1271,9 @@ async fn drain_attestations<R: Relay>(state: &Arc<AppState>, relay: &R) {
 }
 
 /// Marker `tx_hash` stored when the contract reports the debit is already spent
-/// (the on-chain jobId fence): the debit landed but the relay didn't capture its
-/// real tx hash (a crash recovered between a prior `spend` and its local mark).
-/// The row is settled — it just carries this sentinel instead of the spend tx.
+/// (`ComputeMeter.spendOnce`'s jobId fence): the debit landed but the relay didn't
+/// capture its real tx hash (a crash recovered between a prior `spendOnce` and its
+/// local mark). The row is settled — it just carries this sentinel, not a spend tx.
 const ALREADY_SPENT_TX: &str = "already-spent";
 
 /// Spawn the debit relayer: every `interval_secs`, drain the pending-debit backlog
@@ -4373,10 +4372,10 @@ mod tests {
         assert_eq!(spent[0].job_id, eas::job_id_hex(&job.id));
     }
 
-    /// Crash recovery: a prior `spend` landed on-chain but the process died before
-    /// the local mark, so the row is still pending. The re-submit hits the
-    /// contract's (refiled) per-job fence (`AlreadySpent`) and the drain marks the
-    /// row rather than double-debiting the buyer.
+    /// Crash recovery: a prior `spendOnce` landed on-chain but the process died
+    /// before the local mark, so the row is still pending. The re-submit hits
+    /// `ComputeMeter.spendOnce`'s per-job fence (`AlreadySpent`) and the drain marks
+    /// the row rather than double-debiting the buyer.
     #[tokio::test]
     async fn drain_debits_marks_already_spent_without_respending() {
         let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
