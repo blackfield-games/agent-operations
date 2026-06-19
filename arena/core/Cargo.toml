@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 arena-proto = { workspace = true }
 uuid = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

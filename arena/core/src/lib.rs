@@ -16,9 +16,11 @@
 //! one of those would make a replay diverge and break grading.
 
 use arena_proto::{
-    Action, ActionError, ActionIntent, Bam, MatchPhase, SeatId, TeamId, Vec2, VersionMismatch,
-    POSITION_SCALE,
+    Action, ActionError, ActionIntent, Bam, MatchPhase, MatchResult, ReplayRecord, SeatAction,
+    SeatId, SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch, MOVE_INTENT_SCALE,
+    POSITION_SCALE, PROTOCOL_VERSION,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 /// East along +X — a seat on the left of the arena faces this way (toward
@@ -26,6 +28,32 @@ use uuid::Uuid;
 const EAST: Bam = 0;
 /// West along -X (half a turn) — a seat on the right of the arena faces centre.
 const WEST: Bam = 0x8000;
+
+/// Fixed-point scale of the octant facing unit vectors (Q12). Hit resolution
+/// quantizes a seat's [`Bam`] facing to the nearest of eight octants so the beam
+/// direction is an *exact* integer unit vector — no trig, no float, identical on
+/// every platform. Eight-way aim is coarse by design for the reference core;
+/// finer aim resolution is a later refinement.
+const OCTANT_SCALE: i32 = 4096;
+/// `round(OCTANT_SCALE / sqrt(2))` — the diagonal octant component.
+const OCTANT_DIAG: i32 = 2896;
+const OCTANTS: [(i32, i32); 8] = [
+    (OCTANT_SCALE, 0),           // E
+    (OCTANT_DIAG, OCTANT_DIAG),  // NE
+    (0, OCTANT_SCALE),           // N
+    (-OCTANT_DIAG, OCTANT_DIAG), // NW
+    (-OCTANT_SCALE, 0),          // W
+    (-OCTANT_DIAG, -OCTANT_DIAG),// SW
+    (0, -OCTANT_SCALE),          // S
+    (OCTANT_DIAG, -OCTANT_DIAG), // SE
+];
+
+/// The Q12 unit vector for a facing, snapped to the nearest octant. The `+4096`
+/// is half an octant, so the division rounds to nearest rather than truncating.
+fn octant_unit(bam: Bam) -> (i32, i32) {
+    let idx = (((bam as u32) + 4096) >> 13) & 7;
+    OCTANTS[idx as usize]
+}
 
 /// A deterministic SplitMix64 PRNG. Pure integer state so spawns (and any future
 /// sim randomness) are byte-reproducible from the match seed on every platform —
@@ -160,6 +188,10 @@ struct Pawn {
     health: u16,
     max_health: u16,
     ammo: u16,
+    /// Ticks remaining before this pawn may fire again.
+    cooldown: u16,
+    /// Cumulative damage this pawn has dealt to enemies — the match score.
+    score: i32,
     alive: bool,
 }
 
@@ -174,6 +206,10 @@ pub struct Match {
     tick: u64,
     phase: MatchPhase,
     seed: u64,
+    /// The accepted (post-clamp) action stream, one record per simulated tick —
+    /// the deterministic replay.
+    ticks: Vec<TickRecord>,
+    result: Option<MatchResult>,
 }
 
 impl Match {
@@ -222,6 +258,8 @@ impl Match {
                     health: rules.start_health,
                     max_health: rules.start_health,
                     ammo: rules.mag_size,
+                    cooldown: 0,
+                    score: 0,
                     alive: true,
                 }
             })
@@ -235,6 +273,8 @@ impl Match {
             tick: 0,
             phase: MatchPhase::Live,
             seed,
+            ticks: Vec::new(),
+            result: None,
         }
     }
 
@@ -350,6 +390,195 @@ impl Match {
         }
         Ok(action.intent.clamped())
     }
+
+    /// Advance the match exactly one tick from the given accepted intents. A seat
+    /// absent from `intents` forfeited the tick — it holds position and does not
+    /// fire — so a slow or hung seat never stalls the match (the bounded-latency
+    /// invariant; the transport enforces the wall-clock deadline and a timeout
+    /// maps to an absent seat here). Intents are trusted post-clamp: the Gateway
+    /// boundary is [`ingest`](Match::ingest); a replay feeds the recorded
+    /// post-clamp stream, so the same seed + stream reproduces this tick exactly.
+    /// A no-op once the match has [`Ended`].
+    ///
+    /// [`Ended`]: MatchPhase::Ended
+    pub fn step(&mut self, intents: &BTreeMap<SeatId, ActionIntent>) {
+        if self.phase != MatchPhase::Live {
+            return;
+        }
+        let current = self.tick;
+
+        for p in self.pawns.iter_mut().filter(|p| p.alive) {
+            p.cooldown = p.cooldown.saturating_sub(1);
+        }
+
+        // Move + aim, in seat order. A forfeited seat holds still.
+        for i in 0..self.pawns.len() {
+            if !self.pawns[i].alive {
+                continue;
+            }
+            let seat = self.pawns[i].seat;
+            let Some(intent) = intents.get(&seat) else {
+                self.pawns[i].vel = Vec2::ZERO;
+                continue;
+            };
+            let max = self.rules.max_speed as i64;
+            let dx = intent.move_dir.x as i64 * max / MOVE_INTENT_SCALE as i64;
+            let dy = intent.move_dir.y as i64 * max / MOVE_INTENT_SCALE as i64;
+            let bx = self.config.bounds.x as i64;
+            let by = self.config.bounds.y as i64;
+            let nx = (self.pawns[i].pos.x as i64 + dx).clamp(-bx, bx) as i32;
+            let ny = (self.pawns[i].pos.y as i64 + dy).clamp(-by, by) as i32;
+            self.pawns[i].vel = Vec2 { x: nx - self.pawns[i].pos.x, y: ny - self.pawns[i].pos.y };
+            self.pawns[i].pos = Vec2 { x: nx, y: ny };
+            self.pawns[i].facing = intent.aim;
+        }
+
+        // Reload + fire, in seat order. Sequential resolution: a pawn downed
+        // earlier this tick cannot return fire, so a mutual-kill exchange is
+        // decisive (seat order is the documented tie-break) rather than a double
+        // KO that both sides survive or neither does.
+        for i in 0..self.pawns.len() {
+            if !self.pawns[i].alive {
+                continue;
+            }
+            let seat = self.pawns[i].seat;
+            let Some(intent) = intents.get(&seat) else {
+                continue;
+            };
+            if intent.buttons.reload {
+                self.pawns[i].ammo = self.rules.mag_size;
+                self.pawns[i].cooldown = self.rules.fire_cooldown;
+                continue;
+            }
+            if intent.buttons.fire && self.pawns[i].cooldown == 0 && self.pawns[i].ammo > 0 {
+                self.pawns[i].ammo -= 1;
+                self.pawns[i].cooldown = self.rules.fire_cooldown;
+                self.resolve_fire(i);
+            }
+        }
+
+        let actions = intents.iter().map(|(&seat, &intent)| SeatAction { seat, intent }).collect();
+        self.ticks.push(TickRecord { tick: current, actions });
+
+        self.tick += 1;
+        self.maybe_finish();
+    }
+
+    /// Resolve one beam-hitscan shot from `shooter`: damage the nearest enemy
+    /// whose body lies within the beam (in range, in front, within the lateral
+    /// `hit_radius`). All integer: the beam direction is the exact octant unit
+    /// vector, the in-front test is a dot-product sign, and the lateral offset is
+    /// a squared perpendicular distance — no trig anywhere.
+    fn resolve_fire(&mut self, shooter: usize) {
+        let s = self.pawns[shooter];
+        let (fx, fy) = octant_unit(s.facing);
+        let range2 = (self.rules.weapon_range as i64).pow(2);
+        let radius2 = (self.rules.hit_radius as i64).pow(2);
+        let mut best: Option<(usize, i64)> = None;
+        for (j, t) in self.pawns.iter().enumerate() {
+            if j == shooter || !t.alive || t.team == s.team {
+                continue;
+            }
+            let dx = t.pos.x as i64 - s.pos.x as i64;
+            let dy = t.pos.y as i64 - s.pos.y as i64;
+            let dist2 = dx * dx + dy * dy;
+            if dist2 > range2 {
+                continue;
+            }
+            let dot = dx * fx as i64 + dy * fy as i64;
+            if dot <= 0 {
+                continue;
+            }
+            let proj = dot / OCTANT_SCALE as i64;
+            let perp2 = dist2 - proj * proj;
+            if perp2 > radius2 {
+                continue;
+            }
+            if best.is_none_or(|(_, d)| dist2 < d) {
+                best = Some((j, dist2));
+            }
+        }
+        if let Some((j, _)) = best {
+            let dmg = self.rules.damage.min(self.pawns[j].health);
+            self.pawns[j].health -= dmg;
+            if self.pawns[j].health == 0 {
+                self.pawns[j].alive = false;
+            }
+            self.pawns[shooter].score += dmg as i32;
+        }
+    }
+
+    /// End the match when at most one team still has an alive pawn (a winner, or
+    /// everyone down) or the tick cap is reached, freezing the [`MatchResult`].
+    fn maybe_finish(&mut self) {
+        let alive_teams: BTreeSet<TeamId> =
+            self.pawns.iter().filter(|p| p.alive).map(|p| p.team).collect();
+        if alive_teams.len() <= 1 || self.tick >= self.config.max_ticks {
+            self.phase = MatchPhase::Ended;
+            self.result = Some(self.build_result());
+        }
+    }
+
+    fn build_result(&self) -> MatchResult {
+        MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: self.match_id,
+            final_tick: self.tick,
+            outcomes: self.outcomes(),
+            replay_hash: hex::encode(self.build_replay().digest()),
+        }
+    }
+
+    /// Per-seat outcomes, ascending by seat. Placement ranks alive over dead,
+    /// then higher score, then lower seat; seats with the same alive flag and
+    /// score share a placement.
+    fn outcomes(&self) -> Vec<SeatOutcome> {
+        let mut ranked: Vec<&Pawn> = self.pawns.iter().collect();
+        ranked.sort_by(|a, b| {
+            b.alive.cmp(&a.alive).then(b.score.cmp(&a.score)).then(a.seat.cmp(&b.seat))
+        });
+        let mut placement_of: BTreeMap<SeatId, u16> = BTreeMap::new();
+        let mut place = 0u16;
+        let mut prev: Option<(bool, i32)> = None;
+        for (i, p) in ranked.iter().enumerate() {
+            let key = (p.alive, p.score);
+            if prev != Some(key) {
+                place = (i + 1) as u16;
+                prev = Some(key);
+            }
+            placement_of.insert(p.seat, place);
+        }
+        let mut outcomes: Vec<SeatOutcome> = self
+            .pawns
+            .iter()
+            .map(|p| SeatOutcome {
+                seat: p.seat,
+                team: p.team,
+                placement: placement_of[&p.seat],
+                score: p.score,
+                alive_at_end: p.alive,
+            })
+            .collect();
+        outcomes.sort_by_key(|o| o.seat);
+        outcomes
+    }
+
+    fn build_replay(&self) -> ReplayRecord {
+        ReplayRecord {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: self.match_id,
+            seed: self.seed,
+            seats: self.seats.clone(),
+            ticks: self.ticks.clone(),
+        }
+    }
+
+    /// The terminal result once the match has [`Ended`], else `None`.
+    ///
+    /// [`Ended`]: MatchPhase::Ended
+    pub fn result(&self) -> Option<&MatchResult> {
+        self.result.as_ref()
+    }
 }
 
 /// `true` if `b` is within `range` position units of `a` on the ground plane.
@@ -364,7 +593,7 @@ fn within(a: Vec2, b: Vec2, range: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena_proto::{ActionButtons, MatchConfig, SeatInfo, PROTOCOL_VERSION};
+    use arena_proto::{ActionButtons, MatchConfig, SeatInfo};
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
     /// First SplitMix64 output for seed 1, verified against the reference
@@ -401,6 +630,18 @@ mod tests {
 
     fn action_at(m: &Match, seat: SeatId, intent: ActionIntent) -> Action {
         Action { protocol_version: PROTOCOL_VERSION, match_id: m.match_id(), seat, tick: m.tick(), intent }
+    }
+
+    fn step_with(m: &mut Match, intents: &[(SeatId, ActionIntent)]) {
+        let map: BTreeMap<SeatId, ActionIntent> = intents.iter().copied().collect();
+        m.step(&map);
+    }
+
+    /// Two seats spawned ~4 m apart (within weapon range), no jitter, so combat
+    /// tests are exact.
+    fn close_match(seed: u64) -> Match {
+        let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), seed)
     }
 
     #[test]
@@ -503,5 +744,73 @@ mod tests {
         let mut a = action_at(&m, 0, intent(Vec2::ZERO, 0, false));
         a.match_id = Uuid::nil();
         assert!(matches!(m.ingest(0, &a), Err(RejectReason::WrongMatch { .. })));
+    }
+
+    #[test]
+    fn step_moves_pawn_by_clamped_speed_and_reports_velocity() {
+        let mut m = new_match(1);
+        let before = m.observe(0).own.position;
+        step_with(&mut m, &[(0, intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false))]);
+        let after = m.observe(0).own;
+        assert_eq!(after.position.x - before.x, Rules::default().max_speed);
+        assert_eq!(after.position.y, before.y);
+        assert_eq!(after.velocity, Vec2 { x: Rules::default().max_speed, y: 0 });
+        assert_eq!(m.tick(), 1);
+    }
+
+    #[test]
+    fn a_shot_damages_an_enemy_in_the_beam() {
+        // FM2: seat 0 (left, facing East) fires at seat 1 (right); seat 1 forfeits.
+        let mut m = close_match(1);
+        let before = m.observe(1).own.health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.observe(1).own.health, before - Rules::default().damage);
+        assert_eq!(m.observe(0).own.health, before, "the shooter is unharmed");
+    }
+
+    #[test]
+    fn cooldown_blocks_an_immediate_second_shot() {
+        let mut m = close_match(1);
+        let start = m.observe(1).own.health;
+        // Fire on two consecutive ticks; the second is on cooldown, so one hit.
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.observe(1).own.health, start - Rules::default().damage);
+    }
+
+    #[test]
+    fn movement_is_clamped_to_the_arena_bounds() {
+        // FM2: drive seat 1 outward every tick; it pins at the edge, never past.
+        let bounds = Vec2 { x: 21 * POSITION_SCALE, y: 50 * POSITION_SCALE };
+        let cfg = MatchConfig { bounds, ..config(2) };
+        let rules = Rules { spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), 1);
+        for _ in 0..100 {
+            step_with(&mut m, &[(1, intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, WEST, false))]);
+        }
+        let p = m.observe(1).own;
+        assert_eq!(p.position.x, 21 * POSITION_SCALE, "pinned at the bound");
+        assert_eq!(p.velocity, Vec2::ZERO, "no displacement once pinned");
+    }
+
+    #[test]
+    fn a_kill_ends_the_match_with_a_decisive_result() {
+        let mut m = close_match(1);
+        for _ in 0..200 {
+            if m.phase() == MatchPhase::Ended {
+                break;
+            }
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        }
+        assert_eq!(m.phase(), MatchPhase::Ended);
+        let r = m.result().expect("an ended match has a result").clone();
+        let s0 = r.outcomes.iter().find(|o| o.seat == 0).unwrap();
+        let s1 = r.outcomes.iter().find(|o| o.seat == 1).unwrap();
+        assert!(s0.alive_at_end && s0.placement == 1, "the survivor wins");
+        assert!(!s1.alive_at_end && s1.placement == 2, "the downed seat places last");
+        assert!(s0.score >= Rules::default().start_health as i32, "dealt at least lethal damage");
+        assert_eq!(r.final_tick, m.tick());
+        // The result commits to a non-empty replay digest.
+        assert_eq!(r.replay_hash.len(), 64);
     }
 }
