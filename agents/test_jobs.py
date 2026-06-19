@@ -7,7 +7,10 @@ agents/ dir:
     .venv/bin/python -m pytest test_jobs.py -v
 """
 
+import ast
 import json
+import re
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -20,6 +23,9 @@ from common.jobs import (
     MAX_PAYOUT_WEI,
     SPECIALIST_RENDER_KIND,
     RenderJobSpec,
+    _I32_MAX,
+    _I32_MIN,
+    _U8_MAX,
     _asset_url,
     render_jobs,
 )
@@ -373,3 +379,96 @@ def test_spec_rejects_out_of_range_region():
         _spec(region=RegionCoord(x=2**31, y=0, layer=0))  # i32 overflow
     # boundaries accepted
     assert _spec(region=RegionCoord(x=2**31 - 1, y=-(2**31), layer=255)).region.layer == 255
+
+
+# --- cross-language bound parity (base-emission FM3) ---
+# RenderJobSpec mirrors the coordinator's validate_job_spec bounds (and the proto
+# RegionCoord field widths) BY HAND across Rust and Python. These guards read the
+# bound constants straight out of the mesh Rust sources and assert they equal the
+# common/jobs.py constants, so a one-sided change fails CI loudly instead of shipping
+# a producer that emits 422-rejectable specs. Scope is numeric bounds only — the
+# JobKind WIRE spellings stay pinned by
+# test_types.test_job_kind_wire_name_matches_proto_snake_case (FM4).
+
+_VALIDATE_RS = ("mesh", "coordinator", "src", "validate.rs")
+_PROTO_RS = ("mesh", "proto", "src", "lib.rs")
+
+
+def _mesh_source(*parts: str) -> str:
+    """Read a mesh Rust source relative to the repo root, or skip on absence.
+
+    The agents gate must run standalone in checkouts without mesh/ (FM2), so a
+    missing source skips the parity guard with a clear reason — never fails on it.
+    """
+    path = Path(__file__).resolve().parent.parent.joinpath(*parts)
+    if not path.is_file():
+        pytest.skip(f"mesh source {path.name} absent (agents-only checkout); parity guard skipped")
+    return path.read_text()
+
+
+def _find(pattern: str, text: str, what: str) -> str:
+    m = re.search(pattern, text)
+    assert m is not None, f"could not locate {what} in the Rust source (renamed or reformatted?)"
+    return m.group(1)
+
+
+def _fold(node: ast.expr) -> int:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Pow)):
+        left, right = _fold(node.left), _fold(node.right)
+        return left * right if isinstance(node.op, ast.Mult) else left**right
+    raise AssertionError(f"unsupported Rust const expression: {ast.dump(node)}")
+
+
+def _rust_int(expr: str) -> int:
+    """Normalize a Rust integer-const RHS to a Python int.
+
+    Translates the syntax validate.rs uses — `_` separators, `uNN`/`iNN` suffixes,
+    and `base.pow(exp)` — into Python, then folds the constant arithmetic over a tiny
+    AST allowlist (int literals, `*`, `**`). No eval, no names; the source is trusted
+    in-repo code regardless.
+    """
+    s = re.sub(r"(\d[\d_]*)(?:u|i)(?:8|16|32|64|128|size)", r"\1", expr.strip())
+    s = s.replace("_", "")
+    s = re.sub(r"\.pow\(\s*(\d+)\s*\)", r"**\1", s)
+    return _fold(ast.parse(s, mode="eval").body)
+
+
+def _int_bounds(rust_type: str) -> tuple[int, int]:
+    bits = int(rust_type[1:])
+    if rust_type.startswith("i"):
+        return -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+    return 0, 2**bits - 1
+
+
+def test_rust_int_normalization_is_pinned():
+    # FM3: anchor the Rust->Python normalization against known canonical values.
+    # Cross-comparing two independently-wrong values could pass vacuously, so pin the
+    # normalizer (and the type-width derivation) itself before trusting it below.
+    assert _rust_int("86_400") == 86_400
+    assert _rust_int("10u128.pow(30)") == 10**30
+    assert _rust_int("16 * 1024") == 16 * 1024
+    assert _int_bounds("i32") == (-(2**31), 2**31 - 1)
+    assert _int_bounds("u8") == (0, 255)
+
+
+def test_jobspec_numeric_bounds_match_validate_rs():
+    src = _mesh_source(*_VALIDATE_RS)
+    deadline = _rust_int(_find(r"MAX_DEADLINE_SECS:\s*\w+\s*=\s*([^;]+);", src, "MAX_DEADLINE_SECS"))
+    payout = _rust_int(_find(r"MAX_PAYOUT_WEI:\s*\w+\s*=\s*([^;]+);", src, "MAX_PAYOUT_WEI"))
+    inputs = _rust_int(_find(r"MAX_INPUTS_BYTES:\s*\w+\s*=\s*([^;]+);", src, "MAX_INPUTS_BYTES"))
+    assert deadline == MAX_DEADLINE_SECS == 86_400
+    assert payout == MAX_PAYOUT_WEI == 10**30
+    assert inputs == MAX_INPUTS_BYTES == 16 * 1024
+
+
+def test_region_widths_match_proto():
+    src = _mesh_source(*_PROTO_RS)
+    # The proto field TYPE drives the bound; compare to the Python pins so a width
+    # change on either side (i32->i64, u8->u16) breaks the guard.
+    x = _find(r"pub x:\s*(\w+)", src, "RegionCoord.x")
+    y = _find(r"pub y:\s*(\w+)", src, "RegionCoord.y")
+    layer = _find(r"pub layer:\s*(\w+)", src, "RegionCoord.layer")
+    assert _int_bounds(x) == _int_bounds(y) == (_I32_MIN, _I32_MAX)
+    assert _int_bounds(layer) == (0, _U8_MAX)
