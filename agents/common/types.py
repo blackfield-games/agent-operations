@@ -12,6 +12,16 @@ class JobKind(IntEnum):
     DIFFUSION_TILE = 3
     OPTIMIZATION = 4
 
+    @property
+    def wire_name(self) -> str:
+        """The coordinator's on-the-wire spelling of this kind. The mesh proto
+        serializes JobKind with ``#[serde(rename_all = "snake_case")]``, so
+        ``POST /jobs`` expects "terrain"/"foliage"/"npc_tick"/"diffusion_tile"/
+        "optimization" — strings, not this IntEnum's integer form. The variant
+        names are SCREAMING_SNAKE, so ``.lower()`` is exactly that snake_case;
+        pinned per-variant in test_types.py so a rename on either side breaks."""
+        return self.name.lower()
+
 
 class RegionCoord(BaseModel):
     x: int

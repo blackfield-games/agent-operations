@@ -11,7 +11,24 @@ Run from the agents/ dir:
     .venv/bin/python -m pytest test_types.py -v
 """
 
-from common.types import RegionCoord
+from common.types import JobKind, RegionCoord
+
+
+def test_job_kind_wire_name_matches_proto_snake_case():
+    # The mesh proto serializes JobKind with rename_all = "snake_case", so the
+    # coordinator's POST /jobs accepts these exact strings and rejects an unknown
+    # kind. The agents JobKind is an IntEnum (integer wire form), so the producer
+    # must emit wire_name, not the int. Pin each variant to the proto spelling so a
+    # rename on either side of the seam breaks loudly here.
+    assert JobKind.TERRAIN.wire_name == "terrain"
+    assert JobKind.FOLIAGE.wire_name == "foliage"
+    assert JobKind.NPC_TICK.wire_name == "npc_tick"
+    assert JobKind.DIFFUSION_TILE.wire_name == "diffusion_tile"
+    assert JobKind.OPTIMIZATION.wire_name == "optimization"
+    # No member forgotten: every variant maps to one of the five proto spellings.
+    assert {k.wire_name for k in JobKind} == {
+        "terrain", "foliage", "npc_tick", "diffusion_tile", "optimization"
+    }
 
 
 def test_region_id_forces_sign_and_zero_pads():
