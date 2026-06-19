@@ -1159,8 +1159,9 @@ const REGISTRATION_WINDOW_SECS: i64 = 60;
 /// reconnects in bursts well under this — while still capping a single direct source
 /// far below the rate needed to churn the registry. It is a backstop, not a tuned
 /// limit: the PRIMARY per-source defense is edge/OS (and, behind a reverse proxy,
-/// where the peer IP is the proxy's, a trusted-proxy `X-Forwarded-For` parse — left
-/// as a follow-up). An operator on a known-direct deployment tunes it DOWN to
+/// where the peer IP is the proxy's, the trusted-proxy `X-Forwarded-For` attribution
+/// in [`resolve_source_ip`], keyed on `--trusted-proxies`, recovers the real client).
+/// An operator on a known-direct deployment tunes it DOWN to
 /// throttle a single source harder; one fronting a large fleet behind one ingress
 /// tunes it UP. Backs `Args::max_registrations`.
 const DEFAULT_MAX_REGISTRATIONS: u32 = 4096;
