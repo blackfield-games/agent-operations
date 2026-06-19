@@ -41,9 +41,10 @@ def test_render_jobs_empty_when_rejected():
     assert jobs == []
 
 
-def test_render_jobs_emits_one_diffusion_tile_for_accepted_region():
+def test_render_jobs_first_job_is_the_whole_tile_diffusion():
+    # The whole-tile DIFFUSION_TILE is always emitted first, ahead of any per-kind
+    # fan-out, carrying the accepted region's coordinates.
     jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True))
-    assert len(jobs) == 1
     job = jobs[0]
     assert job.kind is JobKind.DIFFUSION_TILE
     assert (job.region.x, job.region.y, job.region.layer) == (42, -17, 0)

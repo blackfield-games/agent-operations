@@ -84,11 +84,15 @@ def test_json_output(tmp_path, monkeypatch, capsys):
 
     assert report["world"].endswith("out/world.usda")
 
-    # The seam: an accepted region surfaces one coordinator-ready render job in the
-    # exact POST /jobs body shape (kind as the snake_case wire string).
-    assert len(report["render_jobs"]) == 1
+    # The seam: an accepted region surfaces coordinator-ready render jobs in the
+    # exact POST /jobs body shape (kind as the snake_case wire string). The whole-
+    # tile diffusion job leads, then one per renderable specialist layer the graph
+    # authored (terrain/biome/npc/optimization -> the 4 non-diffusion kinds, by enum
+    # order); director/lighting/prop carry no render kind.
+    assert [job["kind"] for job in report["render_jobs"]] == [
+        "diffusion_tile", "terrain", "foliage", "npc_tick", "optimization"
+    ]
     job = report["render_jobs"][0]
-    assert job["kind"] == "diffusion_tile"
     assert job["region"] == {"x": 1, "y": 2, "layer": 0}
     assert set(job) == {"kind", "region", "deadline_secs", "max_payout_wei", "inputs"}
     assert job["inputs"]["region_id"] == "r+0001_+0002_l0"
@@ -199,8 +203,10 @@ def _stub_post(monkeypatch, make_results, store=None):
 
 
 def _created(jobs, job_id="srv-7"):
-    j = jobs[0]
-    return [PostResult(j.region.region_id, j.kind.wire_name, PostOutcome.CREATED, status_code=201, job_id=job_id)]
+    return [
+        PostResult(j.region.region_id, j.kind.wire_name, PostOutcome.CREATED, status_code=201, job_id=job_id)
+        for j in jobs
+    ]
 
 
 def test_post_to_ships_accepted_jobs_and_threads_token(tmp_path, monkeypatch, capsys):
@@ -215,9 +221,10 @@ def test_post_to_ships_accepted_jobs_and_threads_token(tmp_path, monkeypatch, ca
     assert code == 0
     assert seen["base_url"] == "http://coord:8080"
     assert seen["token"] == "tok-123"  # threaded from the env var
-    assert len(seen["jobs"]) == 1
+    # The one terrain layer fans out to the whole-tile diffusion job + a TERRAIN job.
+    assert [job.kind.wire_name for job in seen["jobs"]] == ["diffusion_tile", "terrain"]
     out = capsys.readouterr().out
-    assert "posted:    1/1 accepted" in out
+    assert "posted:    2/2 accepted" in out
     assert "id=srv-7" in out
 
 

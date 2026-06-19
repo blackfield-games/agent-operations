@@ -6,10 +6,12 @@ A validated, composed region becomes the render jobs the mesh coordinator's
 producer never emits a spec the coordinator would reject with 422; keep them in
 lockstep with mesh/coordinator/src/validate.rs and mesh/proto/src/lib.rs.
 
-MVP: one ``DIFFUSION_TILE`` job per validated region (the canonical "render this
-tile" kind). Per-kind fan-out across renderable specialist layers is deferred
-(agents-render-job-emission-per-kind); the live HTTP POST transport is
-agents-render-job-poster.
+A validated region emits one whole-tile ``DIFFUSION_TILE`` job plus a kind-specific
+compute job for each renderable specialist that authored a layer (see
+``SPECIALIST_RENDER_KIND``), so a heterogeneous earner fleet picks up
+terrain/foliage/npc/optimization work and the coordinator's per-kind dispatch is
+exercised. The specialist->kind taxonomy is operator-confirmable (see BLOCKERS).
+The live HTTP POST transport is ``runtime/poster.py`` (agents-render-job-poster).
 """
 
 from __future__ import annotations
@@ -32,6 +34,22 @@ _U8_MAX = 255
 # Policy defaults, caller-overridable. 1 $BLCKFLD = 1e18 wei.
 DEFAULT_DEADLINE_SECS = 3600
 DEFAULT_MAX_PAYOUT_WEI = str(10**18)
+
+# The renderable authoring specialists, each mapped to the render kind that
+# processes its layer. A clean bijection of the four renderable specialists onto
+# the four non-diffusion JobKinds: terrain/optimization are exact name matches;
+# biome authors vegetation (FOLIAGE); npc authors non-player characters (NPC_TICK).
+# director/lighting/prop/validator are intentionally ABSENT — they author no
+# kind-specific render workload (validator emits a verdict, director is
+# camera/composition, lighting bakes into the diffusion, prop has no distinct
+# kind), so they feed the composed tile rendered by DIFFUSION_TILE. The mapping is
+# operator-confirmable before it drives a real renderer (see BLOCKERS).
+SPECIALIST_RENDER_KIND: dict[str, JobKind] = {
+    "terrain": JobKind.TERRAIN,
+    "biome": JobKind.FOLIAGE,
+    "npc": JobKind.NPC_TICK,
+    "optimization": JobKind.OPTIMIZATION,
+}
 
 
 class RenderJobSpec(BaseModel):
@@ -103,23 +121,52 @@ def render_jobs(
 
     A rejected or unvalidated world must never become a render job (earners would
     burn compute on work the validator refused), so the accepted-gate is first.
-    MVP emits one ``DIFFUSION_TILE`` job whose ``inputs`` carry the region id, the
-    composed-world filename, and a per-specialist layer manifest.
+
+    Emits the whole-tile ``DIFFUSION_TILE`` job (region id, composed-world filename,
+    full per-specialist layer manifest) FIRST, then one kind-specific compute job
+    per layer whose specialist is in ``SPECIALIST_RENDER_KIND`` — driven by the
+    actual ``layers`` so a partial/failed run emits only what was authored. Per-kind
+    jobs follow in ``JobKind`` enum order for stable output and each focuses on its
+    single layer (the ``layer`` key, vs the diffusion job's ``layers`` manifest).
     """
     if not verdict.accepted:
         return []
     region = brief.region
-    inputs: dict[str, Any] = {
-        "region_id": region.region_id,
-        "world": "world.usda",
-        "layers": [{"specialist": layer.specialist, "path": layer.path} for layer in layers],
-    }
-    return [
-        RenderJobSpec(
-            kind=JobKind.DIFFUSION_TILE,
+
+    def _job(kind: JobKind, inputs: dict[str, Any]) -> RenderJobSpec:
+        return RenderJobSpec(
+            kind=kind,
             region=region,
             deadline_secs=deadline_secs,
             max_payout_wei=max_payout_wei,
             inputs=inputs,
         )
+
+    jobs = [
+        _job(
+            JobKind.DIFFUSION_TILE,
+            {
+                "region_id": region.region_id,
+                "world": "world.usda",
+                "layers": [{"specialist": layer.specialist, "path": layer.path} for layer in layers],
+            },
+        )
     ]
+    renderable = [
+        (SPECIALIST_RENDER_KIND[layer.specialist], layer)
+        for layer in layers
+        if layer.specialist in SPECIALIST_RENDER_KIND
+    ]
+    renderable.sort(key=lambda pair: pair[0].value)
+    jobs.extend(
+        _job(
+            kind,
+            {
+                "region_id": region.region_id,
+                "world": "world.usda",
+                "layer": {"specialist": layer.specialist, "path": layer.path},
+            },
+        )
+        for kind, layer in renderable
+    )
+    return jobs
