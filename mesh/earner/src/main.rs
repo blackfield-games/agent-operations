@@ -215,8 +215,10 @@ fn ws_url(coordinator: &str) -> String {
 /// the coordinator's `MAX_INPUTS_BYTES` (16 KiB); `Challenge`/`Accepted`/`Rejected`
 /// are tiny. 64 KiB leaves generous headroom above a max `JobOffer` (4× the inputs
 /// cap plus the `CoordinatorMsg`/`JobSpec` framing) while shedding anything an honest
-/// coordinator would never send. In-process backstop, the client-side mirror of the
-/// coordinator's own inbound cap (`ws_handler` max_message_size/max_frame_size); the
+/// coordinator would never send. In-process backstop, the client-side analogue of the
+/// coordinator's own inbound cap (`ws_handler` max_message_size/max_frame_size) — set
+/// deliberately LOOSER here (4× the inputs cap vs the coordinator's 2×, since extra
+/// client-side headroom costs nothing and avoids shearing honest dispatch); the
 /// primary defense is still edge/OS (an earner largely controls who it dials).
 const MAX_INBOUND_FRAME_BYTES: usize = 64 * 1024;
 
