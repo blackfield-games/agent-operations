@@ -338,6 +338,17 @@ def test_asset_base_env_fallback(tmp_path, monkeypatch, capsys):
     assert report["render_jobs"][0]["inputs"]["world"] == "https://envcdn/r+0042_-0017_l0/world.usda"
 
 
+def test_asset_base_flag_overrides_env(tmp_path, monkeypatch, capsys):
+    # Both set -> the flag wins over the env var.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(cli.ASSET_BASE_ENV, "https://envcdn")
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+
+    main(["--x", "42", "--y", "-17", "--asset-base", "https://flagcdn", "--json", "--out", "out"])
+    report = json.loads(capsys.readouterr().out)
+    assert report["render_jobs"][0]["inputs"]["world"] == "https://flagcdn/r+0042_-0017_l0/world.usda"
+
+
 def test_post_to_without_asset_base_warns(tmp_path, monkeypatch, capsys, caplog):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv(cli.ASSET_BASE_ENV, raising=False)

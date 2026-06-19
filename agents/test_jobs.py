@@ -216,11 +216,27 @@ def test_asset_url_rejects_scheme_injection():
         _asset_url("https://cdn", "rid", "http://evil/x")
 
 
+def test_asset_url_rejects_lone_dot_segment():
+    # A standalone "." segment is a no-op a normalizing client would collapse;
+    # reject it for consistency with "..". (A dot WITHIN a name like world.usda is fine.)
+    with pytest.raises(ValueError, match="not URL-safe"):
+        _asset_url("https://cdn", "rid", "terrain/./a.usda")
+    assert _asset_url("https://cdn", "rid", "terrain/world.usda").endswith("/terrain/world.usda")
+
+
 def test_render_jobs_unset_base_keeps_relative_paths():
     # FM4: no base -> byte-identical relative behaviour (back-compat dev).
     jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True))
     assert jobs[0].inputs["world"] == "world.usda"
     assert jobs[0].inputs["layers"][0]["path"] == "terrain/a.usda"
+
+
+def test_render_jobs_blank_base_falls_back_to_relative():
+    # A blank/whitespace base is treated as unset (not a malformed "  /..." URL),
+    # matching the docstring contract; the CLI strips, this guards the direct API.
+    for base in ("", "   "):
+        jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True), asset_base_url=base)
+        assert jobs[0].inputs["world"] == "world.usda"
 
 
 def test_render_jobs_resolves_absolute_urls_when_base_set():

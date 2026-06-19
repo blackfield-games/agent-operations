@@ -124,7 +124,7 @@ def _asset_url(base: str, region_id: str, relative: str) -> str:
     normalized)."""
     segments = [region_id, *(seg for seg in relative.split("/") if seg)]
     for seg in segments:
-        if seg == ".." or not _ASSET_SEGMENT.fullmatch(seg):
+        if seg in (".", "..") or not _ASSET_SEGMENT.fullmatch(seg):
             raise ValueError(f"asset path segment is not URL-safe: {seg!r} (in {relative!r})")
     return "/".join([base.rstrip("/"), *segments])
 
@@ -160,9 +160,10 @@ def render_jobs(
     if not verdict.accepted:
         return []
     region = brief.region
+    base = (asset_base_url or "").strip()
 
     def _asset(relative: str) -> str:
-        return _asset_url(asset_base_url, region.region_id, relative) if asset_base_url else relative
+        return _asset_url(base, region.region_id, relative) if base else relative
 
     def _job(kind: JobKind, inputs: dict[str, Any]) -> RenderJobSpec:
         return RenderJobSpec(
