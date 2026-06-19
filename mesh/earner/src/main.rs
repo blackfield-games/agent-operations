@@ -169,9 +169,46 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Total deadline for a single earner→coordinator HTTP request — connect, send,
+/// and the WHOLE response. `reqwest::Client::new()` sets NEITHER a request nor a
+/// connect timeout, so a coordinator (or on-path device) that accepts the TCP
+/// connection then stalls — never sending headers, or trickling the body — hangs
+/// a `poll_once` forever, wedging the entire poll loop (it never returns to
+/// sleep+retry). This bounds the whole exchange, not just connect, so a
+/// post-connect slowloris stall still surfaces as an `Err` the poll loop logs +
+/// backs off on. Generous (45s) so a slow-but-live coordinator under load isn't
+/// sheared into a spurious error; the OS/edge TCP timeouts remain the primary
+/// liveness defense and this is the app-layer backstop — the HTTP twin of the ws
+/// path's `CHALLENGE_TIMEOUT_SECS`. A const, not a knob, to match the sibling
+/// inbound caps (`MAX_INBOUND_FRAME_BYTES`/`MAX_RESPONSE_BODY_BYTES`); promoting
+/// it to a `--request-timeout-secs` arg is a one-line follow-up if an operator
+/// needs per-deployment tuning.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Deadline for just the TCP connect — a subset of [`HTTP_REQUEST_TIMEOUT`].
+/// Trips fast when the coordinator host is unreachable/black-holed so the loop
+/// retries promptly instead of waiting out the full request timeout on a dead
+/// host. Both are set deliberately: a connect timeout alone leaves the
+/// slowloris-response hole (connect succeeds fast, then the body stalls forever).
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Build the earner's HTTP poll client with explicit connect + total request
+/// timeouts. Factored out of [`run_http`] so a test can build a small-timeout
+/// twin and prove a stalled coordinator surfaces as `Err` (not a hang) — and so
+/// dropping either `.timeout()` is caught. Only `run_http` builds an HTTP client;
+/// the ws path uses `tokio_tungstenite` and shares nothing here, so this timeout
+/// never bounds the persistent ws session.
+fn http_client(request_timeout: Duration, connect_timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(request_timeout)
+        .connect_timeout(connect_timeout)
+        .build()
+        .context("building earner HTTP client")
+}
+
 /// Legacy HTTP poll loop. Registers, then polls `/jobs/next` forever.
 async fn run_http(args: &Args, session: &Session) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = http_client(HTTP_REQUEST_TIMEOUT, HTTP_CONNECT_TIMEOUT)?;
     let supported = all_supported();
 
     if let Err(e) = register(&client, args, session).await {
