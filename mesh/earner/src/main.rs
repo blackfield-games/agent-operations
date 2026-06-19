@@ -541,6 +541,19 @@ fn keep_polling_after_submit(status: reqwest::StatusCode) -> bool {
     status.is_success()
 }
 
+/// Hard cap on the coordinator's `GET /jobs/next` response body before it is
+/// buffered and deserialized. The HTTP-transport twin of [`MAX_INBOUND_FRAME_BYTES`]:
+/// the earner dials OUT, and `reqwest` has NO default response-size limit, so a
+/// buggy, compromised, or on-path coordinator returning a giant body would OOM an
+/// operator's earner inside `resp.json()` before serde ever runs. The largest
+/// LEGITIMATE body is a single `JobSpec` whose `inputs` is bounded to the
+/// coordinator's `MAX_INPUTS_BYTES` (16 KiB) — or JSON `null` (no job). 64 KiB is
+/// the same ceiling the inbound WS frame gets (4× the inputs cap plus framing), a
+/// generous backstop that never shears honest dispatch yet sheds anything an honest
+/// coordinator would never send. Enforced on BYTES ACTUALLY READ (see [`poll_once`]),
+/// not the advertised `Content-Length` — a chunked response can omit or lie about it.
+const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+
 async fn poll_once(
     client: &reqwest::Client,
     args: &Args,
@@ -551,7 +564,7 @@ async fn poll_once(
     // Name ourselves so the coordinator filters the hand-out to the kinds we
     // advertised at registration (capability match on the HTTP transport). The
     // self-guard below stays as defense-in-depth for a coordinator that doesn't.
-    let resp = client
+    let mut resp = client
         .get(&url)
         .query(&[("earner", session.address.as_str())])
         .send()
@@ -564,7 +577,21 @@ async fn poll_once(
         .get("x-dispatch-seq")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i64>().ok());
-    let job: Option<JobSpec> = resp.json().await?;
+    // Bounded read, replacing an unbounded `resp.json()`: accumulate the body
+    // chunk-by-chunk and error past the cap so the poll cycle logs + backs off
+    // instead of OOMing on a hostile coordinator. The limit is on bytes ACTUALLY
+    // READ — never the advertised Content-Length, which a chunked response can omit
+    // or under-report.
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(anyhow!(
+                "coordinator /jobs/next body exceeded {MAX_RESPONSE_BODY_BYTES} bytes; refusing to buffer"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let job: Option<JobSpec> = serde_json::from_slice(&body)?;
     let Some(job) = job else { return Ok(false) };
 
     // Capability self-guard (mirrors the ws `handle_offer` guard). Unlike the ws
