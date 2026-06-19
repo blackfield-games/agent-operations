@@ -188,13 +188,24 @@ struct Args {
     /// ceiling). Checked BEFORE the signature verify on both the HTTP `/register` and
     /// WS `Hello` paths, so an over-limit source is shed (`429` / socket close) before
     /// any secp256k1 recovery — bounding the registry-cap sustained-lockout lever
-    /// without spending the expensive op on a flood. Keyed on the connection peer
-    /// address: behind a reverse proxy this is the proxy's IP (it throttles the fleet
-    /// as one source — edge/OS is the primary defense, a trusted-proxy XFF parse a
-    /// follow-up). Set WELL above honest per-source burst; must be >= 1. See
+    /// without spending the expensive op on a flood. Keyed on the source the
+    /// connection arrives from — the peer IP, or the real client recovered from
+    /// `X-Forwarded-For` when the peer is a `--trusted-proxies` entry; behind an
+    /// untrusted hop it is the peer (edge/OS remains the primary flood defense).
+    /// Set WELL above honest per-source burst; must be >= 1. See
     /// [`DEFAULT_MAX_REGISTRATIONS`].
     #[arg(long, env = "COORDINATOR_MAX_REGISTRATIONS", default_value_t = DEFAULT_MAX_REGISTRATIONS)]
     max_registrations: u32,
+    /// Reverse-proxy IPs whose `X-Forwarded-For` header is trusted to name the real
+    /// client for per-source registration rate-limiting. Comma-separated, or repeat
+    /// the flag. EMPTY by default: with no trusted proxy, XFF is ignored and the
+    /// limiter keys on the raw connection peer, so a direct (untrusted) client can
+    /// never spoof its source via a forged XFF. List a proxy here ONLY if it appends
+    /// the address it observed to XFF; the limiter then keys on the rightmost XFF hop
+    /// that is not itself a listed proxy (the address the trust boundary saw). See
+    /// [`DEFAULT_MAX_REGISTRATIONS`] for the edge/OS-vs-app-layer rate-limit layering.
+    #[arg(long, env = "COORDINATOR_TRUSTED_PROXIES", value_delimiter = ',')]
+    trusted_proxies: Vec<IpAddr>,
     /// Wei charged per render-second to a job's buyer at settle, recorded as a
     /// pending ComputeMeter debit for the (operator-gated) on-chain relayer to
     /// spend. `0` (the default) DISABLES metering — no debit row is written — so
@@ -271,6 +282,11 @@ struct AppState {
     /// registration rate-limit seam. Validated >= 1 in `with_store`. Mirrors
     /// `--max-registrations` / `COORDINATOR_MAX_REGISTRATIONS`.
     max_registrations: u32,
+    /// Reverse-proxy IPs whose `X-Forwarded-For` the registration limiter trusts to
+    /// name the real source (otherwise it keys on the connection peer). Empty (the
+    /// default) => XFF is ignored everywhere. Read by `resolve_source_ip` on both
+    /// registration paths. Mirrors `--trusted-proxies` / `COORDINATOR_TRUSTED_PROXIES`.
+    trusted_proxies: TrustedProxies,
 }
 
 impl AppState {
@@ -293,6 +309,7 @@ impl AppState {
         max_queued_jobs: usize,
         max_earners: usize,
         max_registrations: u32,
+        trusted_proxies: TrustedProxies,
     ) -> Result<Arc<Self>> {
         // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
         // dead-letters every non-terminal job on its first tick — the safety
@@ -368,6 +385,7 @@ impl AppState {
             max_earners,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations,
+            trusted_proxies,
         }))
     }
 }
@@ -546,6 +564,7 @@ async fn main() -> Result<()> {
         args.max_queued_jobs,
         args.max_earners,
         args.max_registrations,
+        TrustedProxies(args.trusted_proxies.into_iter().collect()),
     )?;
     tracing::info!(db = %args.db, "store ready");
 
@@ -950,10 +969,72 @@ fn check_registration_rate(
 
 /// The accepted connection's peer address, injected as a request extension by
 /// [`serve`] (per connection) and read by the registration handlers to key the
-/// per-source rate limiter. Behind a reverse proxy this is the proxy's address, not
-/// the earner's — see [`DEFAULT_MAX_REGISTRATIONS`] for the layering.
+/// per-source rate limiter. Behind a reverse proxy this is the proxy's address;
+/// [`resolve_source_ip`] recovers the real client from `X-Forwarded-For` when the
+/// peer is a trusted proxy — see [`DEFAULT_MAX_REGISTRATIONS`] for the layering.
 #[derive(Debug, Clone, Copy)]
 struct PeerAddr(SocketAddr);
+
+/// Reverse-proxy IPs whose `X-Forwarded-For` the registration limiter trusts to
+/// name the real client. Empty by default: with no proxy trusted, XFF is ignored
+/// and the limiter keys on the raw connection peer (byte-identical to the pre-XFF
+/// behavior). Populated from `--trusted-proxies`; read by [`resolve_source_ip`].
+#[derive(Debug, Clone, Default)]
+struct TrustedProxies(HashSet<IpAddr>);
+
+impl TrustedProxies {
+    fn contains(&self, ip: &IpAddr) -> bool {
+        self.0.contains(ip)
+    }
+}
+
+/// Parse one `X-Forwarded-For` node into the IP it names. Handles a bare IP
+/// (`203.0.113.7`, `2001:db8::1`) and the `ip:port` / `[ipv6]:port` forms some
+/// proxies append (via a `SocketAddr` fallback). Returns `None` for an obfuscated
+/// or malformed token (`_hidden`, `unknown`, empty) — the caller treats an
+/// indeterminate nearest hop as a reason to fall back to the connection peer.
+fn parse_forwarded_node(token: &str) -> Option<IpAddr> {
+    let t = token.trim();
+    if let Ok(ip) = t.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    t.parse::<SocketAddr>().ok().map(|sa| sa.ip())
+}
+
+/// Resolve the client IP the per-source registration limiter should key on, from
+/// the connection `peer` and the request's `X-Forwarded-For`, trusting XFF ONLY
+/// when `peer` is itself a configured trusted proxy.
+///
+/// A direct (untrusted) peer can write anything in XFF, so its XFF is ignored and
+/// the limiter keys on the peer — a direct attacker cannot forge a different
+/// source. When `peer` is trusted, walk the XFF chain RIGHT-TO-LEFT: a proxy
+/// APPENDS the address it observed, so the rightmost entries are the nearest hops.
+/// Skip hops that are themselves trusted proxies (our own ingress chain) and
+/// return the first non-trusted address — the IP the trust boundary actually saw
+/// the request arrive from. An upstream attacker can prepend forged entries, but
+/// they sit LEFT of that boundary and are never selected.
+///
+/// Falls back to `peer` when XFF is absent, empty, every hop is trusted (no
+/// observed external client), or the nearest hop is unparseable (indeterminate) —
+/// each collapses onto the conservative proxy bucket, never a looser one. This
+/// rests on the operator's contract that a *listed* proxy appends the observed IP;
+/// a proxy that forwards client-supplied XFF without appending must not be listed.
+fn resolve_source_ip(peer: IpAddr, headers: &HeaderMap, trusted: &TrustedProxies) -> IpAddr {
+    if !trusted.contains(&peer) {
+        return peer;
+    }
+    let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
+        return peer;
+    };
+    for token in xff.rsplit(',') {
+        match parse_forwarded_node(token) {
+            Some(ip) if trusted.contains(&ip) => continue,
+            Some(ip) => return ip,
+            None => return peer,
+        }
+    }
+    peer
+}
 
 /// Per-job absolute wall-clock TTL, as a multiple of the job's own
 /// `deadline_secs`: a job alive (queued or in_flight) past
@@ -1570,24 +1651,27 @@ fn validate_hello(
 async fn register(
     State(state): State<Arc<AppState>>,
     Extension(PeerAddr(peer)): Extension<PeerAddr>,
+    headers: HeaderMap,
     Json(msg): Json<EarnerMsg>,
 ) -> Result<&'static str, StatusCode> {
     // Per-source registration rate limit FIRST — ahead of the secp256k1 verify in
     // `validate_hello` (cheap-reject-first, FM2) — so an over-limit source is shed
-    // with 429 before any curve recovery or registry lock. Keyed on the connection
-    // peer IP; the bucket lock is held only for the check + consume.
+    // with 429 before any curve recovery or registry lock. The source is the
+    // connection peer, or the real client recovered from X-Forwarded-For when the
+    // peer is a trusted proxy; the bucket lock is held only for the check + consume.
+    let source = resolve_source_ip(peer.ip(), &headers, &state.trusted_proxies);
     {
         let now = now_secs();
         let mut buckets = state.registration_buckets.lock().await;
         if !check_registration_rate(
             &mut buckets,
-            peer.ip(),
+            source,
             now,
             state.max_registrations,
             REGISTRATION_WINDOW_SECS,
             MAX_REGISTRATION_BUCKETS,
         ) {
-            tracing::warn!(source = %peer.ip(), "rejected registration: per-source rate limit exceeded");
+            tracing::warn!(%source, "rejected registration: per-source rate limit exceeded");
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
     }
@@ -2900,6 +2984,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         )
         .unwrap()
     }
@@ -5484,6 +5569,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -5612,6 +5698,7 @@ mod tests {
                 DEFAULT_MAX_QUEUED_JOBS,
                 DEFAULT_MAX_EARNERS,
                 DEFAULT_MAX_REGISTRATIONS,
+                TrustedProxies::default(),
             );
             assert!(r.is_err(), "blank token {blank:?} must be rejected at construction");
         }
@@ -5626,6 +5713,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         )
         .is_ok());
     }
@@ -5645,6 +5733,7 @@ mod tests {
             max_queued,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -5666,6 +5755,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -5735,6 +5825,7 @@ mod tests {
             1,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         )
         .unwrap();
         let queued = body_json(get(state, "/stats").await).await["jobs_queued"].as_u64().unwrap();
@@ -5775,6 +5866,7 @@ mod tests {
             0,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         );
         assert!(r.is_err(), "zero max_queued_jobs must be rejected at construction");
     }
@@ -5973,6 +6065,114 @@ mod tests {
         assert!(buckets.contains_key(&ip(3)));
     }
 
+    fn trusted(ips: &[IpAddr]) -> TrustedProxies {
+        TrustedProxies(ips.iter().copied().collect())
+    }
+
+    fn xff(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
+    /// parse_forwarded_node accepts a bare IP and the ip:port / [ipv6]:port forms a
+    /// proxy may append, and rejects obfuscated/garbage tokens.
+    #[test]
+    fn parse_forwarded_node_forms() {
+        assert_eq!(parse_forwarded_node("203.0.113.7"), Some(ip4(203, 0, 113, 7)));
+        assert_eq!(parse_forwarded_node("  203.0.113.7 "), Some(ip4(203, 0, 113, 7)), "trims");
+        assert_eq!(parse_forwarded_node("203.0.113.7:54321"), Some(ip4(203, 0, 113, 7)), "v4:port");
+        assert_eq!(parse_forwarded_node("2001:db8::1"), "2001:db8::1".parse().ok(), "bare v6");
+        assert_eq!(
+            parse_forwarded_node("[2001:db8::1]:443"),
+            "2001:db8::1".parse().ok(),
+            "[v6]:port"
+        );
+        assert_eq!(parse_forwarded_node("_hidden"), None);
+        assert_eq!(parse_forwarded_node("unknown"), None);
+        assert_eq!(parse_forwarded_node(""), None);
+    }
+
+    /// The default (empty) allowlist trusts no proxy, so XFF is ignored and the key
+    /// is the peer — byte-identical to the pre-XFF behavior on every deployment.
+    #[test]
+    fn resolve_empty_allowlist_always_peer() {
+        let t = TrustedProxies::default();
+        assert_eq!(resolve_source_ip(ip(9), &xff("203.0.113.7"), &t), ip(9));
+    }
+
+    /// An untrusted peer can write anything in XFF; it is ignored and the peer is the
+    /// key, so a direct attacker cannot forge a different source.
+    #[test]
+    fn resolve_untrusted_peer_ignores_xff() {
+        let t = trusted(&[ip(1)]);
+        assert_eq!(resolve_source_ip(ip(2), &xff("203.0.113.7"), &t), ip(2));
+    }
+
+    /// Behind one trusted proxy, the limiter keys on the client the proxy appended.
+    #[test]
+    fn resolve_trusted_proxy_single_client() {
+        let t = trusted(&[ip(1)]);
+        assert_eq!(resolve_source_ip(ip(1), &xff("203.0.113.7"), &t), ip4(203, 0, 113, 7));
+    }
+
+    /// Through a chain of two trusted proxies, the trusted hops are skipped and the
+    /// external client (leftmost untrusted) is returned.
+    #[test]
+    fn resolve_trusted_chain_returns_external_client() {
+        let t = trusted(&[ip(1), ip(2)]);
+        // client -> ip(2) -> ip(1)=peer: XFF = "client, ip(2)" (ip(1) appended ip(2)).
+        let h = xff(&format!("203.0.113.7, {}", ip(2)));
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
+    }
+
+    /// A forged XFF prepend sits LEFT of the real client the trusted proxy appended,
+    /// so the rightmost-untrusted pick ignores it.
+    #[test]
+    fn resolve_spoofed_prepend_is_ignored() {
+        let t = trusted(&[ip(1)]);
+        let h = xff("6.6.6.6, 203.0.113.7"); // attacker prepended 6.6.6.6; proxy appended the client
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
+    }
+
+    /// A trusted peer with no XFF (the proxy didn't forward one) falls back to the peer.
+    #[test]
+    fn resolve_trusted_peer_no_xff_falls_back() {
+        let t = trusted(&[ip(1)]);
+        assert_eq!(resolve_source_ip(ip(1), &HeaderMap::new(), &t), ip(1));
+        assert_eq!(resolve_source_ip(ip(1), &xff("   "), &t), ip(1), "blank XFF");
+    }
+
+    /// Every hop in the chain is a trusted proxy (no observed external client), so
+    /// there is nothing untrusted to key on — fall back to the peer.
+    #[test]
+    fn resolve_all_trusted_chain_falls_back() {
+        let t = trusted(&[ip(1), ip(2)]);
+        let h = xff(&format!("{}, {}", ip(2), ip(2)));
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip(1));
+    }
+
+    /// The nearest (rightmost) hop is unparseable, so the source is indeterminate;
+    /// fall back to the peer rather than reach further-left attacker-controlled data.
+    #[test]
+    fn resolve_unparseable_nearest_hop_falls_back() {
+        let t = trusted(&[ip(1)]);
+        let h = xff("203.0.113.7, _obfuscated");
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip(1));
+    }
+
+    /// An ip:port node from the proxy resolves to the bare client IP.
+    #[test]
+    fn resolve_strips_port_from_node() {
+        let t = trusted(&[ip(1)]);
+        assert_eq!(resolve_source_ip(ip(1), &xff("203.0.113.7:51000"), &t), ip4(203, 0, 113, 7));
+    }
+
+    /// A literal IPv4 helper distinct from the loopback `ip(n)` test sources.
+    fn ip4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::from([a, b, c, d])
+    }
+
     /// Empty-queue state with a small earner-registry cap, for the cap tests.
     async fn test_state_empty_with_earner_cap(max_earners: usize) -> Arc<AppState> {
         let state = AppState::with_store(
@@ -5986,6 +6186,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             max_earners,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -6006,6 +6207,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             max_registrations,
+            TrustedProxies::default(),
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -6163,6 +6365,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             0,
             DEFAULT_MAX_REGISTRATIONS,
+            TrustedProxies::default(),
         );
         assert!(r.is_err(), "zero max_earners must be rejected at construction");
     }
@@ -6183,6 +6386,7 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             0,
+            TrustedProxies::default(),
         );
         assert!(r.is_err(), "zero max_registrations must be rejected at construction");
     }
@@ -7600,7 +7804,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -7639,7 +7843,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -7693,7 +7897,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -7712,7 +7916,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -7812,7 +8016,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -8352,6 +8556,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -9315,7 +9520,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_deadline_multiple_knob_is_honored() {
         let state =
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
                 .unwrap();
         assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
 
@@ -9349,12 +9554,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_ttl_deadline_multiple() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
                 .is_err(),
             "multiple=0 must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
                 .is_ok(),
             "the smallest valid multiple (1) constructs"
         );
@@ -9367,12 +9572,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_handshake_timeout() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
                 .is_err(),
             "a zero handshake timeout must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS)
+            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
                 .is_ok(),
             "the smallest positive handshake timeout constructs"
         );
@@ -9458,6 +9663,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         let job = seed_job();
         let job_id = job.id;
@@ -9821,6 +10027,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -9875,6 +10082,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
 
         let terrain_job = JobSpec {
@@ -9934,6 +10142,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -9956,6 +10165,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
 
         let mut ids = Vec::new();
@@ -10051,6 +10261,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
 
         let queued = job_with_deadline(60);
@@ -10162,6 +10373,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -10211,6 +10423,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -10273,6 +10486,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -10329,6 +10543,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -10376,6 +10591,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -10436,6 +10652,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -10502,6 +10719,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -10567,6 +10785,7 @@ mod tests {
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
         });
         let pay = test_address("pay");
         let resp = post_json(
