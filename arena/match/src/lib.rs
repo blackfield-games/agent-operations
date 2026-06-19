@@ -586,4 +586,80 @@ mod tests {
         assert_eq!(m.seed(), seed_for_match(m.match_id()), "the seed derives from the minted id");
         assert_eq!(m.observe(0).own.seat, 0, "the core yields a real parity-bounded observation");
     }
+
+    #[test]
+    fn concurrent_joins_form_matches_atomically() {
+        // FM2: under concurrent joins, formation must not double-seat one
+        // participant or start a match a seat short. Many humans join at once; the
+        // one lock serializes join+form, so each participant is seated exactly once.
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: usize = 64;
+        let mm = Arc::new(open_mm());
+        let formed: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let mm = Arc::clone(&mm);
+                let formed = Arc::clone(&formed);
+                thread::spawn(move || {
+                    let outcome = mm.join(MatchMode::Human, JoinRequest::human(format!("p{i}"))).unwrap();
+                    if let Some(m) = outcome.into_formed() {
+                        let roster = m.seats().iter().map(|s| s.controller.clone()).collect::<Vec<_>>();
+                        formed.lock().unwrap().push(roster);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let formed = Arc::try_unwrap(formed).unwrap().into_inner().unwrap();
+        let mut seated: Vec<String> = formed.iter().flatten().cloned().collect();
+        seated.sort();
+        let mut expected: Vec<String> = (0..N).map(|i| format!("p{i}")).collect();
+        expected.sort();
+        assert_eq!(seated, expected, "every participant seated exactly once — no double-seat, no lost seat");
+        assert_eq!(formed.len(), N / 2, "N participants form N/2 two-seat matches");
+        assert!(formed.iter().all(|r| r.len() == 2), "every formed match is full");
+        assert_eq!(mm.waiting(MatchMode::Human), 0, "no participant stranded in the queue");
+    }
+
+    #[test]
+    fn agent_mode_rejects_unauthenticated_and_admits_authorized() {
+        // FM3: the ranked Agent queue must reject a missing/invalid/foreign
+        // identity token before it can reach a settle-able match.
+        let mm = ranked_mm(&[("0xa", "goodsig")]);
+        let rejected = |r: Result<JoinOutcome, JoinError>, who: &str| match r {
+            Err(JoinError::Unauthenticated { agent_id }) => assert_eq!(agent_id, who),
+            _ => panic!("expected Unauthenticated for {who}"),
+        };
+        // No token — every Agent-mode seat is ranked.
+        rejected(mm.join(MatchMode::Agent, JoinRequest::casual_agent("0xa")), "0xa");
+        // A wrong token for a known agent.
+        rejected(mm.join(MatchMode::Agent, JoinRequest::ranked_agent("0xa", "badsig")), "0xa");
+        // A valid-looking token for an unregistered agent.
+        rejected(mm.join(MatchMode::Agent, JoinRequest::ranked_agent("0xb", "goodsig")), "0xb");
+        assert_eq!(mm.waiting(MatchMode::Agent), 0, "no unauthenticated agent entered the ranked queue");
+
+        // The authorized identity is admitted.
+        assert!(mm.join(MatchMode::Agent, JoinRequest::ranked_agent("0xa", "goodsig")).unwrap().is_queued());
+        assert_eq!(mm.waiting(MatchMode::Agent), 1);
+    }
+
+    #[test]
+    fn mixed_rejects_a_forged_ranked_token_but_admits_casual() {
+        // Mixed allows a casual (token-less) agent for cross-play, but a PRESENTED
+        // token is a ranked claim — a forged one is rejected, so a bad ranked claim
+        // cannot slip in disguised as casual play.
+        let mm = ranked_mm(&[("0xgood", "goodsig")]);
+        assert!(mm.join(MatchMode::Mixed, JoinRequest::casual_agent("0xcasual")).unwrap().is_queued());
+        let forged = mm.join(MatchMode::Mixed, JoinRequest::ranked_agent("0xevil", "forged"));
+        assert!(matches!(forged, Err(JoinError::Unauthenticated { .. })));
+        assert!(mm.join(MatchMode::Mixed, JoinRequest::ranked_agent("0xgood", "goodsig")).unwrap().is_queued());
+        // Two agents, no human → no match formed; the forged join never queued.
+        assert_eq!(mm.waiting(MatchMode::Mixed), 2);
+    }
 }
