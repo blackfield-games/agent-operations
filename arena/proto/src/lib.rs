@@ -16,9 +16,10 @@
 //!   state in full plus only the entities it could perceive that tick. There is
 //!   no field for full world state, so an omniscient agent cannot be built on
 //!   this protocol even by a buggy or malicious server.
-//! - **Explicit versioning.** Every top-level envelope carries
-//!   [`PROTOCOL_VERSION`]; the handshake rejects a mismatch, so the Rust arena
-//!   and the UE5 server cannot silently diverge as they evolve.
+//! - **Explicit versioning.** The handshake and every per-tick envelope carry
+//!   [`PROTOCOL_VERSION`], and the version is fixed at the handshake — a mismatch
+//!   is rejected before a match starts — so the Rust arena and the UE5 server
+//!   cannot silently diverge as they evolve.
 //! - **Canonical, deterministic encoding.** All spatial quantities are integer
 //!   fixed-point (no floats), so the same match produces byte-identical replay
 //!   bytes and the same hash on any platform — the basis for on-chain
@@ -271,7 +272,13 @@ impl ActionIntent {
     pub fn clamped(&self) -> ActionIntent {
         let x = self.move_dir.x as i64;
         let y = self.move_dir.y as i64;
-        let mag_sq = (x * x + y * y) as u64;
+        // Sum in u64: each i64 square of an i32 is ≤ i32::MIN² (4.6e18, in range),
+        // but their i64 SUM overflows at move_dir == {i32::MIN, i32::MIN}
+        // (i64::MAX + 1). Widening the add keeps the clamp panic-free and correct
+        // on every attacker-controlled input — without it a release build wraps to
+        // a tiny magnitude, skips the clamp, and lets that vector through at
+        // god-mode speed.
+        let mag_sq = (x * x) as u64 + (y * y) as u64;
         let max = MOVE_INTENT_SCALE as i64;
         let max_sq = (max * max) as u64;
         let move_dir = if mag_sq <= max_sq {
@@ -794,7 +801,17 @@ mod tests {
     fn move_clamp_never_exceeds_max() {
         let buttons = ActionButtons { fire: false, jump: false, ability: false, reload: false };
         let max_sq = (MOVE_INTENT_SCALE as i64).pow(2);
-        for (x, y) in [(i32::MAX, i32::MAX), (1001, 0), (1000, 1000), (-30000, 12000), (0, i32::MIN + 1)] {
+        // The {i32::MIN, i32::MIN} corner is the worst case: its i64 magnitude
+        // sum is exactly i64::MAX + 1, which overflows without the widened add.
+        for (x, y) in [
+            (i32::MAX, i32::MAX),
+            (i32::MIN, i32::MIN),
+            (i32::MIN, i32::MAX),
+            (1001, 0),
+            (1000, 1000),
+            (-30000, 12000),
+            (0, i32::MIN + 1),
+        ] {
             let c = ActionIntent { move_dir: Vec2 { x, y }, aim: 0, buttons }.clamped();
             let mag_sq = (c.move_dir.x as i64).pow(2) + (c.move_dir.y as i64).pow(2);
             assert!(mag_sq <= max_sq, "clamp let ({x},{y}) through at mag^2={mag_sq} > {max_sq}");
