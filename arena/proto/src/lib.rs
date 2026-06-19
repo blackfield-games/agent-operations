@@ -28,6 +28,7 @@
 //! representation and transport lives in the arena/UE5 crates.
 
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use uuid::Uuid;
 
 /// The Gateway protocol version. Bumped on any wire-incompatible change to the
@@ -353,6 +354,125 @@ impl Action {
     }
 }
 
+impl ActionButtons {
+    /// Pack the four buttons into a byte (bit 0 = fire, 1 = jump, 2 = ability,
+    /// 3 = reload). Used by the replay digest so the canonical encoding of an
+    /// action is fixed-width and order-free.
+    pub fn bits(self) -> u8 {
+        (self.fire as u8) | (self.jump as u8) << 1 | (self.ability as u8) << 2 | (self.reload as u8) << 3
+    }
+}
+
+/// Who held a seat for a match — the controller identity, recorded so a replay
+/// names its players. The identity string is an on-chain agent address for a
+/// ranked agent seat, or a human/label otherwise; the protocol does not
+/// interpret it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatInfo {
+    pub seat: SeatId,
+    pub team: TeamId,
+    pub controller: String,
+}
+
+/// One seat's accepted (post-clamp) intent for one tick. A seat that forfeited
+/// the tick (no action within the deadline) simply has no entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatAction {
+    pub seat: SeatId,
+    pub intent: ActionIntent,
+}
+
+/// One simulated tick's canonical record: the accepted actions that drove it,
+/// ascending by seat. The position of a [`TickRecord`] in
+/// [`ReplayRecord::ticks`] is its tick order, so the stream is fully ordered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickRecord {
+    pub tick: u64,
+    pub actions: Vec<SeatAction>,
+}
+
+/// The full deterministic record of a match — the PRNG seed, the roster, and the
+/// ordered per-tick accepted-action stream — sufficient to re-run the match
+/// bit-for-bit and reproduce its [`MatchResult`].
+///
+/// For the record to be a stable commitment the producer MUST build it in
+/// canonical order: `seats` and each tick's `actions` ascending by seat, `ticks`
+/// in tick order. [`digest`](ReplayRecord::digest) then commits the whole record
+/// to one 32-byte hash that is identical on every platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayRecord {
+    pub protocol_version: u32,
+    pub match_id: MatchId,
+    /// The seed the sim ran from; replay re-runs from this exact value.
+    pub seed: u64,
+    pub seats: Vec<SeatInfo>,
+    pub ticks: Vec<TickRecord>,
+}
+
+impl ReplayRecord {
+    /// The canonical commitment to this match: `keccak256` over a domain-tagged,
+    /// length-prefixed, big-endian, integer-only encoding of every field — no
+    /// JSON, no float, no map iteration, so the same match yields the same 32
+    /// bytes on every platform. This is what an on-chain attestation signs and
+    /// what a grader compares; it mirrors the `mesh/proto` digest discipline.
+    /// Lowercase-hex of this is the wire form carried in
+    /// [`MatchResult::replay_hash`].
+    pub fn digest(&self) -> [u8; 32] {
+        let mut h = Keccak256::new();
+        h.update(b"blackfield/arena/replay/v1");
+        h.update(self.protocol_version.to_be_bytes());
+        h.update(self.match_id.as_bytes());
+        h.update(self.seed.to_be_bytes());
+        h.update((self.seats.len() as u32).to_be_bytes());
+        for s in &self.seats {
+            h.update([s.seat]);
+            h.update(s.team.to_be_bytes());
+            h.update((s.controller.len() as u32).to_be_bytes());
+            h.update(s.controller.as_bytes());
+        }
+        h.update((self.ticks.len() as u32).to_be_bytes());
+        for t in &self.ticks {
+            h.update(t.tick.to_be_bytes());
+            h.update((t.actions.len() as u32).to_be_bytes());
+            for a in &t.actions {
+                h.update([a.seat]);
+                h.update(a.intent.move_dir.x.to_be_bytes());
+                h.update(a.intent.move_dir.y.to_be_bytes());
+                h.update(a.intent.aim.to_be_bytes());
+                h.update([a.intent.buttons.bits()]);
+            }
+        }
+        h.finalize().into()
+    }
+}
+
+/// How one seat finished — ordered, canonical, and enough to settle a ranked
+/// match. `placement` is 1-based (1 = best); tied seats share a placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatOutcome {
+    pub seat: SeatId,
+    pub team: TeamId,
+    pub placement: u16,
+    pub score: i32,
+    pub alive_at_end: bool,
+}
+
+/// The terminal result of a match — the canonical, attestable summary settlement
+/// and grading read. `replay_hash` is the lowercase-hex
+/// [`ReplayRecord::digest`], so the result commits to the exact match that
+/// produced it; anyone with the replay can recompute the hash and re-run the
+/// match to verify both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchResult {
+    pub protocol_version: u32,
+    pub match_id: MatchId,
+    pub final_tick: u64,
+    /// Per-seat outcomes, ascending by seat (canonical order).
+    pub outcomes: Vec<SeatOutcome>,
+    /// Lowercase hex of [`ReplayRecord::digest`].
+    pub replay_hash: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +665,116 @@ mod tests {
         assert_eq!(isqrt_u64(25), 5);
         assert_eq!(isqrt_u64(26), 5);
         assert_eq!(isqrt_u64(u64::MAX), 4294967295);
+    }
+
+    #[test]
+    fn action_buttons_bits_pack() {
+        assert_eq!(ActionButtons { fire: false, jump: false, ability: false, reload: false }.bits(), 0);
+        assert_eq!(ActionButtons { fire: true, jump: false, ability: false, reload: false }.bits(), 1);
+        assert_eq!(ActionButtons { fire: false, jump: true, ability: false, reload: false }.bits(), 2);
+        assert_eq!(ActionButtons { fire: false, jump: false, ability: true, reload: false }.bits(), 4);
+        assert_eq!(ActionButtons { fire: false, jump: false, ability: false, reload: true }.bits(), 8);
+        assert_eq!(ActionButtons { fire: true, jump: true, ability: true, reload: true }.bits(), 15);
+    }
+
+    #[test]
+    fn replay_digest_is_deterministic_and_serde_byte_stable() {
+        // FM3: the same match must produce the same bytes and the same hash on
+        // every run. The digest is over an integer-only canonical encoding (no
+        // float, no map), and serde output is stable because every container is
+        // an ordered Vec — so two encodings are byte-identical.
+        let rec = sample_replay();
+        assert_eq!(rec.digest(), rec.digest(), "digest is not a pure function");
+        let a = serde_json::to_string(&rec).unwrap();
+        let b = serde_json::to_string(&rec.clone()).unwrap();
+        assert_eq!(a, b, "serde encoding is not byte-stable");
+    }
+
+    #[test]
+    fn replay_digest_golden() {
+        // A fixed record must hash to a fixed value. Any change to the canonical
+        // encoding (field order, prefixing, domain tag) flips this — the
+        // hard byte-stability pin for on-chain attestation.
+        assert_eq!(
+            hex::encode(sample_replay().digest()),
+            "35f5283a7492c4e72534fd6e40dad73996571ffe8d17972f0bf8cd9497bca005"
+        );
+    }
+
+    #[test]
+    fn replay_digest_is_order_and_field_sensitive() {
+        let base = sample_replay().digest();
+        // Different seed -> different commitment.
+        let mut r = sample_replay();
+        r.seed ^= 1;
+        assert_ne!(base, r.digest(), "seed must bind");
+        // Reordered ticks -> different commitment (tick order is canonical).
+        let mut r = sample_replay();
+        r.ticks.reverse();
+        assert_ne!(base, r.digest(), "tick order must bind");
+        // A changed action -> different commitment.
+        let mut r = sample_replay();
+        r.ticks[0].actions[0].intent.aim ^= 1;
+        assert_ne!(base, r.digest(), "an action must bind");
+        // A changed controller identity -> different commitment.
+        let mut r = sample_replay();
+        r.seats[0].controller.push('x');
+        assert_ne!(base, r.digest(), "roster must bind");
+    }
+
+    #[test]
+    fn replay_record_wire_shape_is_stable() {
+        let rec = sample_replay();
+        let json = serde_json::to_value(&rec).unwrap();
+        let round: ReplayRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(round, rec, "ReplayRecord did not round-trip");
+    }
+
+    #[test]
+    fn match_result_wire_shape_is_stable_and_commits_to_replay() {
+        let rec = sample_replay();
+        let canonical = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "match_id": FIXED_MATCH,
+            "final_tick": 2,
+            "outcomes": [
+                { "seat": 0, "team": 1, "placement": 1, "score": 3, "alive_at_end": true },
+                { "seat": 1, "team": 2, "placement": 2, "score": 1, "alive_at_end": false }
+            ],
+            "replay_hash": hex::encode(rec.digest())
+        });
+        let parsed: MatchResult = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "MatchResult wire shape drifted");
+        assert_eq!(parsed.replay_hash, hex::encode(rec.digest()), "result must commit to the replay digest");
+    }
+
+    fn sample_replay() -> ReplayRecord {
+        let buttons = ActionButtons { fire: true, jump: false, ability: false, reload: false };
+        ReplayRecord {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: FIXED_MATCH.parse().unwrap(),
+            seed: 0xdead_beef,
+            seats: vec![
+                SeatInfo { seat: 0, team: 1, controller: "0xaaaa".into() },
+                SeatInfo { seat: 1, team: 2, controller: "0xbbbb".into() },
+            ],
+            ticks: vec![
+                TickRecord {
+                    tick: 0,
+                    actions: vec![SeatAction {
+                        seat: 0,
+                        intent: ActionIntent { move_dir: Vec2 { x: 600, y: 800 }, aim: 0x4000, buttons },
+                    }],
+                },
+                TickRecord {
+                    tick: 1,
+                    actions: vec![SeatAction {
+                        seat: 1,
+                        intent: ActionIntent { move_dir: Vec2 { x: -100, y: 0 }, aim: 0, buttons },
+                    }],
+                },
+            ],
+        }
     }
 
     fn sample_action() -> Action {
