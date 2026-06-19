@@ -1,0 +1,9 @@
+[package]
+name = "arena-match"
+version = "0.0.1"
+edition.workspace = true
+
+[dependencies]
+arena-proto = { workspace = true }
+arena-core = { path = "../core" }
+uuid = { workspace = true }

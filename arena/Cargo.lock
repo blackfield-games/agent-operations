@@ -24,6 +24,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arena-match"
+version = "0.0.1"
+dependencies = [
+ "arena-core",
+ "arena-proto",
+ "uuid",
+]
+
+[[package]]
 name = "arena-proto"
 version = "0.0.1"
 dependencies = [
