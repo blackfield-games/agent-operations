@@ -28,6 +28,7 @@
 //! representation and transport lives in the arena/UE5 crates.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// The Gateway protocol version. Bumped on any wire-incompatible change to the
 /// envelopes, observation, action, or replay record. Both peers send it in the
@@ -77,4 +78,116 @@ pub struct Vec2 {
 
 impl Vec2 {
     pub const ZERO: Vec2 = Vec2 { x: 0, y: 0 };
+}
+
+/// Identifies a single match. Server-minted (v4) so a peer can neither forge a
+/// match id nor collide with a live one.
+pub type MatchId = Uuid;
+
+/// A seat in a match — the slot one controller (human or agent) fills. Arenas
+/// seat a bounded roster, so `u8` is ample and keeps the wire form compact; the
+/// matchmaking mode, not the protocol, decides whether a seat is filled by a
+/// human or an agent.
+pub type SeatId = u8;
+
+/// The server-authoritative match lifecycle. A match advances strictly
+/// `Lobby → Starting → Live → Ended` and never moves backward; an agent reads
+/// the current phase off every [`Observation`] and the terminal transition is
+/// carried by [`GatewayMsg::End`]. Actions are simulated only in [`Live`].
+///
+/// [`Live`]: MatchPhase::Live
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchPhase {
+    /// Seats are filling; no simulation yet.
+    Lobby,
+    /// Roster locked, spawn/countdown running; actions are not yet simulated.
+    Starting,
+    /// The match is live; observations stream and actions are simulated.
+    Live,
+    /// The match is over; no further actions are accepted.
+    Ended,
+}
+
+/// The peer announced a [`PROTOCOL_VERSION`] this build cannot speak. Returned by
+/// [`check_version`] and surfaced as a handshake rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionMismatch {
+    pub ours: u32,
+    pub theirs: u32,
+}
+
+impl std::fmt::Display for VersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gateway protocol version mismatch: ours={}, theirs={}",
+            self.ours, self.theirs
+        )
+    }
+}
+
+impl std::error::Error for VersionMismatch {}
+
+/// Reject a handshake whose announced version is not exactly ours. The Gateway
+/// is a moving contract with two independent implementations (the Rust arena and
+/// the UE5 server) that evolve on their own cadence; an agent that conforms to
+/// one version must never be silently simulated under another — that is how a
+/// "passing" agent ends up cheating or desyncing in the field. So the check is
+/// exact-match, run at the handshake, before any match state exists.
+pub fn check_version(theirs: u32) -> Result<(), VersionMismatch> {
+    if theirs == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(VersionMismatch {
+            ours: PROTOCOL_VERSION,
+            theirs,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_handshake_accepts_match_and_rejects_drift() {
+        assert!(check_version(PROTOCOL_VERSION).is_ok());
+        // A peer one version ahead or behind is rejected with both versions
+        // named, so the handshake can report the incompatibility precisely.
+        let err = check_version(PROTOCOL_VERSION + 1).unwrap_err();
+        assert_eq!(err, VersionMismatch { ours: PROTOCOL_VERSION, theirs: PROTOCOL_VERSION + 1 });
+        assert!(check_version(0).is_err());
+    }
+
+    #[test]
+    fn match_phase_tags_are_stable() {
+        let cases = [
+            (MatchPhase::Lobby, "lobby"),
+            (MatchPhase::Starting, "starting"),
+            (MatchPhase::Live, "live"),
+            (MatchPhase::Ended, "ended"),
+        ];
+        for (variant, tag) in cases {
+            let serialized = serde_json::to_value(variant).unwrap();
+            assert_eq!(serialized, serde_json::json!(tag), "MatchPhase::{variant:?} tag drifted");
+            let round: MatchPhase = serde_json::from_value(serialized).unwrap();
+            assert_eq!(round, variant, "MatchPhase::{variant:?} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn vec2_wire_shape_is_stable() {
+        let canonical = serde_json::json!({ "x": 1500, "y": -250 });
+        let parsed: Vec2 = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(parsed, Vec2 { x: 1500, y: -250 });
+        assert_eq!(serde_json::to_value(parsed).unwrap(), canonical, "Vec2 wire shape drifted");
+    }
+
+    #[test]
+    fn bam_quarter_turn_is_half_pi() {
+        // 0x4000 is a quarter turn; the helper is display-only but must be right.
+        let r = bam_to_radians(0x4000);
+        assert!((r - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "got {r}");
+    }
 }
