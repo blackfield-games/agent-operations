@@ -111,6 +111,32 @@ pub enum MatchPhase {
     Ended,
 }
 
+/// How a match's seats are filled — the matchmaking dimension, not a gameplay
+/// fork. One combat core serves all three: `Human` is human-only (clean ranked
+/// PvP), `Agent` is agent-only (ranked A2A), and `Mixed` puts both kinds on the
+/// same battlefield. The mode decides *who* fills the seats and what composition
+/// is valid; the simulation treats every seat identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    /// Every seat is human-controlled.
+    Human,
+    /// Every seat is agent-controlled (ranked A2A).
+    Agent,
+    /// At least one human and at least one agent share the match.
+    Mixed,
+}
+
+/// What kind of controller fills a seat. A human drives a pawn through a
+/// `PlayerController`, an agent through an `AgentController` over the Gateway; the
+/// core cannot tell them apart, so this is a matchmaking/identity label only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerKind {
+    Human,
+    Agent,
+}
+
 /// The peer announced a [`PROTOCOL_VERSION`] this build cannot speak. Returned by
 /// [`check_version`] and surfaced as a handshake rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -651,6 +677,26 @@ mod tests {
             assert_eq!(serialized, serde_json::json!(tag), "MatchPhase::{variant:?} tag drifted");
             let round: MatchPhase = serde_json::from_value(serialized).unwrap();
             assert_eq!(round, variant, "MatchPhase::{variant:?} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn match_mode_and_controller_kind_tags_are_stable() {
+        // Matchmaking vocabulary shared with the match service and (later) the
+        // engine; pin the snake_case wire spelling so a rename breaks loud.
+        for (variant, tag) in [
+            (MatchMode::Human, "human"),
+            (MatchMode::Agent, "agent"),
+            (MatchMode::Mixed, "mixed"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), serde_json::json!(tag));
+            let round: MatchMode = serde_json::from_value(serde_json::json!(tag)).unwrap();
+            assert_eq!(round, variant);
+        }
+        for (variant, tag) in [(ControllerKind::Human, "human"), (ControllerKind::Agent, "agent")] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), serde_json::json!(tag));
+            let round: ControllerKind = serde_json::from_value(serde_json::json!(tag)).unwrap();
+            assert_eq!(round, variant);
         }
     }
 
