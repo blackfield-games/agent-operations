@@ -22,7 +22,11 @@ away:
 
 from __future__ import annotations
 
+import json
+import subprocess
+import threading
 import time
+from collections import defaultdict, deque
 from collections.abc import Callable
 from typing import Protocol
 
@@ -186,3 +190,110 @@ class ArenaClient:
             self.poll(policy)
         assert self.result is not None
         return self.result
+
+
+class GatewayClosed(ProtocolError):
+    """The harness stream ended before the match did."""
+
+
+class SubprocessGateway:
+    """Spawns a gateway harness and multiplexes the seat-tagged transport frames it
+    speaks (`{"seat": u8, "frame": <arena-01>}`) into per-seat queues, so several
+    ArenaClients can share one stdio pipe. A real networked gateway is one
+    connection per seat; this is the local loopback twin used to run a match
+    against the reference core. A watchdog kills a silent harness so a hang fails
+    the caller loudly instead of blocking forever."""
+
+    def __init__(self, argv: list[str], timeout: float = 30.0) -> None:
+        self._proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
+        )
+        self._queues: dict[int, deque[dict]] = defaultdict(deque)
+        self._timeout = timeout
+
+    def _readline(self) -> str:
+        timer = threading.Timer(self._timeout, self._proc.kill)
+        timer.start()
+        try:
+            assert self._proc.stdout is not None
+            return self._proc.stdout.readline()
+        finally:
+            timer.cancel()
+
+    def recv(self, seat: int) -> dict:
+        while not self._queues[seat]:
+            line = self._readline()
+            if not line:
+                raise GatewayClosed("harness closed the stream")
+            env = json.loads(line)
+            self._queues[env["seat"]].append(env["frame"])
+        return self._queues[seat].popleft()
+
+    def send(self, seat: int, frame: dict) -> None:
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(json.dumps({"seat": seat, "frame": frame}) + "\n")
+        self._proc.stdin.flush()
+
+    def close(self) -> None:
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+
+    def __enter__(self) -> SubprocessGateway:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+class SeatTransport:
+    """A per-seat Transport view over a shared SubprocessGateway."""
+
+    def __init__(self, gateway: SubprocessGateway, seat: int) -> None:
+        self._gateway = gateway
+        self._seat = seat
+
+    def recv(self) -> dict:
+        return self._gateway.recv(self._seat)
+
+    def send(self, frame: dict) -> None:
+        self._gateway.send(self._seat, frame)
+
+
+def run_local_match(
+    harness: str,
+    seats: list[int],
+    policies: dict[int, Policy],
+    *,
+    seed: int = 0,
+    match_id: str = "00000000-0000-4000-8000-000000000000",
+    agent_ids: dict[int, str] | None = None,
+    timeout: float = 30.0,
+) -> dict[int, MatchResult]:
+    """Run one match against the harnessed reference core: connect an ArenaClient
+    per seat over a shared transport, then pump observe→act round-robin until every
+    seat reaches End. Single-threaded — the demux buffers whichever seat's frame
+    arrives first — so it is deterministic and deadlock-free. Returns each seat's
+    MatchResult (all seats receive the same canonical result)."""
+    argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
+    ids = agent_ids or {s: f"agent-{s}" for s in seats}
+    with SubprocessGateway(argv, timeout=timeout) as gateway:
+        clients = {s: ArenaClient(SeatTransport(gateway, s), agent_id=ids[s]) for s in seats}
+        for client in clients.values():
+            client.connect()
+        results: dict[int, MatchResult] = {}
+        while len(results) < len(seats):
+            for seat, client in clients.items():
+                if client.done:
+                    continue
+                outcome = client.poll(policies[seat])
+                if outcome is not None:
+                    results[seat] = outcome
+        return results

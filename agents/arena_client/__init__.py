@@ -33,17 +33,23 @@ from .proto import (
 from .baseline import BaselinePolicy, aim_at
 from .sdk import (
     ArenaClient,
+    GatewayClosed,
     HandshakeRejected,
     Policy,
+    SubprocessGateway,
     Transport,
     VersionMismatch,
     check_version,
+    run_local_match,
 )
 
 __all__ = [
     "ArenaClient",
     "BaselinePolicy",
+    "GatewayClosed",
+    "SubprocessGateway",
     "aim_at",
+    "run_local_match",
     "HandshakeRejected",
     "Policy",
     "Transport",

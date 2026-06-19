@@ -13,6 +13,10 @@ the arena workspace is absent, and runs for real under validate.sh.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+from pathlib import Path
+
 import pydantic
 import pytest
 
@@ -410,3 +414,63 @@ def test_baseline_move_is_always_legal_and_deterministic():
         b = pol(obs)
         assert a == b  # pure function of the observation
         assert a.move_dir.x**2 + a.move_dir.y**2 <= proto.MOVE_INTENT_SCALE**2
+
+
+def _arena_harness() -> str | None:
+    """The built arena-harness binary, or None (skip) when cargo / the arena
+    workspace is unavailable. Builds on demand if cargo is present so a plain
+    `pytest` is self-sufficient; under validate.sh the arena build already produced
+    it, so this just locates it."""
+    arena = Path(__file__).resolve().parent.parent / "arena"
+    for profile in ("release", "debug"):
+        candidate = arena / "target" / profile / "arena-harness"
+        if candidate.exists():
+            return str(candidate)
+    if shutil.which("cargo") and (arena / "Cargo.toml").exists():
+        subprocess.run(
+            ["cargo", "build", "-q", "-p", "arena-harness", "--manifest-path", str(arena / "Cargo.toml")],
+            check=True,
+        )
+        candidate = arena / "target" / "debug" / "arena-harness"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def test_baseline_vs_baseline_runs_a_real_decisive_deterministic_match():
+    # The headline of arena-03: a full agent-vs-agent match through the SDK against
+    # the real arena-02 core, gradeable and reproducible. Skips (never fails) where
+    # cargo/arena is absent; runs for real under validate.sh's arena build.
+    harness = _arena_harness()
+    if harness is None:
+        pytest.skip("arena-harness unavailable (needs cargo + the arena workspace)")
+    from arena_client.sdk import run_local_match
+
+    seed = 12345
+    match_id = "11111111-2222-4333-8444-555555555555"
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    results = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id)
+
+    assert set(results) == {0, 1}
+    r0, r1 = results[0], results[1]
+    assert r0 == r1, "every seat sees the same canonical result"
+    assert r0.match_id == match_id
+    assert isinstance(r0, MatchResult)
+
+    # A real, decisive duel: it ended before the tick cap and exactly one seat is
+    # alive (the seat-order tie-break makes a symmetric match decisive, not a draw).
+    assert 0 < r0.final_tick < 3600
+    alive = [o for o in r0.outcomes if o.alive_at_end]
+    assert len(alive) == 1
+    assert alive[0].placement == 1 and alive[0].score > 0
+    assert len(r0.replay_hash) == 64  # keccak256, lowercase hex
+
+    # Determinism: the same seed + match id re-runs byte-for-byte, replay hash incl.
+    again = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id)
+    assert again[0] == r0
+    assert again[0].replay_hash == r0.replay_hash
+
+    # A different seed perturbs the opening, so the match is genuinely seed-driven
+    # (not a fixed script): the replay hash differs.
+    other = run_local_match(harness, [0, 1], policies, seed=seed + 1, match_id=match_id)
+    assert other[0].replay_hash != r0.replay_hash
