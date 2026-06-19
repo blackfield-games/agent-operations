@@ -30,8 +30,22 @@ from .proto import (
     Welcome,
     decode_gateway,
 )
+from .sdk import (
+    ArenaClient,
+    HandshakeRejected,
+    Policy,
+    Transport,
+    VersionMismatch,
+    check_version,
+)
 
 __all__ = [
+    "ArenaClient",
+    "HandshakeRejected",
+    "Policy",
+    "Transport",
+    "VersionMismatch",
+    "check_version",
     "MOVE_INTENT_SCALE",
     "POSITION_SCALE",
     "PROTOCOL_VERSION",

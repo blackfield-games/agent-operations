@@ -13,6 +13,9 @@ the arena workspace is absent, and runs for real under validate.sh.
 
 from __future__ import annotations
 
+import pydantic
+import pytest
+
 from arena_client import proto
 from arena_client.proto import (
     Action,
@@ -105,8 +108,6 @@ def test_unknown_field_is_rejected():
         "position": {"x": 0, "y": 0}, "z": 0, "facing": 0, "in_line_of_sight": True,
         "health": 100,  # a hidden-state field that must never appear on a VisibleEntity
     }
-    import pydantic
-    import pytest
     with pytest.raises(pydantic.ValidationError):
         proto.VisibleEntity.model_validate(bad)
 
@@ -143,7 +144,6 @@ def test_gateway_envelopes_decode():
 
 
 def test_unknown_gateway_tag_raises():
-    import pytest
     with pytest.raises(proto.ProtocolError):
         decode_gateway({"type": "teleport"})
     with pytest.raises(proto.ProtocolError):
@@ -191,3 +191,149 @@ def test_move_clamp_never_exceeds_max():
     for x, y in [(big, big), (-big, big), (1001, 0), (1000, 1000), (-30000, 12000)]:
         c = _intent(x, y).clamped().move_dir
         assert c.x * c.x + c.y * c.y <= proto.MOVE_INTENT_SCALE**2, (x, y, c)
+
+
+class MockTransport:
+    """A scripted transport: `inbound` frames are recv'd in order, every sent frame
+    is appended to `sent`. Lets the client state machine be driven with no I/O."""
+
+    def __init__(self, inbound: list[dict]) -> None:
+        self._inbound = list(inbound)
+        self.sent: list[dict] = []
+
+    def recv(self) -> dict:
+        if not self._inbound:
+            raise proto.ProtocolError("mock transport exhausted")
+        return self._inbound.pop(0)
+
+    def send(self, frame: dict) -> None:
+        self.sent.append(frame)
+
+
+class FakeClock:
+    """A deterministic monotonic clock: returns each scripted reading once, then
+    holds the last value. Lets a deadline test simulate a slow policy with no sleep."""
+
+    def __init__(self, readings: list[float]) -> None:
+        self._readings = list(readings)
+        self._i = 0
+
+    def __call__(self) -> float:
+        v = self._readings[min(self._i, len(self._readings) - 1)]
+        self._i += 1
+        return v
+
+
+def _challenge_frame(nonce: str = "00") -> dict:
+    return {"type": "challenge", "nonce": nonce}
+
+
+def _welcome_frame(version: int = proto.PROTOCOL_VERSION, seat: int = 0) -> dict:
+    return {"type": "welcome", "protocol_version": version, "match_id": FIXED_MATCH, "seat": seat}
+
+
+def _start_frame() -> dict:
+    return {
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+    }
+
+
+def _observe_frame(tick: int = 0, seat: int = 0, alive: bool = True, deadline: int = 50_000) -> dict:
+    return {
+        "type": "observe", "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH,
+        "seat": seat, "tick": tick, "phase": "live", "deadline_micros": deadline,
+        "own": {"seat": seat, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "ammo": 30, "alive": alive},
+        "visible": [],
+    }
+
+
+def _end_frame() -> dict:
+    return {"type": "end", "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH,
+            "final_tick": 1, "outcomes": [], "replay_hash": "00"}
+
+
+def _fixed_policy(_obs) -> ActionIntent:
+    return _intent(100, 0)
+
+
+def test_connect_completes_handshake():
+    from arena_client.sdk import ArenaClient
+    t = MockTransport([_challenge_frame("abcd"), _welcome_frame(seat=2), _start_frame()])
+    c = ArenaClient(t, agent_id="agent-2")
+    c.connect()
+    assert c.seat == 2 and c.match_id == FIXED_MATCH and c.nonce == "abcd"
+    assert c.config is not None and c.config.seats == 2
+    assert len(t.sent) == 1 and t.sent[0]["type"] == "join" and t.sent[0]["signature_hex"] == ""
+
+
+def test_connect_refuses_version_skew():
+    # FM3: a version skew is a clean refusal at connect, before any match state.
+    from arena_client.sdk import ArenaClient, VersionMismatch
+    t = MockTransport([_challenge_frame(), _welcome_frame(version=proto.PROTOCOL_VERSION + 1)])
+    c = ArenaClient(t, agent_id="x")
+    with pytest.raises(VersionMismatch):
+        c.connect()
+    assert not c.connected
+
+
+def test_connect_handles_handshake_reject():
+    from arena_client.sdk import ArenaClient, HandshakeRejected
+    t = MockTransport([_challenge_frame(), {"type": "reject", "reason": "match full"}])
+    c = ArenaClient(t, agent_id="x")
+    with pytest.raises(HandshakeRejected, match="match full"):
+        c.connect()
+
+
+def test_run_answers_each_observation_until_end():
+    from arena_client.sdk import ArenaClient
+    inbound = [_challenge_frame(), _welcome_frame(seat=0), _start_frame(),
+               _observe_frame(tick=0), _observe_frame(tick=1), _end_frame()]
+    t = MockTransport(inbound)
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 0.0]))
+    result = c.run(_fixed_policy)
+    assert isinstance(result, MatchResult) and c.done
+    acts = [f for f in t.sent if f["type"] == "act"]
+    assert [a["tick"] for a in acts] == [0, 1]
+    assert all(a["seat"] == 0 for a in acts)
+
+
+def test_mid_match_reject_is_surfaced_not_raised():
+    # FM1: a reject mid-match is recorded and stepped past, never a desync/crash.
+    from arena_client.sdk import ArenaClient
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0), {"type": "reject", "reason": "stale tick"},
+               _observe_frame(tick=1), _end_frame()]
+    t = MockTransport(inbound)
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 0.0]))
+    result = c.run(_fixed_policy)
+    assert isinstance(result, MatchResult)
+    assert c.rejections == ["stale tick"]
+    assert [a["tick"] for a in t.sent if a["type"] == "act"] == [0, 1]
+
+
+def test_deadline_overrun_forfeits_the_tick():
+    # FM2: a policy slower than deadline_micros forfeits — no late action is sent.
+    from arena_client.sdk import ArenaClient
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0, deadline=1000), _end_frame()]
+    t = MockTransport(inbound)
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 1.0]))  # 1.0s elapsed >> 1000us
+    result = c.run(_fixed_policy)
+    assert isinstance(result, MatchResult)
+    assert c.forfeits == 1
+    assert not any(f["type"] == "act" for f in t.sent)
+
+
+def test_downed_seat_answers_with_passive_hold():
+    from arena_client.sdk import ArenaClient
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0, alive=False), _end_frame()]
+    t = MockTransport(inbound)
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 0.0]))
+    c.run(_fixed_policy)
+    acts = [f for f in t.sent if f["type"] == "act"]
+    assert len(acts) == 1
+    assert acts[0]["intent"]["buttons"]["fire"] is False
+    assert acts[0]["intent"]["move_dir"] == {"x": 0, "y": 0}
