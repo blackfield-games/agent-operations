@@ -2055,8 +2055,12 @@ async fn submit(
 ///
 /// The earner registration and queue/completed state are shared with the HTTP
 /// endpoints, so `/stats` reflects ws activity identically.
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
-    ws.on_upgrade(move |socket| ws_session(socket, state))
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Extension(PeerAddr(peer)): Extension<PeerAddr>,
+) -> Response {
+    ws.on_upgrade(move |socket| ws_session(socket, state, peer))
 }
 
 /// Send a `CoordinatorMsg` as a JSON text frame. Returns `false` if the socket
@@ -2071,9 +2075,9 @@ async fn send_msg(socket: &mut WebSocket, msg: &CoordinatorMsg) -> bool {
     }
 }
 
-async fn ws_session(mut socket: WebSocket, state: Arc<AppState>) {
+async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, peer: SocketAddr) {
     // 1. First message MUST be a Hello.
-    let earner_address = match recv_hello(&mut socket, &state).await {
+    let earner_address = match recv_hello(&mut socket, &state, peer).await {
         Some(addr) => addr,
         None => return,
     };
@@ -2329,8 +2333,8 @@ const HELLO_NONCE_BYTES: usize = 16;
 /// wall-clock, so frame-flooding can't extend it (the deadline is not reset per
 /// frame). On elapse we fail closed: return `None` (no registry insert, no
 /// eviction), the caller returns, and axum closes the socket.
-async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<String> {
-    match tokio::time::timeout(state.handshake_timeout, recv_hello_inner(socket, state)).await {
+async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>, peer: SocketAddr) -> Option<String> {
+    match tokio::time::timeout(state.handshake_timeout, recv_hello_inner(socket, state, peer)).await {
         Ok(result) => result,
         Err(_) => {
             tracing::warn!("ws: registration handshake timed out before a valid Hello; closing");
@@ -2339,7 +2343,11 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<Str
     }
 }
 
-async fn recv_hello_inner(socket: &mut WebSocket, state: &Arc<AppState>) -> Option<String> {
+async fn recv_hello_inner(
+    socket: &mut WebSocket,
+    state: &Arc<AppState>,
+    peer: SocketAddr,
+) -> Option<String> {
     let mut nonce = [0u8; HELLO_NONCE_BYTES];
     if getrandom::getrandom(&mut nonce).is_err() {
         tracing::error!("ws: failed to generate a registration challenge; closing");
@@ -2367,6 +2375,28 @@ async fn recv_hello_inner(socket: &mut WebSocket, state: &Arc<AppState>) -> Opti
             tracing::warn!("ws: first message was not Hello; closing");
             return None;
         };
+        // Per-source registration rate limit, once a Hello frame is in hand and
+        // BEFORE its secp256k1 verify in validate_hello (cheap-reject-first, FM2) —
+        // symmetric with HTTP /register. Over-limit → close the socket (return None),
+        // no registry work. Keyed on the connection peer IP.
+        {
+            let now = now_secs();
+            let mut buckets = state.registration_buckets.lock().await;
+            if !check_registration_rate(
+                &mut buckets,
+                peer.ip(),
+                now,
+                state.max_registrations,
+                REGISTRATION_WINDOW_SECS,
+                MAX_REGISTRATION_BUCKETS,
+            ) {
+                tracing::warn!(
+                    source = %peer.ip(),
+                    "ws: rejected registration: per-source rate limit exceeded; closing"
+                );
+                return None;
+            }
+        }
         if let Err(reason) = validate_hello(
             &earner_address,
             &gpu_model,
@@ -4166,6 +4196,76 @@ mod tests {
             body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
             0,
             "a forged Hello must not register via ws",
+        );
+    }
+
+    /// Poll `/stats` until `gpus_joined` reaches `want`. Serializes the ws rate-limit
+    /// test: the rate check precedes admission, so a registered earner means its token
+    /// is already consumed — making the next connection deterministically the N+1-th
+    /// to draw on the shared source bucket (the three ws connections race otherwise).
+    async fn wait_for_gpus_joined(state: &Arc<AppState>, want: u64) {
+        for _ in 0..200 {
+            if body_json(get(state.clone(), "/stats").await).await["gpus_joined"] == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("gpus_joined never reached {want}");
+    }
+
+    /// WS Hello path parity with HTTP `/register`: a source over its per-source
+    /// allowance is shed (socket closed) BEFORE the signature verify. All loopback
+    /// connections share one source bucket; registrations are serialized via `/stats`
+    /// so the 3rd Hello at a cap of 2 is deterministically the rejected one, and it
+    /// registers nothing.
+    #[tokio::test]
+    async fn ws_over_rate_limit_closes_and_registers_nothing() {
+        let state = test_state_empty_with_registrations(2).await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let mut keep_open = Vec::new();
+        for (i, label) in ["wsra", "wsrb"].iter().enumerate() {
+            let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            let nonce = recv_challenge(&mut ws).await;
+            let sk = test_signing_key(label);
+            let hello = signed_hello_with_nonce(
+                &sk,
+                &address_from_signing_key(&sk),
+                "RTX 4090",
+                24,
+                vec![JobKind::Terrain],
+                &nonce,
+            );
+            ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap()))
+                .await
+                .unwrap();
+            // Block until this earner is registered → its token is consumed before the
+            // next connection sends, so the bucket is provably empty by the 3rd Hello.
+            wait_for_gpus_joined(&state, (i + 1) as u64).await;
+            keep_open.push(ws); // hold the live session so the earner stays in /stats
+        }
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        let sk = test_signing_key("wsrc");
+        let hello = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+            &nonce,
+        );
+        ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+        expect_ws_closed(&mut ws).await;
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            2,
+            "the rate-limited ws Hello registered nothing",
         );
     }
 
