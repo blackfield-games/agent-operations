@@ -1335,6 +1335,99 @@ mod tests {
         );
     }
 
+    /// A near-maximal legitimate JobSpec — `inputs` at the coordinator's 16 KiB
+    /// `MAX_INPUTS_BYTES` cap — still deserializes and dispatches through the bounded
+    /// read. Proves `MAX_RESPONSE_BODY_BYTES` is a backstop, not a functional limit:
+    /// the honest worst-case body sits well under the 64 KiB ceiling (FM2).
+    #[tokio::test]
+    async fn poll_once_accepts_a_max_sized_legitimate_body() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let mut job = dev_job();
+        // ~16 KiB inputs blob: the largest `inputs` the coordinator hands out.
+        job.inputs = serde_json::json!({ "blob": "x".repeat(16 * 1024) });
+        let body_len = serde_json::to_vec(&job).unwrap().len();
+        assert!(
+            body_len > 16 * 1024 && body_len <= MAX_RESPONSE_BODY_BYTES,
+            "test must exercise a large-but-legal body (got {body_len} bytes)"
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-dispatch-seq", "11")
+                    .set_body_json(&job),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
+        assert!(keep, "a max-sized legitimate body must dispatch and keep polling");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().any(|r| r.url.path().ends_with("/submit")),
+            "the earner must submit a result for a max-sized legitimate job: {requests:?}"
+        );
+    }
+
+    /// An oversized `/jobs/next` body is rejected by the bounded read (Err) BEFORE it
+    /// reaches serde — nothing is rendered or submitted. The body is a VALID JobSpec
+    /// JSON, just huge (>2× the cap): the discriminator against the prior unbounded
+    /// `resp.json()`, which would have buffered + deserialized + dispatched it. The
+    /// limit is enforced on bytes actually read, so an under-reported Content-Length
+    /// can't slip the body past (FM1/FM3).
+    #[tokio::test]
+    async fn poll_once_rejects_an_oversized_response_body() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+        let mut job = dev_job();
+        job.inputs = serde_json::json!({ "blob": "x".repeat(MAX_RESPONSE_BODY_BYTES * 2) });
+        assert!(
+            serde_json::to_vec(&job).unwrap().len() > MAX_RESPONSE_BODY_BYTES,
+            "the test body must exceed the cap to be a valid discriminator"
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-dispatch-seq", "13")
+                    .set_body_json(&job),
+            )
+            .mount(&server)
+            .await;
+        // A submit would be a bug; mount a catch-all POST so one would be recorded
+        // (and fail the no-submit assertion) rather than 404-ing silently.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        let result = poll_once(&client, &args, &session, &all_supported()).await;
+        assert!(
+            result.is_err(),
+            "an oversized response body must be rejected (Err), not deserialized: {result:?}"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|r| !r.url.path().ends_with("/submit")),
+            "nothing must be submitted when the body is rejected: {requests:?}"
+        );
+    }
+
     // ---- http register path: register over a wiremock coordinator ----
 
     #[tokio::test]
