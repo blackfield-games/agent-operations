@@ -181,6 +181,14 @@ struct Args {
     /// [`DEFAULT_MAX_REGISTRATIONS`].
     #[arg(long, env = "COORDINATOR_MAX_REGISTRATIONS", default_value_t = DEFAULT_MAX_REGISTRATIONS)]
     max_registrations: u32,
+    /// Wei charged per render-second to a job's buyer at settle, recorded as a
+    /// pending ComputeMeter debit for the (operator-gated) on-chain relayer to
+    /// spend. `0` (the default) DISABLES metering — no debit row is written — so
+    /// the feature is opt-in: a deploy charges real buyer credit only once this is
+    /// set to the real economic rate. Only jobs ingested with a `buyer` are
+    /// metered; an unattributed job is never charged. See [`DEFAULT_COMPUTE_RATE_WEI`].
+    #[arg(long, env = "COORDINATOR_COMPUTE_RATE_WEI", default_value_t = DEFAULT_COMPUTE_RATE_WEI)]
+    compute_rate_wei: u128,
 }
 
 /// A registered earner's capabilities, recorded on `EarnerMsg::Hello`.
@@ -504,7 +512,7 @@ async fn main() -> Result<()> {
         .with_env_filter("coordinator=info,tower_http=info")
         .init();
     let args = Args::parse();
-    let store = Store::open(&args.db)?;
+    let store = Store::open(&args.db)?.with_compute_rate_wei(args.compute_rate_wei);
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
     // `with_store` also reclaims jobs left in_flight by a previous crash.
     let state = AppState::with_store(
@@ -520,6 +528,19 @@ async fn main() -> Result<()> {
         args.max_registrations,
     )?;
     tracing::info!(db = %args.db, "store ready");
+
+    // Metering posture: a nonzero rate charges real buyer credit at settle, so make
+    // the ENABLED state explicit at startup. Disabled is the safe opt-in default
+    // (info, not a warning — the inverse of the ingestion-auth posture below, where
+    // OPEN is the risky state).
+    if args.compute_rate_wei > 0 {
+        tracing::info!(
+            rate_wei = %args.compute_rate_wei,
+            "ComputeMeter metering ENABLED — a settled job with a buyer is charged rate * render-seconds wei"
+        );
+    } else {
+        tracing::info!("ComputeMeter metering disabled (--compute-rate-wei 0) — no buyer is charged");
+    }
 
     // Ingestion auth posture (FM2): an open `POST /jobs` is fine for local dev but
     // a silent wide-open write surface in production is how a deploy ships
@@ -982,6 +1003,13 @@ const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 /// load; an operator running a larger backlog raises it. The backstop against an
 /// unbounded queued backlog (disk-fill, slower dispatch scans, FIFO starvation).
 const DEFAULT_MAX_QUEUED_JOBS: usize = 10_000;
+
+/// Default wei charged per render-second to a job's buyer at settle (a pending
+/// ComputeMeter debit). `0` DISABLES metering: no debit row is written, so the
+/// feature is strictly opt-in — a deploy starts charging real buyer credit only
+/// once the operator sets the real economic rate via `--compute-rate-wei` /
+/// `COORDINATOR_COMPUTE_RATE_WEI`. Backs `Args::compute_rate_wei`.
+const DEFAULT_COMPUTE_RATE_WEI: u128 = 0;
 
 /// Default cap on the in-memory earner registry (`state.earners`). Registration is
 /// signature-gated for identity but fresh keypairs are free, so cheap distinct
@@ -5688,6 +5716,23 @@ mod tests {
             Args::parse_from(["coordinator", "--max-queued-jobs", "42"]).max_queued_jobs,
             42,
             "the flag is honored"
+        );
+    }
+
+    #[test]
+    fn args_compute_rate_wei_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).compute_rate_wei,
+            DEFAULT_COMPUTE_RATE_WEI,
+            "unset default == the const (0 = metering disabled, opt-in)"
+        );
+        assert_eq!(DEFAULT_COMPUTE_RATE_WEI, 0, "the metering default must be disabled");
+        // A 1e18-scale rate must parse as u128 (it overflows u64/i64) — proves the
+        // knob can carry a realistic wei-per-render-second value.
+        assert_eq!(
+            Args::parse_from(["coordinator", "--compute-rate-wei", "1000000000000000000"]).compute_rate_wei,
+            1_000_000_000_000_000_000,
+            "the flag is honored at 1e18 scale"
         );
     }
 

@@ -76,6 +76,14 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Set the per-render-second wei rate charged to a job's buyer at settle (a
+    /// pending ComputeMeter debit). `0` (the default) disables metering. Consuming
+    /// builder so the rate is fixed at open from the `--compute-rate-wei` knob.
+    pub fn with_compute_rate_wei(mut self, rate_wei: u128) -> Self {
+        self.compute_rate_wei = rate_wei;
+        self
+    }
+
     /// Test-only: does an index named `name` exist (i.e. did schema init create it)?
     #[cfg(test)]
     pub fn has_index(&self, name: &str) -> Result<bool> {
