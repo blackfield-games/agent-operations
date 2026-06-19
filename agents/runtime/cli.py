@@ -198,7 +198,9 @@ def main(argv: list[str] | None = None) -> int:
     if not verdict.accepted:
         return 1
     if posted is not None and not all(r.ok for r in posted):
-        return 2  # accepted + authored, but a job failed to reach the coordinator
+        # Distinct from argparse's usage exit 2 and the rejection exit 1: the region
+        # was authored + composed, but a job failed to reach the coordinator.
+        return 3
     return 0
 
 

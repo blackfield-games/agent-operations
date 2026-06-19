@@ -242,7 +242,7 @@ def test_post_failure_returns_exit_2(tmp_path, monkeypatch, capsys):
     )
 
     code = main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--out", "out"])
-    assert code == 2  # accepted + authored, but the post failed to land
+    assert code == 3  # distinct from rejection (1) and argparse usage (2)
 
 
 def test_no_post_to_does_not_post(tmp_path, monkeypatch, capsys):
