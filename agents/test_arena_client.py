@@ -117,6 +117,26 @@ def test_unknown_field_is_rejected():
         proto.VisibleEntity.model_validate(bad)
 
 
+def test_out_of_domain_fields_are_rejected():
+    # Integer fields mirror the Rust wire width and match_id is UUID-shaped, so a
+    # value the server cannot hold fails here with a parity error rather than
+    # panicking the Rust harness on deserialize.
+    with pytest.raises(pydantic.ValidationError):
+        proto.ActionIntent.model_validate({  # aim is u16; 70000 overflows it
+            "move_dir": {"x": 0, "y": 0}, "aim": 70_000,
+            "buttons": {"fire": False, "jump": False, "ability": False, "reload": False},
+        })
+    with pytest.raises(pydantic.ValidationError):
+        proto.SelfState.model_validate({  # seat is u8
+            "seat": -1, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+            "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "ammo": 30, "alive": True,
+        })
+    with pytest.raises(pydantic.ValidationError):
+        proto.Welcome.model_validate(  # match_id must be a UUID
+            {"protocol_version": proto.PROTOCOL_VERSION, "match_id": "not-a-uuid", "seat": 0}
+        )
+
+
 def test_gateway_envelopes_decode():
     nonce = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
     assert decode_gateway({"type": "challenge", "nonce": nonce}) == Challenge(nonce=nonce)
@@ -331,6 +351,19 @@ def test_deadline_overrun_forfeits_the_tick():
     assert not any(f["type"] == "act" for f in t.sent)
 
 
+def test_deadline_not_enforced_still_answers():
+    # The loopback path disables enforcement (no wall-clock; the harness blocks for
+    # one frame per seat). A slow policy must then still answer — never drop a frame.
+    from arena_client.sdk import ArenaClient
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0, deadline=1000), _end_frame()]
+    t = MockTransport(inbound)
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 1.0]), enforce_deadline=False)
+    c.run(_fixed_policy)
+    assert c.forfeits == 0
+    assert [a["tick"] for a in t.sent if a["type"] == "act"] == [0]
+
+
 def test_downed_seat_answers_with_passive_hold():
     from arena_client.sdk import ArenaClient
     inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
@@ -374,11 +407,12 @@ def test_baseline_moves_and_fires_toward_enemy():
 
 
 def test_baseline_targets_the_nearest_enemy():
-    # A closer enemy east, a farther one north; the baseline picks the closer.
-    obs = _make_obs(0, 0, team=0, visible=[(1, 1, 0, 4000), (2, 1, 3000, 0)])
+    # A far enemy east, a closer one north; the baseline picks the closer and aims
+    # NORTH (not east) — so a constant/east aim would fail this, not pass by chance.
+    obs = _make_obs(0, 0, team=0, visible=[(1, 1, 5000, 0), (2, 1, 0, 3000)])
     intent = BaselinePolicy()(obs)
-    assert intent.aim == 0  # toward the nearer (east) enemy, not the northern one
-    assert intent.move_dir.x > 0 and intent.move_dir.y == 0
+    assert intent.aim == 16384  # north, toward the nearer enemy
+    assert intent.move_dir.y > 0 and intent.move_dir.x == 0
 
 
 def test_baseline_reloads_when_empty():

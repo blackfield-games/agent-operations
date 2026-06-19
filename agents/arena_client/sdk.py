@@ -95,11 +95,18 @@ class ArenaClient:
         agent_id: str,
         signature_hex: str = "",
         clock: Callable[[], float] = time.monotonic,
+        enforce_deadline: bool = True,
     ) -> None:
         self.transport = transport
         self.agent_id = agent_id
         self.signature_hex = signature_hex
         self._clock = clock
+        # A real transport has a server-side wall-clock deadline, so dropping a late
+        # action (and sending nothing) is correct — the server forfeits the tick and
+        # streams the next observation. A lock-step in-process transport (the loopback
+        # harness) has NO wall-clock and blocks until it gets one frame per seat, so a
+        # dropped frame would deadlock; that path disables enforcement instead.
+        self.enforce_deadline = enforce_deadline
         self.match_id: str | None = None
         self.seat: int | None = None
         self.config: MatchConfig | None = None
@@ -161,7 +168,7 @@ class ArenaClient:
         start = self._clock()
         intent = policy(obs)
         elapsed_micros = (self._clock() - start) * 1_000_000
-        if elapsed_micros > obs.deadline_micros:
+        if self.enforce_deadline and elapsed_micros > obs.deadline_micros:
             # FM2: by the time a late answer reaches the server it answers a stale
             # tick and is rejected — so drop it here and forfeit the tick rather than
             # send an action bound to a tick that has passed.
@@ -285,7 +292,13 @@ def run_local_match(
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     with SubprocessGateway(argv, timeout=timeout) as gateway:
-        clients = {s: ArenaClient(SeatTransport(gateway, s), agent_id=ids[s]) for s in seats}
+        # The loopback harness blocks for one frame per seat per tick and enforces no
+        # wall-clock, so the client must always answer — never drop a frame on a
+        # deadline (that is a real-transport behaviour and would deadlock here).
+        clients = {
+            s: ArenaClient(SeatTransport(gateway, s), agent_id=ids[s], enforce_deadline=False)
+            for s in seats
+        }
         for client in clients.values():
             client.connect()
         results: dict[int, MatchResult] = {}

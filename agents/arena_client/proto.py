@@ -8,17 +8,21 @@ match `arena/proto/src/lib.rs` byte-for-byte; `test_arena_client.py` pins the
 same canonical frames the Rust crate pins, so a drift on either side breaks loud.
 
 Like the Rust side, every spatial quantity is integer fixed-point — no floats on
-the wire — so the same match hashes identically on every platform. `extra=forbid`
+the wire — so the same match hashes identically on every platform. Integer fields
+mirror the Rust integer WIDTH (`u8`/`u16`/`u32`/`u64`/`i32`) and `match_id` is
+UUID-shaped, so an out-of-domain value an agent might emit fails here with a clean
+parity error rather than panicking the Rust server on deserialize. `extra=forbid`
 makes an unexpected field a decode error rather than a silent drop: within a
 `PROTOCOL_VERSION` the shape is fixed, and a new field means a version bump.
 """
 
 from __future__ import annotations
 
+import uuid
 from math import isqrt
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 PROTOCOL_VERSION = 1
 POSITION_SCALE = 1000
@@ -28,14 +32,30 @@ MOVE_INTENT_SCALE = 1000
 Phase = Literal["lobby", "starting", "live", "ended"]
 EntityKindName = Literal["player", "projectile", "pickup"]
 
+# Integer fields carry the Rust wire width, so a value the Rust type cannot hold
+# is rejected on the Python side instead of panicking the server.
+U8 = Annotated[int, Field(ge=0, le=2**8 - 1)]
+U16 = Annotated[int, Field(ge=0, le=2**16 - 1)]
+U32 = Annotated[int, Field(ge=0, le=2**32 - 1)]
+U64 = Annotated[int, Field(ge=0, le=2**64 - 1)]
+I32 = Annotated[int, Field(ge=-(2**31), le=2**31 - 1)]
+
+
+def _uuid_str(v: str) -> str:
+    uuid.UUID(v)  # arena-01 match_id is a Uuid; reject a non-UUID before the wire
+    return v
+
+
+MatchIdStr = Annotated[str, AfterValidator(_uuid_str)]
+
 
 class _Wire(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
 class Vec2(_Wire):
-    x: int
-    y: int
+    x: I32
+    y: I32
 
 
 class ActionButtons(_Wire):
@@ -56,7 +76,7 @@ def _trunc_div(a: int, b: int) -> int:
 
 class ActionIntent(_Wire):
     move_dir: Vec2
-    aim: int
+    aim: U16
     buttons: ActionButtons
 
     def clamped(self) -> ActionIntent:
@@ -80,73 +100,73 @@ class ActionIntent(_Wire):
 
 
 class Action(_Wire):
-    protocol_version: int
-    match_id: str
-    seat: int
-    tick: int
+    protocol_version: U32
+    match_id: MatchIdStr
+    seat: U8
+    tick: U64
     intent: ActionIntent
 
 
 class SelfState(_Wire):
-    seat: int
-    team: int
+    seat: U8
+    team: U16
     position: Vec2
-    z: int
-    facing: int
+    z: I32
+    facing: U16
     velocity: Vec2
-    health: int
-    max_health: int
-    ammo: int
+    health: U16
+    max_health: U16
+    ammo: U16
     alive: bool
 
 
 class VisibleEntity(_Wire):
-    entity_id: int
+    entity_id: U32
     kind: EntityKindName
-    team: int
+    team: U16
     position: Vec2
-    z: int
-    facing: int
+    z: I32
+    facing: U16
     in_line_of_sight: bool
 
 
 class Observation(_Wire):
-    protocol_version: int
-    match_id: str
-    seat: int
-    tick: int
+    protocol_version: U32
+    match_id: MatchIdStr
+    seat: U8
+    tick: U64
     phase: Phase
-    deadline_micros: int
+    deadline_micros: U32
     own: SelfState
     visible: list[VisibleEntity]
 
 
 class SeatOutcome(_Wire):
-    seat: int
-    team: int
-    placement: int
-    score: int
+    seat: U8
+    team: U16
+    placement: U16
+    score: I32
     alive_at_end: bool
 
 
 class MatchResult(_Wire):
-    protocol_version: int
-    match_id: str
-    final_tick: int
+    protocol_version: U32
+    match_id: MatchIdStr
+    final_tick: U64
     outcomes: list[SeatOutcome]
     replay_hash: str
 
 
 class MatchConfig(_Wire):
-    tick_hz: int
-    max_ticks: int
+    tick_hz: U16
+    max_ticks: U64
     bounds: Vec2
-    seats: int
+    seats: U8
 
 
 class SeatInfo(_Wire):
-    seat: int
-    team: int
+    seat: U8
+    team: U16
     controller: str
 
 
@@ -155,9 +175,9 @@ class Challenge(_Wire):
 
 
 class Welcome(_Wire):
-    protocol_version: int
-    match_id: str
-    seat: int
+    protocol_version: U32
+    match_id: MatchIdStr
+    seat: U8
 
 
 class Reject(_Wire):
@@ -165,7 +185,7 @@ class Reject(_Wire):
 
 
 class Start(_Wire):
-    match_id: str
+    match_id: MatchIdStr
     config: MatchConfig
 
 
