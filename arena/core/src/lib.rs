@@ -472,24 +472,28 @@ impl Match {
     fn resolve_fire(&mut self, shooter: usize) {
         let s = self.pawns[shooter];
         let (fx, fy) = octant_unit(s.facing);
-        let range2 = (self.rules.weapon_range as i64).pow(2);
-        let radius2 = (self.rules.hit_radius as i64).pow(2);
-        let mut best: Option<(usize, i64)> = None;
+        // i128 throughout: positions are i32 and bounded by config.bounds, so a
+        // squared planar distance can exceed i64 at extreme (operator-set) arena
+        // sizes. Widening keeps the hit test panic-free and exact regardless of
+        // bounds, the same defensiveness the move clamp uses.
+        let range2 = (self.rules.weapon_range as i128).pow(2);
+        let radius2 = (self.rules.hit_radius as i128).pow(2);
+        let mut best: Option<(usize, i128)> = None;
         for (j, t) in self.pawns.iter().enumerate() {
             if j == shooter || !t.alive || t.team == s.team {
                 continue;
             }
-            let dx = t.pos.x as i64 - s.pos.x as i64;
-            let dy = t.pos.y as i64 - s.pos.y as i64;
+            let dx = t.pos.x as i128 - s.pos.x as i128;
+            let dy = t.pos.y as i128 - s.pos.y as i128;
             let dist2 = dx * dx + dy * dy;
             if dist2 > range2 {
                 continue;
             }
-            let dot = dx * fx as i64 + dy * fy as i64;
+            let dot = dx * fx as i128 + dy * fy as i128;
             if dot <= 0 {
                 continue;
             }
-            let proj = dot / OCTANT_SCALE as i64;
+            let proj = dot / OCTANT_SCALE as i128;
             let perp2 = dist2 - proj * proj;
             if perp2 > radius2 {
                 continue;
@@ -643,11 +647,12 @@ pub fn replay_match(mut m: Match, replay: &ReplayRecord) -> Match {
 }
 
 /// `true` if `b` is within `range` position units of `a` on the ground plane.
-/// Squared comparison in `i64` so an attacker-sized coordinate can't overflow.
+/// Squared comparison in `i128` so a large (operator-set) arena coordinate can't
+/// overflow the distance check.
 fn within(a: Vec2, b: Vec2, range: i32) -> bool {
-    let dx = b.x as i64 - a.x as i64;
-    let dy = b.y as i64 - a.y as i64;
-    let r = range as i64;
+    let dx = b.x as i128 - a.x as i128;
+    let dy = b.y as i128 - a.y as i128;
+    let r = range as i128;
     dx * dx + dy * dy <= r * r
 }
 
@@ -852,6 +857,22 @@ mod tests {
         let p = m.observe(1).own;
         assert_eq!(p.position.x, 21 * POSITION_SCALE, "pinned at the bound");
         assert_eq!(p.velocity, Vec2::ZERO, "no displacement once pinned");
+    }
+
+    #[test]
+    fn the_hit_test_does_not_overflow_at_extreme_arena_bounds() {
+        // A squared planar distance between near-i32 coordinates exceeds i64; the
+        // i128 hit math must not panic when checking such a (far, out-of-range)
+        // target. Extreme operator config, not agent-reachable — defensive only.
+        let edge = i32::MAX;
+        let cfg = MatchConfig { bounds: Vec2 { x: edge, y: edge }, ..config(2) };
+        let rules = Rules { spawn_radius: edge, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), 1);
+        let before = m.observe(1).own.health;
+        // Seats spawn at opposite i32 extremes; firing must not panic, and the
+        // far target is out of range, so no hit lands — the point is no panic.
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.observe(1).own.health, before);
     }
 
     #[test]
