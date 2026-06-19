@@ -4603,7 +4603,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.enqueue(&seed_job()).unwrap();
         store.enqueue(&seed_job()).unwrap();
-        let plan = store.queued_count_query_plan().unwrap();
+        // The plan of the REAL enqueue_within_cap statement (INSERT...SELECT...WHERE
+        // (subquery COUNT) < cap), not a standalone proxy for the subquery.
+        let plan = store.enqueue_within_cap_query_plan(10).unwrap();
         assert!(
             plan.contains("idx_jobs_status_created_at"),
             "the cap's queued COUNT must use the index, got plan: {plan}"

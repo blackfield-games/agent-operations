@@ -125,17 +125,26 @@ impl Store {
         Ok(plan)
     }
 
-    /// Test-only: the EXPLAIN QUERY PLAN for the queued-depth COUNT that gates
-    /// `enqueue_within_cap`, so a test can assert it is served by
+    /// Test-only: the EXPLAIN QUERY PLAN for the ACTUAL `enqueue_within_cap`
+    /// statement (the full `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < ?`,
+    /// byte-for-byte), so a test can assert the gating COUNT subquery is served by
     /// `idx_jobs_status_created_at` and never full-scans the (unbounded, terminal-
     /// row-bearing) jobs table — the FM1 that would let a flood turn each cap check
-    /// into an O(table) scan. Mirrors the subquery in `enqueue_within_cap` verbatim.
+    /// into an O(table) scan. Explaining the real statement (not a standalone proxy
+    /// for the subquery) closes any planner divergence between the two forms. The
+    /// bind values are placeholders: EXPLAIN plans the statement, it does not insert.
     #[cfg(test)]
-    pub fn queued_count_query_plan(&self) -> Result<String> {
-        let mut stmt = self
-            .conn
-            .prepare("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM jobs WHERE status = ?1")?;
-        let rows = stmt.query_map([STATUS_QUEUED], |r| r.get::<_, String>(3))?;
+    pub fn enqueue_within_cap_query_plan(&self, max_queued: usize) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "EXPLAIN QUERY PLAN
+             INSERT INTO jobs (id, spec_json, status, created_at)
+             SELECT ?1, ?2, ?3, CAST(strftime('%s','now') AS INTEGER)
+             WHERE (SELECT COUNT(*) FROM jobs WHERE status = ?3) < ?4",
+        )?;
+        let rows = stmt.query_map(
+            ("explain-only", "{}", STATUS_QUEUED, max_queued as i64),
+            |r| r.get::<_, String>(3),
+        )?;
         let mut plan = String::new();
         for row in rows {
             plan.push_str(&row?);
