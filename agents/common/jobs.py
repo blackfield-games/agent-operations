@@ -68,7 +68,10 @@ class RenderJobSpec(BaseModel):
             raise ValueError(f"region x/y must fit proto i32: ({r.x}, {r.y})")
         if not 0 <= r.layer <= _U8_MAX:
             raise ValueError(f"region layer must fit proto u8 [0, {_U8_MAX}]: {r.layer}")
-        size = len(json.dumps(self.inputs, separators=(",", ":")).encode())
+        # Mirror serde_json::to_vec(inputs).len(): compact, UTF-8 bytes (not the
+        # \uXXXX-escaped ASCII json.dumps emits by default), so the byte count
+        # matches what the coordinator measures.
+        size = len(json.dumps(self.inputs, separators=(",", ":"), ensure_ascii=False).encode())
         if size > MAX_INPUTS_BYTES:
             raise ValueError(
                 f"inputs serialize to {size} bytes, over MAX_INPUTS_BYTES={MAX_INPUTS_BYTES}"

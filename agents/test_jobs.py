@@ -144,6 +144,16 @@ def test_spec_rejects_oversized_inputs():
         _spec(inputs=big)
 
 
+def test_spec_measures_inputs_in_utf8_bytes_like_serde():
+    # The coordinator measures inputs via serde_json::to_vec (compact UTF-8). A
+    # 2-byte char counts as 2, not as the 6-byte \uXXXX escape json.dumps emits by
+    # default — so a non-ASCII manifest well under the UTF-8 limit is accepted even
+    # though the escaped form would exceed it. 4000 * "é" = ~8 KiB UTF-8 (< 16 KiB)
+    # but ~24 KiB escaped (> 16 KiB): a regression to ensure_ascii=True rejects this.
+    payload = {"blob": "é" * 4000}
+    assert _spec(inputs=payload).inputs == payload  # accepted (no ValidationError)
+
+
 # --- proto integer widths (FM4) ---
 
 def test_spec_rejects_out_of_range_region():
