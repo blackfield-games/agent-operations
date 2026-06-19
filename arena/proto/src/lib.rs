@@ -146,6 +146,89 @@ pub fn check_version(theirs: u32) -> Result<(), VersionMismatch> {
     }
 }
 
+/// What an observed entity is — enough to reason about it without leaking any
+/// of its hidden internal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityKind {
+    Player,
+    Projectile,
+    Pickup,
+}
+
+/// The receiving seat's OWN pawn state, in full. A controller always knows its
+/// own health, ammo, position and facing — this is the one place full internal
+/// state appears in an [`Observation`], and it is always the receiver's own, so
+/// it grants no perception advantage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfState {
+    pub seat: SeatId,
+    pub team: TeamId,
+    /// Ground-plane position (see [`POSITION_SCALE`]).
+    pub position: Vec2,
+    /// Elevation in [`POSITION_SCALE`] units; `0` on a planar arena.
+    pub z: i32,
+    pub facing: Bam,
+    /// Per-tick planar velocity (see [`VELOCITY_SCALE`]).
+    pub velocity: Vec2,
+    pub health: u16,
+    pub max_health: u16,
+    pub ammo: u16,
+    pub alive: bool,
+}
+
+/// One entity the seat can perceive at the current tick.
+///
+/// This type is the parity bound made structural. It carries only what a player
+/// standing in the seat's pawn could observe: identity, team, kind, the
+/// last-perceived position/facing, and whether the entity is in line of sight
+/// *right now*. There is deliberately NO field for another entity's health,
+/// ammo, cooldowns, or intent — the bound is the *absence* of those fields, so an
+/// agent built on this protocol cannot read hidden state even if the server that
+/// fills it is buggy or hostile. Widening this struct with internal state is a
+/// security regression and is pinned against by a wire-shape test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisibleEntity {
+    pub entity_id: u32,
+    pub kind: EntityKind,
+    pub team: TeamId,
+    /// Last perceived ground-plane position (see [`POSITION_SCALE`]).
+    pub position: Vec2,
+    /// Last perceived elevation (see [`POSITION_SCALE`]).
+    pub z: i32,
+    pub facing: Bam,
+    /// `true` if in the seat's line of sight this tick; `false` if this is a
+    /// last-known position the seat has since lost sight of.
+    pub in_line_of_sight: bool,
+}
+
+/// A parity-bounded, player-perspective snapshot for one seat at one tick — the
+/// security boundary of the Gateway.
+///
+/// It carries the seat's own state in full ([`own`](Observation::own)) plus ONLY
+/// the entities that seat could perceive this tick
+/// ([`visible`](Observation::visible)). There is intentionally no field for full
+/// world state — no global pawn table, no all-entities list — so an omniscient
+/// agent cannot be constructed on this protocol by anyone, including a server
+/// that wants to. `visible` is in ascending `entity_id` order so the snapshot is
+/// canonical and replay-stable. `deadline_micros` bounds how long the agent may
+/// take to answer before it forfeits the tick, so a slow agent never stalls the
+/// match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Observation {
+    pub protocol_version: u32,
+    pub match_id: MatchId,
+    pub seat: SeatId,
+    pub tick: u64,
+    pub phase: MatchPhase,
+    /// Microseconds the agent has to return an [`Action`] for this tick before
+    /// the tick is forfeited on its behalf. Server-set; the bounded-latency
+    /// invariant.
+    pub deadline_micros: u32,
+    pub own: SelfState,
+    pub visible: Vec<VisibleEntity>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +272,119 @@ mod tests {
         // 0x4000 is a quarter turn; the helper is display-only but must be right.
         let r = bam_to_radians(0x4000);
         assert!((r - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "got {r}");
+    }
+
+    const FIXED_MATCH: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn object_keys(v: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn visible_entity_exposes_no_hidden_state() {
+        // FM1: the parity bound is the ABSENCE of hidden-state fields. Pin the
+        // exact perceivable key set so adding another entity's health / ammo /
+        // intent / cooldown — anything a player couldn't see — fails CI.
+        let e = VisibleEntity {
+            entity_id: 7,
+            kind: EntityKind::Player,
+            team: 2,
+            position: Vec2 { x: 1000, y: -2000 },
+            z: 0,
+            facing: 0x4000,
+            in_line_of_sight: true,
+        };
+        let json = serde_json::to_value(e).unwrap();
+        assert_eq!(
+            object_keys(&json),
+            ["entity_id", "facing", "in_line_of_sight", "kind", "position", "team", "z"],
+            "VisibleEntity gained or lost a field — the perceivable set is a security contract"
+        );
+        for forbidden in ["health", "ammo", "max_health", "intent", "cooldown", "velocity"] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "VisibleEntity must not leak hidden state field `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_carries_no_full_world_field() {
+        // FM1: an Observation may carry the seat's own state + only what it
+        // perceives. Pin the exact top-level key set so no global pawn table /
+        // all-entities / world-state field can be added without failing CI.
+        let obs = sample_observation();
+        let json = serde_json::to_value(&obs).unwrap();
+        assert_eq!(
+            object_keys(&json),
+            ["deadline_micros", "match_id", "own", "phase", "protocol_version", "seat", "tick", "visible"],
+            "Observation gained or lost a top-level field — omniscient state must never appear"
+        );
+        for forbidden in ["all_pawns", "entities", "world", "world_state", "pawns"] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "Observation must not carry full-world field `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_wire_shape_is_stable() {
+        let canonical = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "match_id": FIXED_MATCH,
+            "seat": 0,
+            "tick": 128,
+            "phase": "live",
+            "deadline_micros": 50_000,
+            "own": {
+                "seat": 0, "team": 1,
+                "position": { "x": 0, "y": 0 }, "z": 0,
+                "facing": 16384,
+                "velocity": { "x": 0, "y": 0 },
+                "health": 100, "max_health": 100, "ammo": 30, "alive": true
+            },
+            "visible": [{
+                "entity_id": 7, "kind": "player", "team": 2,
+                "position": { "x": 1000, "y": -2000 }, "z": 0,
+                "facing": 16384, "in_line_of_sight": true
+            }]
+        });
+        let parsed: Observation = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "Observation wire shape drifted");
+    }
+
+    fn sample_observation() -> Observation {
+        Observation {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: FIXED_MATCH.parse().unwrap(),
+            seat: 0,
+            tick: 128,
+            phase: MatchPhase::Live,
+            deadline_micros: 50_000,
+            own: SelfState {
+                seat: 0,
+                team: 1,
+                position: Vec2::ZERO,
+                z: 0,
+                facing: 0x4000,
+                velocity: Vec2::ZERO,
+                health: 100,
+                max_health: 100,
+                ammo: 30,
+                alive: true,
+            },
+            visible: vec![VisibleEntity {
+                entity_id: 7,
+                kind: EntityKind::Player,
+                team: 2,
+                position: Vec2 { x: 1000, y: -2000 },
+                z: 0,
+                facing: 0x4000,
+                in_line_of_sight: true,
+            }],
+        }
     }
 }
