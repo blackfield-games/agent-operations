@@ -6199,9 +6199,12 @@ mod tests {
         state
     }
 
-    /// Empty-queue state with a small per-source registration allowance, for the
-    /// rate-limit tests.
-    async fn test_state_empty_with_registrations(max_registrations: u32) -> Arc<AppState> {
+    /// Empty-queue state with a small per-source registration allowance and a
+    /// trusted-proxy allowlist, for the XFF-attribution rate-limit tests.
+    async fn test_state_registrations_trusted(
+        max_registrations: u32,
+        trusted: TrustedProxies,
+    ) -> Arc<AppState> {
         let state = AppState::with_store(
             Store::open_in_memory().unwrap(),
             5,
@@ -6213,11 +6216,17 @@ mod tests {
             DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             max_registrations,
-            TrustedProxies::default(),
+            trusted,
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
         state
+    }
+
+    /// Empty-queue state with a small per-source registration allowance, for the
+    /// rate-limit tests.
+    async fn test_state_empty_with_registrations(max_registrations: u32) -> Arc<AppState> {
+        test_state_registrations_trusted(max_registrations, TrustedProxies::default()).await
     }
 
     /// Below the per-source allowance, registration is byte-identical to before — a
@@ -6268,10 +6277,89 @@ mod tests {
         );
     }
 
+    /// Two distinct clients behind the SAME trusted proxy are attributed to SEPARATE
+    /// buckets via X-Forwarded-For: one client exhausting its allowance does not
+    /// throttle the other. Were the limiter still keyed on the proxy peer, the second
+    /// client's first registration would be shed — this is the whole point of XFF
+    /// attribution, exercised end-to-end through the HTTP `/register` handler.
+    #[tokio::test]
+    async fn register_trusted_proxy_separates_xff_clients() {
+        let proxy = ip(1); // 10.0.0.1, the trusted reverse proxy
+        let state = test_state_registrations_trusted(1, trusted(&[proxy])).await;
+        let peer = SocketAddr::new(proxy, 4000);
+
+        // Client X registers through the proxy — its own bucket, allowed.
+        assert_eq!(
+            register_from(&state, peer, Some("203.0.113.10"), &hello("cx", 24, vec![JobKind::Terrain])).await,
+            StatusCode::OK
+        );
+        // Client X again, over its cap of 1 → shed.
+        assert_eq!(
+            register_from(&state, peer, Some("203.0.113.10"), &hello("cx2", 24, vec![JobKind::Terrain])).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Client Y, same proxy peer but a different XFF client → its own bucket,
+        // unaffected by X having exhausted theirs.
+        assert_eq!(
+            register_from(&state, peer, Some("203.0.113.20"), &hello("cy", 24, vec![JobKind::Terrain])).await,
+            StatusCode::OK
+        );
+        // Exactly the two admitted clients joined; X's second attempt admitted nothing.
+        let stats = body_json(get(state, "/stats").await).await;
+        assert_eq!(stats["gpus_joined"], 2);
+    }
+
+    /// An UNTRUSTED peer's X-Forwarded-For is ignored for bucketing: two forged XFF
+    /// clients from one direct peer collapse onto the peer's single bucket, so a
+    /// direct attacker cannot spoof distinct XFF values to manufacture separate
+    /// allowances and dodge the per-source limit.
+    #[tokio::test]
+    async fn register_untrusted_peer_ignores_xff_for_bucketing() {
+        // Empty allowlist: no proxy trusted, so XFF is never honored.
+        let state = test_state_empty_with_registrations(1).await;
+        let peer = SocketAddr::new(ip(7), 5000); // 10.0.0.7, a direct (untrusted) peer
+
+        assert_eq!(
+            register_from(&state, peer, Some("203.0.113.10"), &hello("da", 24, vec![JobKind::Terrain])).await,
+            StatusCode::OK
+        );
+        // Different forged XFF, same peer → same bucket → shed at cap 1.
+        assert_eq!(
+            register_from(&state, peer, Some("203.0.113.99"), &hello("db", 24, vec![JobKind::Terrain])).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let stats = body_json(get(state, "/stats").await).await;
+        assert_eq!(stats["gpus_joined"], 1);
+    }
+
     /// Register `msg` over HTTP `/register`, returning the status.
     async fn register_hello(state: &Arc<AppState>, msg: &EarnerMsg) -> StatusCode {
         post_json(state.clone(), "/register", &serde_json::to_value(msg).unwrap())
             .await
+            .status()
+    }
+
+    /// Register `msg` over HTTP `/register` from a specific connection `peer`,
+    /// optionally carrying an `X-Forwarded-For` header — the two inputs
+    /// `resolve_source_ip` keys the per-source limiter on. Returns the status.
+    async fn register_from(
+        state: &Arc<AppState>,
+        peer: SocketAddr,
+        xff: Option<&str>,
+        msg: &EarnerMsg,
+    ) -> StatusCode {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header("content-type", "application/json");
+        if let Some(v) = xff {
+            builder = builder.header("x-forwarded-for", v);
+        }
+        router(state.clone())
+            .layer(Extension(PeerAddr(peer)))
+            .oneshot(builder.body(Body::from(serde_json::to_vec(msg).unwrap())).unwrap())
+            .await
+            .unwrap()
             .status()
     }
 
