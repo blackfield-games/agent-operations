@@ -13,14 +13,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 from pathlib import Path
 
 import anyio
+import httpx
 
 from common.compose import compose_world, layer_summary
 from common.jobs import RenderJobSpec, render_jobs
 from common.types import LayerSpec, RegionCoord, ValidatorVerdict, WorldBrief
+from runtime.poster import PostResult, post_jobs
 from runtime.supervisor import build_graph
+
+logger = logging.getLogger(__name__)
+
+INGEST_TOKEN_ENV = "COORDINATOR_INGEST_TOKEN"
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -43,6 +51,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="emit the region report as JSON instead of human-readable text",
     )
+    p.add_argument(
+        "--post-to",
+        default=None,
+        metavar="URL",
+        help=(
+            "coordinator base URL to POST an accepted region's render jobs to "
+            f"(bearer token from ${INGEST_TOKEN_ENV}); opt-in, off by default"
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -61,6 +78,7 @@ def _render_report(
     world_path: Path,
     rounds: int,
     jobs: list[RenderJobSpec],
+    posted: list[PostResult] | None = None,
 ) -> str:
     """Concise human-readable summary of one runtime invocation."""
     status = "ACCEPTED" if verdict.accepted else "REJECTED"
@@ -83,6 +101,12 @@ def _render_report(
             f"  [{job.kind.wire_name}] {job.region.region_id} "
             f"deadline={job.deadline_secs}s payout={job.max_payout_wei}wei"
         )
+    if posted is not None:
+        accepted = sum(1 for r in posted if r.ok)
+        lines.append(f"posted:    {accepted}/{len(posted)} accepted by coordinator")
+        for r in posted:
+            tag = f"id={r.job_id}" if r.ok else r.outcome.value
+            lines.append(f"  [{r.kind}] {r.region_id} -> {tag}")
     return "\n".join(lines)
 
 
@@ -93,13 +117,15 @@ def _render_report_json(
     world_path: Path,
     rounds: int,
     jobs: list[RenderJobSpec],
+    posted: list[PostResult] | None = None,
 ) -> str:
     """Machine-readable JSON form of the runtime report (see `_render_report` for
     the human form). Stable keys for HUD/CI consumers; `layer_counts` is the
     per-specialist breakdown from `layer_summary`; `rounds` is the number of
     validator passes (1 when accepted on the first round, more after route-backs);
     `render_jobs` is each emitted job in the exact `POST /jobs` body shape (empty
-    when the region was rejected)."""
+    when the region was rejected); `posted` is present only with `--post-to` and
+    holds the per-job coordinator outcome (no token)."""
     report = {
         "region_id": region_id,
         "accepted": verdict.accepted,
@@ -112,12 +138,38 @@ def _render_report_json(
         "world": str(world_path),
         "render_jobs": [job.to_request() for job in jobs],
     }
+    if posted is not None:
+        report["posted"] = [
+            {
+                "region_id": r.region_id,
+                "kind": r.kind,
+                "outcome": r.outcome.value,
+                "status_code": r.status_code,
+                "job_id": r.job_id,
+            }
+            for r in posted
+        ]
     return json.dumps(report, indent=2)
 
 
 async def _run_graph(brief: WorldBrief) -> dict:
     graph = build_graph()
     return await graph.ainvoke({"brief": brief, "layers": [], "rounds": 0})
+
+
+def _post_jobs(jobs: list[RenderJobSpec], base_url: str) -> list[PostResult]:
+    """POST an accepted region's render jobs to the coordinator. The bearer token
+    comes from $COORDINATOR_INGEST_TOKEN and is never printed; a missing token
+    posts unauthenticated (the coordinator 401s if it requires one)."""
+    token = (os.environ.get(INGEST_TOKEN_ENV) or "").strip() or None
+    if token is None:
+        logger.warning(
+            "--post-to set but $%s is empty; posting unauthenticated "
+            "(the coordinator will 401 if it requires a token)",
+            INGEST_TOKEN_ENV,
+        )
+    with httpx.Client() as client:
+        return post_jobs(jobs, base_url=base_url, token=token, client=client)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,12 +185,21 @@ def main(argv: list[str] | None = None) -> int:
 
     world_path = compose_world(layers, Path(args.out))
     jobs = render_jobs(brief, layers, verdict)
-    if args.json:
-        print(_render_report_json(brief.region.region_id, verdict, layers, world_path, rounds, jobs))
-    else:
-        print(_render_report(brief.region.region_id, verdict, layers, world_path, rounds, jobs))
 
-    return 0 if verdict.accepted else 1
+    # Posting is opt-in; a rejected region emits no jobs, so there is nothing to ship.
+    posted = _post_jobs(jobs, args.post_to) if args.post_to and jobs else None
+
+    region_id = brief.region.region_id
+    if args.json:
+        print(_render_report_json(region_id, verdict, layers, world_path, rounds, jobs, posted))
+    else:
+        print(_render_report(region_id, verdict, layers, world_path, rounds, jobs, posted))
+
+    if not verdict.accepted:
+        return 1
+    if posted is not None and not all(r.ok for r in posted):
+        return 2  # accepted + authored, but a job failed to reach the coordinator
+    return 0
 
 
 if __name__ == "__main__":

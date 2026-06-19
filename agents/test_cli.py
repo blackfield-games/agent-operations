@@ -11,6 +11,7 @@ import pytest
 from common.types import LayerSpec, ValidatorVerdict
 from runtime import cli
 from runtime.cli import main
+from runtime.poster import PostOutcome, PostResult
 
 # The 7 authoring specialists (validator emits no layer of its own).
 AUTHORING = ("director", "terrain", "biome", "prop", "lighting", "npc", "optimization")
@@ -172,3 +173,135 @@ def test_layer_arg_flows_into_region_id():
     brief = cli._build_brief(cli._parse_args(["--x", "3", "--y", "-4", "--layer", "2"]))
     assert brief.region.region_id == "r+0003_-0004_l2"
     assert (brief.region.x, brief.region.y, brief.region.layer) == (3, -4, 2)
+
+
+# --- --post-to: ship an accepted region's render jobs to the coordinator ---
+
+def _accepted_result(region_id="r+0042_-0017_l0"):
+    return {
+        "verdict": ValidatorVerdict(accepted=True, issues=[]),
+        "layers": [
+            LayerSpec(specialist="terrain", region_id=region_id, path="terrain/a.usda", summary="ridge", metrics={}),
+        ],
+        "rounds": 1,
+    }
+
+
+def _stub_post(monkeypatch, make_results, store=None):
+    """Replace cli.post_jobs with a fake that records the call (token/base_url/jobs)
+    and returns canned results, so the CLI wiring is tested without a coordinator
+    (the transport itself is covered in test_poster.py)."""
+    def fake(jobs, *, base_url, token, client):
+        if store is not None:
+            store.update(jobs=jobs, base_url=base_url, token=token)
+        return make_results(jobs)
+    monkeypatch.setattr(cli, "post_jobs", fake)
+
+
+def _created(jobs, job_id="srv-7"):
+    j = jobs[0]
+    return [PostResult(j.region.region_id, j.kind.wire_name, PostOutcome.CREATED, status_code=201, job_id=job_id)]
+
+
+def test_post_to_ships_accepted_jobs_and_threads_token(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORDINATOR_INGEST_TOKEN", "tok-123")
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+    seen: dict = {}
+    _stub_post(monkeypatch, _created, store=seen)
+
+    code = main(["--x", "42", "--y", "-17", "--post-to", "http://coord:8080", "--out", "out"])
+
+    assert code == 0
+    assert seen["base_url"] == "http://coord:8080"
+    assert seen["token"] == "tok-123"  # threaded from the env var
+    assert len(seen["jobs"]) == 1
+    out = capsys.readouterr().out
+    assert "posted:    1/1 accepted" in out
+    assert "id=srv-7" in out
+
+
+def test_post_to_token_never_printed(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    secret = "TOPSECRET-ingest-9f3"
+    monkeypatch.setenv("COORDINATOR_INGEST_TOKEN", secret)
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+    _stub_post(monkeypatch, _created)
+
+    main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--json", "--out", "out"])
+    assert secret not in capsys.readouterr().out
+
+
+def test_post_failure_returns_exit_2(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORDINATOR_INGEST_TOKEN", "t")
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+    _stub_post(
+        monkeypatch,
+        lambda jobs: [PostResult(jobs[0].region.region_id, jobs[0].kind.wire_name, PostOutcome.UNAVAILABLE, status_code=503)],
+    )
+
+    code = main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--out", "out"])
+    assert code == 2  # accepted + authored, but the post failed to land
+
+
+def test_no_post_to_does_not_post(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+
+    def boom(*a, **k):
+        raise AssertionError("post_jobs must not run without --post-to")
+
+    monkeypatch.setattr(cli, "post_jobs", boom)
+
+    code = main(["--x", "42", "--y", "-17", "--out", "out"])
+    assert code == 0
+    assert "posted:" not in capsys.readouterr().out
+
+
+def test_post_to_without_token_warns_and_posts_unauthenticated(tmp_path, monkeypatch, capsys, caplog):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("COORDINATOR_INGEST_TOKEN", raising=False)
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+    seen: dict = {}
+    _stub_post(monkeypatch, _created, store=seen)
+
+    with caplog.at_level("WARNING"):
+        main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--out", "out"])
+    assert seen["token"] is None  # empty env -> unauthenticated post
+    assert "unauthenticated" in caplog.text
+
+
+def test_post_to_rejected_region_posts_nothing(tmp_path, monkeypatch, capsys):
+    # A rejected region emits no jobs, so --post-to must not reach the transport.
+    monkeypatch.chdir(tmp_path)
+    result = {
+        "verdict": ValidatorVerdict(accepted=False, issues=["bad"]),
+        "layers": [LayerSpec(specialist="terrain", region_id="r+0042_-0017_l0", path="terrain/a.usda", summary="t", metrics={})],
+        "rounds": 1,
+    }
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(result))
+
+    def boom(*a, **k):
+        raise AssertionError("must not post a rejected region")
+
+    monkeypatch.setattr(cli, "post_jobs", boom)
+
+    code = main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--out", "out"])
+    assert code == 1  # rejection still dominates the exit code
+    assert "posted:" not in capsys.readouterr().out
+
+
+def test_post_to_json_includes_posted(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORDINATOR_INGEST_TOKEN", "t")
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+    _stub_post(monkeypatch, lambda jobs: _created(jobs, job_id="J1"))
+
+    code = main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--json", "--out", "out"])
+    assert code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert "posted" in report
+    assert report["posted"][0]["outcome"] == "created"
+    assert report["posted"][0]["job_id"] == "J1"
+    assert report["posted"][0]["region_id"] == "r+0042_-0017_l0"
