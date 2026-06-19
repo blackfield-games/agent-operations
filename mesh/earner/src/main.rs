@@ -1363,4 +1363,68 @@ mod tests {
             "a non-2xx register response must surface as Err"
         );
     }
+
+    /// The inbound cap binds BOTH the message and the single-frame size to
+    /// MAX_INBOUND_FRAME_BYTES. Pinning both is the point: a per-frame cap alone
+    /// would still let a message split across many frames grow to the message cap.
+    #[test]
+    fn ws_config_caps_both_inbound_message_and_frame_size() {
+        let cfg = ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_INBOUND_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_INBOUND_FRAME_BYTES));
+    }
+
+    /// End-to-end proof that `ws_config()` ENFORCES the cap on the wire, not merely
+    /// that its fields hold the right values: an ephemeral server sends one text frame
+    /// just over MAX_INBOUND_FRAME_BYTES; a client connected with `ws_config()` errors
+    /// on recv (frame too large), where a client on tungstenite's DEFAULT config (64
+    /// MiB) decodes the SAME frame fine. The baseline is the discriminator — it proves
+    /// the rejection is our cap, not a malformed or absolutely-oversized frame. Drop
+    /// the `Some(ws_config())` (revert to the default) and the capped assertion fails.
+    #[tokio::test]
+    async fn ws_config_rejects_an_oversized_inbound_frame() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Each accepted connection gets one oversized text frame, in its own task so
+        // the two client connections below are served concurrently (no head-of-line
+        // block while a handler holds its socket open).
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut ws) = accept_async(stream).await {
+                        let oversized = "x".repeat(MAX_INBOUND_FRAME_BYTES + 1);
+                        let _ = ws.send(WsMessage::text(oversized)).await;
+                        let _ = ws.flush().await;
+                        let _ = ws.next().await; // hold open until the client reacts
+                    }
+                });
+            }
+        });
+        let url = format!("ws://{addr}");
+
+        let (mut capped, _) =
+            tokio_tungstenite::connect_async_with_config(&url, Some(ws_config()), false)
+                .await
+                .unwrap();
+        let capped_recv = capped.next().await.expect("a frame or error arrives");
+        assert!(
+            capped_recv.is_err(),
+            "ws_config() must shed the oversized inbound frame, got {capped_recv:?}",
+        );
+
+        let (mut uncapped, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let msg = uncapped
+            .next()
+            .await
+            .expect("a frame arrives")
+            .expect("the default 64 MiB config accepts the same frame the cap rejected");
+        assert_eq!(
+            msg.len(),
+            MAX_INBOUND_FRAME_BYTES + 1,
+            "baseline decodes the exact frame the cap rejected — so the cap is the discriminator",
+        );
+    }
 }
