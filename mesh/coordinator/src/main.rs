@@ -2318,7 +2318,12 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Extension(PeerAddr(peer)): Extension<PeerAddr>,
+    headers: HeaderMap,
 ) -> Response {
+    // Resolve the rate-limit source from the upgrade request's headers BEFORE the
+    // upgrade consumes it: the real client behind a trusted proxy (via
+    // X-Forwarded-For), else the connection peer — the same rule HTTP /register uses.
+    let source = resolve_source_ip(peer.ip(), &headers, &state.trusted_proxies);
     // Bound inbound frames/messages to the same ceiling the HTTP paths enforce, so a
     // Hello — like any earner frame — is size-checked at the protocol layer BEFORE
     // serde parses it. Without this the ws path inherits tungstenite's 64 MiB default,
@@ -2332,7 +2337,7 @@ async fn ws_handler(
     let ws = ws
         .max_message_size(MAX_REQUEST_BODY_BYTES)
         .max_frame_size(MAX_REQUEST_BODY_BYTES);
-    ws.on_upgrade(move |socket| ws_session(socket, state, peer))
+    ws.on_upgrade(move |socket| ws_session(socket, state, source))
 }
 
 /// Send a `CoordinatorMsg` as a JSON text frame. Returns `false` if the socket
@@ -2347,9 +2352,9 @@ async fn send_msg(socket: &mut WebSocket, msg: &CoordinatorMsg) -> bool {
     }
 }
 
-async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, peer: SocketAddr) {
+async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, source: IpAddr) {
     // 1. First message MUST be a Hello.
-    let earner_address = match recv_hello(&mut socket, &state, peer).await {
+    let earner_address = match recv_hello(&mut socket, &state, source).await {
         Some(addr) => addr,
         None => return,
     };
@@ -2605,8 +2610,8 @@ const HELLO_NONCE_BYTES: usize = 16;
 /// wall-clock, so frame-flooding can't extend it (the deadline is not reset per
 /// frame). On elapse we fail closed: return `None` (no registry insert, no
 /// eviction), the caller returns, and axum closes the socket.
-async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>, peer: SocketAddr) -> Option<String> {
-    match tokio::time::timeout(state.handshake_timeout, recv_hello_inner(socket, state, peer)).await {
+async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>, source: IpAddr) -> Option<String> {
+    match tokio::time::timeout(state.handshake_timeout, recv_hello_inner(socket, state, source)).await {
         Ok(result) => result,
         Err(_) => {
             tracing::warn!("ws: registration handshake timed out before a valid Hello; closing");
@@ -2618,7 +2623,7 @@ async fn recv_hello(socket: &mut WebSocket, state: &Arc<AppState>, peer: SocketA
 async fn recv_hello_inner(
     socket: &mut WebSocket,
     state: &Arc<AppState>,
-    peer: SocketAddr,
+    source: IpAddr,
 ) -> Option<String> {
     let mut nonce = [0u8; HELLO_NONCE_BYTES];
     if getrandom::getrandom(&mut nonce).is_err() {
@@ -2650,20 +2655,21 @@ async fn recv_hello_inner(
         // Per-source registration rate limit, once a Hello frame is in hand and
         // BEFORE its secp256k1 verify in validate_hello (cheap-reject-first, FM2) —
         // symmetric with HTTP /register. Over-limit → close the socket (return None),
-        // no registry work. Keyed on the connection peer IP.
+        // no registry work. Keyed on the resolved source (peer, or the trusted-proxy
+        // X-Forwarded-For client) computed in ws_handler.
         {
             let now = now_secs();
             let mut buckets = state.registration_buckets.lock().await;
             if !check_registration_rate(
                 &mut buckets,
-                peer.ip(),
+                source,
                 now,
                 state.max_registrations,
                 REGISTRATION_WINDOW_SECS,
                 MAX_REGISTRATION_BUCKETS,
             ) {
                 tracing::warn!(
-                    source = %peer.ip(),
+                    %source,
                     "ws: rejected registration: per-source rate limit exceeded; closing"
                 );
                 return None;
