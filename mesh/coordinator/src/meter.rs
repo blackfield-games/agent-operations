@@ -17,6 +17,9 @@
 
 use crate::eas::job_id_hex;
 use proto::JobResult;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 /// A settled render's pending ComputeMeter debit: the `spend` arguments in the
 /// contract's types. `buyer` is the 0x-prefixed EVM address charged (validated
@@ -61,6 +64,187 @@ impl PendingDebit {
             amount_wei: amount.to_string(),
             job_id: job_id_hex(&result.job_id),
         })
+    }
+}
+
+// ---- on-chain spend transport (the metering twin of `crate::relay`) ----
+//
+// The drain loop (`drain_debits` in `main.rs`) reads pending debit rows and
+// submits each as a `ComputeMeter.spend(buyer, amount, jobId)` call on Base,
+// returning the spend tx hash. This is the transport boundary: the [`Spender`]
+// trait plus a [`MockSpender`] for tests and the `--spender-dev-mock` local path.
+// Kept in `meter.rs` (rather than a separate module like `relay.rs`) so the small
+// metering concern stays in one file. The live Base impl (an RPC provider + an
+// authorized spender key with gas) is operator-gated and not built here.
+//
+// IDEMPOTENCY — verified against `contracts/src/ComputeMeter.sol`: unlike
+// `RenderReceipts.issueReceipt` (which has a per-job `DuplicateReceipt` fence),
+// `spend` is NOT idempotent — it debits `credit[buyer]` on every call and only
+// emits `Spent(jobId)`; it tracks no spent jobIds. So a crash between an on-chain
+// `spend` and the local `mark_debit_submitted` would re-claim the row and
+// DOUBLE-DEBIT the buyer on restart. [`SpendError::AlreadySpent`] is the seam for
+// an on-chain jobId fence (refiled `contracts-computemeter-spend-idempotency`):
+// the live transport is safe to wire ONLY once that fence exists, so its go-live
+// is gated on BOTH credentials AND the fence (see BLOCKERS). `MockSpender` models
+// the post-fence contract.
+
+/// Why an on-chain `spend` failed — the drain loop reacts differently to each.
+#[derive(Debug)]
+pub enum SpendError {
+    /// This `jobId` is already debited on-chain — an *idempotent success*: a crash
+    /// between a prior `spend` and its local mark left the row pending, and the
+    /// re-submit hit the contract's (refiled) per-job fence. The drain marks the
+    /// row and moves on rather than double-debiting. REQUIRES the on-chain jobId
+    /// fence to be real (see the module note above).
+    AlreadySpent,
+    /// The spender key is not in `ComputeMeter.authorizedSpenders` (the contract
+    /// reverts `NotAuthorized`). Every spend reverts until the owner calls
+    /// `setSpender`, so this is a loud, distinct operator-config error — NOT a
+    /// transient retry that masquerades as progress. The drain stops; the backlog
+    /// (visible at `/stats pending_debits`) stays put until authorization lands.
+    NotAuthorized,
+    /// A transient fault (RPC timeout, nonce contention, a reorg). The debit is not
+    /// on-chain; the row stays pending and is retried on the next drain tick.
+    Transient(String),
+    /// A non-retryable fault that is NOT a global config problem — e.g. the
+    /// contract reverts `InsufficientCredit` for an underfunded buyer. Retrying in
+    /// a hot loop or dropping the debit are both wrong, so the drain stops and
+    /// surfaces it; the row stays pending.
+    Permanent(String),
+}
+
+/// Submits a pending debit as a `ComputeMeter.spend(buyer, amount, jobId)` call,
+/// returning the spend tx hash on success. The future is `Send` so the drain loop
+/// can run on the multi-threaded runtime; implementors must not block.
+pub trait Spender: Send + Sync {
+    fn spend(
+        &self,
+        debit: &PendingDebit,
+    ) -> impl Future<Output = Result<String, SpendError>> + Send;
+}
+
+/// In-process [`Spender`] for tests and the `--spender-dev-mock` local path. Never
+/// touches a chain: it replays a scripted outcome and records every call so the
+/// drain loop can be exercised deterministically — success, transient-then-ok,
+/// permanent, not-authorized, or already-spent — without RPC or funds.
+pub struct MockSpender {
+    inner: Mutex<MockSpenderInner>,
+    /// Test-only gate: when set, `spend` signals `started` then awaits `release`
+    /// before resolving, so a test can hold a spend in-flight and assert the drain
+    /// keeps the store lock free during it. `None` (always) on the dev path.
+    started: Option<Arc<Notify>>,
+    release: Option<Arc<Notify>>,
+}
+
+struct MockSpenderInner {
+    /// Fail this many calls with `Transient` before succeeding.
+    transient_remaining: usize,
+    /// Always fail with `Permanent`.
+    permanent: bool,
+    /// Always fail with `NotAuthorized` (models an unauthorized spender key).
+    not_authorized: bool,
+    /// Always fail with `AlreadySpent` (models a debit already on-chain).
+    already_spent: bool,
+    /// Total `spend` calls (successful or not).
+    calls: usize,
+    /// `job_id` (bytes32 hex) of every debit that was freshly spent.
+    spent: Vec<String>,
+}
+
+impl MockSpender {
+    /// Always succeeds, returning a deterministic mock tx hash. Used by `main`'s
+    /// `--spender-dev-mock` path and by the happy-path tests.
+    pub fn succeeding() -> Self {
+        Self {
+            inner: Mutex::new(MockSpenderInner {
+                transient_remaining: 0,
+                permanent: false,
+                not_authorized: false,
+                already_spent: false,
+                calls: 0,
+                spent: Vec::new(),
+            }),
+            started: None,
+            release: None,
+        }
+    }
+
+    /// Fail the first `n` spends with `Transient`, then succeed.
+    #[cfg(test)]
+    pub fn transient_then_ok(n: usize) -> Self {
+        let mut m = Self::succeeding();
+        m.inner.get_mut().unwrap().transient_remaining = n;
+        m
+    }
+
+    /// Always fail with `Permanent` (e.g. an underfunded buyer's `InsufficientCredit`).
+    #[cfg(test)]
+    pub fn permanent() -> Self {
+        let mut m = Self::succeeding();
+        m.inner.get_mut().unwrap().permanent = true;
+        m
+    }
+
+    /// Always fail with `NotAuthorized` (the spender key isn't authorized on-chain).
+    #[cfg(test)]
+    pub fn not_authorized() -> Self {
+        let mut m = Self::succeeding();
+        m.inner.get_mut().unwrap().not_authorized = true;
+        m
+    }
+
+    /// Always fail with `AlreadySpent` (the debit is already on-chain).
+    #[cfg(test)]
+    pub fn already_spent() -> Self {
+        let mut m = Self::succeeding();
+        m.inner.get_mut().unwrap().already_spent = true;
+        m
+    }
+
+    /// Total `spend` calls so far.
+    #[cfg(test)]
+    pub fn calls(&self) -> usize {
+        self.inner.lock().unwrap().calls
+    }
+
+    /// `job_id`s freshly spent (excludes `AlreadySpent`, which spends nothing new).
+    #[cfg(test)]
+    pub fn spent(&self) -> Vec<String> {
+        self.inner.lock().unwrap().spent.clone()
+    }
+}
+
+/// Deterministic mock tx hash for a given debit, so a test can assert the drain
+/// stored exactly what the spender returned.
+fn mock_tx_hash(debit: &PendingDebit) -> String {
+    format!("0xspend-{}", debit.job_id)
+}
+
+impl Spender for MockSpender {
+    async fn spend(&self, debit: &PendingDebit) -> Result<String, SpendError> {
+        if let Some(s) = &self.started {
+            s.notify_one();
+        }
+        if let Some(r) = &self.release {
+            r.notified().await;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls += 1;
+        if inner.permanent {
+            return Err(SpendError::Permanent("mock permanent".into()));
+        }
+        if inner.not_authorized {
+            return Err(SpendError::NotAuthorized);
+        }
+        if inner.already_spent {
+            return Err(SpendError::AlreadySpent);
+        }
+        if inner.transient_remaining > 0 {
+            inner.transient_remaining -= 1;
+            return Err(SpendError::Transient("mock transient".into()));
+        }
+        inner.spent.push(debit.job_id.clone());
+        Ok(mock_tx_hash(debit))
     }
 }
 
@@ -115,5 +299,57 @@ mod tests {
     fn build_skips_when_render_seconds_is_zero() {
         // A zero-second job owes nothing — a zero spend is a no-op, so skip the row.
         assert!(PendingDebit::build(Some(BUYER), &result(0), 1_000).is_none());
+    }
+
+    fn debit() -> PendingDebit {
+        PendingDebit::build(Some(BUYER), &result(3), 1_000).expect("buyer + nonzero amount")
+    }
+
+    #[tokio::test]
+    async fn spend_succeeding_returns_tx_hash_and_records_the_call() {
+        let s = MockSpender::succeeding();
+        let d = debit();
+        let tx = s.spend(&d).await.expect("succeeds");
+        assert_eq!(tx, mock_tx_hash(&d));
+        assert_eq!(s.calls(), 1);
+        assert_eq!(s.spent(), vec![d.job_id]);
+    }
+
+    #[tokio::test]
+    async fn spend_transient_then_ok_fails_then_succeeds() {
+        let s = MockSpender::transient_then_ok(2);
+        let d = debit();
+        assert!(matches!(s.spend(&d).await, Err(SpendError::Transient(_))));
+        assert!(matches!(s.spend(&d).await, Err(SpendError::Transient(_))));
+        assert!(s.spend(&d).await.is_ok());
+        assert_eq!(s.calls(), 3);
+        // Only the successful call recorded a spend.
+        assert_eq!(s.spent(), vec![d.job_id]);
+    }
+
+    #[tokio::test]
+    async fn spend_permanent_never_spends() {
+        let s = MockSpender::permanent();
+        assert!(matches!(s.spend(&debit()).await, Err(SpendError::Permanent(_))));
+        assert!(s.spent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spend_not_authorized_never_spends() {
+        let s = MockSpender::not_authorized();
+        assert!(matches!(
+            s.spend(&debit()).await,
+            Err(SpendError::NotAuthorized)
+        ));
+        assert_eq!(s.calls(), 1);
+        assert!(s.spent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spend_already_spent_never_spends() {
+        let s = MockSpender::already_spent();
+        assert!(matches!(s.spend(&debit()).await, Err(SpendError::AlreadySpent)));
+        assert_eq!(s.calls(), 1);
+        assert!(s.spent().is_empty());
     }
 }

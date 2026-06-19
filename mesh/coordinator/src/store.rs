@@ -1348,6 +1348,68 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// The oldest still-pending debit (`tx_hash IS NULL`), oldest-first by insert
+    /// order, as `(job_id, PendingDebit)` — or `None` when the backlog is empty.
+    /// The metering twin of [`claim_oldest_pending`](Self::claim_oldest_pending): a
+    /// pure read that does NOT reserve or mutate the row, so the drain loop drops
+    /// the store lock before the slow on-chain `spend` and only re-acquires it to
+    /// `mark_debit_submitted`. A single drain task is the only caller and settles
+    /// only ever INSERT new pending rows, so no reservation is needed to avoid a
+    /// double-claim.
+    pub fn claim_oldest_pending_debit(
+        &self,
+    ) -> Result<Option<(uuid::Uuid, crate::meter::PendingDebit)>> {
+        let row = self.conn.query_row(
+            "SELECT job_id, buyer, amount_wei, job_id_b32
+             FROM pending_debits
+             WHERE tx_hash IS NULL
+             ORDER BY created_at ASC, rowid ASC
+             LIMIT 1",
+            [],
+            |r| {
+                let job_id: String = r.get(0)?;
+                Ok((
+                    job_id,
+                    crate::meter::PendingDebit {
+                        buyer: r.get(1)?,
+                        amount_wei: r.get(2)?,
+                        job_id: r.get(3)?,
+                    },
+                ))
+            },
+        );
+        match row {
+            Ok((job_id, debit)) => {
+                let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
+                    anyhow::anyhow!("pending_debits.job_id not a uuid {job_id:?}: {e}")
+                })?;
+                Ok(Some((uuid, debit)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Mark a pending debit spent on-chain by writing its `tx_hash` +
+    /// `submitted_at`, but ONLY while it is still pending (`tx_hash IS NULL`).
+    /// Returns whether a row was updated. The `tx_hash IS NULL` guard makes a
+    /// re-mark after a crash-recovery re-submit a no-op, so a debit is never marked
+    /// (or counted as drained) twice. The metering twin of
+    /// [`mark_submitted`](Self::mark_submitted).
+    pub fn mark_debit_submitted(
+        &self,
+        job_id: &uuid::Uuid,
+        tx_hash: &str,
+        now_secs: i64,
+    ) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_debits SET tx_hash = ?1, submitted_at = ?2
+             WHERE job_id = ?3 AND tx_hash IS NULL",
+            (tx_hash, now_secs, job_id.to_string()),
+        )?;
+        Ok(updated > 0)
+    }
+
     /// The oldest still-pending attestation (`uid IS NULL`), oldest-first by
     /// insert order, as `(job_id, PendingAttestation)` — or `None` when the
     /// backlog is empty. A pure read: it does NOT reserve or mutate the row, so

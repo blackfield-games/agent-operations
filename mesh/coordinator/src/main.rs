@@ -53,6 +53,7 @@ mod store;
 mod validate;
 mod verify;
 
+use meter::{SpendError, Spender};
 use relay::{Relay, RelayError};
 use store::Store;
 
@@ -139,6 +140,19 @@ struct Args {
     /// `/stats pending_attestations`.
     #[arg(long, env = "COORDINATOR_RELAY_DEV_MOCK", default_value = "false")]
     relay_dev_mock: bool,
+    /// How often (seconds) the debit relayer drains pending ComputeMeter debits to
+    /// the chain. Only runs when a spender is configured (see `--spender-dev-mock`).
+    #[arg(long, env = "COORDINATOR_SPENDER_INTERVAL_SECS", default_value = "10")]
+    spender_interval_secs: u64,
+    /// LOCAL DEV ONLY: drain pending debits to an in-process mock spender instead
+    /// of the chain. Exercises the full drain path (claim → spend → mark) without
+    /// an RPC, a signer, or gas. The live Base spender (an RPC provider + an
+    /// authorized ComputeMeter spender key) is operator-gated AND additionally
+    /// blocked on the on-chain jobId fence (`spend` is not idempotent — see
+    /// `meter.rs`); with this flag off (the default) pending debits accumulate,
+    /// surfaced at `/stats pending_debits`.
+    #[arg(long, env = "COORDINATOR_SPENDER_DEV_MOCK", default_value = "false")]
+    spender_dev_mock: bool,
     /// Shared-secret bearer token gating `POST /jobs` ingestion. When SET, a
     /// job-creation request must carry `Authorization: Bearer <token>` (compared
     /// in constant time); a request that is absent, malformed, or carries the
@@ -582,6 +596,28 @@ async fn main() -> Result<()> {
     } else {
         tracing::info!(
             "on-chain attestation relayer disabled (operator-gated: needs a Base RPC + an authorized coordinator EAS signer). Pending receipts accumulate; see /stats pending_attestations."
+        );
+    }
+
+    // Background debit relayer — the metering twin of the attestation relayer
+    // above. The live Base spender (RPC + an authorized ComputeMeter spender key
+    // with gas) is operator-gated AND additionally blocked on the on-chain jobId
+    // fence (`ComputeMeter.spend` is not idempotent today — see meter.rs), so it is
+    // not wired here; `--spender-dev-mock` drives the same drain loop against an
+    // in-process mock. With neither configured the backlog accumulates (by design)
+    // and is visible at `/stats pending_debits`.
+    if args.spender_dev_mock {
+        tracing::warn!(
+            "DEV: draining ComputeMeter debits to an in-process MOCK spender — nothing is spent on-chain. Never enable in production."
+        );
+        spawn_debit_relayer(
+            state.clone(),
+            meter::MockSpender::succeeding(),
+            args.spender_interval_secs,
+        );
+    } else {
+        tracing::info!(
+            "on-chain debit relayer disabled (operator-gated: needs a Base RPC + an authorized ComputeMeter spender key, and the on-chain jobId fence). Pending debits accumulate; see /stats pending_debits."
         );
     }
 
@@ -1229,6 +1265,87 @@ async fn drain_attestations<R: Relay>(state: &Arc<AppState>, relay: &R) {
             Ok(false) => tracing::warn!(%job_id, "relay: receipt already marked submitted"),
             Err(e) => {
                 tracing::error!(%job_id, ?e, "relay: mark_submitted failed");
+                return;
+            }
+        }
+    }
+}
+
+/// Marker `tx_hash` stored when the contract reports the debit is already spent
+/// (the on-chain jobId fence): the debit landed but the relay didn't capture its
+/// real tx hash (a crash recovered between a prior `spend` and its local mark).
+/// The row is settled — it just carries this sentinel instead of the spend tx.
+const ALREADY_SPENT_TX: &str = "already-spent";
+
+/// Spawn the debit relayer: every `interval_secs`, drain the pending-debit backlog
+/// through `spender`. Mirrors `spawn_relayer`; only the real binary spawns it.
+fn spawn_debit_relayer<S: Spender + 'static>(state: Arc<AppState>, spender: S, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            tick.tick().await;
+            drain_debits(&state, &spender).await;
+        }
+    });
+}
+
+/// Drain pending ComputeMeter debits oldest-first through `spender`, settling each
+/// to its on-chain spend tx hash — the metering twin of [`drain_attestations`].
+///
+/// The store lock is NEVER held across the spend await: each debit is claimed
+/// under the lock, the lock is dropped for the (slow) on-chain call, and only
+/// re-acquired to mark the result, so settles and `/stats` never stall behind RPC
+/// latency. `AlreadySpent` is an idempotent success (the debit is on-chain after a
+/// recovered crash) so it is marked and the drain continues; `NotAuthorized` is
+/// surfaced loudly + distinctly (the spender key needs `ComputeMeter.setSpender`);
+/// a transient or permanent error stops the batch (backs off to the next tick)
+/// without dropping or double-spending any debit.
+async fn drain_debits<S: Spender>(state: &Arc<AppState>, spender: &S) {
+    loop {
+        let claimed = {
+            let store = state.store.lock().await;
+            store.claim_oldest_pending_debit()
+        }; // lock dropped before the on-chain spend below
+        let claimed = match claimed {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(?e, "spender: claim_oldest_pending_debit failed");
+                return;
+            }
+        };
+        let Some((job_id, debit)) = claimed else { return }; // backlog drained
+
+        let tx_hash = match spender.spend(&debit).await {
+            Ok(tx) => tx,
+            Err(SpendError::AlreadySpent) => {
+                tracing::info!(%job_id, "spender: debit already spent on-chain; marking submitted");
+                ALREADY_SPENT_TX.to_string()
+            }
+            Err(SpendError::NotAuthorized) => {
+                tracing::error!(%job_id, "spender: NotAuthorized — the spender key is not authorized on ComputeMeter (owner must call setSpender); draining paused");
+                return;
+            }
+            Err(SpendError::Transient(msg)) => {
+                tracing::warn!(%job_id, %msg, "spender: transient spend failure; retrying next tick");
+                return; // back off to the next tick
+            }
+            Err(SpendError::Permanent(msg)) => {
+                tracing::error!(%job_id, %msg, "spender: permanent spend failure; draining paused (e.g. an underfunded buyer's InsufficientCredit)");
+                return;
+            }
+        };
+
+        let marked = {
+            let store = state.store.lock().await;
+            store.mark_debit_submitted(&job_id, &tx_hash, now_secs())
+        };
+        match marked {
+            Ok(true) => {}
+            // The row was already marked (a concurrent/duplicate drain) — not an
+            // error; keep draining the rest of the backlog.
+            Ok(false) => tracing::warn!(%job_id, "spender: debit already marked submitted"),
+            Err(e) => {
+                tracing::error!(%job_id, ?e, "spender: mark_debit_submitted failed");
                 return;
             }
         }
