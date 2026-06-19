@@ -473,6 +473,71 @@ pub struct MatchResult {
     pub replay_hash: String,
 }
 
+/// The rules a match is played under, sent to every seat at [`GatewayMsg::Start`]
+/// so an agent knows the tick rate, the time limit, and the arena bounds it must
+/// stay within. Read-only; the server is authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchConfig {
+    /// Simulation ticks per second.
+    pub tick_hz: u16,
+    /// Hard cap on match length in ticks; the match ends at this tick if no
+    /// earlier win condition fires.
+    pub max_ticks: u64,
+    /// Arena half-extent per axis (see [`POSITION_SCALE`]): play stays within
+    /// `[-bounds, +bounds]`.
+    pub bounds: Vec2,
+    /// Number of seats in the match.
+    pub seats: u8,
+}
+
+/// Server → agent messages — the Gateway side of the protocol, consumed by an
+/// agent's `AgentController` (or the reference harness). Internally tagged on
+/// `type`, exactly like `mesh/proto`'s `CoordinatorMsg`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GatewayMsg {
+    /// Handshake accepted: the seat is admitted. Confirms the
+    /// [`PROTOCOL_VERSION`] the server speaks — the agent MUST
+    /// [`check_version`] it — and the seat it was assigned.
+    Welcome {
+        protocol_version: u32,
+        match_id: MatchId,
+        seat: SeatId,
+    },
+    /// Handshake refused (version mismatch, full match, or unauthenticated
+    /// ranked seat). Terminal for this connection.
+    Reject { reason: String },
+    /// The match is starting; here are the rules.
+    Start { match_id: MatchId, config: MatchConfig },
+    /// A per-tick parity-bounded observation; the agent answers with
+    /// [`AgentMsg::Act`] before its `deadline_micros` elapses.
+    Observe(Observation),
+    /// The match is over; the canonical, attestable result.
+    End(MatchResult),
+}
+
+/// Agent → server messages — the controller side of the protocol. Internally
+/// tagged on `type`, exactly like `mesh/proto`'s `EarnerMsg`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMsg {
+    /// Handshake: request a seat. Carries the agent's [`PROTOCOL_VERSION`] (the
+    /// server [`check_version`]s it and replies [`GatewayMsg::Welcome`] or
+    /// [`GatewayMsg::Reject`]) and its claimed identity. For a ranked agent seat
+    /// `agent_id` is an on-chain agent address, proven by `signature_hex` over
+    /// the join digest; a casual/unranked seat may send an empty `signature_hex`
+    /// and matchmaking decides whether that seat is allowed.
+    Join {
+        protocol_version: u32,
+        agent_id: String,
+        signature_hex: String,
+    },
+    /// The action answering the observation tick it names.
+    Act(Action),
+    /// Leave or forfeit the match.
+    Leave { reason: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +811,94 @@ mod tests {
         let parsed: MatchResult = serde_json::from_value(canonical.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "MatchResult wire shape drifted");
         assert_eq!(parsed.replay_hash, hex::encode(rec.digest()), "result must commit to the replay digest");
+    }
+
+    #[test]
+    fn match_config_wire_shape_is_stable() {
+        let canonical = serde_json::json!({
+            "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8
+        });
+        let parsed: MatchConfig = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), canonical, "MatchConfig wire shape drifted");
+    }
+
+    #[test]
+    fn gateway_msg_wire_shapes_are_stable() {
+        // Welcome — struct variant.
+        let welcome = serde_json::json!({
+            "type": "welcome", "protocol_version": PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 2
+        });
+        assert_round::<GatewayMsg>(&welcome, "GatewayMsg::Welcome");
+
+        // Reject — struct variant.
+        let reject = serde_json::json!({ "type": "reject", "reason": "version mismatch" });
+        assert_round::<GatewayMsg>(&reject, "GatewayMsg::Reject");
+
+        // Start — struct variant carrying the config.
+        let start = serde_json::json!({
+            "type": "start", "match_id": FIXED_MATCH,
+            "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 }
+        });
+        assert_round::<GatewayMsg>(&start, "GatewayMsg::Start");
+
+        // Observe — newtype variant: the Observation fields flatten next to "type".
+        let mut observe = serde_json::to_value(sample_observation()).unwrap();
+        observe.as_object_mut().unwrap().insert("type".into(), "observe".into());
+        assert_round::<GatewayMsg>(&observe, "GatewayMsg::Observe");
+
+        // End — newtype variant: the MatchResult fields flatten next to "type".
+        let result = MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: FIXED_MATCH.parse().unwrap(),
+            final_tick: 2,
+            outcomes: vec![SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true }],
+            replay_hash: hex::encode(sample_replay().digest()),
+        };
+        let mut end = serde_json::to_value(&result).unwrap();
+        end.as_object_mut().unwrap().insert("type".into(), "end".into());
+        assert_round::<GatewayMsg>(&end, "GatewayMsg::End");
+    }
+
+    #[test]
+    fn agent_msg_wire_shapes_are_stable() {
+        // Join — struct variant.
+        let join = serde_json::json!({
+            "type": "join", "protocol_version": PROTOCOL_VERSION,
+            "agent_id": "0xabcdef1234567890abcdef1234567890abcdef12", "signature_hex": "0xcafe"
+        });
+        assert_round::<AgentMsg>(&join, "AgentMsg::Join");
+
+        // Act — newtype variant: the Action fields flatten next to "type".
+        let mut act = serde_json::to_value(sample_action()).unwrap();
+        act.as_object_mut().unwrap().insert("type".into(), "act".into());
+        assert_round::<AgentMsg>(&act, "AgentMsg::Act");
+
+        // Leave — struct variant.
+        let leave = serde_json::json!({ "type": "leave", "reason": "forfeit" });
+        assert_round::<AgentMsg>(&leave, "AgentMsg::Leave");
+    }
+
+    #[test]
+    fn join_version_drives_welcome_or_reject() {
+        // The handshake: a matching version is welcomed onto a seat; a drifted
+        // version is rejected before any match state exists.
+        let decide = |v: u32| -> GatewayMsg {
+            match check_version(v) {
+                Ok(()) => GatewayMsg::Welcome {
+                    protocol_version: PROTOCOL_VERSION,
+                    match_id: FIXED_MATCH.parse().unwrap(),
+                    seat: 0,
+                },
+                Err(m) => GatewayMsg::Reject { reason: m.to_string() },
+            }
+        };
+        assert!(matches!(decide(PROTOCOL_VERSION), GatewayMsg::Welcome { .. }));
+        assert!(matches!(decide(PROTOCOL_VERSION + 1), GatewayMsg::Reject { .. }));
+    }
+
+    fn assert_round<T: Serialize + for<'de> Deserialize<'de>>(canonical: &serde_json::Value, what: &str) {
+        let parsed: T = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(&serde_json::to_value(&parsed).unwrap(), canonical, "{what} wire shape drifted");
     }
 
     fn sample_replay() -> ReplayRecord {
