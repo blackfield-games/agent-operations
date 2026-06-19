@@ -3818,6 +3818,143 @@ mod tests {
         assert_eq!(json["pending_attestations"], 2);
     }
 
+    // ---- pending ComputeMeter debits ----
+
+    const TEST_BUYER: &str = "0x00000000000000000000000000000000000000b1";
+
+    /// Enqueue `job` attributed to `buyer` through the same capped path POST /jobs
+    /// uses, so a later settle reads the buyer back and builds the debit. (The plain
+    /// `enqueue` helper is buyerless, like seed/recovery.)
+    async fn enqueue_with_buyer(state: &Arc<AppState>, job: &JobSpec, buyer: &str) {
+        assert!(state
+            .store
+            .lock()
+            .await
+            .enqueue_within_cap(job, state.max_queued_jobs, Some(buyer))
+            .unwrap());
+    }
+
+    /// Settling a buyer-attributed job under a nonzero rate durably records a
+    /// pending debit in the same step, with `amount = rate * render_seconds` and
+    /// the buyer/job mapped per the contract's `spend(buyer, amount, jobId)`.
+    #[tokio::test]
+    async fn settle_with_buyer_records_a_pending_debit_mapped_from_result() {
+        let rate = 1_000_000_000_000u128; // 1e12 wei / render-second
+        let state = test_state_empty_with_compute_rate(rate).await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue_with_buyer(&state, &job, TEST_BUYER).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let result = signed_result(job_id, "render-1"); // render_seconds = 1
+        let mut store = state.store.lock().await;
+        assert!(store.record_completed(&result).unwrap());
+        assert_eq!(store.pending_debit_count().unwrap(), 1);
+
+        let stored = store
+            .pending_debit(&job_id)
+            .unwrap()
+            .expect("pending debit row exists");
+        // Round-trips through the canonical builder...
+        assert_eq!(
+            stored,
+            meter::PendingDebit::build(Some(TEST_BUYER), &result, rate).unwrap()
+        );
+        // ...and the mapping is exactly the contract's spend args.
+        assert_eq!(stored.buyer, TEST_BUYER);
+        assert_eq!(stored.amount_wei, "1000000000000"); // rate * 1 render-second
+        assert_eq!(stored.job_id, eas::job_id_hex(&job_id));
+    }
+
+    /// A second settle on an already-done job is refused by the in_flight guard
+    /// (belt-and-suspenders with the debit's ON CONFLICT), so the debit backlog
+    /// never double-counts a job.
+    #[tokio::test]
+    async fn replayed_settle_keeps_one_pending_debit() {
+        let state = test_state_empty_with_compute_rate(1_000_000_000_000).await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue_with_buyer(&state, &job, TEST_BUYER).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let result = signed_result(job_id, "render-1");
+        let mut store = state.store.lock().await;
+        assert!(store.record_completed(&result).unwrap());
+        assert!(
+            !store.record_completed(&result).unwrap(),
+            "second settle refused (done)"
+        );
+        assert_eq!(store.pending_debit_count().unwrap(), 1);
+    }
+
+    /// The key divergence from the attestation: an unattributed job (no buyer)
+    /// settles cleanly and is still attested, but accrues NO debit — there is
+    /// nobody to charge. A settle must never be bricked by the absence of a buyer.
+    #[tokio::test]
+    async fn settle_without_buyer_records_no_debit_but_still_attests() {
+        let state = test_state_empty_with_compute_rate(1_000_000_000_000).await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await; // buyerless
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let mut store = state.store.lock().await;
+        assert!(store.record_completed(&signed_result(job_id, "r")).unwrap());
+        assert_eq!(store.pending_debit_count().unwrap(), 0, "no buyer → no debit");
+        assert_eq!(
+            store.pending_attestation_count().unwrap(),
+            1,
+            "the attestation still lands — the debit skip must not gate it"
+        );
+    }
+
+    /// Metering is opt-in: with the default rate (0), even a buyer-attributed job
+    /// accrues no debit, so the slice can't silently start charging real credit
+    /// before an operator sets the economic rate.
+    #[tokio::test]
+    async fn settle_with_metering_disabled_records_no_debit() {
+        let state = test_state_empty().await; // default store: compute_rate_wei = 0
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue_with_buyer(&state, &job, TEST_BUYER).await;
+        state.store.lock().await.take_next(|_| true).unwrap();
+
+        let mut store = state.store.lock().await;
+        assert!(store.record_completed(&signed_result(job_id, "r")).unwrap());
+        assert_eq!(
+            store.pending_debit_count().unwrap(),
+            0,
+            "rate 0 = metering disabled → no debit even with a buyer"
+        );
+    }
+
+    /// `/stats` exposes the debit backlog (the metering twin of
+    /// `pending_attestations`): until the operator-gated relayer drains them, each
+    /// settled+metered job stays pending, so it tracks `jobs_completed`.
+    #[tokio::test]
+    async fn stats_reports_pending_debit_backlog() {
+        let state = test_state_empty_with_compute_rate(1_000_000_000_000).await;
+        let jobs = [seed_job(), seed_job()];
+        for job in &jobs {
+            enqueue_with_buyer(&state, job, TEST_BUYER).await;
+            state
+                .store
+                .lock()
+                .await
+                .take_next(|j| j.id == job.id)
+                .unwrap();
+            state
+                .store
+                .lock()
+                .await
+                .record_completed(&signed_result(job.id, "r"))
+                .unwrap();
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 2);
+        assert_eq!(json["pending_debits"], 2);
+    }
+
     // ---- attestation relayer (drain loop) ----
 
     use relay::MockRelay;
@@ -5172,6 +5309,27 @@ mod tests {
             DEFAULT_HANDSHAKE_TIMEOUT,
             None,
             max_queued,
+            DEFAULT_MAX_EARNERS,
+            DEFAULT_MAX_REGISTRATIONS,
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
+    /// Empty-queue state whose store charges `rate` wei per render-second at settle,
+    /// backing the pending-debit persistence tests (a settled job with a buyer
+    /// accrues a debit; with `rate` 0 — the default state — none does).
+    async fn test_state_empty_with_compute_rate(rate_wei: u128) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap().with_compute_rate_wei(rate_wei),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            DEFAULT_MAX_QUEUED_JOBS,
             DEFAULT_MAX_EARNERS,
             DEFAULT_MAX_REGISTRATIONS,
         )
