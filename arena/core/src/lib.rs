@@ -16,8 +16,8 @@
 //! one of those would make a replay diverge and break grading.
 
 use arena_proto::{
-    Action, ActionError, ActionIntent, Bam, MatchPhase, MatchResult, ReplayRecord, SeatAction,
-    SeatId, SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch, MOVE_INTENT_SCALE,
+    Action, ActionError, ActionIntent, Bam, MatchPhase, MatchResult, Observation, ReplayRecord,
+    SeatAction, SeatId, SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch, MOVE_INTENT_SCALE,
     POSITION_SCALE, PROTOCOL_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -579,6 +579,67 @@ impl Match {
     pub fn result(&self) -> Option<&MatchResult> {
         self.result.as_ref()
     }
+
+    /// Consume the match for its deterministic [`ReplayRecord`] — seed, roster,
+    /// and the ordered accepted-action stream, sufficient to re-run the match
+    /// bit-for-bit via [`replay_match`].
+    pub fn into_replay(self) -> ReplayRecord {
+        ReplayRecord {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: self.match_id,
+            seed: self.seed,
+            seats: self.seats,
+            ticks: self.ticks,
+        }
+    }
+}
+
+/// A controller that answers each tick's observation with an action — the same
+/// surface a human's controller and an external agent's `AgentController` both
+/// present to the core. Returning `None` forfeits the tick (a hung or timed-out
+/// agent maps here); the match advances regardless.
+pub trait Policy {
+    fn act(&mut self, obs: &Observation) -> Option<Action>;
+}
+
+/// Drive a match to its end with one policy per roster seat (indexed in roster
+/// order). Each tick: observe every seat, let its policy answer, pass the answer
+/// through the server-authoritative [`ingest`](Match::ingest) gate (a rejected or
+/// absent action forfeits that seat's tick), then [`step`](Match::step). The loop
+/// is bounded by the tick cap, so it always terminates even if every seat
+/// forfeits. Panics if `policies.len()` does not match the roster.
+pub fn run_match(mut m: Match, policies: &mut [Box<dyn Policy>]) -> Match {
+    let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
+    assert_eq!(policies.len(), seat_ids.len(), "one policy per roster seat");
+    while m.phase() == MatchPhase::Live {
+        let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+        for (idx, &seat) in seat_ids.iter().enumerate() {
+            let obs = m.observe(seat);
+            if let Some(action) = policies[idx].act(&obs) {
+                if let Ok(intent) = m.ingest(seat, &action) {
+                    intents.insert(seat, intent);
+                }
+            }
+        }
+        m.step(&intents);
+    }
+    m
+}
+
+/// Re-run a match from a recorded [`ReplayRecord`]'s action stream. `m` must be
+/// freshly built with the same match id, config, rules, roster, and seed as the
+/// recorded match (so spawns match); feeding the recorded post-clamp intents back
+/// through [`step`](Match::step) reproduces the original result bit-for-bit.
+pub fn replay_match(mut m: Match, replay: &ReplayRecord) -> Match {
+    for tr in &replay.ticks {
+        if m.phase() != MatchPhase::Live {
+            break;
+        }
+        let intents: BTreeMap<SeatId, ActionIntent> =
+            tr.actions.iter().map(|a| (a.seat, a.intent)).collect();
+        m.step(&intents);
+    }
+    m
 }
 
 /// `true` if `b` is within `range` position units of `a` on the ground plane.
@@ -812,5 +873,124 @@ mod tests {
         assert_eq!(r.final_tick, m.tick());
         // The result commits to a non-empty replay digest.
         assert_eq!(r.replay_hash.len(), 64);
+    }
+
+    fn dist2(a: Vec2, b: Vec2) -> i64 {
+        let dx = b.x as i64 - a.x as i64;
+        let dy = b.y as i64 - a.y as i64;
+        dx * dx + dy * dy
+    }
+
+    /// Nearest octant BAM toward `(dx, dy)` — integer argmax over the octant unit
+    /// vectors, so the policy is float-free and a played match stays
+    /// byte-reproducible on every platform.
+    fn octant_bam_toward(dx: i32, dy: i32) -> Bam {
+        let mut best_idx = 0usize;
+        let mut best_dot = i64::MIN;
+        for (i, &(ox, oy)) in OCTANTS.iter().enumerate() {
+            let d = dx as i64 * ox as i64 + dy as i64 * oy as i64;
+            if d > best_dot {
+                best_dot = d;
+                best_idx = i;
+            }
+        }
+        (best_idx as u32 * 8192) as Bam
+    }
+
+    fn octant_move(dx: i32, dy: i32) -> Vec2 {
+        let (ox, oy) = octant_unit(octant_bam_toward(dx, dy));
+        Vec2 { x: ox * MOVE_INTENT_SCALE / OCTANT_SCALE, y: oy * MOVE_INTENT_SCALE / OCTANT_SCALE }
+    }
+
+    /// Closes on the nearest visible enemy until within weapon range, then holds
+    /// and fires. Integer-only — no float anywhere — so a played match is
+    /// byte-reproducible.
+    struct Seeker;
+    impl Policy for Seeker {
+        fn act(&mut self, obs: &Observation) -> Option<Action> {
+            let me = &obs.own;
+            if !me.alive {
+                return None;
+            }
+            let target =
+                obs.visible.iter().filter(|e| e.team != me.team).min_by_key(|e| dist2(me.position, e.position))?;
+            let dx = target.position.x - me.position.x;
+            let dy = target.position.y - me.position.y;
+            let range2 = (Rules::default().weapon_range as i64).pow(2);
+            let in_range = dist2(me.position, target.position) <= range2;
+            let move_dir = if in_range { Vec2::ZERO } else { octant_move(dx, dy) };
+            Some(Action {
+                protocol_version: obs.protocol_version,
+                match_id: obs.match_id,
+                seat: obs.seat,
+                tick: obs.tick,
+                intent: ActionIntent {
+                    move_dir,
+                    aim: octant_bam_toward(dx, dy),
+                    buttons: ActionButtons { fire: in_range, jump: false, ability: false, reload: false },
+                },
+            })
+        }
+    }
+
+    /// Never answers — a hung or timed-out seat. Every tick is forfeited.
+    struct Silent;
+    impl Policy for Silent {
+        fn act(&mut self, _obs: &Observation) -> Option<Action> {
+            None
+        }
+    }
+
+    fn play(seed: u64) -> Match {
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        run_match(close_match(seed), &mut policies)
+    }
+
+    #[test]
+    fn full_a2a_match_is_decisive() {
+        let m = play(1);
+        assert_eq!(m.phase(), MatchPhase::Ended);
+        let r = m.result().unwrap();
+        assert!(r.outcomes.iter().any(|o| o.placement == 1 && o.alive_at_end), "a winner emerges");
+        assert!(r.outcomes.iter().any(|o| !o.alive_at_end), "a loser is downed");
+        assert_eq!(r.replay_hash.len(), 64);
+    }
+
+    #[test]
+    fn a_played_match_replays_byte_for_byte() {
+        // FM1: run two trivial agents to the end, then re-run from the recorded
+        // action stream on a fresh same-seed match — identical result + digest.
+        let played = play(1);
+        let result = played.result().unwrap().clone();
+        let replay = played.into_replay();
+
+        let replayed = replay_match(close_match(1), &replay);
+        assert_eq!(replayed.phase(), MatchPhase::Ended);
+        assert_eq!(replayed.result().unwrap(), &result, "replay diverged from the live result");
+        assert_eq!(replayed.into_replay().digest(), replay.digest(), "replay digest diverged");
+    }
+
+    #[test]
+    fn same_seed_is_byte_identical_across_runs() {
+        // FM1: the whole pipeline (seed spawns + integer policy + integer sim) is
+        // deterministic, so two independent runs are byte-identical — the basis
+        // for grading and on-chain attestation.
+        let a = play(7).into_replay();
+        let b = play(7).into_replay();
+        assert_eq!(a.digest(), b.digest());
+        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    }
+
+    #[test]
+    fn a_hung_seat_forfeits_every_tick_and_the_match_still_ends() {
+        // FM3 (bounded latency): seat 1 never answers; the match must still
+        // advance and end rather than stall, and the hung seat does nothing.
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Silent)];
+        let m = run_match(close_match(1), &mut policies);
+        assert_eq!(m.phase(), MatchPhase::Ended);
+        let r = m.result().unwrap();
+        let s1 = r.outcomes.iter().find(|o| o.seat == 1).unwrap();
+        assert!(!s1.alive_at_end, "the active seat downed the hung one");
+        assert_eq!(s1.score, 0, "the hung seat never acted");
     }
 }
