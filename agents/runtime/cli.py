@@ -29,6 +29,7 @@ from runtime.supervisor import build_graph
 logger = logging.getLogger(__name__)
 
 INGEST_TOKEN_ENV = "COORDINATOR_INGEST_TOKEN"
+ASSET_BASE_ENV = "ASSET_BASE_URL"
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -58,6 +59,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=(
             "coordinator base URL to POST an accepted region's render jobs to "
             f"(bearer token from ${INGEST_TOKEN_ENV}); opt-in, off by default"
+        ),
+    )
+    p.add_argument(
+        "--asset-base",
+        default=None,
+        metavar="URL",
+        help=(
+            f"asset base URL (or ${ASSET_BASE_ENV}) to resolve render-job inputs to "
+            "fetchable <base>/<region_id>/<path> URLs; relative paths when unset"
         ),
     )
     return p.parse_args(argv)
@@ -184,9 +194,18 @@ def main(argv: list[str] | None = None) -> int:
     rounds: int = result.get("rounds", 0)
 
     world_path = compose_world(layers, Path(args.out))
-    jobs = render_jobs(brief, layers, verdict)
+    asset_base = (args.asset_base or os.environ.get(ASSET_BASE_ENV) or "").strip() or None
+    jobs = render_jobs(brief, layers, verdict, asset_base_url=asset_base)
 
     # Posting is opt-in; a rejected region emits no jobs, so there is nothing to ship.
+    if args.post_to and jobs and asset_base is None:
+        # Shipping to a real coordinator with relative paths: an earner can't fetch
+        # them. Warn (don't refuse) — mirrors the unauthenticated-post posture.
+        logger.warning(
+            "--post-to set without --asset-base/$%s; render jobs carry relative asset "
+            "paths an earner cannot fetch (set an asset base for production)",
+            ASSET_BASE_ENV,
+        )
     posted = _post_jobs(jobs, args.post_to) if args.post_to and jobs else None
 
     region_id = brief.region.region_id

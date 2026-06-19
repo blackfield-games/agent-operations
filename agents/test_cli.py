@@ -312,3 +312,50 @@ def test_post_to_json_includes_posted(tmp_path, monkeypatch, capsys):
     assert report["posted"][0]["outcome"] == "created"
     assert report["posted"][0]["job_id"] == "J1"
     assert report["posted"][0]["region_id"] == "r+0042_-0017_l0"
+
+
+# --- --asset-base: resolve render-job inputs to fetchable URLs ---
+
+def test_asset_base_resolves_render_job_urls(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(cli.ASSET_BASE_ENV, raising=False)
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+
+    main(["--x", "42", "--y", "-17", "--asset-base", "https://cdn.blackfield.games", "--json", "--out", "out"])
+    report = json.loads(capsys.readouterr().out)
+    inputs = report["render_jobs"][0]["inputs"]
+    assert inputs["world"] == "https://cdn.blackfield.games/r+0042_-0017_l0/world.usda"
+    assert inputs["layers"][0]["path"] == "https://cdn.blackfield.games/r+0042_-0017_l0/terrain/a.usda"
+
+
+def test_asset_base_env_fallback(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(cli.ASSET_BASE_ENV, "https://envcdn")
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+
+    main(["--x", "42", "--y", "-17", "--json", "--out", "out"])  # no --asset-base flag
+    report = json.loads(capsys.readouterr().out)
+    assert report["render_jobs"][0]["inputs"]["world"] == "https://envcdn/r+0042_-0017_l0/world.usda"
+
+
+def test_post_to_without_asset_base_warns(tmp_path, monkeypatch, capsys, caplog):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(cli.ASSET_BASE_ENV, raising=False)
+    monkeypatch.setenv("COORDINATOR_INGEST_TOKEN", "t")
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+    _stub_post(monkeypatch, _created)
+
+    with caplog.at_level("WARNING"):
+        main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--out", "out"])
+    assert "relative asset" in caplog.text
+
+
+def test_post_to_with_asset_base_does_not_warn(tmp_path, monkeypatch, capsys, caplog):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COORDINATOR_INGEST_TOKEN", "t")
+    monkeypatch.setattr(cli, "_run_graph", _stub_run_graph(_accepted_result()))
+    _stub_post(monkeypatch, _created)
+
+    with caplog.at_level("WARNING"):
+        main(["--x", "42", "--y", "-17", "--post-to", "http://c", "--asset-base", "https://cdn", "--out", "out"])
+    assert "relative asset" not in caplog.text
