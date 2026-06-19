@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["proto", "core"]
+members = ["proto", "core", "harness"]
 
 [workspace.package]
 edition = "2021"

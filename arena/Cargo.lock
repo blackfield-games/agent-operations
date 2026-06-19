@@ -13,6 +13,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arena-harness"
+version = "0.0.1"
+dependencies = [
+ "arena-core",
+ "arena-proto",
+ "hex",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "arena-proto"
 version = "0.0.1"
 dependencies = [

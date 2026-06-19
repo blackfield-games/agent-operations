@@ -1,0 +1,15 @@
+[package]
+name = "arena-harness"
+version = "0.0.1"
+edition.workspace = true
+
+[[bin]]
+name = "arena-harness"
+path = "src/main.rs"
+
+[dependencies]
+arena-proto = { workspace = true }
+arena-core = { path = "../core" }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
