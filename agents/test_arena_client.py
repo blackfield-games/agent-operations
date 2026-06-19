@@ -17,6 +17,7 @@ import pydantic
 import pytest
 
 from arena_client import proto
+from arena_client.baseline import BaselinePolicy, aim_at
 from arena_client.proto import (
     Action,
     ActionButtons,
@@ -337,3 +338,75 @@ def test_downed_seat_answers_with_passive_hold():
     assert len(acts) == 1
     assert acts[0]["intent"]["buttons"]["fire"] is False
     assert acts[0]["intent"]["move_dir"] == {"x": 0, "y": 0}
+
+
+def _make_obs(x, y, ammo=30, alive=True, team=0, facing=0, visible=()):
+    return Observation.model_validate({
+        "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 0,
+        "phase": "live", "deadline_micros": 50_000,
+        "own": {"seat": 0, "team": team, "position": {"x": x, "y": y}, "z": 0, "facing": facing,
+                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "ammo": ammo, "alive": alive},
+        "visible": [{"entity_id": eid, "kind": "player", "team": t, "position": {"x": ex, "y": ey},
+                     "z": 0, "facing": 0, "in_line_of_sight": True} for (eid, t, ex, ey) in visible],
+    })
+
+
+def test_aim_at_cardinals_and_diagonals():
+    assert aim_at(1000, 0) == 0          # E
+    assert aim_at(1000, 1000) == 8192    # NE
+    assert aim_at(0, 1000) == 16384      # N
+    assert aim_at(-1000, 0) == 32768     # W
+    assert aim_at(0, -1000) == 49152     # S
+    assert aim_at(1000, -1000) == 57344  # SE
+
+
+def test_baseline_moves_and_fires_toward_enemy():
+    # Own at origin (team 0), one enemy (team 1) due east and out of move range.
+    obs = _make_obs(0, 0, team=0, visible=[(1, 1, 5000, 0)])
+    intent = BaselinePolicy()(obs)
+    assert intent.aim == 0  # east
+    assert intent.move_dir == Vec2(x=1000, y=0)  # full-speed east, clamped to the cap
+    assert intent.buttons.fire is True
+
+
+def test_baseline_targets_the_nearest_enemy():
+    # A closer enemy east, a farther one north; the baseline picks the closer.
+    obs = _make_obs(0, 0, team=0, visible=[(1, 1, 0, 4000), (2, 1, 3000, 0)])
+    intent = BaselinePolicy()(obs)
+    assert intent.aim == 0  # toward the nearer (east) enemy, not the northern one
+    assert intent.move_dir.x > 0 and intent.move_dir.y == 0
+
+
+def test_baseline_reloads_when_empty():
+    obs = _make_obs(0, 0, ammo=0, team=0, visible=[(1, 1, 1000, 0)])
+    intent = BaselinePolicy()(obs)
+    assert intent.buttons.reload is True
+    assert intent.buttons.fire is False
+    assert intent.move_dir == Vec2(x=0, y=0)
+
+
+def test_baseline_advances_on_centre_when_no_enemy_in_sight():
+    # Spawned off-centre with nothing visible: close on the arena centre, never fire.
+    obs = _make_obs(20000, 3000, team=0, visible=[])
+    intent = BaselinePolicy()(obs)
+    assert intent.buttons.fire is False
+    assert intent.move_dir.x < 0  # heading back toward the origin
+    assert intent.move_dir.x**2 + intent.move_dir.y**2 <= proto.MOVE_INTENT_SCALE**2
+
+
+def test_baseline_ignores_allies():
+    # A same-team entity is not a target — with only an ally visible, advance.
+    obs = _make_obs(10000, 0, team=1, visible=[(5, 1, 11000, 0)])
+    intent = BaselinePolicy()(obs)
+    assert intent.buttons.fire is False
+    assert intent.move_dir.x < 0  # toward centre, since no ENEMY is in sight
+
+
+def test_baseline_move_is_always_legal_and_deterministic():
+    pol = BaselinePolicy()
+    for ex, ey in [(50000, 0), (-12345, 67890), (1, -1), (0, 0), (-99999, -99999)]:
+        obs = _make_obs(0, 0, team=0, visible=[(1, 1, ex, ey)])
+        a = pol(obs)
+        b = pol(obs)
+        assert a == b  # pure function of the observation
+        assert a.move_dir.x**2 + a.move_dir.y**2 <= proto.MOVE_INTENT_SCALE**2

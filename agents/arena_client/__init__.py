@@ -30,6 +30,7 @@ from .proto import (
     Welcome,
     decode_gateway,
 )
+from .baseline import BaselinePolicy, aim_at
 from .sdk import (
     ArenaClient,
     HandshakeRejected,
@@ -41,6 +42,8 @@ from .sdk import (
 
 __all__ = [
     "ArenaClient",
+    "BaselinePolicy",
+    "aim_at",
     "HandshakeRejected",
     "Policy",
     "Transport",
