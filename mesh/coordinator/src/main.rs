@@ -4714,6 +4714,209 @@ mod tests {
         assert!(r.is_err(), "zero max_queued_jobs must be rejected at construction");
     }
 
+    // -- earner registry size cap (--max-earners) -------------------------
+
+    /// An `EarnerInfo` with a chosen `last_seen` and otherwise fixed fields, so the
+    /// `admit_earner` unit tests vary only the staleness the cap policy keys on.
+    fn earner_info(last_seen: i64) -> EarnerInfo {
+        EarnerInfo {
+            gpu_model: "RTX 4090".into(),
+            vram_gb: 24,
+            supported: vec![JobKind::Terrain],
+            last_seen,
+        }
+    }
+
+    /// Below the cap a NEW address is admitted unconditionally and the map grows.
+    #[test]
+    fn admit_earner_inserts_below_cap() {
+        let mut earners = HashMap::new();
+        assert!(admit_earner(&mut earners, "a".into(), earner_info(100), 3, 100, 60));
+        assert!(admit_earner(&mut earners, "b".into(), earner_info(100), 3, 100, 60));
+        assert_eq!(earners.len(), 2);
+    }
+
+    /// FM2: re-registration of an already-known address is an in-place upsert — it
+    /// never counts against the cap (the map doesn't grow) and refreshes the entry,
+    /// even when the registry is otherwise full of live earners.
+    #[test]
+    fn admit_earner_upsert_never_blocked_at_cap() {
+        let mut earners = HashMap::new();
+        earners.insert("a".to_string(), earner_info(100));
+        earners.insert("b".to_string(), earner_info(100));
+        // At cap (2), all live: re-Hello from "a" still succeeds and updates it.
+        assert!(admit_earner(&mut earners, "a".into(), earner_info(150), 2, 200, 60));
+        assert_eq!(earners.len(), 2);
+        assert_eq!(earners["a"].last_seen, 150, "the upsert refreshed the existing entry");
+    }
+
+    /// FM1/FM2: at the cap with every entry currently LIVE, a new registration is
+    /// rejected and no live earner is displaced — a genuinely full fleet sheds the
+    /// newcomer rather than evicting working earners.
+    #[test]
+    fn admit_earner_at_cap_all_live_rejects() {
+        let mut earners = HashMap::new();
+        earners.insert("a".to_string(), earner_info(100));
+        earners.insert("b".to_string(), earner_info(100));
+        assert!(!admit_earner(&mut earners, "c".into(), earner_info(100), 2, 100, 60));
+        assert_eq!(earners.len(), 2);
+        assert!(earners.contains_key("a") && earners.contains_key("b"));
+        assert!(!earners.contains_key("c"), "no live earner displaced for the newcomer");
+    }
+
+    /// FM1: at the cap a new registration is admitted by evicting the stalest entry
+    /// already past its TTL — the live earner is kept, the stale one reclaimed.
+    #[test]
+    fn admit_earner_at_cap_evicts_stalest_past_ttl() {
+        let mut earners = HashMap::new();
+        earners.insert("stale".to_string(), earner_info(10)); // now-10=90 > ttl 60 → not live
+        earners.insert("live".to_string(), earner_info(100)); // now-100=0 → live
+        assert!(admit_earner(&mut earners, "new".into(), earner_info(100), 2, 100, 60));
+        assert_eq!(earners.len(), 2);
+        assert!(!earners.contains_key("stale"), "the past-TTL entry was evicted");
+        assert!(earners.contains_key("live"), "the live entry was kept");
+        assert!(earners.contains_key("new"));
+    }
+
+    /// The eviction picks the STALEST (smallest `last_seen`) among several past-TTL
+    /// entries, not an arbitrary one.
+    #[test]
+    fn admit_earner_evicts_the_stalest_among_several_stale() {
+        let mut earners = HashMap::new();
+        earners.insert("a".to_string(), earner_info(10));
+        earners.insert("b".to_string(), earner_info(5)); // the stalest
+        earners.insert("c".to_string(), earner_info(20));
+        // now=100, ttl=60 → all three are past TTL; cap=3 is full.
+        assert!(admit_earner(&mut earners, "d".into(), earner_info(100), 3, 100, 60));
+        assert_eq!(earners.len(), 3);
+        assert!(!earners.contains_key("b"), "the stalest (last_seen=5) was evicted");
+        assert!(earners.contains_key("a") && earners.contains_key("c") && earners.contains_key("d"));
+    }
+
+    /// Empty-queue state with a small earner-registry cap, for the cap tests.
+    async fn test_state_empty_with_earner_cap(max_earners: usize) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            DEFAULT_MAX_QUEUED_JOBS,
+            max_earners,
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
+    /// Register `msg` over HTTP `/register`, returning the status.
+    async fn register_hello(state: &Arc<AppState>, msg: &EarnerMsg) -> StatusCode {
+        post_json(state.clone(), "/register", &serde_json::to_value(msg).unwrap())
+            .await
+            .status()
+    }
+
+    /// FM3: below the cap, registration behaves exactly as before — a configured but
+    /// un-reached cap is invisible. One earner registers and surfaces in `/stats`.
+    #[tokio::test]
+    async fn register_below_cap_is_unchanged() {
+        let state = test_state_empty_with_earner_cap(5).await;
+        assert_eq!(
+            register_hello(&state, &hello("below", 24, vec![JobKind::Terrain])).await,
+            StatusCode::OK
+        );
+        let stats = body_json(get(state, "/stats").await).await;
+        assert_eq!(stats["gpus_joined"], 1);
+        assert_eq!(stats["total_vram_gb"], 24);
+    }
+
+    /// FM1/FM2 through the real HTTP handler: at the cap with all earners live, a new
+    /// registration is shed with a retryable 503 and no live earner is displaced.
+    #[tokio::test]
+    async fn register_at_cap_all_live_returns_503() {
+        let state = test_state_empty_with_earner_cap(2).await;
+        assert_eq!(register_hello(&state, &hello("rega", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, &hello("regb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(
+            register_hello(&state, &hello("regc", 24, vec![JobKind::Terrain])).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(body_json(get(state.clone(), "/stats").await).await["gpus_joined"], 2);
+        let earners = state.earners.lock().await;
+        assert!(!earners.contains_key(&test_address("regc")), "the newcomer was not admitted");
+    }
+
+    /// FM1 through the real HTTP handler: at the cap, a registration evicts the
+    /// stalest past-TTL earner to make room. "rega" is aged past its TTL, so the
+    /// next registration reclaims its slot while the live "regb" is kept.
+    #[tokio::test]
+    async fn register_at_cap_evicts_stalest_past_ttl() {
+        let state = test_state_empty_with_earner_cap(2).await;
+        assert_eq!(register_hello(&state, &hello("rega", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, &hello("regb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        // Age "rega" past the 60s TTL so it becomes evictable.
+        state.earners.lock().await.get_mut(&test_address("rega")).unwrap().last_seen = now_secs() - 10_000;
+        assert_eq!(register_hello(&state, &hello("regc", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        let earners = state.earners.lock().await;
+        assert_eq!(earners.len(), 2);
+        assert!(!earners.contains_key(&test_address("rega")), "the stale earner was evicted");
+        assert!(earners.contains_key(&test_address("regb")), "the live earner was kept");
+        assert!(earners.contains_key(&test_address("regc")));
+    }
+
+    /// FM4 parity: the WS registration path enforces the SAME cap (both transports
+    /// share `admit_earner`). With the cap filled by a live HTTP-registered earner, a
+    /// ws Hello for a new distinct earner is rejected and the socket closed.
+    #[tokio::test]
+    async fn ws_registration_enforces_earner_cap() {
+        let state = test_state_empty_with_earner_cap(1).await;
+        assert_eq!(register_hello(&state, &hello("wsfull", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        let sk = test_signing_key("wsnew");
+        let hello_msg = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+            &nonce,
+        );
+        ws.send(WsMessage::text(serde_json::to_string(&hello_msg).unwrap()))
+            .await
+            .unwrap();
+        expect_ws_closed(&mut ws).await;
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            1,
+            "the ws newcomer must not register past the cap",
+        );
+        assert!(!state.earners.lock().await.contains_key(&test_address("wsnew")));
+    }
+
+    /// A zero earner cap is rejected at construction (it would reject every
+    /// registration the moment the map is non-empty), mirroring the other zero-knobs.
+    #[test]
+    fn with_store_rejects_zero_max_earners() {
+        let r = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            5,
+            10,
+            60,
+            JOB_TTL_DEADLINE_MULTIPLE,
+            DEFAULT_HANDSHAKE_TIMEOUT,
+            None,
+            DEFAULT_MAX_QUEUED_JOBS,
+            0,
+        );
+        assert!(r.is_err(), "zero max_earners must be rejected at construction");
+    }
+
     /// FM1: the queued-depth COUNT gating the cap must be served by
     /// `idx_jobs_status_created_at`, never a full scan of the jobs table (which
     /// carries unbounded terminal `completed`/`failed` history) — otherwise the very
