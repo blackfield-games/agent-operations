@@ -7,6 +7,8 @@ agents/ dir:
     .venv/bin/python -m pytest test_jobs.py -v
 """
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -18,6 +20,7 @@ from common.jobs import (
     MAX_PAYOUT_WEI,
     SPECIALIST_RENDER_KIND,
     RenderJobSpec,
+    _asset_url,
     render_jobs,
 )
 from common.types import JobKind, LayerSpec, RegionCoord, ValidatorVerdict, WorldBrief
@@ -183,6 +186,91 @@ def test_render_jobs_duplicate_specialist_layers_each_emit_a_job():
     jobs = render_jobs(_brief(), layers, ValidatorVerdict(accepted=True))
     assert [job.kind for job in jobs] == [JobKind.DIFFUSION_TILE, JobKind.TERRAIN, JobKind.TERRAIN]
     assert [job.inputs["layer"]["path"] for job in jobs[1:]] == ["terrain/a.usda", "terrain/b.usda"]
+
+
+# --- asset-URL resolution (agents-render-job-input-url-resolution) ---
+
+def test_asset_url_joins_base_region_and_path():
+    assert (
+        _asset_url("https://cdn.blackfield.games", "r+0042_-0017_l0", "terrain/a.usda")
+        == "https://cdn.blackfield.games/r+0042_-0017_l0/terrain/a.usda"
+    )
+
+
+def test_asset_url_normalizes_trailing_slash_exactly_once():
+    # A base with or without a trailing slash yields the identical URL (no double slash).
+    no_slash = _asset_url("https://cdn", "rid", "terrain/a.usda")
+    with_slash = _asset_url("https://cdn/", "rid", "terrain/a.usda")
+    assert no_slash == with_slash == "https://cdn/rid/terrain/a.usda"
+
+
+def test_asset_url_rejects_traversal_segment():
+    with pytest.raises(ValueError, match="not URL-safe"):
+        _asset_url("https://cdn", "rid", "../../etc/passwd")
+
+
+def test_asset_url_rejects_scheme_injection():
+    # A path segment carrying a scheme (colon) is outside the allowlist -> rejected,
+    # so a layer path can't smuggle an absolute URL into the namespace.
+    with pytest.raises(ValueError, match="not URL-safe"):
+        _asset_url("https://cdn", "rid", "http://evil/x")
+
+
+def test_render_jobs_unset_base_keeps_relative_paths():
+    # FM4: no base -> byte-identical relative behaviour (back-compat dev).
+    jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True))
+    assert jobs[0].inputs["world"] == "world.usda"
+    assert jobs[0].inputs["layers"][0]["path"] == "terrain/a.usda"
+
+
+def test_render_jobs_resolves_absolute_urls_when_base_set():
+    base = "https://cdn.blackfield.games"
+    jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True), asset_base_url=base)
+    diffusion = jobs[0]
+    assert diffusion.inputs["world"] == f"{base}/r+0042_-0017_l0/world.usda"
+    assert diffusion.inputs["layers"] == [
+        {"specialist": "terrain", "path": f"{base}/r+0042_-0017_l0/terrain/a.usda"},
+        {"specialist": "biome", "path": f"{base}/r+0042_-0017_l0/biome/a.usda"},
+    ]
+    # the per-kind jobs resolve too, not just the diffusion tile
+    terrain = next(job for job in jobs if job.kind is JobKind.TERRAIN)
+    assert terrain.inputs["world"] == f"{base}/r+0042_-0017_l0/world.usda"
+    assert terrain.inputs["layer"]["path"] == f"{base}/r+0042_-0017_l0/terrain/a.usda"
+
+
+def test_render_jobs_resolved_specs_stay_coordinator_valid():
+    jobs = render_jobs(_brief(), _layers(), ValidatorVerdict(accepted=True), asset_base_url="https://cdn")
+    for job in jobs:
+        body = job.to_request()
+        assert set(body) == {"kind", "region", "deadline_secs", "max_payout_wei", "inputs"}
+        assert isinstance(body["kind"], str)
+
+
+def test_render_jobs_re_checks_inputs_size_after_url_expansion():
+    # FM3: a manifest that fits under MAX_INPUTS_BYTES as relative paths can exceed it
+    # once expanded to absolute URLs. Every job is built through RenderJobSpec, whose
+    # validator re-measures the final inputs, so the over-limit URL form is rejected
+    # while the identical relative manifest is accepted.
+    rid = "r+0042_-0017_l0"
+    layers = [
+        LayerSpec(specialist="terrain", region_id=rid, path="terrain/" + "a" * 32, summary="x")
+        for _ in range(200)
+    ]
+    verdict = ValidatorVerdict(accepted=True)
+    relative = render_jobs(_brief(), layers, verdict)
+    # sanity: the relative manifest is genuinely under the cap (so the URL form is what trips it)
+    size = len(json.dumps(relative[0].inputs, separators=(",", ":"), ensure_ascii=False).encode())
+    assert size < MAX_INPUTS_BYTES
+    with pytest.raises(ValidationError):
+        render_jobs(_brief(), layers, verdict, asset_base_url="https://cdn.blackfield.games")
+
+
+def test_render_jobs_rejects_traversal_layer_path_when_resolving():
+    # A layer path with a traversal segment can't be turned into a URL (defense in
+    # depth even though compose allowlists paths).
+    bad = [LayerSpec(specialist="terrain", region_id="r+0042_-0017_l0", path="../secret.usda", summary="x")]
+    with pytest.raises(ValueError, match="not URL-safe"):
+        render_jobs(_brief(), bad, ValidatorVerdict(accepted=True), asset_base_url="https://cdn")
 
 
 # --- to_request: the wire shape (FM1) ---

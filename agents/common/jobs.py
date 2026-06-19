@@ -17,6 +17,7 @@ The live HTTP POST transport is ``runtime/poster.py`` (agents-render-job-poster)
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -30,6 +31,11 @@ MAX_INPUTS_BYTES = 16 * 1024
 # proto::RegionCoord field widths (mesh/proto/src/lib.rs): x,y are i32; layer is u8.
 _I32_MIN, _I32_MAX = -(2**31), 2**31 - 1
 _U8_MAX = 255
+
+# One asset-path segment when resolving to a fetchable URL: the compose allowlist
+# ([A-Za-z0-9._/+-], compose.py) minus the slash. All are RFC-3986 path-safe, so a
+# validated segment needs no percent-encoding; a `..` segment is rejected separately.
+_ASSET_SEGMENT = re.compile(r"[A-Za-z0-9._+-]+")
 
 # Policy defaults, caller-overridable. 1 $BLCKFLD = 1e18 wei.
 DEFAULT_DEADLINE_SECS = 3600
@@ -109,6 +115,20 @@ class RenderJobSpec(BaseModel):
         }
 
 
+def _asset_url(base: str, region_id: str, relative: str) -> str:
+    """Join a configured asset base, the region id, and a relative layer path into
+    one absolute fetchable URL (``<base>/<region_id>/<relative>``). The path segments
+    are pipeline-derived and already compose-allowlisted, but validate them here too
+    so a producer can never emit a traversal (``..``) or scheme-injecting URL; the
+    base is trusted operator config and passed through (only its trailing slash is
+    normalized)."""
+    segments = [region_id, *(seg for seg in relative.split("/") if seg)]
+    for seg in segments:
+        if seg == ".." or not _ASSET_SEGMENT.fullmatch(seg):
+            raise ValueError(f"asset path segment is not URL-safe: {seg!r} (in {relative!r})")
+    return "/".join([base.rstrip("/"), *segments])
+
+
 def render_jobs(
     brief: WorldBrief,
     layers: list[LayerSpec],
@@ -116,6 +136,7 @@ def render_jobs(
     *,
     deadline_secs: int = DEFAULT_DEADLINE_SECS,
     max_payout_wei: str = DEFAULT_MAX_PAYOUT_WEI,
+    asset_base_url: str | None = None,
 ) -> list[RenderJobSpec]:
     """Render jobs for a validated region, or ``[]`` if the validator rejected it.
 
@@ -128,10 +149,20 @@ def render_jobs(
     actual ``layers`` so a partial/failed run emits only what was authored. Per-kind
     jobs follow in ``JobKind`` enum order for stable output and each focuses on its
     single layer (the ``layer`` key, vs the diffusion job's ``layers`` manifest).
+
+    With ``asset_base_url`` set, the ``world`` and each layer ``path`` are resolved
+    to absolute fetchable URLs (``<base>/<region_id>/<path>``) so an earner can pull
+    them; without it they stay relative (dev/back-compat). The keys are unchanged
+    either way — only the value form differs. URL expansion is bound-checked for free
+    because every job is built through ``RenderJobSpec``, whose validator re-measures
+    the final ``inputs`` against ``MAX_INPUTS_BYTES``.
     """
     if not verdict.accepted:
         return []
     region = brief.region
+
+    def _asset(relative: str) -> str:
+        return _asset_url(asset_base_url, region.region_id, relative) if asset_base_url else relative
 
     def _job(kind: JobKind, inputs: dict[str, Any]) -> RenderJobSpec:
         return RenderJobSpec(
@@ -147,8 +178,8 @@ def render_jobs(
             JobKind.DIFFUSION_TILE,
             {
                 "region_id": region.region_id,
-                "world": "world.usda",
-                "layers": [{"specialist": layer.specialist, "path": layer.path} for layer in layers],
+                "world": _asset("world.usda"),
+                "layers": [{"specialist": layer.specialist, "path": _asset(layer.path)} for layer in layers],
             },
         )
     ]
@@ -163,8 +194,8 @@ def render_jobs(
             kind,
             {
                 "region_id": region.region_id,
-                "world": "world.usda",
-                "layer": {"specialist": layer.specialist, "path": layer.path},
+                "world": _asset("world.usda"),
+                "layer": {"specialist": layer.specialist, "path": _asset(layer.path)},
             },
         )
         for kind, layer in renderable
