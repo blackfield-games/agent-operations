@@ -54,6 +54,11 @@ fn ignore_duplicate_column(res: rusqlite::Result<usize>) -> Result<()> {
 /// connection is correct and simple.
 pub struct Store {
     conn: Connection,
+    /// Wei charged per render-second to a job's buyer at settle, recorded as a
+    /// pending ComputeMeter debit. `0` (the default) disables metering: no debit
+    /// row is written. Set from the `--compute-rate-wei` operator knob; read by
+    /// [`Store::record_completed`].
+    compute_rate_wei: u128,
 }
 
 impl Store {
@@ -205,6 +210,23 @@ impl Store {
                  created_at     INTEGER NOT NULL,
                  uid            TEXT,
                  submitted_at   INTEGER
+             );
+             -- Pending ComputeMeter debits: written atomically with the settle
+             -- (see record_completed), the metering twin of pending_attestations,
+             -- so a crash before the on-chain ComputeMeter.spend cannot lose a
+             -- buyer's charge. Fields map to spend(buyer, amount, jobId) — see
+             -- meter.rs. amount_wei is a decimal wei string (like max_payout_wei),
+             -- never an INTEGER (a 1e18-scale value overflows i64). A row is
+             -- PENDING while `tx_hash IS NULL`; the (operator-gated) relayer flips
+             -- it by writing the spend tx_hash + submitted_at.
+             CREATE TABLE IF NOT EXISTS pending_debits (
+                 job_id       TEXT PRIMARY KEY,
+                 buyer        TEXT NOT NULL,
+                 amount_wei   TEXT NOT NULL,
+                 job_id_b32   TEXT NOT NULL,
+                 created_at   INTEGER NOT NULL,
+                 submitted_at INTEGER,
+                 tx_hash      TEXT
              );",
         )?;
         // Migrate pre-existing DBs (created before the relayer's `uid` /
@@ -218,6 +240,17 @@ impl Store {
             "ALTER TABLE pending_attestations ADD COLUMN submitted_at INTEGER",
             [],
         ))?;
+        // Migrate pre-existing DBs (created before the debit relayer's `submitted_at`
+        // / `tx_hash` columns). NULL on every existing row means "still pending",
+        // which is correct: nothing had been spent on-chain yet. Mirrors the
+        // pending_attestations migration above. Swallow only the duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_debits ADD COLUMN submitted_at INTEGER",
+            [],
+        ))?;
+        ignore_duplicate_column(
+            conn.execute("ALTER TABLE pending_debits ADD COLUMN tx_hash TEXT", []),
+        )?;
         // Migrate pre-existing DBs (created before `started_at` was added). The
         // column already exists on a later boot, so we swallow only that one
         // error and let any other failure propagate.
@@ -293,7 +326,10 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at)",
             [],
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            compute_rate_wei: 0,
+        })
     }
 
     /// True when no jobs exist yet — used to decide whether to seed a fresh DB
@@ -365,10 +401,10 @@ impl Store {
     }
 
     /// The EVM address charged for this job's validated compute, or `None` if the
-    /// job was ingested unattributed (or is unknown). Read at settle by the
-    /// ComputeMeter metering seam to build the pending debit; `None` means the job
-    /// is simply not metered. A NULL column or a missing row both map to `None`.
-    #[allow(dead_code)] // read by the ComputeMeter debit settle path (metering seam)
+    /// job was ingested unattributed (or is unknown). Read at settle by
+    /// [`record_completed`](Self::record_completed) to build the pending debit;
+    /// `None` means the job is simply not metered. A NULL column or a missing row
+    /// both map to `None`.
     pub fn job_buyer(&self, id: &uuid::Uuid) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -647,6 +683,12 @@ impl Store {
     /// `results` is a further guard so a result is recorded at most once.
     pub fn record_completed(&mut self, result: &JobResult) -> Result<bool> {
         let job_id = result.job_id.to_string();
+        // Settle-policy inputs, read before the tx: the compute rate (Copy) and the
+        // job's buyer. Buyer is write-once at enqueue and never mutated, so it needs
+        // no transactional snapshot — and reading it via the accessor inside the tx
+        // would double-borrow the connection. Both feed the pending debit below.
+        let compute_rate_wei = self.compute_rate_wei;
+        let buyer = self.job_buyer(&result.job_id)?;
         let tx = self.conn.transaction()?;
 
         // Re-check lifecycle inside the transaction; only an in_flight job is
@@ -721,6 +763,29 @@ impl Store {
             None => {
                 tracing::warn!(%job_id, "settle: spec unreadable or output_hash malformed; pending attestation skipped");
             }
+        }
+        // Record the pending ComputeMeter debit in the SAME settle tx (the metering
+        // twin of the pending attestation above) so a crash before the on-chain
+        // spend cannot lose the charge. build() returns None — no row, never an
+        // error — when there is no buyer to charge or the amount is zero (metering
+        // disabled or zero render-seconds), so an unmetered job still settles and
+        // is still attested. ON CONFLICT keeps a replay a no-op.
+        if let Some(debit) =
+            crate::meter::PendingDebit::build(buyer.as_deref(), result, compute_rate_wei)
+        {
+            tx.execute(
+                "INSERT INTO pending_debits
+                     (job_id, buyer, amount_wei, job_id_b32, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(job_id) DO NOTHING",
+                (
+                    &job_id,
+                    &debit.buyer,
+                    &debit.amount_wei,
+                    &debit.job_id,
+                    created_at,
+                ),
+            )?;
         }
         tx.commit()?;
         Ok(true)

@@ -47,6 +47,7 @@ const PLACEHOLDER_ATTESTATION_UID: &str =
 const DISPATCH_SEQ_HEADER: &str = "x-dispatch-seq";
 
 mod eas;
+mod meter;
 mod relay;
 mod store;
 mod validate;
