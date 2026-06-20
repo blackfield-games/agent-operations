@@ -752,6 +752,37 @@ mod tests {
     }
 
     #[test]
+    fn self_state_is_only_the_observers_own_full_state() {
+        // FM2: `own` is the ONE place full internal state appears, and it is always
+        // the receiver's own. Pin its exact key set so a field that would smuggle
+        // another seat's private data — or global/RNG state — into `own` fails CI.
+        let s = SelfState {
+            seat: 0,
+            team: 1,
+            position: Vec2 { x: 0, y: 0 },
+            z: 0,
+            facing: 0x4000,
+            velocity: Vec2 { x: 0, y: 0 },
+            health: 100,
+            max_health: 100,
+            ammo: 30,
+            alive: true,
+        };
+        let json = serde_json::to_value(s).unwrap();
+        assert_eq!(
+            object_keys(&json),
+            ["alive", "ammo", "facing", "health", "max_health", "position", "seat", "team", "velocity", "z"],
+            "SelfState gained or lost a field — the observable self-surface is a security contract"
+        );
+        for forbidden in ["enemies", "visible", "all_pawns", "rng_state", "world", "world_state"] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "SelfState must not carry global / other-seat field `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
     fn observation_carries_no_full_world_field() {
         // FM1: an Observation may carry the seat's own state + only what it
         // perceives. Pin the exact top-level key set so no global pawn table /
