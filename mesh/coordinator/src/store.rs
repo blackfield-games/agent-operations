@@ -49,6 +49,18 @@ fn ignore_duplicate_column(res: rusqlite::Result<usize>) -> Result<()> {
     }
 }
 
+/// True if `table` currently has a column named `column`. Used to detect a legacy
+/// table shape before a one-time rebuild migration. `table` is always a hardcoded
+/// literal here (never caller input), so the unparameterizable PRAGMA name is safe.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        (table, column),
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// SQLite-backed store. Wraps a single connection; callers serialize access
 /// (the coordinator holds it behind a `Mutex`). At this scale a single
 /// connection is correct and simple.
@@ -188,15 +200,15 @@ impl Store {
     }
 
     /// Test-only: the EXPLAIN QUERY PLAN for the ACTUAL `faults_by_earner` statement
-    /// (the `SELECT earner, COUNT(*) ... GROUP BY earner`, byte-for-byte), so a test
-    /// can assert the GROUP BY is served from the `idx_earner_faults_earner` index
-    /// with NO `USE TEMP B-TREE FOR GROUP BY` — the structural win this index buys
-    /// (FM1: creation alone doesn't imply use). Mirrors the live query.
+    /// (the `SELECT earner, fault_count FROM earner_faults`, byte-for-byte), so a
+    /// test can assert the per-earner counter read is a plain scan with NO `USE TEMP
+    /// B-TREE FOR GROUP BY` — the counter collapses the old GROUP BY entirely.
+    /// Mirrors the live query.
     #[cfg(test)]
     pub fn faults_by_earner_query_plan(&self) -> Result<String> {
         let mut stmt = self.conn.prepare(
             "EXPLAIN QUERY PLAN
-             SELECT earner, COUNT(*) FROM earner_faults GROUP BY earner",
+             SELECT earner, fault_count FROM earner_faults",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
         let mut plan = String::new();
@@ -229,18 +241,21 @@ impl Store {
              );
              -- Idempotency: at most one recorded result per job.
              CREATE UNIQUE INDEX IF NOT EXISTS idx_results_job_id ON results(job_id);
-             -- Per-earner GENUINE quality faults (bad/forged/replayed signature,
-             -- malformed/implausible content, submit-before-accept, job_id
-             -- mismatch), for reputation attribution on /earners. One row per
-             -- fault event; an honest Decline of an unsupported kind is NEVER
-             -- recorded here (protocol-correct, not a fault). Distinct from the
+             -- Per-earner GENUINE quality-fault tally (bad/forged/replayed
+             -- signature, malformed/implausible content, submit-before-accept,
+             -- job_id mismatch), for reputation attribution on /earners. ONE row
+             -- per earner: `fault_count` is its lifetime count of fault EVENTS (no
+             -- dedup — the same earner faulting the same job across reconnects
+             -- counts twice). An honest Decline of an unsupported kind is NEVER
+             -- tallied here (protocol-correct, not a fault). Distinct from the
              -- per-JOB `jobs.faults` budget (which a Decline DOES bump, so a job
              -- no live earner can serve still dead-letters): that counter has no
-             -- earner identity, which is exactly why this table exists.
+             -- earner identity, which is exactly why this table exists. A counter
+             -- keyed by earner (not one row per fault) so it stays bounded by the
+             -- distinct faulting-earner count, never by total faults ever recorded.
              CREATE TABLE IF NOT EXISTS earner_faults (
-                 earner     TEXT NOT NULL,
-                 job_id     TEXT NOT NULL,
-                 created_at INTEGER NOT NULL
+                 earner      TEXT PRIMARY KEY,
+                 fault_count INTEGER NOT NULL DEFAULT 0
              );
              -- Pending EAS render receipts: written atomically with the settle
              -- (see record_completed) so a crash before the on-chain
@@ -397,21 +412,31 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_jobs_attempts_faults ON jobs(attempts, faults)",
             [],
         )?;
-        // Cover the `/earners` per-earner fault count: SELECT earner, COUNT(*) FROM
-        // earner_faults GROUP BY earner. Without an index the GROUP BY full-scans the
-        // table AND builds a temp b-tree to sort rows into earner order; this index
-        // serves the grouping from an ordered covering scan with no temp b-tree. Only
-        // genuine quality faults land here (honest declines never do), so the table —
-        // and this index — grow slowly and the per-fault insert write-amp is
-        // negligible. RESIDUAL (not closed here): the table is still never archived,
-        // so both it and this index grow without bound over a long-lived mesh's fault
-        // history; the asymptotic fix is terminal-row retention/archival (a
-        // retention-policy decision: how long fault history must feed reputation),
-        // deferred and documented in PROJECT_STATE, not built in this slice.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_earner_faults_earner ON earner_faults(earner)",
-            [],
-        )?;
+        // Migrate a legacy ROW-shaped earner_faults (the pre-counter table: one row
+        // per fault event, carrying the write-only `job_id`/`created_at` columns) into
+        // the counter shape (one row per earner, `fault_count` = its lifetime event
+        // total). Detected by the legacy `job_id` column; the rebuild rolls each
+        // earner's row COUNT into `fault_count`, preserving every earner's total
+        // EXACTLY, then swaps the rebuilt table in — dropping the old table also drops
+        // its now-redundant `idx_earner_faults_earner` (the prior covering index for
+        // the GROUP BY; `earner` is the counter's PRIMARY KEY, so the read no longer
+        // groups). Wrapped in one transaction so a crash mid-rebuild leaves the
+        // original table intact. Runs once: after the swap the table has no `job_id`
+        // column, so the guard is false on every later boot (idempotent).
+        if table_has_column(&conn, "earner_faults", "job_id")? {
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE earner_faults_counter (
+                     earner      TEXT PRIMARY KEY,
+                     fault_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO earner_faults_counter (earner, fault_count)
+                     SELECT earner, COUNT(*) FROM earner_faults GROUP BY earner;
+                 DROP TABLE earner_faults;
+                 ALTER TABLE earner_faults_counter RENAME TO earner_faults;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self {
             conn,
             compute_rate_wei: 0,
@@ -713,7 +738,7 @@ impl Store {
         // in the same locked, no-await path as the budget bump below so the
         // per-earner tally can never diverge from the per-job faults counter.
         if let Some(earner) = attribute_to {
-            self.record_earner_fault(earner, job)?;
+            self.record_earner_fault(earner)?;
         }
 
         let new_faults = faults + 1;
@@ -745,14 +770,16 @@ impl Store {
     /// Unlike the per-JOB `jobs.faults` budget that `requeue_earner_fault` bumps,
     /// this is keyed by earner and is NEVER written for an honest
     /// `EarnerMsg::Decline` of an unsupported kind — declining a kind you cannot
-    /// serve is correct, anti-hot-loop behavior, not a reputation fault. One row
-    /// per fault event (no dedup): the same earner faulting the same job across
-    /// reconnects is two genuine bad submissions and counts twice.
-    pub fn record_earner_fault(&self, earner: &str, job: &JobSpec) -> Result<()> {
+    /// serve is correct, anti-hot-loop behavior, not a reputation fault. Increments
+    /// the earner's lifetime tally by one fault EVENT (no dedup): the same earner
+    /// faulting the same job across reconnects is two genuine bad submissions and
+    /// counts twice. The counter is the single source of truth — there is no
+    /// per-fault row to diverge from — so the bump is one atomic UPSERT.
+    pub fn record_earner_fault(&self, earner: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO earner_faults (earner, job_id, created_at)
-             VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER))",
-            (earner, job.id.to_string()),
+            "INSERT INTO earner_faults (earner, fault_count) VALUES (?1, 1)
+             ON CONFLICT(earner) DO UPDATE SET fault_count = fault_count + 1",
+            [earner],
         )?;
         Ok(())
     }
@@ -1672,15 +1699,17 @@ impl Store {
         Ok(totals)
     }
 
-    /// Genuine quality-fault count grouped by earner (`earner_faults.earner`), for
+    /// Genuine quality-fault tally per earner (`earner_faults.fault_count`), for
     /// the `GET /earners` leaderboard `faults` field. Counts only attributed
     /// quality faults (honest declines are never recorded), so an earner with a
     /// clean record — or any earner on a fresh mesh — is simply absent from the
-    /// map (the caller defaults it to 0). Empty map when no faults recorded.
+    /// map (the caller defaults it to 0). Empty map when no faults recorded. One
+    /// row per earner, so this is a plain scan of a table bounded by the distinct
+    /// faulting-earner count — no GROUP BY, no temp b-tree.
     pub fn faults_by_earner(&self) -> Result<HashMap<String, usize>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT earner, COUNT(*) FROM earner_faults GROUP BY earner")?;
+            .prepare("SELECT earner, fault_count FROM earner_faults")?;
         let rows = stmt.query_map([], |row| {
             let earner: String = row.get(0)?;
             let count: i64 = row.get(1)?;
@@ -1692,6 +1721,16 @@ impl Store {
             counts.insert(earner, count);
         }
         Ok(counts)
+    }
+
+    /// Test-only: the physical row count of `earner_faults`, to prove the counter
+    /// stays bounded by the distinct faulting-earner count (one row per earner) and
+    /// not by total faults ever recorded.
+    #[cfg(test)]
+    pub fn earner_faults_row_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM earner_faults", [], |r| r.get(0))?)
     }
 
     /// Sum of `max_payout_wei` across all DONE jobs — the HUD "total $BLCKFLD

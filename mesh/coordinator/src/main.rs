@@ -9257,27 +9257,24 @@ mod tests {
 
     // ---- per-earner fault attribution (earner_faults table) ----
 
-    /// `record_earner_fault` attributes each genuine quality fault to the faulting
-    /// earner, and `faults_by_earner` groups the count per earner. One row per
-    /// fault event with NO dedup: the same earner faulting the same job twice
-    /// (across reconnects) counts twice — each is a distinct bad submission.
+    /// `record_earner_fault` tallies each genuine quality fault to the faulting
+    /// earner, and `faults_by_earner` reports the per-earner count. NO dedup: an
+    /// earner faulting three times counts three — each is a distinct bad submission.
     #[test]
     fn faults_by_earner_groups_genuine_faults_per_earner() {
         let store = Store::open_in_memory().unwrap();
         let a = test_address("earner-a");
         let b = test_address("earner-b");
-        let job1 = job_with_deadline(60);
-        let job2 = job_with_deadline(60);
 
-        // A faults job1 twice (no dedup) + job2 once → 3; B faults job1 once → 1.
-        store.record_earner_fault(&a, &job1).unwrap();
-        store.record_earner_fault(&a, &job1).unwrap();
-        store.record_earner_fault(&a, &job2).unwrap();
-        store.record_earner_fault(&b, &job1).unwrap();
+        // A faults three times (no dedup) → 3; B faults once → 1.
+        store.record_earner_fault(&a).unwrap();
+        store.record_earner_fault(&a).unwrap();
+        store.record_earner_fault(&a).unwrap();
+        store.record_earner_fault(&b).unwrap();
 
         let by_earner = store.faults_by_earner().unwrap();
-        assert_eq!(by_earner.get(&a).copied(), Some(3), "A: 2×job1 + 1×job2");
-        assert_eq!(by_earner.get(&b).copied(), Some(1), "B: 1×job1");
+        assert_eq!(by_earner.get(&a).copied(), Some(3), "A: 3 faults");
+        assert_eq!(by_earner.get(&b).copied(), Some(1), "B: 1 fault");
         assert_eq!(by_earner.len(), 2, "only earners with faults appear");
     }
 
@@ -10156,40 +10153,44 @@ mod tests {
         );
     }
 
-    /// Schema init creates the index for the `/earners` per-earner fault GROUP BY.
-    /// Idempotent across restarts (CREATE INDEX IF NOT EXISTS).
+    /// The counter stays bounded under sustained faults: 50 faults from one earner
+    /// collapse to a SINGLE row whose `fault_count` is the total — the table grows by
+    /// distinct faulting earner, never by total faults recorded. This is the
+    /// unbounded-growth residual the per-earner counter closes (vs the old one-row-
+    /// per-fault table). Mutation check: the old INSERT-per-fault would make this 50.
     #[test]
-    fn earner_faults_earner_index_exists_after_init() {
+    fn earner_faults_is_a_bounded_per_earner_counter() {
         let store = Store::open_in_memory().unwrap();
-        assert!(store.has_index("idx_earner_faults_earner").unwrap());
+        let a = test_address("earner-a");
+        for _ in 0..50 {
+            store.record_earner_fault(&a).unwrap();
+        }
+        assert_eq!(
+            store.earner_faults_row_count().unwrap(),
+            1,
+            "one row per earner, not one per fault"
+        );
+        assert_eq!(store.faults_by_earner().unwrap().get(&a).copied(), Some(50));
     }
 
-    /// FM1: creation alone doesn't imply use. The `GROUP BY earner` must be served
-    /// from `idx_earner_faults_earner` (an ordered covering scan) with NO
-    /// `USE TEMP B-TREE FOR GROUP BY` — eliminating the sort is the structural win
-    /// this index buys.
+    /// The per-earner counter read is a plain scan of `earner_faults` with NO
+    /// `USE TEMP B-TREE FOR GROUP BY` — the counter (one row per earner) collapses
+    /// the old GROUP BY entirely, so the structural sort the prior covering index
+    /// removed can no longer arise at all.
     #[test]
-    fn faults_by_earner_query_plan_uses_the_index_without_a_temp_btree() {
+    fn faults_by_earner_query_plan_has_no_temp_btree() {
         let store = Store::open_in_memory().unwrap();
-        store
-            .record_earner_fault(&test_address("earner-a"), &job_with_deadline(60))
-            .unwrap();
-        store
-            .record_earner_fault(&test_address("earner-b"), &job_with_deadline(60))
-            .unwrap();
+        store.record_earner_fault(&test_address("earner-a")).unwrap();
+        store.record_earner_fault(&test_address("earner-b")).unwrap();
 
         let plan = store.faults_by_earner_query_plan().unwrap();
-        // COUNT(*) needs no column data, so the (earner) index fully covers the
-        // group — pin that stronger property (COVERING), not just the name.
         assert!(
-            plan.contains("USING COVERING INDEX idx_earner_faults_earner"),
-            "per-earner fault GROUP BY must be served from the covering index, \
-             got plan: {plan}"
+            plan.contains("earner_faults"),
+            "the read must scan earner_faults, got plan: {plan}"
         );
         assert!(
             !plan.contains("TEMP B-TREE"),
-            "per-earner fault GROUP BY must be index-served, not a temp-b-tree \
-             sort, got plan: {plan}"
+            "the counter read has no GROUP BY, so no temp-b-tree sort, got plan: {plan}"
         );
     }
 
