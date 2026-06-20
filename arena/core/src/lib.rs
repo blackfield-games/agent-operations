@@ -20,6 +20,7 @@ use arena_proto::{
     SeatAction, SeatId, SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch, MOVE_INTENT_SCALE,
     POSITION_SCALE, PROTOCOL_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
@@ -86,7 +87,12 @@ impl SplitMix64 {
 /// (which is the read-only rules summary sent to agents). These are the
 /// server-authoritative constants the sim clamps and resolves against; an agent
 /// never sets them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Every field is a determinant of the match outcome (movement, hit resolution,
+/// scoring, spawns), so a [`MatchRecord`] embeds the `Rules` it ran under — a
+/// record carrying the wrong tuning would replay to a different result. Serde so
+/// the rules persist inside a self-determining record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rules {
     /// Max planar displacement per tick at full move intent, in position units.
     pub max_speed: i32,

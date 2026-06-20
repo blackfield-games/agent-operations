@@ -8,6 +8,7 @@ version = "0.0.1"
 dependencies = [
  "arena-proto",
  "hex",
+ "serde",
  "serde_json",
  "uuid",
 ]
