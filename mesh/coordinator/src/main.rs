@@ -1033,8 +1033,8 @@ fn parse_forwarded_element(element: &str) -> Option<IpAddr> {
 /// ordering as `X-Forwarded-For`). Multiple header lines are flattened in order,
 /// then each comma-separated forwarded-element yields one entry: its parsed `for=`
 /// client, or `None` for a missing/obfuscated/unparseable hop. Empty when no
-/// `Forwarded` header is present, which is the signal `resolve_source_ip` uses to
-/// fall through to the XFF path.
+/// `Forwarded` header is present; `resolve_source_ip` reaches this only when no
+/// `X-Forwarded-For` is present, and an empty result then falls back to the peer.
 fn parse_forwarded_for_nodes(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
     headers
         .get_all("forwarded")
@@ -1042,6 +1042,22 @@ fn parse_forwarded_for_nodes(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|line| line.split(','))
         .map(parse_forwarded_element)
+        .collect()
+}
+
+/// Parse the `X-Forwarded-For` header(s) into the ordered client hops, left-to-right
+/// (farthest→nearest). Flattens BOTH the comma-separated entries within a line and
+/// multiple header lines (per HTTP, repeated field lines are equivalent to one
+/// comma-joined value) — using `get_all`, so a proxy that appends the observed client
+/// as a separate `X-Forwarded-For` line still places it as the nearest hop, and an
+/// attacker cannot win the nearest slot by adding a second line.
+fn parse_xff_nodes(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
+    headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|line| line.split(','))
+        .map(parse_forwarded_node)
         .collect()
 }
 
@@ -1103,8 +1119,9 @@ fn resolve_source_ip(peer: IpAddr, headers: &HeaderMap, trusted: &TrustedProxies
     if !trusted.contains(&peer) {
         return peer;
     }
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        return select_untrusted_hop(xff.rsplit(',').map(parse_forwarded_node), peer, trusted);
+    if headers.get("x-forwarded-for").is_some() {
+        let xff = parse_xff_nodes(headers);
+        return select_untrusted_hop(xff.into_iter().rev(), peer, trusted);
     }
     let forwarded = parse_forwarded_for_nodes(headers);
     if forwarded.is_empty() {
@@ -6383,6 +6400,19 @@ mod tests {
     fn resolve_strips_port_from_node() {
         let t = trusted(&[ip(1)]);
         assert_eq!(resolve_source_ip(ip(1), &xff("203.0.113.7:51000"), &t), ip4(203, 0, 113, 7));
+    }
+
+    /// SECURITY: X-Forwarded-For is flattened across MULTIPLE header lines, not just
+    /// the first — a proxy that appends the observed client as a separate XFF line
+    /// still places it as the nearest hop, so an attacker's earlier line cannot win
+    /// the key. (With the old first-line-only read this returned 6.6.6.6.)
+    #[test]
+    fn resolve_xff_multiline_right_to_left() {
+        let t = trusted(&[ip(1)]);
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap()); // attacker line, farthest
+        h.append("x-forwarded-for", "203.0.113.7".parse().unwrap()); // proxy-appended, nearest
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
     }
 
     /// Behind one trusted proxy emitting RFC-7239, the limiter keys on the quoted
