@@ -156,6 +156,9 @@ def _route_back_target(verdict: ValidatorVerdict) -> str | None:
     can't close. Keep only names that are real route-back targets (`PIPELINE_ORDER`)
     and pick the pipeline-earliest — a FIXABLE target is repaired first even on a
     `terminal` verdict (a co-occurring over-budget signal must not short-circuit it).
+    That fixable target may itself be optimization: `terminal` marks the over_budget
+    METRIC unfixable (a deterministic recompute), not optimization's re-runnable flaws
+    (a malformed file / composition conflict still routes back to re-run it).
 
     With no fixable target left, a `terminal` verdict returns `None` (END) — routing
     back is futile because the blamed stage is deterministic. A non-terminal verdict

@@ -239,6 +239,25 @@ async def test_run_over_budget_with_co_occurring_fixable_still_routes_back(tmp_p
     assert _route_back_target(verdict) == "biome"
 
 
+async def test_run_over_budget_with_malformed_optimization_file_routes_back_to_fix_it(tmp_path):
+    # The terminal flag is about the over_budget METRIC (a deterministic recompute),
+    # NOT about file I/O. A co-occurring MALFORMED optimization FILE is a separate,
+    # genuinely re-runnable issue — the wellformedness gate routes any bad-file
+    # specialist back to re-run (a write can fail transiently). So a verdict that is
+    # BOTH terminal AND blames optimization for its malformed file routes back to
+    # optimization to repair the file; terminal does not strand it (FM2 applied to
+    # optimization's own fixable flaw). A re-run that writes a valid file then sees
+    # over_budget alone → terminal, no fixable → END (converges in two rounds); a
+    # persistently garbage-writing optimizer is bounded by MAX_ROUNDS like any broken
+    # specialist — NOT the deterministic-over-budget-alone world the slice converges.
+    opt = _layer(tmp_path, "optimization", body="garbage\n", metrics={"over_budget": 1.0})
+    verdict = await validator.run(_brief(), _with_override(tmp_path, "optimization", opt), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert verdict.terminal  # the over-budget signal is still terminal
+    assert "optimization" in verdict.failing_specialists  # but the malformed file IS re-runnable
+    assert _route_back_target(verdict) == "optimization"  # repair the file; terminal doesn't strand it
+
+
 async def test_run_accepts_int_valued_metrics(tmp_path):
     # FM3 discriminator: int metrics must NOT be flagged against the float contract.
     # Bypass Pydantic (which coerces int->float) so the values are genuinely int.
