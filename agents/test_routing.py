@@ -14,14 +14,19 @@ def test_missing_layers_routes_to_earliest_missing():
     assert _failing_specialist([issue]) == "biome"
 
 
-def test_triangle_budget_routes_to_optimization():
-    issue = "triangle budget exceeded — re-run optimization with stricter LODs"
+def test_missing_metric_routes_to_optimization():
+    # The scanner's route-to-optimization branch keys on a RE-RUNNABLE optimization
+    # issue — a missing required metric (the optimizer must re-emit it). over_budget
+    # itself no longer routes here: it is a terminal rejection that names no
+    # specialist (see the validator gate + the terminal tests below), so it never
+    # reaches this text scan.
+    issue = "optimization layer layers/optimization.usda is missing the required metric 'over_budget' its role must emit"
     assert _failing_specialist([issue]) == "optimization"
 
 
 def test_earliest_specialist_wins_across_issues():
     issues = [
-        "triangle budget exceeded — re-run optimization with stricter LODs",
+        "optimization layer layers/optimization.usda is missing the required metric 'over_budget' its role must emit",
         "missing specialist layers: ['terrain']",
     ]
     # terrain is upstream of optimization → repair the cause first
@@ -94,8 +99,10 @@ def test_exact_path_segment_equal_to_specialist_still_routes():
 # ---- _route_back_target: structured attribution preferred over the text scan ----
 
 
-def _verdict(issues: list[str], failing: list[str] | None = None) -> ValidatorVerdict:
-    kwargs = {"accepted": False, "issues": issues}
+def _verdict(
+    issues: list[str], failing: list[str] | None = None, terminal: bool = False
+) -> ValidatorVerdict:
+    kwargs = {"accepted": False, "issues": issues, "terminal": terminal}
     if failing is not None:
         kwargs["failing_specialists"] = failing
     return ValidatorVerdict(**kwargs)
@@ -163,3 +170,50 @@ def test_structured_and_text_disagree_structured_wins():
     )
     assert _failing_specialist(verdict.issues) == "biome"
     assert _route_back_target(verdict) == "prop"
+
+
+# ---- _route_back_target: terminal verdicts END when nothing fixable remains ----
+
+# An over-budget world's real issue text names "optimization" (it explains the
+# budget was exceeded AFTER optimization), so a text scan over it WOULD route back
+# to the optimizer. The terminal flag is what stops that futile re-run.
+OVER_BUDGET_ISSUE = (
+    "triangle budget exceeded — the world is over the triangle budget after "
+    "optimization (the terminal LOD authority); a re-run recomputes the same "
+    "result, so it must shed source geometry rather than be revised"
+)
+
+
+def test_terminal_verdict_with_no_fixable_ends():
+    # FM1: a pure over-budget rejection — terminal, no failing specialist. Re-running
+    # the deterministic optimizer can't help, so route-back is None (the supervisor
+    # ENDs in one pass instead of looping to MAX_ROUNDS).
+    verdict = _verdict([OVER_BUDGET_ISSUE], failing=[], terminal=True)
+    assert _route_back_target(verdict) is None
+
+
+def test_terminal_flag_is_what_ends_it_not_the_text():
+    # Discriminator for the test above: the SAME issue text without the terminal flag
+    # still falls to the text scan, which routes to optimization (the word is in the
+    # text). So it is `terminal`, not the wording, that converts the loop into an END.
+    routed = _verdict([OVER_BUDGET_ISSUE], failing=[], terminal=False)
+    assert _route_back_target(routed) == "optimization"
+    ended = _verdict([OVER_BUDGET_ISSUE], failing=[], terminal=True)
+    assert _route_back_target(ended) is None
+
+
+def test_terminal_verdict_repairs_co_occurring_fixable_first():
+    # FM2: terminal does NOT short-circuit a fixable issue. A terminal over-budget
+    # verdict that also names a re-runnable biome routes back to biome — the fixable
+    # cause is repaired before the loop can ever reach the terminal END.
+    verdict = _verdict([OVER_BUDGET_ISSUE, "missing specialist layers: ['biome']"], failing=["biome"], terminal=True)
+    assert _route_back_target(verdict) == "biome"
+
+
+def test_terminal_verdict_with_only_unknown_attributed_ends():
+    # A terminal verdict naming only non-route-back targets (the validator itself) has
+    # no fixable specialist left, so it ENDs — unlike the NON-terminal present-but-
+    # unknown case, which falls back to director (asserted alongside to prove terminal
+    # is what flips the branch).
+    assert _route_back_target(_verdict(["x"], failing=["validator"], terminal=True)) is None
+    assert _route_back_target(_verdict(["x"], failing=["validator"], terminal=False)) == "director"
