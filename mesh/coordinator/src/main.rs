@@ -10179,6 +10179,70 @@ mod tests {
         );
     }
 
+    // ---- /stats + /earners aggregation indexes ----
+
+    /// Schema init creates the covering index for the `/stats` lifetime
+    /// SUM(attempts), SUM(faults) over the never-archived jobs table. Idempotent
+    /// across restarts (CREATE INDEX IF NOT EXISTS).
+    #[test]
+    fn attempt_fault_totals_index_exists_after_init() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.has_index("idx_jobs_attempts_faults").unwrap());
+    }
+
+    /// FM1: creation alone doesn't imply use. The unfiltered SUM has no predicate to
+    /// SEARCH on, so it SCANs — but it must scan the SKINNY `idx_jobs_attempts_faults`
+    /// COVERING index (the marker), not the fat jobs table whose every row carries an
+    /// inline multi-KB `spec_json`. A bare `SCAN jobs` with no `USING COVERING INDEX`
+    /// is the regression this guards against.
+    #[test]
+    fn attempt_fault_totals_query_plan_uses_the_covering_index() {
+        let store = Store::open_in_memory().unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+
+        let plan = store.attempt_fault_totals_query_plan().unwrap();
+        assert!(
+            plan.contains("USING COVERING INDEX idx_jobs_attempts_faults"),
+            "attempt/fault SUM must scan the skinny covering index, not the fat \
+             jobs table, got plan: {plan}"
+        );
+    }
+
+    /// Schema init creates the index for the `/earners` per-earner fault GROUP BY.
+    /// Idempotent across restarts (CREATE INDEX IF NOT EXISTS).
+    #[test]
+    fn earner_faults_earner_index_exists_after_init() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.has_index("idx_earner_faults_earner").unwrap());
+    }
+
+    /// FM1: creation alone doesn't imply use. The `GROUP BY earner` must be served
+    /// from `idx_earner_faults_earner` (an ordered covering scan) with NO
+    /// `USE TEMP B-TREE FOR GROUP BY` — eliminating the sort is the structural win
+    /// this index buys.
+    #[test]
+    fn faults_by_earner_query_plan_uses_the_index_without_a_temp_btree() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_earner_fault(&test_address("earner-a"), &job_with_deadline(60))
+            .unwrap();
+        store
+            .record_earner_fault(&test_address("earner-b"), &job_with_deadline(60))
+            .unwrap();
+
+        let plan = store.faults_by_earner_query_plan().unwrap();
+        assert!(
+            plan.contains("idx_earner_faults_earner"),
+            "per-earner fault GROUP BY must use the index, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "per-earner fault GROUP BY must be index-served, not a temp-b-tree \
+             sort, got plan: {plan}"
+        );
+    }
+
     // ---- GET /jobs/{id} full detail ----
 
     /// `GET /jobs/{id}` returns the full spec; `result` is null while the job is

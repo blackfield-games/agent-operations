@@ -166,6 +166,47 @@ impl Store {
         Ok(plan)
     }
 
+    /// Test-only: the EXPLAIN QUERY PLAN for the ACTUAL `attempt_fault_totals`
+    /// statement (the `SUM(attempts), SUM(faults) FROM jobs`, byte-for-byte), so a
+    /// test can assert the planner serves it from the `idx_jobs_attempts_faults`
+    /// COVERING index — scanning the skinny (attempts, faults) entries — instead of
+    /// a full `SCAN jobs` that drags every row's inline `spec_json` through the
+    /// b-tree (FM1: creation alone doesn't imply use). Mirrors the live query.
+    #[cfg(test)]
+    pub fn attempt_fault_totals_query_plan(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT COALESCE(SUM(attempts), 0), COALESCE(SUM(faults), 0) FROM jobs",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+        let mut plan = String::new();
+        for row in rows {
+            plan.push_str(&row?);
+            plan.push('\n');
+        }
+        Ok(plan)
+    }
+
+    /// Test-only: the EXPLAIN QUERY PLAN for the ACTUAL `faults_by_earner` statement
+    /// (the `SELECT earner, COUNT(*) ... GROUP BY earner`, byte-for-byte), so a test
+    /// can assert the GROUP BY is served from the `idx_earner_faults_earner` index
+    /// with NO `USE TEMP B-TREE FOR GROUP BY` — the structural win this index buys
+    /// (FM1: creation alone doesn't imply use). Mirrors the live query.
+    #[cfg(test)]
+    pub fn faults_by_earner_query_plan(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT earner, COUNT(*) FROM earner_faults GROUP BY earner",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+        let mut plan = String::new();
+        for row in rows {
+            plan.push_str(&row?);
+            plan.push('\n');
+        }
+        Ok(plan)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
