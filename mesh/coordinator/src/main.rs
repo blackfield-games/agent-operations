@@ -196,16 +196,18 @@ struct Args {
     /// [`DEFAULT_MAX_REGISTRATIONS`].
     #[arg(long, env = "COORDINATOR_MAX_REGISTRATIONS", default_value_t = DEFAULT_MAX_REGISTRATIONS)]
     max_registrations: u32,
-    /// Reverse-proxy IPs whose `X-Forwarded-For` header is trusted to name the real
-    /// client for per-source registration rate-limiting. Comma-separated, or repeat
-    /// the flag. EMPTY by default: with no trusted proxy, XFF is ignored and the
-    /// limiter keys on the raw connection peer, so a direct (untrusted) client can
-    /// never spoof its source via a forged XFF. List a proxy here ONLY if it appends
-    /// the address it observed to XFF; the limiter then keys on the rightmost XFF hop
-    /// that is not itself a listed proxy (the address the trust boundary saw). See
+    /// Reverse-proxy IPs or CIDR ranges whose `X-Forwarded-For` header is trusted to
+    /// name the real client for per-source registration rate-limiting. Each entry is a
+    /// bare IP (`10.0.0.1`, `2001:db8::1`) or a CIDR (`10.0.0.0/8`, `2001:db8::/32`);
+    /// comma-separated, or repeat the flag. EMPTY by default: with no trusted proxy,
+    /// XFF is ignored and the limiter keys on the raw connection peer, so a direct
+    /// (untrusted) client can never spoof its source via a forged XFF. List a proxy
+    /// here ONLY if it appends the address it observed to XFF; the limiter then keys on
+    /// the rightmost XFF hop that is not itself a listed proxy/range (the address the
+    /// trust boundary saw). A malformed entry is rejected at startup. See
     /// [`DEFAULT_MAX_REGISTRATIONS`] for the edge/OS-vs-app-layer rate-limit layering.
     #[arg(long, env = "COORDINATOR_TRUSTED_PROXIES", value_delimiter = ',')]
-    trusted_proxies: Vec<IpAddr>,
+    trusted_proxies: Vec<String>,
     /// Wei charged per render-second to a job's buyer at settle, recorded as a
     /// pending ComputeMeter debit for the (operator-gated) on-chain relayer to
     /// spend. `0` (the default) DISABLES metering — no debit row is written — so
@@ -558,7 +560,7 @@ async fn main() -> Result<()> {
             max_queued_jobs: args.max_queued_jobs,
             max_earners: args.max_earners,
             max_registrations: args.max_registrations,
-            trusted_proxies: TrustedProxies(args.trusted_proxies.into_iter().collect()),
+            trusted_proxies: TrustedProxies::parse(&args.trusted_proxies)?,
         },
     )?;
     tracing::info!(db = %args.db, "store ready");
@@ -970,16 +972,71 @@ fn check_registration_rate(
 #[derive(Debug, Clone, Copy)]
 struct PeerAddr(SocketAddr);
 
-/// Reverse-proxy IPs whose `X-Forwarded-For` the registration limiter trusts to
-/// name the real client. Empty by default: with no proxy trusted, XFF is ignored
-/// and the limiter keys on the raw connection peer (byte-identical to the pre-XFF
-/// behavior). Populated from `--trusted-proxies`; read by [`resolve_source_ip`].
+/// One trusted-proxy allowlist entry: an exact IP (stored as a `/32` or `/128`) or a
+/// CIDR network. [`contains`](TrustedCidr::contains) compares `(peer & mask) ==
+/// (network & mask)` within the SAME address family, so the network's host bits are
+/// irrelevant (masked off both sides) and a v4 entry never matches a v6 peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrustedCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl TrustedCidr {
+    fn contains(&self, peer: &IpAddr) -> bool {
+        match (self.network, peer) {
+            (IpAddr::V4(net), IpAddr::V4(peer)) => {
+                let mask = if self.prefix == 0 { 0 } else { u32::MAX << (32 - self.prefix) };
+                (u32::from(net) & mask) == (u32::from(*peer) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(peer)) => {
+                let mask = if self.prefix == 0 { 0 } else { u128::MAX << (128 - self.prefix) };
+                (u128::from(net) & mask) == (u128::from(*peer) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parse one `--trusted-proxies` entry: a bare IP (`10.0.0.1`, `2001:db8::1`) as an
+/// exact `/32`/`/128`, or a CIDR (`10.0.0.0/8`, `2001:db8::/32`). A malformed
+/// address, an unparseable prefix, an out-of-family-range prefix, or a blank entry is
+/// rejected — never silently widened to a `/0` catch-all that would trust every peer.
+fn parse_trusted_entry(entry: &str) -> Result<TrustedCidr> {
+    let entry = entry.trim();
+    anyhow::ensure!(!entry.is_empty(), "blank trusted-proxy entry");
+    if let Some((addr, prefix)) = entry.split_once('/') {
+        let network: IpAddr =
+            addr.parse().map_err(|_| anyhow::anyhow!("invalid trusted-proxy CIDR address: {entry}"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid trusted-proxy CIDR prefix: {entry}"))?;
+        let max = if network.is_ipv4() { 32 } else { 128 };
+        anyhow::ensure!(prefix <= max, "trusted-proxy CIDR prefix /{prefix} exceeds /{max}: {entry}");
+        Ok(TrustedCidr { network, prefix })
+    } else {
+        let network: IpAddr =
+            entry.parse().map_err(|_| anyhow::anyhow!("invalid trusted-proxy IP: {entry}"))?;
+        let prefix = if network.is_ipv4() { 32 } else { 128 };
+        Ok(TrustedCidr { network, prefix })
+    }
+}
+
+/// Reverse-proxy IPs/ranges whose `X-Forwarded-For` (or RFC-7239 `Forwarded`) the
+/// registration limiter trusts to name the real client. Empty by default: with no
+/// proxy trusted, forwarded headers are ignored and the limiter keys on the raw
+/// connection peer (byte-identical to the pre-XFF behavior). Populated from
+/// `--trusted-proxies` (exact IPs and/or CIDR ranges); read by [`resolve_source_ip`].
 #[derive(Debug, Clone, Default)]
-struct TrustedProxies(HashSet<IpAddr>);
+struct TrustedProxies(Vec<TrustedCidr>);
 
 impl TrustedProxies {
-    fn contains(&self, ip: &IpAddr) -> bool {
-        self.0.contains(ip)
+    fn parse(entries: &[String]) -> Result<Self> {
+        entries.iter().map(|e| parse_trusted_entry(e)).collect::<Result<Vec<_>>>().map(TrustedProxies)
+    }
+
+    fn contains(&self, peer: &IpAddr) -> bool {
+        self.0.iter().any(|c| c.contains(peer))
     }
 }
 
@@ -3111,7 +3168,7 @@ mod tests {
                 max_queued_jobs: 123,
                 max_earners: 456,
                 max_registrations: 789,
-                trusted_proxies: TrustedProxies([probe_ip].into_iter().collect()),
+                trusted_proxies: TrustedProxies::parse(&[probe_ip.to_string()]).unwrap(),
             },
         )
         .unwrap();
@@ -6228,7 +6285,7 @@ mod tests {
     }
 
     fn trusted(ips: &[IpAddr]) -> TrustedProxies {
-        TrustedProxies(ips.iter().copied().collect())
+        TrustedProxies::parse(&ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>()).unwrap()
     }
 
     fn xff(value: &str) -> HeaderMap {
