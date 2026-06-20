@@ -16,9 +16,9 @@
 //! one of those would make a replay diverge and break grading.
 
 use arena_proto::{
-    Action, ActionError, ActionIntent, Bam, MatchConfig, MatchPhase, MatchResult, Observation,
-    ReplayRecord, SeatAction, SeatId, SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch,
-    MOVE_INTENT_SCALE, POSITION_SCALE, PROTOCOL_VERSION,
+    check_version, Action, ActionError, ActionIntent, Bam, MatchConfig, MatchPhase, MatchResult,
+    Observation, ReplayRecord, SeatAction, SeatId, SeatOutcome, TeamId, TickRecord, Vec2,
+    VersionMismatch, MOVE_INTENT_SCALE, POSITION_SCALE, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -746,6 +746,92 @@ impl std::fmt::Display for ReplayError {
 }
 
 impl std::error::Error for ReplayError {}
+
+impl MatchRecord {
+    /// Re-derive the match from this record ALONE and confirm it is a faithful,
+    /// self-consistent commitment: the inputs (`config`, `rules`, and the
+    /// `replay`'s seed + action stream) re-run through the same core to exactly
+    /// the recorded `result`, and the result's `replay_hash` is the canonical
+    /// [`digest`](ReplayRecord::digest) of that re-run. Returns the reproduced
+    /// [`MatchResult`] on success.
+    ///
+    /// Every rejection is a typed [`ReplayError`] — `verify` NEVER panics, so a
+    /// truncated or hand-tampered record is a cleanly rejected input, not a way to
+    /// crash a verifier (on-chain settlement, a grader, a spectator feed). The
+    /// cheap structural checks (protocol version, match-id agreement, a
+    /// well-formed roster, canonical tick + seat order) run BEFORE the re-run, so
+    /// a malformed record is rejected without simulating it and a bad action
+    /// stream can never reach [`step`](Match::step) to panic or be silently
+    /// reshaped into a different hash.
+    pub fn verify(&self) -> Result<MatchResult, ReplayError> {
+        check_version(self.replay.protocol_version).map_err(ReplayError::Version)?;
+        check_version(self.result.protocol_version).map_err(ReplayError::Version)?;
+
+        if self.replay.match_id != self.result.match_id {
+            return Err(ReplayError::MatchIdMismatch {
+                replay: self.replay.match_id,
+                result: self.result.match_id,
+            });
+        }
+
+        // A real match has at least one seat, `config.seats` agrees with the
+        // roster length, and no two seats share an id. `roster` doubles as the
+        // membership set for the per-tick seat check below.
+        let mut roster: BTreeSet<SeatId> = BTreeSet::new();
+        let seats = &self.replay.seats;
+        if seats.is_empty()
+            || self.config.seats as usize != seats.len()
+            || !seats.iter().all(|s| roster.insert(s.seat))
+        {
+            return Err(ReplayError::InvalidRoster);
+        }
+
+        // The live sim records exactly one tick per simulated tick, in order, each
+        // tick's actions ascending-unique by a seat in the roster. Enforce that
+        // canonical shape up front: a reordered, gapped, or corpse-padded stream
+        // is rejected here rather than silently re-clamped into a divergent hash.
+        for (index, tr) in self.replay.ticks.iter().enumerate() {
+            if tr.tick != index as u64 {
+                return Err(ReplayError::TickOrder { index, tick: tr.tick });
+            }
+            let mut prev: Option<SeatId> = None;
+            for a in &tr.actions {
+                if !roster.contains(&a.seat) {
+                    return Err(ReplayError::UnknownSeat { tick: tr.tick, seat: a.seat });
+                }
+                if prev.is_some_and(|p| p >= a.seat) {
+                    return Err(ReplayError::SeatOrder { tick: tr.tick });
+                }
+                prev = Some(a.seat);
+            }
+        }
+
+        let fresh = Match::new(
+            self.replay.match_id,
+            self.config,
+            self.rules,
+            self.replay.seats.clone(),
+            self.replay.seed,
+        );
+        let rerun = replay_match(fresh, &self.replay);
+        let Some(reproduced) = rerun.result() else {
+            return Err(ReplayError::NotTerminal);
+        };
+
+        if reproduced.outcomes != self.result.outcomes
+            || reproduced.final_tick != self.result.final_tick
+        {
+            return Err(ReplayError::ResultMismatch);
+        }
+        if reproduced.replay_hash != self.result.replay_hash {
+            return Err(ReplayError::HashMismatch {
+                expected: self.result.replay_hash.clone(),
+                recomputed: reproduced.replay_hash.clone(),
+            });
+        }
+        Ok(reproduced.clone())
+    }
+}
 
 /// A controller that answers each tick's observation with an action — the same
 /// surface a human's controller and an external agent's `AgentController` both
