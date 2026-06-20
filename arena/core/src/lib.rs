@@ -16,9 +16,9 @@
 //! one of those would make a replay diverge and break grading.
 
 use arena_proto::{
-    Action, ActionError, ActionIntent, Bam, MatchPhase, MatchResult, Observation, ReplayRecord,
-    SeatAction, SeatId, SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch, MOVE_INTENT_SCALE,
-    POSITION_SCALE, PROTOCOL_VERSION,
+    Action, ActionError, ActionIntent, Bam, MatchConfig, MatchPhase, MatchResult, Observation,
+    ReplayRecord, SeatAction, SeatId, SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch,
+    MOVE_INTENT_SCALE, POSITION_SCALE, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -618,6 +618,24 @@ impl Match {
         self.result.as_ref()
     }
 
+    /// The complete [`MatchRecord`] for a finished match — the setup it ran under
+    /// (`config` + `rules`), its [`ReplayRecord`], and the terminal
+    /// [`MatchResult`], bundled into one self-determining artifact that
+    /// [`MatchRecord::verify`] can re-run and check from scratch. `None` until the
+    /// match has [`Ended`]: an in-progress match has no terminal result to commit,
+    /// so there is nothing to record yet.
+    ///
+    /// [`Ended`]: MatchPhase::Ended
+    pub fn to_record(&self) -> Option<MatchRecord> {
+        let result = self.result.clone()?;
+        Some(MatchRecord {
+            config: self.config,
+            rules: self.rules,
+            replay: self.build_replay(),
+            result,
+        })
+    }
+
     /// Consume the match for its deterministic [`ReplayRecord`] — seed, roster,
     /// and the ordered accepted-action stream, sufficient to re-run the match
     /// bit-for-bit via [`replay_match`].
@@ -631,6 +649,103 @@ impl Match {
         }
     }
 }
+
+/// A complete, self-determining record of one finished match.
+///
+/// A bare [`ReplayRecord`] carries the seed, roster, and action stream — but NOT
+/// the [`MatchConfig`] (arena bounds, tick cap) or the [`Rules`] (all combat
+/// tuning) the sim also consumes, so a `ReplayRecord` alone does not determine a
+/// match: replayed under different bounds or damage it yields a different result.
+/// A `MatchRecord` closes that gap by bundling the full determinant set (the
+/// `config`, the `rules`, the `replay` inputs, and the terminal `result` they
+/// produced), so [`verify`](MatchRecord::verify) re-runs it from the record
+/// ALONE, with nothing supplied out of band. That self-containment is what an
+/// on-chain settlement check (`contracts-agent-match-settlement` commits
+/// `result.replay_hash`) and a spectator/replay feed both rely on: hand either
+/// one this record and it can reproduce and check the match end to end.
+///
+/// It is plain serde (like the wire types), so the persisted form is its serde
+/// representation; every container inside is an ordered `Vec`, so the encoding is
+/// byte-stable and a round-trip through JSON re-verifies unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchRecord {
+    /// The read-only rules summary (bounds, tick cap) the match ran under — a
+    /// sim determinant: `bounds` clamps movement and `max_ticks` ends the match.
+    pub config: MatchConfig,
+    /// The server-authoritative combat tuning the match ran under — a sim
+    /// determinant in every field (speed, hit resolution, scoring, spawns).
+    pub rules: Rules,
+    /// Seed, roster, and the ordered accepted-action stream — the per-tick inputs.
+    pub replay: ReplayRecord,
+    /// The terminal result the inputs produced, committing to
+    /// [`ReplayRecord::digest`] via `replay_hash`. `verify` recomputes this and
+    /// rejects the record if it does not match.
+    pub result: MatchResult,
+}
+
+/// Why a [`MatchRecord`] failed [`verify`](MatchRecord::verify). Every malformed,
+/// truncated, or tampered record maps to one of these — `verify` NEVER panics, so
+/// a corrupt record is a cleanly rejected input, not a denial-of-service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayError {
+    /// The record (replay or result) was built under a different
+    /// [`PROTOCOL_VERSION`] than this core speaks, so it cannot be interpreted.
+    Version(VersionMismatch),
+    /// The replay and result name different matches — a spliced record.
+    MatchIdMismatch { replay: Uuid, result: Uuid },
+    /// The roster is empty, or `config.seats` disagrees with the roster length, or
+    /// two seats share an id — the record cannot describe a real match.
+    InvalidRoster,
+    /// A recorded action names a seat that is not in the roster.
+    UnknownSeat { tick: u64, seat: SeatId },
+    /// A tick's actions are not in canonical ascending-unique seat order.
+    SeatOrder { tick: u64 },
+    /// The `ticks` are not the canonical contiguous `0,1,2,…` sequence (reordered,
+    /// duplicated, or gapped) — the live sim records one record per tick in order.
+    TickOrder { index: usize, tick: u64 },
+    /// The recorded action stream did not drive the match to a terminal state, so
+    /// it does not account for the whole match (e.g. a truncated record).
+    NotTerminal,
+    /// Re-running the inputs produced different outcomes than the record claims —
+    /// a determinant was altered (seed, an action, the rules) or the result was
+    /// tampered with.
+    ResultMismatch,
+    /// The outcomes reproduce, but the committed `replay_hash` does not match the
+    /// digest of the re-run — a tampered or stale commitment.
+    HashMismatch { expected: String, recomputed: String },
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayError::Version(m) => write!(f, "invalid replay: {m}"),
+            ReplayError::MatchIdMismatch { replay, result } => {
+                write!(f, "invalid replay: match id mismatch (replay {replay}, result {result})")
+            }
+            ReplayError::InvalidRoster => write!(f, "invalid replay: malformed roster"),
+            ReplayError::UnknownSeat { tick, seat } => {
+                write!(f, "invalid replay: tick {tick} names seat {seat} not in the roster")
+            }
+            ReplayError::SeatOrder { tick } => {
+                write!(f, "invalid replay: tick {tick} actions are not in canonical seat order")
+            }
+            ReplayError::TickOrder { index, tick } => {
+                write!(f, "invalid replay: tick {tick} at position {index} breaks canonical order")
+            }
+            ReplayError::NotTerminal => {
+                write!(f, "invalid replay: action stream did not end the match")
+            }
+            ReplayError::ResultMismatch => {
+                write!(f, "invalid replay: re-run did not reproduce the recorded result")
+            }
+            ReplayError::HashMismatch { expected, recomputed } => {
+                write!(f, "invalid replay: replay hash mismatch (recorded {expected}, recomputed {recomputed})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
 
 /// A controller that answers each tick's observation with an action — the same
 /// surface a human's controller and an external agent's `AgentController` both
