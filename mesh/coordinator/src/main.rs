@@ -1070,26 +1070,35 @@ fn select_untrusted_hop(
 /// rightmost entries are the nearest hops, and the first non-trusted one is the IP
 /// the trust boundary saw.
 ///
-/// PRECEDENCE: the standardized RFC-7239 `Forwarded` header wins when present, else
-/// `X-Forwarded-For`, else the peer — a single deterministic source of truth, so an
-/// attacker behind the proxy cannot supply the *other* header to obtain a looser
-/// key. This holds an operator contract: a *listed* proxy appends the observed
-/// address to the header it emits, and overwrites/strips any inbound client copy of
-/// the header it does NOT emit (a proxy that forwards client-supplied forwarded
-/// headers verbatim must not be listed). The right-to-left walk already neutralizes
-/// prepended entries in the header the proxy DOES append.
+/// PRECEDENCE: `X-Forwarded-For` takes precedence over RFC-7239 `Forwarded` when
+/// both are present; `Forwarded` is consulted only when no `X-Forwarded-For` is
+/// present at all, else the peer. XFF-first is the NO-REGRESSION order: before
+/// `Forwarded` was parsed, an XFF-fronted deployment ignored any client-supplied
+/// `Forwarded`, so keeping XFF authoritative whenever present means an attacker
+/// behind such a proxy still cannot inject a `Forwarded` to override the real
+/// XFF-attributed client (Forwarded-first WOULD let them — the common nginx config
+/// emits XFF but passes an inbound `Forwarded` through verbatim). A present-but-junk
+/// XFF collapses to the peer here, never falling through to `Forwarded`, so the
+/// flip cannot reintroduce that cross-header bypass.
+///
+/// Residual (documented): a proxy that emits *only* `Forwarded` must itself
+/// strip/overwrite any inbound `X-Forwarded-For`, or an attacker could supply one to
+/// win precedence — symmetric to the long-standing XFF-strip discipline, and a
+/// fresh-config requirement of the new capability, not a regression. The
+/// right-to-left walk already neutralizes prepended entries within whichever header
+/// is authoritative.
 fn resolve_source_ip(peer: IpAddr, headers: &HeaderMap, trusted: &TrustedProxies) -> IpAddr {
     if !trusted.contains(&peer) {
         return peer;
     }
-    let forwarded = parse_forwarded_for_nodes(headers);
-    if !forwarded.is_empty() {
-        return select_untrusted_hop(forwarded.into_iter().rev(), peer, trusted);
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        return select_untrusted_hop(xff.rsplit(',').map(parse_forwarded_node), peer, trusted);
     }
-    let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
+    let forwarded = parse_forwarded_for_nodes(headers);
+    if forwarded.is_empty() {
         return peer;
-    };
-    select_untrusted_hop(xff.rsplit(',').map(parse_forwarded_node), peer, trusted)
+    }
+    select_untrusted_hop(forwarded.into_iter().rev(), peer, trusted)
 }
 
 /// Per-job absolute wall-clock TTL, as a multiple of the job's own
@@ -6425,26 +6434,27 @@ mod tests {
         assert_eq!(resolve_source_ip(ip(2), &fwd("for=203.0.113.7"), &t), ip(2));
     }
 
-    /// With BOTH headers present, Forwarded wins the documented precedence so the key
-    /// has a single deterministic source — XFF is not consulted.
+    /// SECURITY/precedence: with BOTH headers present, X-Forwarded-For wins. This is
+    /// the NO-REGRESSION order — an XFF-fronted deployment behaves exactly as it did
+    /// before Forwarded was parsed, so an attacker behind it cannot inject a
+    /// `Forwarded: for=...` to override the proxy's real XFF-attributed client
+    /// (Forwarded-first would have allowed that bypass).
     #[test]
-    fn resolve_forwarded_takes_precedence_over_xff() {
+    fn resolve_xff_takes_precedence_over_forwarded() {
         let t = trusted(&[ip(1)]);
-        let mut h = fwd("for=1.1.1.1");
-        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
-        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(1, 1, 1, 1));
+        let mut h = fwd("for=6.6.6.6"); // attacker-injected, passed through by the proxy
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap()); // proxy's real XFF
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
     }
 
-    /// SECURITY: a PRESENT-but-indeterminate Forwarded does not fall through to a
-    /// good XFF — the precedence is unconditional, so an attacker cannot pair a
-    /// junk Forwarded with a forged XFF to steer the resolver to the looser key.
-    /// Forwarded wins, its nearest hop is None, so the source is the conservative
-    /// peer bucket.
+    /// SECURITY: a PRESENT-but-junk XFF collapses to the peer and does NOT fall
+    /// through to a `Forwarded` header — so once XFF is authoritative an attacker
+    /// cannot pair an unparseable XFF with a forged Forwarded to win the looser key.
     #[test]
-    fn resolve_forwarded_present_does_not_fall_through_to_xff() {
+    fn resolve_junk_xff_does_not_fall_through_to_forwarded() {
         let t = trusted(&[ip(1)]);
-        let mut h = fwd("for=unknown");
-        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        let mut h = fwd("for=6.6.6.6");
+        h.insert("x-forwarded-for", "   ".parse().unwrap()); // present but blank
         assert_eq!(resolve_source_ip(ip(1), &h, &t), ip(1));
     }
 
