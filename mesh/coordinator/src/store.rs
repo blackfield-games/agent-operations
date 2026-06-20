@@ -334,6 +334,43 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at)",
             [],
         )?;
+        // Cover the `/stats` lifetime SUM(attempts), SUM(faults) over jobs. The
+        // table is never archived, so the unfiltered SUM scans one row per job EVER
+        // — and each row carries the multi-KB `spec_json` inline, so the full table
+        // scan pulls every spec blob through the b-tree just to read two integers.
+        // This covering index lets the planner scan only the skinny (attempts,
+        // faults, rowid) entries instead, a large constant-factor reduction in pages
+        // read (the spec_json is never touched). NOTE: an unfiltered SUM is still
+        // O(rows) — the index bounds the CONSTANT FACTOR, not the asymptote; a true
+        // O(1) read would need a maintained running total, deliberately NOT taken
+        // (attempts/faults mutate across dispatch/reap/earner-fault/restart, so a
+        // side counter would have to update under every one of those in the same
+        // transaction and rebuild on restart — a correctness risk the live-row SUM
+        // does not carry, for a cosmetic stat). Keyed on neither `status` nor
+        // `created_at`, so it does not perturb the reaper/dispatch/enqueue-cap plans
+        // (asserted by their EXPLAIN tests). The only write cost is one skinny entry
+        // move per attempts/faults bump, marginal beside the row write that bump
+        // already does. Created AFTER the attempts/faults migrations above so a
+        // legacy DB has both columns before the index references them.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_attempts_faults ON jobs(attempts, faults)",
+            [],
+        )?;
+        // Cover the `/earners` per-earner fault count: SELECT earner, COUNT(*) FROM
+        // earner_faults GROUP BY earner. Without an index the GROUP BY full-scans the
+        // table AND builds a temp b-tree to sort rows into earner order; this index
+        // serves the grouping from an ordered covering scan with no temp b-tree. Only
+        // genuine quality faults land here (honest declines never do), so the table —
+        // and this index — grow slowly and the per-fault insert write-amp is
+        // negligible. RESIDUAL (not closed here): the table is still never archived,
+        // so both it and this index grow without bound over a long-lived mesh's fault
+        // history; the asymptotic fix is terminal-row retention/archival (a
+        // retention-policy decision: how long fault history must feed reputation),
+        // deferred and documented in PROJECT_STATE, not built in this slice.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_earner_faults_earner ON earner_faults(earner)",
+            [],
+        )?;
         Ok(Self {
             conn,
             compute_rate_wei: 0,
