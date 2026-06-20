@@ -175,6 +175,32 @@ def test_after_validator_ends_on_recursion_guard():
     assert sup._after_validator(state) == END
 
 
+def test_after_validator_ends_on_terminal_no_fixable():
+    # A terminal rejection with nothing fixable ENDs on the FIRST round (well under
+    # the cap) — the convergence the round guard alone could not give (it would still
+    # burn every round). _route_back_target is None → _after_validator maps it to END.
+    state = {
+        "verdict": ValidatorVerdict(accepted=False, issues=["triangle budget exceeded"], terminal=True),
+        "rounds": 1,
+    }
+    assert sup._after_validator(state) == END
+
+
+def test_after_validator_routes_back_despite_terminal_when_fixable():
+    # A terminal verdict that ALSO names a fixable specialist routes back to it (the
+    # fixable cause is repaired first); terminal only ENDs once nothing fixable remains.
+    state = {
+        "verdict": ValidatorVerdict(
+            accepted=False,
+            issues=["missing specialist layers: ['biome']", "triangle budget exceeded"],
+            failing_specialists=["biome"],
+            terminal=True,
+        ),
+        "rounds": 1,
+    }
+    assert sup._after_validator(state) == "biome"
+
+
 # ---- end-to-end route-back loop (integrated build_graph run) ----
 
 
@@ -234,6 +260,37 @@ async def test_persistently_failing_validator_terminates_at_round_cap(tmp_path, 
     assert result["verdict"].accepted is False
     assert result["rounds"] == sup.MAX_ROUNDS
     assert calls["n"] == sup.MAX_ROUNDS, "validator runs exactly MAX_ROUNDS times, then the guard ENDs"
+
+
+async def test_over_budget_world_converges_in_one_round(tmp_path, monkeypatch):
+    # FM1, end to end: the headline of this slice. A deterministically over-budget
+    # world must END in ONE pass, not burn MAX_ROUNDS routing back to the optimizer.
+    # The validator ALWAYS rejects (like the cap test above) but the rejection is
+    # TERMINAL and names no fixable specialist — so the supervisor ENDs immediately
+    # instead of looping. The issue text names "optimization" on purpose: were the
+    # terminal handling dropped, the text scan would route back and this would burn
+    # MAX_ROUNDS exactly like the cap test — so calls["n"] == 1 is the discriminator.
+    monkeypatch.chdir(tmp_path)
+
+    calls = {"n": 0}
+
+    async def over_budget(brief, layers):
+        calls["n"] += 1
+        return ValidatorVerdict(
+            accepted=False,
+            issues=["triangle budget exceeded — over budget after optimization"],
+            terminal=True,
+        )
+
+    monkeypatch.setattr(sup.validator, "run", over_budget)
+
+    brief = WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
+    result = await sup.build_graph().ainvoke({"brief": brief, "layers": [], "rounds": 0})
+
+    assert result["verdict"].accepted is False
+    assert result["verdict"].terminal is True
+    assert calls["n"] == 1, "a terminal over-budget verdict ENDs in one pass, not MAX_ROUNDS"
+    assert result["rounds"] == 1
 
 
 # ---- rounds normalization (robust to a missing/None/negative counter) ----
