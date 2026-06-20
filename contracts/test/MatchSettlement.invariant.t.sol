@@ -45,7 +45,7 @@ contract MatchSettlementHandler is Test {
         view
         returns (address a, address b, uint256 stake, bool aF, bool bF, MatchSettlement.Status s)
     {
-        (a, b, stake,,, aF, bF, s) = settlement.matches(id);
+        (a, b, stake,,, aF, bF, s,) = settlement.matches(id);
     }
 
     function openMatch(uint256 aSeed, uint256 bSeed, uint256 stake) external {

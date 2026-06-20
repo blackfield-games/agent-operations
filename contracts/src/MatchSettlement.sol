@@ -49,13 +49,18 @@ contract MatchSettlement is Ownable2Step {
     using SafeERC20 for IERC20;
 
     /// @dev `None` is the zero default, so an untouched `matchId` reads `None` and
-    ///      `openMatch` gates on it. `Open` → funded/played; the two terminal states
-    ///      (`Settled`, `Cancelled`) are each reached at most once and never left.
+    ///      `openMatch` gates on it. `Open` → funded/played; the three terminal states
+    ///      (`Settled`, `Cancelled`, `Expired`) are each reached at most once and never
+    ///      left. `Expired` is a deadline self-refund — mechanically a cancel, kept
+    ///      distinct so a void caused by a vanished attester is observable as such
+    ///      (a rising `Expired` count is an attester-liveness alarm) rather than
+    ///      conflated with an attester's deliberate `cancelMatch`.
     enum Status {
         None,
         Open,
         Settled,
-        Cancelled
+        Cancelled,
+        Expired
     }
 
     struct Match {
@@ -74,6 +79,11 @@ contract MatchSettlement is Ownable2Step {
         bool aFunded;
         bool bFunded;
         Status status;
+        /// @dev Wall-clock instant (set at `openMatch` to `block.timestamp +
+        ///      settleWindow`) at and after which either side may `refundExpired` a
+        ///      still-`Open` match. Packs into the same slot as `winner`/the flags/
+        ///      `status`, so recording it is free on the SSTORE `openMatch` already does.
+        uint64 deadline;
     }
 
     IAgentRegistry public immutable registry;
@@ -90,6 +100,25 @@ contract MatchSettlement is Ownable2Step {
     ///         signed). The attester names the winner but cannot choose this
     ///         magnitude, so it can never inflate an agent's standing arbitrarily.
     uint256 public reputationDelta;
+
+    /// @notice Lower/upper bounds and the construction default for `settleWindow`. The
+    ///         floor is generous (a match plays in seconds and an attester settles in
+    ///         one tx, so an hour is ~60× headroom) so a still-in-progress match can
+    ///         never be refunded out from under a merely-slow attester; the ceiling caps
+    ///         how long a both-funded escrow stays locked when the attester truly
+    ///         vanishes. The default is what every deploy starts with (the constructor
+    ///         takes no window arg, to keep its signature stable), tunable in-range
+    ///         post-deploy.
+    uint64 public constant MIN_SETTLE_WINDOW = 1 hours;
+    uint64 public constant MAX_SETTLE_WINDOW = 30 days;
+    uint64 public constant DEFAULT_SETTLE_WINDOW = 1 days;
+
+    /// @notice How long after `openMatch` the attester has to resolve a match before
+    ///         either participant may `refundExpired` it. Owner-set within
+    ///         [`MIN_SETTLE_WINDOW`, `MAX_SETTLE_WINDOW`]; the per-match `deadline` is
+    ///         frozen from this value at open, so retuning the window never moves an
+    ///         already-open match's deadline.
+    uint64 public settleWindow;
 
     mapping(bytes32 matchId => Match) public matches;
     mapping(address attester => bool authorized) public resultAttesters;
@@ -108,8 +137,10 @@ contract MatchSettlement is Ownable2Step {
         bytes32 indexed matchId, address indexed agentA, address indexed agentB, bytes32 replayHash
     );
     event MatchCancelled(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
+    event MatchExpired(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event AttesterSet(address indexed attester, bool authorized);
     event ReputationDeltaSet(uint256 reputationDelta);
+    event SettleWindowSet(uint64 settleWindow);
 
     error NotAttester();
     error ZeroRegistry();
@@ -128,6 +159,8 @@ contract MatchSettlement is Ownable2Step {
     error NotFullyFunded();
     error InvalidWinner();
     error ZeroReplayHash();
+    error NotExpired();
+    error SettleWindowOutOfRange();
 
     constructor(address registry_, address owner_, uint256 reputationDelta_) Ownable(owner_) {
         if (registry_ == address(0)) revert ZeroRegistry();
@@ -142,6 +175,10 @@ contract MatchSettlement is Ownable2Step {
         if (address(t) == address(0)) revert ZeroToken();
         token = t;
         reputationDelta = reputationDelta_;
+        // The constructor takes no window argument (its signature is fixed by the
+        // deploy script), so every deploy starts at the in-range default; the owner
+        // tunes it with `setSettleWindow` before or after go-live.
+        settleWindow = DEFAULT_SETTLE_WINDOW;
     }
 
     modifier onlyAttester() {
@@ -167,6 +204,20 @@ contract MatchSettlement is Ownable2Step {
         emit ReputationDeltaSet(newDelta);
     }
 
+    /// @notice Owner sets the attester-resolution window. Bounded to
+    ///         [`MIN_SETTLE_WINDOW`, `MAX_SETTLE_WINDOW`] so it can be neither so short
+    ///         that an in-progress match is refunded out from under the attester nor so
+    ///         long that a vanished-attester escrow stays locked unreasonably. Only
+    ///         affects matches opened AFTER the change — an open match's deadline was
+    ///         frozen at its open.
+    function setSettleWindow(uint64 newWindow) external onlyOwner {
+        if (newWindow < MIN_SETTLE_WINDOW || newWindow > MAX_SETTLE_WINDOW) {
+            revert SettleWindowOutOfRange();
+        }
+        settleWindow = newWindow;
+        emit SettleWindowSet(newWindow);
+    }
+
     /// @notice Open a fresh match between two registered agents with a per-seat
     ///         `stake` (0 for a reputation-only match). Attester-gated: the match
     ///         service that formed the pair declares the roster and the agreed stake;
@@ -188,6 +239,11 @@ contract MatchSettlement is Ownable2Step {
         m.agentB = agentB;
         m.stake = stake;
         m.status = Status.Open;
+        // Freeze the self-refund deadline from the window in force at open, so a later
+        // `setSettleWindow` cannot retroactively move this match's deadline. `+` is
+        // checked (0.8) and bounded (block.timestamp + ≤30 days ≪ uint64 max), so it
+        // can neither wrap nor be pushed to an unreachable instant.
+        m.deadline = uint64(block.timestamp) + settleWindow;
         emit MatchOpened(matchId, agentA, agentB, stake);
     }
 
@@ -304,14 +360,48 @@ contract MatchSettlement is Ownable2Step {
     function cancelMatch(bytes32 matchId) external onlyAttester {
         Match storage m = matches[matchId];
         if (m.status != Status.Open) revert MatchNotOpen();
+        (uint256 refundA, uint256 refundB) = _refundBoth(m, Status.Cancelled);
+        emit MatchCancelled(matchId, refundA, refundB);
+    }
+
+    /// @notice Permissionless self-refund of an open match the attester has not resolved
+    ///         by its `deadline` — the escape hatch that removes the attester-liveness
+    ///         dependency for a BOTH-funded match (`reclaim` only rescues a stake before
+    ///         the opponent funds). Callable by ANYONE once `block.timestamp >= deadline`
+    ///         while the match is still `Open`: every refund goes to the funded
+    ///         participants (never the caller), so it can only return stranded escrow to
+    ///         its rightful owners — there is no griefing incentive and no need to gate
+    ///         the caller. Behaves EXACTLY like `cancelMatch` — refunds funded seats,
+    ///         records NO reputation, commits NO replay — so a match cannot be turned
+    ///         into a result by stalling past the deadline; it only ever becomes a void.
+    ///         Resolves to the distinct `Expired` state. The `Open` fence keeps it
+    ///         single-shot against a late `settle` that lands first (whichever flips the
+    ///         status wins; the other reverts `MatchNotOpen`).
+    function refundExpired(bytes32 matchId) external {
+        Match storage m = matches[matchId];
+        if (m.status != Status.Open) revert MatchNotOpen();
+        if (block.timestamp < m.deadline) revert NotExpired();
+        (uint256 refundA, uint256 refundB) = _refundBoth(m, Status.Expired);
+        emit MatchExpired(matchId, refundA, refundB);
+    }
+
+    /// @dev Shared void-and-refund mechanics for `cancelMatch` and `refundExpired`: flip
+    ///      to the given terminal `status` and clear the funded flags BEFORE refunding
+    ///      (checks-effects-interactions), so neither path can double-refund a stake nor
+    ///      be reentered to drain a second one, and a voided match can never later
+    ///      settle. Returns the per-seat refunds for the caller to event. Keeping the
+    ///      two paths on ONE helper means their refund logic can never drift apart.
+    function _refundBoth(Match storage m, Status terminal)
+        private
+        returns (uint256 refundA, uint256 refundB)
+    {
         uint256 stake = m.stake;
-        uint256 refundA = m.aFunded ? stake : 0;
-        uint256 refundB = m.bFunded ? stake : 0;
-        m.status = Status.Cancelled;
+        refundA = m.aFunded ? stake : 0;
+        refundB = m.bFunded ? stake : 0;
+        m.status = terminal;
         m.aFunded = false;
         m.bFunded = false;
         if (refundA != 0) token.safeTransfer(m.agentA, refundA);
         if (refundB != 0) token.safeTransfer(m.agentB, refundB);
-        emit MatchCancelled(matchId, refundA, refundB);
     }
 }

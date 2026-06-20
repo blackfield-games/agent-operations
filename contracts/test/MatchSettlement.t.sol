@@ -83,7 +83,7 @@ contract MatchSettlementTest is Test {
     }
 
     function _status(bytes32 id) internal view returns (MatchSettlement.Status) {
-        (,,,,,,, MatchSettlement.Status s) = settlement.matches(id);
+        (,,,,,,, MatchSettlement.Status s,) = settlement.matches(id);
         return s;
     }
 
@@ -137,7 +137,8 @@ contract MatchSettlementTest is Test {
             address winner,
             bool aFunded,
             bool bFunded,
-            MatchSettlement.Status status
+            MatchSettlement.Status status,
+            uint64 deadline
         ) = settlement.matches(MATCH);
         assertEq(agentA, alice);
         assertEq(agentB, bob);
@@ -147,6 +148,7 @@ contract MatchSettlementTest is Test {
         assertFalse(aFunded);
         assertFalse(bFunded);
         assertTrue(status == MatchSettlement.Status.Open);
+        assertEq(deadline, uint64(block.timestamp) + settlement.settleWindow());
     }
 
     /// @dev FM2: only an authorized attester may open (and thus later settle) a match.
@@ -199,7 +201,7 @@ contract MatchSettlementTest is Test {
         settlement.fund(MATCH);
         assertEq(token.balanceOf(address(settlement)), 2 * STAKE);
 
-        (,,,,, bool aFunded, bool bFunded,) = settlement.matches(MATCH);
+        (,,,,, bool aFunded, bool bFunded,,) = settlement.matches(MATCH);
         assertTrue(aFunded);
         assertTrue(bFunded);
     }
@@ -261,7 +263,7 @@ contract MatchSettlementTest is Test {
 
         assertEq(token.balanceOf(alice), before, "stake fully returned");
         assertEq(token.balanceOf(address(settlement)), 0);
-        (,,,,, bool aFunded,,) = settlement.matches(MATCH);
+        (,,,,, bool aFunded,,,) = settlement.matches(MATCH);
         assertFalse(aFunded, "seat marked unfunded again");
         // Match is still open and re-fundable.
         vm.prank(alice);
@@ -310,7 +312,7 @@ contract MatchSettlementTest is Test {
         assertEq(registry.reputationOf(alice), int256(REP_DELTA));
         assertEq(registry.reputationOf(bob), -int256(REP_DELTA));
 
-        (,,, bytes32 replayHash, address winner,,, MatchSettlement.Status status) = settlement.matches(MATCH);
+        (,,, bytes32 replayHash, address winner,,, MatchSettlement.Status status,) = settlement.matches(MATCH);
         assertEq(replayHash, HASH);
         assertEq(winner, alice);
         assertTrue(status == MatchSettlement.Status.Settled);
@@ -441,7 +443,7 @@ contract MatchSettlementTest is Test {
         assertEq(registry.reputationOf(alice), 0, "draw moves no reputation");
         assertEq(registry.reputationOf(bob), 0);
 
-        (,,, bytes32 replayHash,,,, MatchSettlement.Status status) = settlement.matches(MATCH);
+        (,,, bytes32 replayHash,,,, MatchSettlement.Status status,) = settlement.matches(MATCH);
         assertEq(replayHash, HASH, "draw still commits the replay");
         assertTrue(status == MatchSettlement.Status.Settled);
         (,, uint64 aMatches,,,) = registry.agents(alice);

@@ -22,6 +22,45 @@
   },
   {
     "inputs": [],
+    "name": "DEFAULT_SETTLE_WINDOW",
+    "outputs": [
+      {
+        "internalType": "uint64",
+        "name": "",
+        "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "MAX_SETTLE_WINDOW",
+    "outputs": [
+      {
+        "internalType": "uint64",
+        "name": "",
+        "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "MIN_SETTLE_WINDOW",
+    "outputs": [
+      {
+        "internalType": "uint64",
+        "name": "",
+        "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "acceptOwnership",
     "outputs": [],
     "stateMutability": "nonpayable",
@@ -102,6 +141,11 @@
         "internalType": "enum MatchSettlement.Status",
         "name": "status",
         "type": "uint8"
+      },
+      {
+        "internalType": "uint64",
+        "name": "deadline",
+        "type": "uint64"
       }
     ],
     "stateMutability": "view",
@@ -170,6 +214,19 @@
       }
     ],
     "name": "reclaim",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
+    "name": "refundExpired",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -260,6 +317,19 @@
   {
     "inputs": [
       {
+        "internalType": "uint64",
+        "name": "newWindow",
+        "type": "uint64"
+      }
+    ],
+    "name": "setSettleWindow",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "bytes32",
         "name": "matchId",
         "type": "bytes32"
@@ -296,6 +366,19 @@
     "name": "settleDraw",
     "outputs": [],
     "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "settleWindow",
+    "outputs": [
+      {
+        "internalType": "uint64",
+        "name": "",
+        "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
     "type": "function"
   },
   {
@@ -397,6 +480,31 @@
       }
     ],
     "name": "MatchDrawn",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "refundA",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "refundB",
+        "type": "uint256"
+      }
+    ],
+    "name": "MatchExpired",
     "type": "event"
   },
   {
@@ -569,6 +677,19 @@
     "type": "event"
   },
   {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint64",
+        "name": "settleWindow",
+        "type": "uint64"
+      }
+    ],
+    "name": "SettleWindowSet",
+    "type": "event"
+  },
+  {
     "inputs": [
       {
         "internalType": "address",
@@ -607,6 +728,11 @@
   {
     "inputs": [],
     "name": "NotAttester",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "NotExpired",
     "type": "error"
   },
   {
@@ -670,6 +796,11 @@
   {
     "inputs": [],
     "name": "SameAgent",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "SettleWindowOutOfRange",
     "type": "error"
   },
   {
