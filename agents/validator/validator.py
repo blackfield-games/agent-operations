@@ -75,6 +75,10 @@ async def run(
     # specialist name can't misroute route-back. Surfaced as
     # `ValidatorVerdict.failing_specialists`.
     failing: set[str] = set()
+    # Set when a rejection cannot be repaired by re-running any specialist (an
+    # over-budget world; see the gate below). The supervisor ends the revision loop
+    # rather than routing back when this is set and no fixable specialist remains.
+    terminal = False
 
     expected = {"director", "terrain", "biome", "prop", "lighting", "npc", "optimization"}
     got = {layer.specialist for layer in layers}
@@ -103,8 +107,18 @@ async def run(
     opt = next((layer for layer in layers if layer.specialist == "optimization"), None)
     over_budget = opt.metrics.get("over_budget", 0.0) if opt else 0.0
     if _is_finite_number(over_budget) and over_budget > 0:
-        issues.append("triangle budget exceeded — re-run optimization with stricter LODs")
-        failing.add("optimization")
+        # Terminal, NOT routed back to optimization: optimization is the last,
+        # deterministic LOD authority — re-running it recomputes the same triangle
+        # sum and re-reports over_budget, so a route-back can only loop to MAX_ROUNDS.
+        # The world is genuinely over budget and must shed source geometry; we reject
+        # and let the supervisor end the loop (it still routes back for any co-occurring
+        # FIXABLE issue, since over_budget no longer blames a specialist here).
+        issues.append(
+            "triangle budget exceeded — the world is over the triangle budget after "
+            "optimization (the terminal LOD authority); a re-run recomputes the same "
+            "result, so it must shed source geometry rather than be revised"
+        )
+        terminal = True
 
     # Open every emitted layer and confirm the engine could too: a garbled header,
     # a missing defaultPrim, or a dangling file composes into a world.usda that
@@ -131,7 +145,9 @@ async def run(
     # for now, accept if no other issues
     accepted = len(issues) == 0
 
-    return ValidatorVerdict(accepted=accepted, issues=issues, failing_specialists=sorted(failing))
+    return ValidatorVerdict(
+        accepted=accepted, issues=issues, failing_specialists=sorted(failing), terminal=terminal
+    )
 
 
 def _is_finite_number(value: object) -> bool:
