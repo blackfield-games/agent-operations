@@ -6202,6 +6202,12 @@ mod tests {
         h
     }
 
+    fn fwd(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("forwarded", value.parse().unwrap());
+        h
+    }
+
     /// parse_forwarded_node accepts a bare IP and the ip:port / [ipv6]:port forms a
     /// proxy may append, and rejects obfuscated/garbage tokens.
     #[test]
@@ -6218,6 +6224,69 @@ mod tests {
         assert_eq!(parse_forwarded_node("_hidden"), None);
         assert_eq!(parse_forwarded_node("unknown"), None);
         assert_eq!(parse_forwarded_node(""), None);
+    }
+
+    /// parse_forwarded_element pulls the `for=` client out of an RFC-7239
+    /// forwarded-element across the legal shapes: bare/quoted IPv4, quoted
+    /// bracketed IPv6 (with and without a port), a case-insensitive key, `for=`
+    /// alongside other params — and maps obfuscated/`unknown`/empty/missing `for=`
+    /// to None (the indeterminate-hop signal that falls back to the peer).
+    #[test]
+    fn parse_forwarded_element_forms() {
+        assert_eq!(parse_forwarded_element("for=203.0.113.7"), Some(ip4(203, 0, 113, 7)));
+        assert_eq!(parse_forwarded_element("for=\"203.0.113.7\""), Some(ip4(203, 0, 113, 7)), "quoted");
+        assert_eq!(parse_forwarded_element("For=203.0.113.7"), Some(ip4(203, 0, 113, 7)), "case-insensitive key");
+        assert_eq!(
+            parse_forwarded_element("for=203.0.113.7;proto=https"),
+            Some(ip4(203, 0, 113, 7)),
+            "trailing params"
+        );
+        assert_eq!(
+            parse_forwarded_element("by=198.51.100.1;for=203.0.113.7;proto=http"),
+            Some(ip4(203, 0, 113, 7)),
+            "for among by/proto"
+        );
+        assert_eq!(
+            parse_forwarded_element("for=\"203.0.113.7:51000\""),
+            Some(ip4(203, 0, 113, 7)),
+            "quoted v4:port"
+        );
+        assert_eq!(
+            parse_forwarded_element("for=\"[2001:db8::1]:443\""),
+            "2001:db8::1".parse().ok(),
+            "quoted [v6]:port"
+        );
+        assert_eq!(
+            parse_forwarded_element("for=\"[2001:db8::1]\""),
+            "2001:db8::1".parse().ok(),
+            "quoted [v6] no port"
+        );
+        assert_eq!(parse_forwarded_element("for=_hidden"), None, "obfuscated");
+        assert_eq!(parse_forwarded_element("for=unknown"), None, "unknown token");
+        assert_eq!(parse_forwarded_element("for=\"\""), None, "empty quoted");
+        assert_eq!(parse_forwarded_element("proto=https;by=198.51.100.1"), None, "no for=");
+        assert_eq!(parse_forwarded_element(""), None, "empty element");
+    }
+
+    /// parse_forwarded_for_nodes flattens the header's comma-separated elements —
+    /// and multiple `Forwarded` lines — into the ordered for= hops left-to-right
+    /// (farthest→nearest), and is empty with no header so resolve falls to XFF.
+    #[test]
+    fn parse_forwarded_for_nodes_orders_and_flattens() {
+        assert_eq!(
+            parse_forwarded_for_nodes(&fwd("for=6.6.6.6, for=203.0.113.7")),
+            vec![Some(ip4(6, 6, 6, 6)), Some(ip4(203, 0, 113, 7))],
+            "one line, two elements, left-to-right"
+        );
+        let mut multi = HeaderMap::new();
+        multi.append("forwarded", "for=6.6.6.6".parse().unwrap());
+        multi.append("forwarded", "for=203.0.113.7".parse().unwrap());
+        assert_eq!(
+            parse_forwarded_for_nodes(&multi),
+            vec![Some(ip4(6, 6, 6, 6)), Some(ip4(203, 0, 113, 7))],
+            "multiple header lines flatten in order"
+        );
+        assert!(parse_forwarded_for_nodes(&HeaderMap::new()).is_empty(), "no header -> empty");
     }
 
     /// The default (empty) allowlist trusts no proxy, so XFF is ignored and the key
@@ -6293,6 +6362,103 @@ mod tests {
     fn resolve_strips_port_from_node() {
         let t = trusted(&[ip(1)]);
         assert_eq!(resolve_source_ip(ip(1), &xff("203.0.113.7:51000"), &t), ip4(203, 0, 113, 7));
+    }
+
+    /// Behind one trusted proxy emitting RFC-7239, the limiter keys on the quoted
+    /// `for=` client the proxy appended — the Forwarded twin of the XFF single-client
+    /// case.
+    #[test]
+    fn resolve_forwarded_single_client() {
+        let t = trusted(&[ip(1)]);
+        let h = fwd("for=\"203.0.113.7\";proto=https");
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
+    }
+
+    /// A bracketed IPv6 `for=` with a port resolves to the bare client address.
+    #[test]
+    fn resolve_forwarded_bracketed_ipv6() {
+        let t = trusted(&[ip(1)]);
+        let h = fwd("for=\"[2001:db8::1]:443\"");
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), "2001:db8::1".parse::<IpAddr>().unwrap());
+    }
+
+    /// An obfuscated nearest `for=` is indeterminate, so the source falls back to the
+    /// peer rather than reaching a farther-left attacker-controlled hop.
+    #[test]
+    fn resolve_forwarded_obfuscated_falls_back() {
+        let t = trusted(&[ip(1)]);
+        assert_eq!(resolve_source_ip(ip(1), &fwd("for=_hidden"), &t), ip(1));
+    }
+
+    /// Through a chain of two trusted proxies, the trusted nearest hop is skipped
+    /// right-to-left and the external `for=` client is returned.
+    #[test]
+    fn resolve_forwarded_chain_skips_trusted() {
+        let t = trusted(&[ip(1), ip(2)]);
+        // client -> ip(2) -> ip(1)=peer: Forwarded = "for=client, for=ip(2)".
+        let h = fwd(&format!("for=203.0.113.7, for=\"{}\"", ip(2)));
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
+    }
+
+    /// A forged `for=` prepend sits LEFT of the real client the trusted proxy
+    /// appended, so the rightmost-untrusted pick ignores it.
+    #[test]
+    fn resolve_forwarded_spoofed_prepend_ignored() {
+        let t = trusted(&[ip(1)]);
+        let h = fwd("for=6.6.6.6, for=203.0.113.7");
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
+    }
+
+    /// The right-to-left walk spans multiple `Forwarded` header LINES (each a hop),
+    /// not just comma-separated elements within one line.
+    #[test]
+    fn resolve_forwarded_multiline_right_to_left() {
+        let t = trusted(&[ip(1)]);
+        let mut h = HeaderMap::new();
+        h.append("forwarded", "for=6.6.6.6".parse().unwrap());
+        h.append("forwarded", "for=203.0.113.7".parse().unwrap());
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(203, 0, 113, 7));
+    }
+
+    /// An untrusted peer can write anything in Forwarded; it is ignored and the peer
+    /// is the key, mirroring the XFF untrusted-peer guard.
+    #[test]
+    fn resolve_untrusted_peer_ignores_forwarded() {
+        let t = trusted(&[ip(1)]);
+        assert_eq!(resolve_source_ip(ip(2), &fwd("for=203.0.113.7"), &t), ip(2));
+    }
+
+    /// With BOTH headers present, Forwarded wins the documented precedence so the key
+    /// has a single deterministic source — XFF is not consulted.
+    #[test]
+    fn resolve_forwarded_takes_precedence_over_xff() {
+        let t = trusted(&[ip(1)]);
+        let mut h = fwd("for=1.1.1.1");
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip4(1, 1, 1, 1));
+    }
+
+    /// SECURITY: a PRESENT-but-indeterminate Forwarded does not fall through to a
+    /// good XFF — the precedence is unconditional, so an attacker cannot pair a
+    /// junk Forwarded with a forged XFF to steer the resolver to the looser key.
+    /// Forwarded wins, its nearest hop is None, so the source is the conservative
+    /// peer bucket.
+    #[test]
+    fn resolve_forwarded_present_does_not_fall_through_to_xff() {
+        let t = trusted(&[ip(1)]);
+        let mut h = fwd("for=unknown");
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(resolve_source_ip(ip(1), &h, &t), ip(1));
+    }
+
+    /// The default (empty) allowlist trusts no proxy, so BOTH forwarded headers are
+    /// ignored and the key is the peer — byte-identical to the pre-XFF behavior.
+    #[test]
+    fn resolve_empty_allowlist_ignores_forwarded_and_xff() {
+        let t = TrustedProxies::default();
+        let mut h = fwd("for=1.1.1.1");
+        h.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        assert_eq!(resolve_source_ip(ip(9), &h, &t), ip(9));
     }
 
     /// A literal IPv4 helper distinct from the loopback `ip(n)` test sources.
