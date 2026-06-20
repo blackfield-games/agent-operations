@@ -1008,8 +1008,20 @@ fn parse_forwarded_element(element: &str) -> Option<IpAddr> {
         .split(';')
         .filter_map(|pair| pair.split_once('='))
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("for"))?
-        .1;
-    let v = raw.trim().trim_matches('"').trim();
+        .1
+        .trim();
+    // A value is a bare token or a quoted-string. Honor a MATCHED pair of quotes and
+    // reject an embedded or unbalanced quote — a comma/semicolon-bearing quoted value
+    // is torn apart by the header-line (`,`) and element (`;`) splits upstream, so the
+    // fragments carry a stray quote; failing them to None makes such a value fall back
+    // to the peer rather than yield a spurious IP.
+    let v = match raw.strip_prefix('"') {
+        Some(inner) => inner.strip_suffix('"')?.trim(),
+        None => raw,
+    };
+    if v.contains('"') {
+        return None;
+    }
     if let Some(inner) = v.strip_prefix('[') {
         return inner.split(']').next()?.parse::<IpAddr>().ok();
     }
@@ -6272,6 +6284,9 @@ mod tests {
         assert_eq!(parse_forwarded_element("for=\"\""), None, "empty quoted");
         assert_eq!(parse_forwarded_element("proto=https;by=198.51.100.1"), None, "no for=");
         assert_eq!(parse_forwarded_element(""), None, "empty element");
+        assert_eq!(parse_forwarded_element("for=\"203.0.113.7"), None, "unbalanced leading quote");
+        assert_eq!(parse_forwarded_element("for=203.0.113.7\""), None, "stray trailing quote");
+        assert_eq!(parse_forwarded_element("for=\"a\"b\""), None, "embedded quote");
     }
 
     /// parse_forwarded_for_nodes flattens the header's comma-separated elements —
@@ -6386,6 +6401,16 @@ mod tests {
         let t = trusted(&[ip(1)]);
         let h = fwd("for=\"[2001:db8::1]:443\"");
         assert_eq!(resolve_source_ip(ip(1), &h, &t), "2001:db8::1".parse::<IpAddr>().unwrap());
+    }
+
+    /// SECURITY: a quoted `for=` value bearing a comma is torn by the element split,
+    /// but strict matched-quote handling fails both fragments to None, so no spurious
+    /// victim hop is injected — resolution falls back to the conservative peer instead
+    /// of keying on the attacker-named `9.9.9.9`.
+    #[test]
+    fn resolve_forwarded_quoted_comma_injection_falls_back() {
+        let t = trusted(&[ip(1)]);
+        assert_eq!(resolve_source_ip(ip(1), &fwd("for=\"a, for=9.9.9.9\""), &t), ip(1));
     }
 
     /// An obfuscated nearest `for=` is indeterminate, so the source falls back to the
