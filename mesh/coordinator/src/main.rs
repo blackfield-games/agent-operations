@@ -2992,6 +2992,42 @@ mod tests {
         }
     }
 
+    /// FM1: the named-field refactor's point is that no knob can be silently
+    /// transposed. Construct a StoreConfig whose every field holds a DISTINCT value
+    /// and assert each lands on the matching AppState field — a swap of any two
+    /// same-typed fields (the `u32`/`usize` knobs) would put a detectably-wrong value
+    /// on at least one field and red this test.
+    #[test]
+    fn with_store_maps_each_config_field_to_state() {
+        let probe_ip = IpAddr::from([10, 1, 2, 3]);
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            StoreConfig {
+                max_attempts: 3,
+                max_faults: 7,
+                earner_ttl_secs: 99,
+                ttl_deadline_multiple: 4,
+                handshake_timeout: Duration::from_secs(11),
+                ingest_token: Some("map-probe-token".to_string()),
+                max_queued_jobs: 123,
+                max_earners: 456,
+                max_registrations: 789,
+                trusted_proxies: TrustedProxies([probe_ip].into_iter().collect()),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.max_attempts, 3);
+        assert_eq!(state.max_faults, 7);
+        assert_eq!(state.earner_ttl_secs, 99);
+        assert_eq!(state.ttl_deadline_multiple, 4);
+        assert_eq!(state.handshake_timeout, Duration::from_secs(11));
+        assert_eq!(state.ingest_token.as_deref(), Some("map-probe-token"));
+        assert_eq!(state.max_queued_jobs, 123);
+        assert_eq!(state.max_earners, 456);
+        assert_eq!(state.max_registrations, 789);
+        assert!(state.trusted_proxies.contains(&probe_ip));
+    }
+
     /// In-memory store-backed state (no disk) with a custom handshake timeout, for
     /// the anti-slowloris tests that need a sub-second bound.
     fn test_state_handshake(handshake_timeout: Duration) -> Arc<AppState> {
