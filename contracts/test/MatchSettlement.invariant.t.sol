@@ -110,6 +110,22 @@ contract MatchSettlementHandler is Test {
         settlement.cancelMatch(id);
     }
 
+    /// @notice Deadline self-refund. Warps FORWARD to the match's frozen deadline (never
+    ///         backward — block.timestamp stays monotonic across the sequence) so the
+    ///         permissionless refund is allowed, then voids the match exactly like
+    ///         cancel — no reputation, no settled-count bump. Holding the escrow and
+    ///         zero-sum invariants over this path proves the new void can't double-refund
+    ///         or leak a stray reputation write.
+    function refundExpired(uint256 mSeed) external {
+        if (matchIds.length == 0) return;
+        bytes32 id = matchIds[mSeed % matchIds.length];
+        (,,,,, MatchSettlement.Status s) = _match(id);
+        if (s != MatchSettlement.Status.Open) return;
+        (,,,,,,,, uint64 deadline) = settlement.matches(id);
+        if (block.timestamp < deadline) vm.warp(deadline);
+        settlement.refundExpired(id);
+    }
+
     /// @notice The escrow the contract MUST be holding: per open match, `stake` for
     ///         each funded seat. Settled/cancelled matches hold nothing.
     function expectedEscrow() external view returns (uint256 total) {
