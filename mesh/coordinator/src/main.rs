@@ -289,78 +289,71 @@ struct AppState {
     trusted_proxies: TrustedProxies,
 }
 
-impl AppState {
-    /// Build state backed by `store`. Seeds one job only when the DB has no
-    /// jobs yet, so a fresh DB gives earners something to do while a restart
-    /// with existing jobs does NOT double-seed.
-    // Config constructor: the knob count has grown past clippy's 7-arg threshold.
-    // A `StoreConfig` struct is the right fix (named fields kill the transposition
-    // risk of bare positional u32/Duration args) — tracked as a follow-up; kept
-    // positional here to keep this slice scoped to the queue cap.
-    #[allow(clippy::too_many_arguments)]
-    fn with_store(
-        store: Store,
-        max_attempts: u32,
-        max_faults: u32,
-        earner_ttl_secs: i64,
-        ttl_deadline_multiple: u32,
-        handshake_timeout: Duration,
-        ingest_token: Option<String>,
-        max_queued_jobs: usize,
-        max_earners: usize,
-        max_registrations: u32,
-        trusted_proxies: TrustedProxies,
-    ) -> Result<Arc<Self>> {
-        // A zero multiple makes every job's TTL `deadline * 0 == 0`, so the reaper
-        // dead-letters every non-terminal job on its first tick — the safety
-        // backstop becomes a guillotine. Reject it at construction (FM1). A small
-        // value (1, 2) is allowed but aggressive: the TTL collapses toward the bare
-        // deadline, so a job a legitimate redispatch would finish may be reaped.
+/// The non-store construction knobs for [`AppState::with_store`], named so a long
+/// list of same-typed positional args (several `u32`/`usize`, plus an `i64`) can't
+/// be transposed into a silently mis-wired limit that still compiles. Each field
+/// mirrors the like-named [`AppState`] field and its `--flag` / `COORDINATOR_*` env
+/// knob; see those for the full semantics.
+struct StoreConfig {
+    max_attempts: u32,
+    max_faults: u32,
+    earner_ttl_secs: i64,
+    ttl_deadline_multiple: u32,
+    handshake_timeout: Duration,
+    ingest_token: Option<String>,
+    max_queued_jobs: usize,
+    max_earners: usize,
+    max_registrations: u32,
+    trusted_proxies: TrustedProxies,
+}
+
+impl StoreConfig {
+    /// Reject the zero/blank knob values that each turn a safety bound into an
+    /// outage: a 0 `ttl_deadline_multiple` makes every job's TTL `deadline * 0 == 0`,
+    /// so the reaper dead-letters every non-terminal job on its first tick; a 0
+    /// `handshake_timeout` fires `timeout(ZERO, …)` immediately, rejecting every
+    /// connection before its Hello; a blank `ingest_token` matches `Authorization:
+    /// Bearer ` and so authenticates every caller (leave it UNSET for the dev-open
+    /// posture, not blank); a 0 `max_queued_jobs`/`max_earners`/`max_registrations`
+    /// sheds all ingestion/registration the moment the first job/earner/bucket lands.
+    fn validate(&self) -> Result<()> {
         anyhow::ensure!(
-            ttl_deadline_multiple > 0,
+            self.ttl_deadline_multiple > 0,
             "ttl_deadline_multiple must be >= 1 (0 would dead-letter every job on the first reap tick)"
         );
-        // A zero handshake timeout fires `timeout(ZERO, …)` immediately, rejecting
-        // every connection before it can send its Hello — the slowloris bound
-        // becomes a total registration outage. Reject it at construction.
         anyhow::ensure!(
-            !handshake_timeout.is_zero(),
+            !self.handshake_timeout.is_zero(),
             "handshake_timeout must be > 0 (0 would reject every registration before its Hello)"
         );
-        // A blank ingest token is the wide-open posture wearing a configured
-        // disguise: an empty secret matches `Authorization: Bearer ` (and a
-        // whitespace-only one is almost certainly a misconfiguration), so a deploy
-        // that "set the token" would still authenticate every caller. Reject it at
-        // construction (FM4); leave it UNSET for the intentional dev-open posture.
-        if let Some(token) = ingest_token.as_deref() {
+        if let Some(token) = self.ingest_token.as_deref() {
             anyhow::ensure!(
                 !token.trim().is_empty(),
                 "ingest_token must be non-blank if set (an empty/whitespace token authenticates every caller — leave --ingest-token unset for the dev-open posture instead)"
             );
         }
-        // A zero queue cap would 503 every POST /jobs before the first job is ever
-        // enqueued — runtime ingestion becomes a total outage. Reject it at
-        // construction, mirroring the other zero-knob guards.
         anyhow::ensure!(
-            max_queued_jobs > 0,
+            self.max_queued_jobs > 0,
             "max_queued_jobs must be >= 1 (0 would reject every job ingestion)"
         );
-        // A zero earner cap would reject every registration the moment the map is
-        // non-empty (and admit exactly one earner only to evict it on the next),
-        // starving the whole mesh of earners. Reject it at construction, mirroring
-        // the other zero-knob guards.
         anyhow::ensure!(
-            max_earners > 0,
+            self.max_earners > 0,
             "max_earners must be >= 1 (0 would reject every earner registration)"
         );
-        // A zero registration allowance would shed every registration the moment a
-        // source's bucket is created (it inserts full but `capacity * window == 0`,
-        // so `level < window` rejects immediately), starving the mesh of earners.
-        // Reject it at construction, mirroring the other zero-knob guards.
         anyhow::ensure!(
-            max_registrations > 0,
+            self.max_registrations > 0,
             "max_registrations must be >= 1 (0 would reject every earner registration)"
         );
+        Ok(())
+    }
+}
+
+impl AppState {
+    /// Build state backed by `store`, configured by `cfg`. Seeds one job only when
+    /// the DB has no jobs yet, so a fresh DB gives earners something to do while a
+    /// restart with existing jobs does NOT double-seed; also reclaims jobs left
+    /// `in_flight` by a previous crash before deciding whether to seed.
+    fn with_store(store: Store, cfg: StoreConfig) -> Result<Arc<Self>> {
+        cfg.validate()?;
         // Reclaim any jobs left `in_flight` by a previous crash before we decide
         // whether to seed: a recovered job means the queue is not empty.
         let recovered = store.recover_in_flight()?;
@@ -375,17 +368,17 @@ impl AppState {
         Ok(Arc::new(AppState {
             store: Mutex::new(store),
             earners: Mutex::new(HashMap::new()),
-            max_attempts,
-            max_faults,
-            earner_ttl_secs,
-            ttl_deadline_multiple,
-            handshake_timeout,
-            ingest_token,
-            max_queued_jobs,
-            max_earners,
+            max_attempts: cfg.max_attempts,
+            max_faults: cfg.max_faults,
+            earner_ttl_secs: cfg.earner_ttl_secs,
+            ttl_deadline_multiple: cfg.ttl_deadline_multiple,
+            handshake_timeout: cfg.handshake_timeout,
+            ingest_token: cfg.ingest_token,
+            max_queued_jobs: cfg.max_queued_jobs,
+            max_earners: cfg.max_earners,
             registration_buckets: Mutex::new(HashMap::new()),
-            max_registrations,
-            trusted_proxies,
+            max_registrations: cfg.max_registrations,
+            trusted_proxies: cfg.trusted_proxies,
         }))
     }
 }
@@ -555,16 +548,18 @@ async fn main() -> Result<()> {
     // `with_store` also reclaims jobs left in_flight by a previous crash.
     let state = AppState::with_store(
         store,
-        args.max_attempts,
-        args.max_faults,
-        args.earner_ttl_secs as i64,
-        args.ttl_deadline_multiple,
-        Duration::from_secs(args.handshake_timeout_secs),
-        args.ingest_token,
-        args.max_queued_jobs,
-        args.max_earners,
-        args.max_registrations,
-        TrustedProxies(args.trusted_proxies.into_iter().collect()),
+        StoreConfig {
+            max_attempts: args.max_attempts,
+            max_faults: args.max_faults,
+            earner_ttl_secs: args.earner_ttl_secs as i64,
+            ttl_deadline_multiple: args.ttl_deadline_multiple,
+            handshake_timeout: Duration::from_secs(args.handshake_timeout_secs),
+            ingest_token: args.ingest_token,
+            max_queued_jobs: args.max_queued_jobs,
+            max_earners: args.max_earners,
+            max_registrations: args.max_registrations,
+            trusted_proxies: TrustedProxies(args.trusted_proxies.into_iter().collect()),
+        },
     )?;
     tracing::info!(db = %args.db, "store ready");
 
@@ -2977,21 +2972,32 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
 
+    /// The common [`StoreConfig`] the test helpers build on: the test-chosen
+    /// attempt/fault/TTL knobs plus the production defaults. Tests that exercise one
+    /// knob override just that field via struct-update (`StoreConfig { knob: x,
+    /// ..test_config() }`), so a call site names only what it varies — no positional
+    /// list to transpose.
+    fn test_config() -> StoreConfig {
+        StoreConfig {
+            max_attempts: 5,
+            max_faults: 10,
+            earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
+        }
+    }
+
     /// In-memory store-backed state (no disk) with a custom handshake timeout, for
     /// the anti-slowloris tests that need a sub-second bound.
     fn test_state_handshake(handshake_timeout: Duration) -> Arc<AppState> {
         AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            handshake_timeout,
-            None,
-            DEFAULT_MAX_QUEUED_JOBS,
-            DEFAULT_MAX_EARNERS,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { handshake_timeout, ..test_config() },
         )
         .unwrap()
     }
@@ -5644,16 +5650,7 @@ mod tests {
     async fn test_state_empty_with_token(token: &str) -> Arc<AppState> {
         let state = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            Some(token.to_string()),
-            DEFAULT_MAX_QUEUED_JOBS,
-            DEFAULT_MAX_EARNERS,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { ingest_token: Some(token.to_string()), ..test_config() },
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -5773,31 +5770,13 @@ mod tests {
         for blank in ["", "   ", "\t"] {
             let r = AppState::with_store(
                 Store::open_in_memory().unwrap(),
-                5,
-                10,
-                60,
-                JOB_TTL_DEADLINE_MULTIPLE,
-                DEFAULT_HANDSHAKE_TIMEOUT,
-                Some(blank.to_string()),
-                DEFAULT_MAX_QUEUED_JOBS,
-                DEFAULT_MAX_EARNERS,
-                DEFAULT_MAX_REGISTRATIONS,
-                TrustedProxies::default(),
+                StoreConfig { ingest_token: Some(blank.to_string()), ..test_config() },
             );
             assert!(r.is_err(), "blank token {blank:?} must be rejected at construction");
         }
         assert!(AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            Some("real-token".to_string()),
-            DEFAULT_MAX_QUEUED_JOBS,
-            DEFAULT_MAX_EARNERS,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { ingest_token: Some("real-token".to_string()), ..test_config() },
         )
         .is_ok());
     }
@@ -5808,16 +5787,7 @@ mod tests {
     async fn test_state_empty_with_cap(max_queued: usize) -> Arc<AppState> {
         let state = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            max_queued,
-            DEFAULT_MAX_EARNERS,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { max_queued_jobs: max_queued, ..test_config() },
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -5830,16 +5800,7 @@ mod tests {
     async fn test_state_empty_with_compute_rate(rate_wei: u128) -> Arc<AppState> {
         let state = AppState::with_store(
             Store::open_in_memory().unwrap().with_compute_rate_wei(rate_wei),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            DEFAULT_MAX_QUEUED_JOBS,
-            DEFAULT_MAX_EARNERS,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            test_config(),
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -5900,16 +5861,7 @@ mod tests {
     async fn queue_cap_exempts_the_boot_seed() {
         let state = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            1,
-            DEFAULT_MAX_EARNERS,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { max_queued_jobs: 1, ..test_config() },
         )
         .unwrap();
         let queued = body_json(get(state, "/stats").await).await["jobs_queued"].as_u64().unwrap();
@@ -5941,16 +5893,7 @@ mod tests {
     fn with_store_rejects_zero_max_queued_jobs() {
         let r = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            0,
-            DEFAULT_MAX_EARNERS,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { max_queued_jobs: 0, ..test_config() },
         );
         assert!(r.is_err(), "zero max_queued_jobs must be rejected at construction");
     }
@@ -6261,16 +6204,7 @@ mod tests {
     async fn test_state_empty_with_earner_cap(max_earners: usize) -> Arc<AppState> {
         let state = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            DEFAULT_MAX_QUEUED_JOBS,
-            max_earners,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { max_earners, ..test_config() },
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -6285,16 +6219,7 @@ mod tests {
     ) -> Arc<AppState> {
         let state = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            DEFAULT_MAX_QUEUED_JOBS,
-            DEFAULT_MAX_EARNERS,
-            max_registrations,
-            trusted,
+            StoreConfig { max_registrations, trusted_proxies: trusted, ..test_config() },
         )
         .unwrap();
         drain_seeded_jobs(&state).await;
@@ -6528,16 +6453,7 @@ mod tests {
     fn with_store_rejects_zero_max_earners() {
         let r = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            DEFAULT_MAX_QUEUED_JOBS,
-            0,
-            DEFAULT_MAX_REGISTRATIONS,
-            TrustedProxies::default(),
+            StoreConfig { max_earners: 0, ..test_config() },
         );
         assert!(r.is_err(), "zero max_earners must be rejected at construction");
     }
@@ -6549,16 +6465,7 @@ mod tests {
     fn with_store_rejects_zero_max_registrations() {
         let r = AppState::with_store(
             Store::open_in_memory().unwrap(),
-            5,
-            10,
-            60,
-            JOB_TTL_DEADLINE_MULTIPLE,
-            DEFAULT_HANDSHAKE_TIMEOUT,
-            None,
-            DEFAULT_MAX_QUEUED_JOBS,
-            DEFAULT_MAX_EARNERS,
-            0,
-            TrustedProxies::default(),
+            StoreConfig { max_registrations: 0, ..test_config() },
         );
         assert!(r.is_err(), "zero max_registrations must be rejected at construction");
     }
@@ -7976,7 +7883,7 @@ mod tests {
         let queued_before;
         let completed_before;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), test_config()).unwrap();
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -8015,7 +7922,7 @@ mod tests {
 
         // --- second "process": reopen the same file. with_store must NOT
         //     re-seed (jobs already exist), and counts must match. ---
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), test_config()).unwrap();
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
             json["jobs_queued"].as_u64().unwrap(),
@@ -8069,7 +7976,7 @@ mod tests {
         let taken_id;
         let seeded;
         {
-            let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
+            let state = AppState::with_store(Store::open(&db_path).unwrap(), test_config()).unwrap();
             let store = state.store.lock().await;
             let mut ids = Vec::new();
             while let Some((job, _)) = store.take_next(|_| true).unwrap() {
@@ -8088,7 +7995,7 @@ mod tests {
 
         // Second "process": reopen the SAME db. with_store must reclaim the
         // orphaned in_flight jobs on startup.
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), test_config()).unwrap();
         let store = state.store.lock().await;
         assert_eq!(
             store.job_status(&taken_id).unwrap().as_deref(),
@@ -8188,7 +8095,7 @@ mod tests {
 
         // "Process 2": restart through with_store, which recovers on boot and must
         // NOT re-seed (jobs already exist).
-        let state = AppState::with_store(Store::open(&db_path).unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default()).unwrap();
+        let state = AppState::with_store(Store::open(&db_path).unwrap(), test_config()).unwrap();
         let store = state.store.lock().await;
 
         // The done job survived and is still credited; it is not requeued.
@@ -9692,7 +9599,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_deadline_multiple_knob_is_honored() {
         let state =
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 2, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
+            AppState::with_store(Store::open_in_memory().unwrap(), StoreConfig { ttl_deadline_multiple: 2, ..test_config() })
                 .unwrap();
         assert_eq!(state.ttl_deadline_multiple, 2, "the knob is carried into state");
 
@@ -9726,12 +9633,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_ttl_deadline_multiple() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 0, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
+            AppState::with_store(Store::open_in_memory().unwrap(), StoreConfig { ttl_deadline_multiple: 0, ..test_config() })
                 .is_err(),
             "multiple=0 must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, 1, DEFAULT_HANDSHAKE_TIMEOUT, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
+            AppState::with_store(Store::open_in_memory().unwrap(), StoreConfig { ttl_deadline_multiple: 1, ..test_config() })
                 .is_ok(),
             "the smallest valid multiple (1) constructs"
         );
@@ -9744,12 +9651,12 @@ mod tests {
     #[test]
     fn with_store_rejects_zero_handshake_timeout() {
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::ZERO, None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
+            AppState::with_store(Store::open_in_memory().unwrap(), StoreConfig { handshake_timeout: Duration::ZERO, ..test_config() })
                 .is_err(),
             "a zero handshake timeout must be rejected"
         );
         assert!(
-            AppState::with_store(Store::open_in_memory().unwrap(), 5, 10, 60, JOB_TTL_DEADLINE_MULTIPLE, Duration::from_millis(1), None, DEFAULT_MAX_QUEUED_JOBS, DEFAULT_MAX_EARNERS, DEFAULT_MAX_REGISTRATIONS, TrustedProxies::default())
+            AppState::with_store(Store::open_in_memory().unwrap(), StoreConfig { handshake_timeout: Duration::from_millis(1), ..test_config() })
                 .is_ok(),
             "the smallest positive handshake timeout constructs"
         );
