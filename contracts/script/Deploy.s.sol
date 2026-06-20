@@ -6,8 +6,10 @@ import {ComputeMeter} from "../src/ComputeMeter.sol";
 import {RenderReceipts} from "../src/RenderReceipts.sol";
 import {RegionAuthority} from "../src/RegionAuthority.sol";
 import {ArtifactTemplate} from "../src/ArtifactTemplate.sol";
+import {AgentRegistry} from "../src/AgentRegistry.sol";
+import {MatchSettlement} from "../src/MatchSettlement.sol";
 
-/// @notice Production-shaped deploy for the four Blackfield contracts.
+/// @notice Production-shaped deploy for the six Blackfield contracts.
 ///
 ///         The on-chain logic lives in `deploy(...)` so it can be exercised from
 ///         tests with mocks (no RPC, no broadcast). `run()` only resolves config
@@ -25,6 +27,9 @@ contract Deploy is Script {
         string artifactBaseUri; // ERC-1155 base URI for artifact templates
         uint256 artifactMintFeeRate; // ArtifactTemplate per-unit full-rarity mint fee
         uint256 artifactRoyaltyRate; // ArtifactTemplate per-unit full-rarity region royalty
+        uint256 agentMinBond; // AgentRegistry $BLCKFLD bond floor (may be 0)
+        address matchAttester; // MatchSettlement result attester — the match-service key
+        uint256 matchReputationDelta; // MatchSettlement per-match reputation magnitude (non-zero)
     }
 
     /// @dev Deployed contract handles, returned to callers (tests + run()).
@@ -33,6 +38,8 @@ contract Deploy is Script {
         RenderReceipts renderReceipts;
         RegionAuthority regionAuthority;
         ArtifactTemplate artifactTemplate;
+        AgentRegistry agentRegistry;
+        MatchSettlement matchSettlement;
     }
 
     function run() external returns (Deployed memory deployed) {
@@ -47,7 +54,7 @@ contract Deploy is Script {
         _log(cfg, deployed);
     }
 
-    /// @notice Deploys all four contracts and performs post-deploy wiring.
+    /// @notice Deploys all six contracts and performs post-deploy wiring.
     /// @dev Pure on-chain logic — no broadcast, no env. Callable from tests.
     ///
     ///      `deployer` is whoever actually sends the CREATE + wiring calls: the
@@ -89,6 +96,17 @@ contract Deploy is Script {
             cfg.artifactRoyaltyRate
         );
 
+        // 5. Agent registry — on-chain identity + reputation for ranked agents. Bonds
+        //    in the same $BLCKFLD as everything else; reputation is moved only by an
+        //    owner-authorized writer (the settlement contract below).
+        AgentRegistry agentRegistry = new AgentRegistry(cfg.token, cfg.agentMinBond, deployer);
+
+        // 6. Match settlement — A2A wager escrow + reputation write-back. Binds its
+        //    escrow token to AgentRegistry.TOKEN() internally (can't desync), so it
+        //    takes the registry address + the owner-set reputation magnitude only.
+        MatchSettlement matchSettlement =
+            new MatchSettlement(address(agentRegistry), deployer, cfg.matchReputationDelta);
+
         // --- post-deploy wiring (deployer is owner) ---
 
         // Register the canonical EAS schema and authorize the coordinator to issue receipts.
@@ -103,19 +121,32 @@ contract Deploy is Script {
         // must itself be an authorized spender or every fee-charging mint reverts.
         computeMeter.setSpender(address(artifactTemplate), true);
 
+        // Settlement is the sole reputation writer on the registry (an agent can never
+        // move its own standing) — without this every on-chain settle reverts
+        // NotReputationWriter. Authorize the match-service key to open/settle matches —
+        // an unset/wrong attester means the service can never open or settle a match.
+        // Both calls MUST land while the deployer still owns the contracts, i.e. before
+        // the transfer below — mirrors the existing four-contract wiring-then-transfer.
+        agentRegistry.setReputationWriter(address(matchSettlement), true);
+        matchSettlement.setAttester(cfg.matchAttester, true);
+
         // --- hand ownership to the configured owner (two-step; owner must accept) ---
         if (cfg.owner != deployer) {
             computeMeter.transferOwnership(cfg.owner);
             renderReceipts.transferOwnership(cfg.owner);
             regionAuthority.transferOwnership(cfg.owner);
             artifactTemplate.transferOwnership(cfg.owner);
+            agentRegistry.transferOwnership(cfg.owner);
+            matchSettlement.transferOwnership(cfg.owner);
         }
 
         deployed = Deployed({
             computeMeter: computeMeter,
             renderReceipts: renderReceipts,
             regionAuthority: regionAuthority,
-            artifactTemplate: artifactTemplate
+            artifactTemplate: artifactTemplate,
+            agentRegistry: agentRegistry,
+            matchSettlement: matchSettlement
         });
     }
 
@@ -141,16 +172,27 @@ contract Deploy is Script {
             vm.envOr("ARTIFACT_BASE_URI", string("https://artifacts.blackfield.xyz/{id}.json"));
         cfg.artifactMintFeeRate = vm.envOr("ARTIFACT_MINT_FEE_RATE", uint256(1 ether));
         cfg.artifactRoyaltyRate = vm.envOr("ARTIFACT_ROYALTY_RATE", uint256(1 ether));
+        // Optional anti-Sybil bond floor for a ranked registration; 0 = no floor.
+        cfg.agentMinBond = vm.envOr("AGENT_MIN_BOND", uint256(0));
+        // The match-service result attester. Defaults to the deployer EOA like owner/
+        // coordinator; the operator sets the real high-trust match-service key via env.
+        cfg.matchAttester = vm.envOr("MATCH_ATTESTER_ADDRESS", msg.sender);
+        // Fixed per-match reputation magnitude (win +k / loss −k). Rejected at zero by
+        // the constructor; placeholder default — operator sets the real value before mainnet.
+        cfg.matchReputationDelta = vm.envOr("MATCH_REPUTATION_DELTA", uint256(10 ether));
     }
 
     function _log(DeployConfig memory cfg, Deployed memory deployed) internal pure {
         console2.log("== Blackfield deploy ==");
         console2.log("owner:           ", cfg.owner);
         console2.log("coordinator:     ", cfg.coordinator);
+        console2.log("attester:        ", cfg.matchAttester);
         console2.log("token:           ", cfg.token);
         console2.log("ComputeMeter:    ", address(deployed.computeMeter));
         console2.log("RenderReceipts:  ", address(deployed.renderReceipts));
         console2.log("RegionAuthority: ", address(deployed.regionAuthority));
         console2.log("ArtifactTemplate:", address(deployed.artifactTemplate));
+        console2.log("AgentRegistry:   ", address(deployed.agentRegistry));
+        console2.log("MatchSettlement: ", address(deployed.matchSettlement));
     }
 }

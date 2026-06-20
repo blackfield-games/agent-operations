@@ -4,6 +4,7 @@ pragma solidity ^0.8.27;
 import {Test} from "forge-std/Test.sol";
 import {Deploy} from "../script/Deploy.s.sol";
 import {IEAS, ISchemaRegistry} from "../src/RenderReceipts.sol";
+import {MatchSettlement} from "../src/MatchSettlement.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 /// @dev Minimal EAS mock — only `attest` is reachable in the deploy path.
@@ -49,6 +50,7 @@ contract DeployTest is Test {
 
     address owner = address(0xA11CE);
     address coordinator = address(0xC0DE);
+    address attester = address(0xA77E57E5);
 
     Deploy.Deployed deployed;
 
@@ -68,7 +70,10 @@ contract DeployTest is Test {
             renderFeeRate: 1e12,
             artifactBaseUri: "https://artifacts.test/{id}.json",
             artifactMintFeeRate: 1 ether,
-            artifactRoyaltyRate: 1 ether
+            artifactRoyaltyRate: 1 ether,
+            agentMinBond: 0,
+            matchAttester: attester,
+            matchReputationDelta: 10 ether
         });
 
         // In the test path the script contract itself sends the CREATE + wiring calls,
@@ -82,6 +87,8 @@ contract DeployTest is Test {
         deployed.renderReceipts.acceptOwnership();
         deployed.regionAuthority.acceptOwnership();
         deployed.artifactTemplate.acceptOwnership();
+        deployed.agentRegistry.acceptOwnership();
+        deployed.matchSettlement.acceptOwnership();
         vm.stopPrank();
     }
 
@@ -174,7 +181,10 @@ contract DeployTest is Test {
             renderFeeRate: 1e12,
             artifactBaseUri: "ipfs://{id}",
             artifactMintFeeRate: 1 ether,
-            artifactRoyaltyRate: 1 ether
+            artifactRoyaltyRate: 1 ether,
+            agentMinBond: 0,
+            matchAttester: attester,
+            matchReputationDelta: 10 ether
         });
         Deploy.Deployed memory fresh = script.deploy(cfg, address(script));
 
