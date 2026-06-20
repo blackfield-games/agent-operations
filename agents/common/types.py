@@ -62,6 +62,14 @@ class ValidatorVerdict(BaseModel):
     # merely looks like a specialist name can't misroute route-back. Empty/absent on
     # an older or synthesized verdict, where the supervisor falls back to the scan.
     failing_specialists: list[str] = Field(default_factory=list)
+    # A rejection that re-running a specialist cannot repair — e.g. the world is over
+    # the triangle budget after optimization, the terminal LOD authority, whose output
+    # is deterministic, so a route-back recomputes the same result and loops to
+    # MAX_ROUNDS. The supervisor ends the revision loop instead of routing back when a
+    # terminal verdict leaves no FIXABLE specialist to re-run. Distinct from
+    # `failing_specialists` (the re-runnable culprits): a verdict can be both terminal
+    # AND name a fixable specialist, in which case the fixable issue is repaired first.
+    terminal: bool = False
     fixes_applied: list[str] = Field(default_factory=list)
     layer_kept: bool = True
 
