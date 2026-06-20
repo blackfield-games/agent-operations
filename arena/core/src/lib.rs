@@ -375,6 +375,51 @@ impl Match {
         }
     }
 
+    /// Project the whole-battlefield SPECTATOR view — every pawn's public on-stage
+    /// state — as an [`arena_proto::Broadcast`]. This is the caster-camera feed a
+    /// non-participant watches, the deliberate counterpart to
+    /// [`observe`](Match::observe), and the two never reach each other:
+    ///
+    /// - `observe` is one seat's PARITY-BOUNDED slice — its own full state plus only
+    ///   the enemies it can perceive — and is the gameplay security boundary, left
+    ///   untouched. A participant still learns nothing it could not perceive, so
+    ///   adding this feed widens no agent's view.
+    /// - `broadcast` is omniscient over PUBLIC state only: it reports EVERY pawn
+    ///   (alive or dead, in or out of anyone's perception) because a spectator sees
+    ///   the whole stage, but it carries only what is on screen — position, team,
+    ///   facing, the health bar, and the scoreboard `score`. It deliberately omits
+    ///   the private HUD internals (`ammo`, `cooldown`) the parity bound also hides,
+    ///   so the feed is not a tactical x-ray.
+    ///
+    /// Entities are in ascending `entity_id` (== seat) order, so the frame is
+    /// canonical and replay-stable like every other record.
+    pub fn broadcast(&self) -> arena_proto::Broadcast {
+        let mut entities: Vec<arena_proto::BroadcastEntity> = self
+            .pawns
+            .iter()
+            .map(|p| arena_proto::BroadcastEntity {
+                entity_id: p.seat as u32,
+                kind: arena_proto::EntityKind::Player,
+                team: p.team,
+                position: p.pos,
+                z: p.z,
+                facing: p.facing,
+                health: p.health,
+                max_health: p.max_health,
+                score: p.score,
+                alive: p.alive,
+            })
+            .collect();
+        entities.sort_by_key(|e| e.entity_id);
+        arena_proto::Broadcast {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: self.match_id,
+            tick: self.tick,
+            phase: self.phase,
+            entities,
+        }
+    }
+
     /// Validate a raw action envelope at the Gateway boundary and return the
     /// accepted, **clamped** intent. This is the single server-authoritative gate
     /// every seat's input passes through — the same path a human's input would
@@ -984,6 +1029,65 @@ mod tests {
         let m = new_match(1);
         assert_eq!(m.phase(), MatchPhase::Live);
         assert_eq!(m.tick(), 0);
+    }
+
+    #[test]
+    fn broadcast_is_the_whole_stage_not_a_parity_bounded_observation() {
+        // FM1: the spectator broadcast is its OWN projection — the whole
+        // battlefield — NOT a reuse of a seat's parity-bounded observation. Spawn two
+        // seats out of each other's perception (1 m range under a 4 m spawn gap), so
+        // each seat's `observe` sees NO enemy, yet the broadcast still shows BOTH
+        // pawns: the caster view, distinct from any seat's.
+        let rules = Rules {
+            perception_range: POSITION_SCALE,
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), 1);
+
+        assert!(m.observe(0).visible.is_empty(), "seat 0 perceives no enemy at this range");
+        assert!(m.observe(1).visible.is_empty(), "seat 1 perceives no enemy at this range");
+
+        let b = m.broadcast();
+        assert_eq!(b.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(b.match_id, m.match_id());
+        assert_eq!(b.tick, 0);
+        assert_eq!(b.phase, MatchPhase::Live);
+        let ids: Vec<u32> = b.entities.iter().map(|e| e.entity_id).collect();
+        assert_eq!(ids, vec![0, 1], "broadcast shows every pawn, ascending by entity_id");
+    }
+
+    #[test]
+    fn broadcast_agrees_with_owner_public_state_and_tracks_combat() {
+        let mut m = close_match(7);
+        // At spawn, the broadcast's per-pawn public facts match each seat's own
+        // SelfState — the broadcast and the owner agree on public state.
+        let b0 = m.broadcast();
+        for seat in [0u8, 1u8] {
+            let own = m.observe(seat).own;
+            let e = b0.entities.iter().find(|e| e.entity_id == seat as u32).expect("seat in broadcast");
+            assert_eq!(e.team, own.team);
+            assert_eq!(e.position, own.position);
+            assert_eq!(e.facing, own.facing);
+            assert_eq!(e.health, own.health);
+            assert_eq!(e.max_health, own.max_health);
+            assert_eq!(e.alive, own.alive);
+            assert_eq!(e.score, 0, "no damage dealt at spawn");
+        }
+        // Seat 0 fires on seat 1 (its spawned facing already points at the enemy)
+        // until the match ends; the broadcast then shows seat 1 downed and seat 0's
+        // scoreboard raised — a live spectator view tracked through combat.
+        let aim = m.observe(0).own.facing;
+        while m.phase() == MatchPhase::Live {
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, aim, true))]);
+        }
+        let b = m.broadcast();
+        let s0 = b.entities.iter().find(|e| e.entity_id == 0).unwrap();
+        let s1 = b.entities.iter().find(|e| e.entity_id == 1).unwrap();
+        assert!(s0.score > 0, "seat 0's damage shows on the broadcast scoreboard");
+        assert!(!s1.alive, "the downed pawn reads dead in the broadcast");
+        assert_eq!(b.phase, MatchPhase::Ended);
     }
 
     #[test]
