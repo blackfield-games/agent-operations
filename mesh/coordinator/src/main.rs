@@ -10202,10 +10202,14 @@ mod tests {
         store.enqueue(&job_with_deadline(60)).unwrap();
 
         let plan = store.attempt_fault_totals_query_plan().unwrap();
+        // The helper newline-terminates every detail row, so matching the name with
+        // a trailing `\n` discriminates against a rename superstring
+        // (`idx_jobs_attempts_faults_x`) too — the plan test stands on its own, not
+        // only paired with the index-exists test.
         assert!(
-            plan.contains("USING COVERING INDEX idx_jobs_attempts_faults"),
-            "attempt/fault SUM must scan the skinny covering index, not the fat \
-             jobs table, got plan: {plan}"
+            plan.contains("USING COVERING INDEX idx_jobs_attempts_faults\n"),
+            "attempt/fault SUM must scan the skinny covering index by exact name, \
+             not the fat jobs table, got plan: {plan}"
         );
     }
 
@@ -10232,9 +10236,12 @@ mod tests {
             .unwrap();
 
         let plan = store.faults_by_earner_query_plan().unwrap();
+        // COUNT(*) needs no column data, so the (earner) index fully covers the
+        // group — pin that stronger property (COVERING), not just the name.
         assert!(
-            plan.contains("idx_earner_faults_earner"),
-            "per-earner fault GROUP BY must use the index, got plan: {plan}"
+            plan.contains("USING COVERING INDEX idx_earner_faults_earner"),
+            "per-earner fault GROUP BY must be served from the covering index, \
+             got plan: {plan}"
         );
         assert!(
             !plan.contains("TEMP B-TREE"),
