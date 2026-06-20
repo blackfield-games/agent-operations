@@ -145,26 +145,33 @@ def _failing_specialist(issues: list[str]) -> str:
     return min(candidates, key=PIPELINE_ORDER.index)
 
 
-def _route_back_target(verdict: ValidatorVerdict) -> str:
-    """The earliest pipeline specialist to re-run for `verdict`.
+def _route_back_target(verdict: ValidatorVerdict) -> str | None:
+    """The earliest pipeline specialist to re-run for `verdict`, or `None` when the
+    rejection is terminal and nothing a re-run can fix remains (the supervisor ENDs).
 
     Prefer the validator's STRUCTURED attribution (`verdict.failing_specialists`):
     each issue is owned by the specialist the validator blamed at the point it was
     raised, so a prim path segment that merely looks like — or is exactly equal to
     — a specialist name can't misroute, the residual the word-boundary text scan
     can't close. Keep only names that are real route-back targets (`PIPELINE_ORDER`)
-    and pick the pipeline-earliest; unknown names (a typo, `validator`, a composed
-    prim owner) are ignored. A field that is present but names ONLY unknowns routes
-    to `director` (the brief/style owner) rather than second-guessing from text.
+    and pick the pipeline-earliest — a FIXABLE target is repaired first even on a
+    `terminal` verdict (a co-occurring over-budget signal must not short-circuit it).
 
-    Only when the field is empty/absent — an older validator, or a synthesized /
-    hand-built verdict that never set it — fall back to the word-boundary text scan
-    over `issues` (`_failing_specialist`), preserving back-compat.
+    With no fixable target left, a `terminal` verdict returns `None` (END) — routing
+    back is futile because the blamed stage is deterministic. A non-terminal verdict
+    with no structured target keeps the prior fallbacks: present-but-only-unknowns
+    routes to `director` (the brief/style owner); empty/absent falls back to the
+    word-boundary text scan over `issues` (`_failing_specialist`), preserving
+    back-compat with an older or synthesized verdict.
     """
     attributed = verdict.failing_specialists or []
     if attributed:
         known = [name for name in attributed if name in PIPELINE_ORDER]
-        return min(known, key=PIPELINE_ORDER.index) if known else "director"
+        if known:
+            return min(known, key=PIPELINE_ORDER.index)
+        return None if verdict.terminal else "director"
+    if verdict.terminal:
+        return None
     return _failing_specialist(verdict.issues)
 
 
@@ -225,7 +232,10 @@ def _after_validator(state: State) -> str:
         return END
     if _rounds(state) >= MAX_ROUNDS:  # recursion guard, see MAX_ROUNDS
         return END
-    return _route_back_target(verdict)
+    target = _route_back_target(verdict)
+    if target is None:  # terminal rejection, nothing a re-run can repair — END now
+        return END
+    return target
 
 
 def build_graph():
