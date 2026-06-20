@@ -1031,8 +1031,17 @@ fn parse_trusted_entry(entry: &str) -> Result<TrustedCidr> {
 struct TrustedProxies(Vec<TrustedCidr>);
 
 impl TrustedProxies {
+    /// Blank/whitespace-only entries are skipped (an empty `COORDINATOR_TRUSTED_PROXIES`
+    /// env var or a trailing comma yields trust-no-proxy, never a startup crash); a
+    /// non-blank malformed entry is still rejected.
     fn parse(entries: &[String]) -> Result<Self> {
-        entries.iter().map(|e| parse_trusted_entry(e)).collect::<Result<Vec<_>>>().map(TrustedProxies)
+        entries
+            .iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(parse_trusted_entry)
+            .collect::<Result<Vec<_>>>()
+            .map(TrustedProxies)
     }
 
     fn contains(&self, peer: &IpAddr) -> bool {
@@ -6311,6 +6320,18 @@ mod tests {
         assert!(parse_trusted_entry("10.0.0.0/x").is_err(), "non-numeric prefix");
         assert!(parse_trusted_entry("10.0.0.0/33").is_err(), "v4 prefix > 32");
         assert!(parse_trusted_entry("2001:db8::/129").is_err(), "v6 prefix > 128");
+    }
+
+    /// parse() skips blank/whitespace entries (an empty env var or a trailing comma
+    /// yields trust-no-proxy, never a startup crash) but still rejects a non-blank
+    /// malformed entry — a blank is never widened to a /0 catch-all.
+    #[test]
+    fn trusted_proxies_parse_skips_blank_entries() {
+        let t = TrustedProxies::parse(&["".into(), "  ".into(), "10.0.0.1".into()]).unwrap();
+        assert!(t.contains(&IpAddr::from([10, 0, 0, 1])), "non-blank entry honored");
+        assert!(!t.contains(&IpAddr::from([8, 8, 8, 8])), "blank did not become a catch-all");
+        assert!(TrustedProxies::parse(&["".into(), "   ".into()]).unwrap().0.is_empty(), "all-blank -> empty");
+        assert!(TrustedProxies::parse(&["10.0.0.1".into(), "garbage".into()]).is_err(), "garbage rejected");
     }
 
     /// A CIDR entry trusts every peer inside the range and none outside it (mask, not
