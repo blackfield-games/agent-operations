@@ -61,9 +61,8 @@ contract Deploy is Script {
     ///      broadcasting EOA (`msg.sender`) under `run()`, or the calling script
     ///      contract in tests. It is set as the initial owner so it can perform the
     ///      owner-gated wiring, then ownership is transferred to `cfg.owner`.
-    ///      ComputeMeter / RenderReceipts / RegionAuthority are Ownable2Step, so
-    ///      `cfg.owner` must call `acceptOwnership()` on each to finalize.
-    ///      ArtifactTemplate transfer (also Ownable2Step) is identical.
+    ///      All six contracts are Ownable2Step, so `cfg.owner` must call
+    ///      `acceptOwnership()` on each to finalize the handoff.
     function deploy(DeployConfig memory cfg, address deployer) public returns (Deployed memory deployed) {
         // 1. Compute budget meter — burns $BLCKFLD, credits buyers.
         ComputeMeter computeMeter = new ComputeMeter(cfg.token, deployer);
