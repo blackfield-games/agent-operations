@@ -1028,6 +1028,173 @@ mod tests {
         assert!(m.observe(1).visible.is_empty());
     }
 
+    /// White-box parity audit: against ground-truth pawn state, every seat's
+    /// [`Observation`] exposes ONLY what it may legitimately perceive — its own
+    /// full state, and exactly the OTHER pawns that are alive AND within
+    /// perception this tick, each shown only by its real, current, perceivable
+    /// facets. A pawn appears in the visible set IFF it is perceivable, so neither
+    /// an out-of-range/downed pawn leaks in nor an in-range one is hidden.
+    ///
+    /// Returns the count of alive enemies correctly EXCLUDED for being out of
+    /// perception — a nonzero total proves the range filter was load-bearing, so
+    /// the audit can't pass vacuously in an everyone-always-in-range scenario.
+    fn assert_parity_bound(m: &Match) -> usize {
+        let perception = m.rules.perception_range;
+        let mut excluded_out_of_range = 0;
+        for truth in &m.pawns {
+            let seat = truth.seat;
+            let obs = m.observe(seat);
+            // `own` is the observer's OWN real state — never another seat's.
+            assert_eq!(obs.own.seat, seat, "own is the observer's own seat");
+            assert_eq!(obs.own.position, truth.pos, "own position is the observer's real one");
+            assert_eq!(obs.own.health, truth.health, "own health is the observer's real one");
+            assert_eq!(obs.own.alive, truth.alive);
+            // The observer never perceives itself.
+            assert!(obs.visible.iter().all(|e| e.entity_id != seat as u32), "seat {seat} perceives itself");
+            // The visible set is canonical: ascending entity_id, no duplicates.
+            let ids: Vec<u32> = obs.visible.iter().map(|e| e.entity_id).collect();
+            let mut canon = ids.clone();
+            canon.sort_unstable();
+            canon.dedup();
+            assert_eq!(ids, canon, "seat {seat} visible set is not ascending+unique");
+            // The bound, both directions, against ground truth.
+            for other in &m.pawns {
+                let in_range = within(truth.pos, other.pos, perception);
+                let perceivable = other.seat != seat && other.alive && in_range;
+                let entry = obs.visible.iter().find(|e| e.entity_id == other.seat as u32);
+                assert_eq!(
+                    entry.is_some(),
+                    perceivable,
+                    "seat {seat}: parity violated for entity {} (perceivable={perceivable})",
+                    other.seat
+                );
+                if let Some(e) = entry {
+                    assert_eq!(e.position, other.pos, "perceived position must be the real current one");
+                    assert_eq!(e.team, other.team, "perceived team must be the real one");
+                    assert_eq!(e.kind, arena_proto::EntityKind::Player);
+                }
+                if other.seat != seat && other.alive && !in_range {
+                    excluded_out_of_range += 1;
+                }
+            }
+        }
+        excluded_out_of_range
+    }
+
+    #[test]
+    fn parity_bound_holds_for_every_seat_through_a_full_match() {
+        // FM1+FM3: pin the per-seat bound against ground truth after EVERY tick of
+        // a real 3-seat match — start, mid-match movement, AND the death
+        // transition — not just t=0. A future observe() that leaks an out-of-range
+        // or downed pawn, or mislabels own state, fails here.
+        //
+        // perception_range is deliberately TIGHT (3 m) against a 2 m spawn radius:
+        // adjacent seats (2 m) perceive each other and fight, but the two ends
+        // (4 m apart) start OUT of perception — so the range filter is load-bearing
+        // and a leak-everything regression is actually caught here, not masked by a
+        // scenario where everyone is always in range.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "a".into() },
+            SeatInfo { seat: 1, team: 1, controller: "b".into() },
+            SeatInfo { seat: 2, team: 2, controller: "c".into() },
+        ];
+        let rules = Rules {
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            perception_range: 3 * POSITION_SCALE,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker), Box::new(Seeker)];
+
+        let mut excluded = assert_parity_bound(&m);
+        let mut ticks = 0u64;
+        while m.phase() == MatchPhase::Live {
+            let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+            for (i, &seat) in seat_ids.iter().enumerate() {
+                let obs = m.observe(seat);
+                if let Some(a) = policies[i].act(&obs) {
+                    if let Ok(intent) = m.ingest(seat, &a) {
+                        intents.insert(seat, intent);
+                    }
+                }
+            }
+            m.step(&intents);
+            excluded += assert_parity_bound(&m);
+            ticks += 1;
+        }
+        assert!(ticks > 1, "the match ran multiple ticks");
+        assert!(m.pawns.iter().any(|p| !p.alive), "the match exercised a death transition");
+        assert!(excluded > 0, "the range filter was never load-bearing — the bound check was vacuous");
+    }
+
+    #[test]
+    fn an_enemy_just_past_perception_is_absent_everywhere() {
+        // Adversarial: an enemy exactly AT the perception edge is perceived
+        // (`within` is inclusive); one a single unit BEYOND it is absent, and its
+        // position never appears anywhere in the observation — no occluded entity
+        // leaks through.
+        let r = 10 * POSITION_SCALE;
+        let rules = Rules { perception_range: r, spawn_jitter: 0, ..Default::default() };
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "obs".into() },
+            SeatInfo { seat: 1, team: 1, controller: "edge".into() },
+            SeatInfo { seat: 2, team: 2, controller: "beyond".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        let beyond_pos = Vec2 { x: r + 1, y: 0 };
+        for p in &mut m.pawns {
+            match p.seat {
+                0 => p.pos = Vec2 { x: 0, y: 0 },
+                1 => p.pos = Vec2 { x: r, y: 0 },
+                2 => p.pos = beyond_pos,
+                _ => {}
+            }
+        }
+        let obs = m.observe(0);
+        let ids: Vec<u32> = obs.visible.iter().map(|e| e.entity_id).collect();
+        assert_eq!(ids, vec![1], "only the at-edge enemy is perceived");
+        assert!(obs.visible.iter().all(|e| e.position != beyond_pos), "a hidden enemy's position must not appear");
+        // And the bound holds for every seat in this hand-placed configuration.
+        assert_parity_bound(&m);
+    }
+
+    #[test]
+    fn perception_is_recomputed_as_a_seat_crosses_into_range() {
+        // FM3: perception is a per-tick computation, not a t=0 snapshot. A
+        // stationary enemy starts beyond range (absent); the observer walks toward
+        // it and it appears ONLY once the observer has closed to within range.
+        let r = 10 * POSITION_SCALE;
+        let rules =
+            Rules { perception_range: r, spawn_jitter: 0, max_speed: POSITION_SCALE, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), 1);
+        for p in &mut m.pawns {
+            match p.seat {
+                0 => p.pos = Vec2 { x: 0, y: 0 },
+                1 => p.pos = Vec2 { x: r + 3 * POSITION_SCALE, y: 0 },
+                _ => {}
+            }
+        }
+        assert!(m.observe(0).visible.is_empty(), "enemy starts beyond perception");
+
+        let east = intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false);
+        let mut seen = false;
+        while m.phase() == MatchPhase::Live && !seen && m.tick() < 100 {
+            step_with(&mut m, &[(0, east)]);
+            seen = !m.observe(0).visible.is_empty();
+        }
+        assert!(seen, "the enemy entered perception as the observer closed in");
+        assert_eq!(
+            m.observe(0).visible.iter().map(|e| e.entity_id).collect::<Vec<_>>(),
+            vec![1],
+            "exactly the now-in-range enemy is perceived"
+        );
+        let me = m.pawns.iter().find(|p| p.seat == 0).unwrap().pos;
+        let foe = m.pawns.iter().find(|p| p.seat == 1).unwrap().pos;
+        assert!(within(me, foe, r), "visibility flipped on exactly when within perception");
+    }
+
     #[test]
     fn ingest_accepts_well_formed_and_clamps_overlong_move() {
         let m = new_match(1);
