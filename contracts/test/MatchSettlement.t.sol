@@ -43,8 +43,10 @@ contract MatchSettlementTest is Test {
         bytes32 indexed matchId, address indexed agentA, address indexed agentB, bytes32 replayHash
     );
     event MatchCancelled(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
+    event MatchExpired(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event AttesterSet(address indexed attester, bool authorized);
     event ReputationDeltaSet(uint256 reputationDelta);
+    event SettleWindowSet(uint64 settleWindow);
 
     function setUp() public {
         token = new MockToken();
@@ -85,6 +87,11 @@ contract MatchSettlementTest is Test {
     function _status(bytes32 id) internal view returns (MatchSettlement.Status) {
         (,,,,,,, MatchSettlement.Status s,) = settlement.matches(id);
         return s;
+    }
+
+    function _deadline(bytes32 id) internal view returns (uint64) {
+        (,,,,,,,, uint64 d) = settlement.matches(id);
+        return d;
     }
 
     // --- construction ---
@@ -562,6 +569,228 @@ contract MatchSettlementTest is Test {
         vm.expectRevert(MatchSettlement.MatchExists.selector);
         vm.prank(attester);
         settlement.openMatch(MATCH, alice, bob, STAKE);
+    }
+
+    // --- refundExpired (deadline self-refund for a vanished attester) ---
+
+    /// @dev Happy path: a both-funded match the attester never resolves can be voided
+    ///      by anyone once past its deadline — both seats refunded, no reputation, no
+    ///      replay, and the distinct Expired terminal state.
+    function test_refundExpired_refundsBothFundedSeatsAfterDeadline() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+
+        vm.warp(_deadline(MATCH));
+        vm.expectEmit(true, false, false, true);
+        emit MatchExpired(MATCH, STAKE, STAKE);
+        settlement.refundExpired(MATCH);
+
+        assertEq(token.balanceOf(alice), aBefore + STAKE, "alice refunded own stake");
+        assertEq(token.balanceOf(bob), bBefore + STAKE, "bob refunded own stake");
+        assertEq(token.balanceOf(address(settlement)), 0, "escrow emptied");
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Expired);
+
+        (,,, bytes32 replayHash, address winner,,,,) = settlement.matches(MATCH);
+        assertEq(replayHash, bytes32(0), "no replay committed");
+        assertEq(winner, address(0), "no winner named");
+    }
+
+    /// @dev Callable by ANYONE (no caller gate) — the refunds still go to the
+    ///      participants, never the caller, so there is no griefing or theft vector.
+    function test_refundExpired_permissionlessRefundsParticipantsNotCaller() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        uint256 carolBefore = token.balanceOf(carol);
+
+        vm.warp(_deadline(MATCH));
+        vm.prank(carol); // an unrelated third party triggers the void
+        settlement.refundExpired(MATCH);
+
+        assertEq(token.balanceOf(alice), aBefore + STAKE);
+        assertEq(token.balanceOf(bob), bBefore + STAKE);
+        assertEq(token.balanceOf(carol), carolBefore, "caller gains nothing");
+    }
+
+    function test_refundExpired_refundsOnlyFundedSeat() public {
+        _open(MATCH, STAKE);
+        vm.prank(alice);
+        settlement.fund(MATCH);
+        uint256 aBefore = token.balanceOf(alice);
+
+        vm.warp(_deadline(MATCH));
+        vm.expectEmit(true, false, false, true);
+        emit MatchExpired(MATCH, STAKE, 0);
+        settlement.refundExpired(MATCH);
+        assertEq(token.balanceOf(alice), aBefore + STAKE);
+        assertEq(token.balanceOf(address(settlement)), 0);
+    }
+
+    /// @dev A zero-stake (reputation-only) match still expires cleanly — no token
+    ///      movement, no reputation, just the terminal flip.
+    function test_refundExpired_zeroStakeMatch() public {
+        _open(MATCH, 0);
+        vm.warp(_deadline(MATCH));
+        settlement.refundExpired(MATCH);
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Expired);
+        assertEq(registry.reputationOf(alice), 0);
+    }
+
+    /// @dev FM2: the deadline must not refund a match still in progress — before it
+    ///      passes, refundExpired reverts and the escrow is untouched.
+    function test_refundExpired_revertsBeforeDeadline() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.warp(uint256(_deadline(MATCH)) - 1);
+        vm.expectRevert(MatchSettlement.NotExpired.selector);
+        settlement.refundExpired(MATCH);
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE, "escrow held while in-window");
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Open);
+    }
+
+    /// @dev Boundary: the refund is permitted at exactly the deadline (the guard is
+    ///      `block.timestamp < deadline`, so `==` passes).
+    function test_refundExpired_succeedsAtExactDeadline() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.warp(_deadline(MATCH));
+        settlement.refundExpired(MATCH);
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Expired);
+    }
+
+    function test_refundExpired_revertsMatchNotOpen_whenNeverOpened() public {
+        vm.warp(block.timestamp + 365 days);
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        settlement.refundExpired(MATCH);
+    }
+
+    /// @dev FM1: a match the attester DID settle cannot then be expired — even past the
+    ///      deadline the Settled fence wins, so the refund can't double-resolve a paid
+    ///      match. The settle path also has no deadline guard, so a slow-but-alive
+    ///      attester can still settle after the window opens (it just races the refund).
+    function test_refundExpired_revertsAfterSettle() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        vm.warp(_deadline(MATCH));
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        settlement.refundExpired(MATCH);
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Settled, "stays settled");
+    }
+
+    /// @dev FM1 (the converse race): once the deadline passes either resolution can land
+    ///      first, and whichever flips the status wins — a settle after a refund reverts
+    ///      MatchNotOpen, so there is never a double payout/refund.
+    function test_refundExpired_thenSettleReverts() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.warp(_deadline(MATCH));
+        settlement.refundExpired(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+    }
+
+    /// @dev FM1: an expired match is terminal — not re-refundable, not settleable, not
+    ///      cancellable, not re-openable under its id (no double refund).
+    function test_refundExpired_isTerminal() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.warp(_deadline(MATCH));
+        settlement.refundExpired(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        settlement.refundExpired(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.cancelMatch(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.openMatch(MATCH, alice, bob, STAKE);
+    }
+
+    /// @dev FM3: stalling past the deadline cannot turn a match into a result an agent
+    ///      could use to dodge a loss — the expired match records NO reputation and
+    ///      counts for NEITHER agent, exactly like cancelMatch (a void, never a win).
+    function test_refundExpired_recordsNoReputationOrMatchCount() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.warp(_deadline(MATCH));
+        settlement.refundExpired(MATCH);
+
+        assertEq(registry.reputationOf(alice), 0, "no reputation moved");
+        assertEq(registry.reputationOf(bob), 0);
+        (,, uint64 aMatches,,,) = registry.agents(alice);
+        (,, uint64 bMatches,,,) = registry.agents(bob);
+        assertEq(aMatches, 0, "expired match counts for neither agent");
+        assertEq(bMatches, 0);
+    }
+
+    // --- setSettleWindow ---
+
+    function test_constructor_defaultSettleWindow() public view {
+        assertEq(settlement.settleWindow(), settlement.DEFAULT_SETTLE_WINDOW());
+    }
+
+    function test_setSettleWindow_onlyOwnerAndEmits() public {
+        vm.expectEmit(false, false, false, true);
+        emit SettleWindowSet(2 days);
+        vm.prank(owner);
+        settlement.setSettleWindow(2 days);
+        assertEq(settlement.settleWindow(), 2 days);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        settlement.setSettleWindow(3 days);
+    }
+
+    function test_setSettleWindow_revertsBelowMin() public {
+        uint64 belowMin = settlement.MIN_SETTLE_WINDOW() - 1;
+        vm.expectRevert(MatchSettlement.SettleWindowOutOfRange.selector);
+        vm.prank(owner);
+        settlement.setSettleWindow(belowMin);
+    }
+
+    function test_setSettleWindow_revertsAboveMax() public {
+        uint64 aboveMax = settlement.MAX_SETTLE_WINDOW() + 1;
+        vm.expectRevert(MatchSettlement.SettleWindowOutOfRange.selector);
+        vm.prank(owner);
+        settlement.setSettleWindow(aboveMax);
+    }
+
+    /// @dev FM2: the window is generously bounded — both inclusive endpoints are
+    ///      accepted, so the floor can't be set so short an in-progress match expires.
+    function test_setSettleWindow_acceptsBoundaries() public {
+        vm.startPrank(owner);
+        settlement.setSettleWindow(settlement.MIN_SETTLE_WINDOW());
+        assertEq(settlement.settleWindow(), settlement.MIN_SETTLE_WINDOW());
+        settlement.setSettleWindow(settlement.MAX_SETTLE_WINDOW());
+        assertEq(settlement.settleWindow(), settlement.MAX_SETTLE_WINDOW());
+        vm.stopPrank();
+    }
+
+    /// @dev FM2: retuning the window only affects matches opened AFTER the change — an
+    ///      already-open match's deadline was frozen at its open and never moves.
+    function test_setSettleWindow_onlyAffectsFutureMatches() public {
+        _open(MATCH, STAKE);
+        uint64 frozen = _deadline(MATCH);
+
+        uint64 maxWindow = settlement.MAX_SETTLE_WINDOW();
+        vm.prank(owner);
+        settlement.setSettleWindow(maxWindow);
+        assertEq(_deadline(MATCH), frozen, "open match deadline unchanged by retune");
+
+        bytes32 later = bytes32("match-2");
+        _open(later, STAKE);
+        assertEq(_deadline(later), uint64(block.timestamp) + maxWindow, "new match uses the retuned window");
     }
 
     // --- admin ---
