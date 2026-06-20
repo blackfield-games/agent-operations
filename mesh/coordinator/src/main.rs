@@ -6288,6 +6288,82 @@ mod tests {
         TrustedProxies::parse(&ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>()).unwrap()
     }
 
+    /// parse_trusted_entry accepts a bare IP (as an exact /32 or /128) and an
+    /// ip/prefix CIDR, and REJECTS a malformed address, an unparseable or
+    /// out-of-range prefix, and a blank entry — never silently widening to /0.
+    #[test]
+    fn parse_trusted_entry_forms() {
+        assert_eq!(
+            parse_trusted_entry("10.0.0.1").unwrap(),
+            TrustedCidr { network: IpAddr::from([10, 0, 0, 1]), prefix: 32 },
+            "bare v4 -> /32"
+        );
+        assert_eq!(
+            parse_trusted_entry("  10.0.0.0/8 ").unwrap(),
+            TrustedCidr { network: IpAddr::from([10, 0, 0, 0]), prefix: 8 },
+            "v4 cidr, trimmed"
+        );
+        assert_eq!(parse_trusted_entry("2001:db8::1").unwrap().prefix, 128, "bare v6 -> /128");
+        assert_eq!(parse_trusted_entry("2001:db8::/32").unwrap().prefix, 32, "v6 cidr");
+        assert!(parse_trusted_entry("").is_err(), "blank");
+        assert!(parse_trusted_entry("   ").is_err(), "whitespace-only");
+        assert!(parse_trusted_entry("nope").is_err(), "garbage ip");
+        assert!(parse_trusted_entry("10.0.0.0/x").is_err(), "non-numeric prefix");
+        assert!(parse_trusted_entry("10.0.0.0/33").is_err(), "v4 prefix > 32");
+        assert!(parse_trusted_entry("2001:db8::/129").is_err(), "v6 prefix > 128");
+    }
+
+    /// A CIDR entry trusts every peer inside the range and none outside it (mask, not
+    /// string-prefix); an exact IP entry still matches only itself; the two unify and
+    /// an empty allowlist trusts nobody.
+    #[test]
+    fn trusted_cidr_containment_and_union() {
+        let t = TrustedProxies::parse(&["10.0.0.0/8".into(), "192.168.1.5".into()]).unwrap();
+        assert!(t.contains(&IpAddr::from([10, 0, 0, 0])), "network address in range");
+        assert!(t.contains(&IpAddr::from([10, 0, 0, 1])), "in-range low");
+        assert!(t.contains(&IpAddr::from([10, 255, 255, 254])), "in-range high");
+        assert!(!t.contains(&IpAddr::from([11, 0, 0, 1])), "just outside the range");
+        assert!(!t.contains(&IpAddr::from([9, 255, 255, 255])), "just below the range");
+        assert!(t.contains(&IpAddr::from([192, 168, 1, 5])), "exact IP still trusted");
+        assert!(!t.contains(&IpAddr::from([192, 168, 1, 6])), "neighbor of exact IP untrusted");
+        assert!(!TrustedProxies::parse(&[]).unwrap().contains(&IpAddr::from([10, 0, 0, 1])), "empty");
+    }
+
+    /// CIDR containment is family-correct: a v4 range never contains a v6 (or
+    /// v4-mapped-v6) peer, and a v6 range never matches a bare v4.
+    #[test]
+    fn trusted_cidr_cross_family_never_matches() {
+        let v4 = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        assert!(!v4.contains(&"::ffff:10.0.0.1".parse().unwrap()), "v4 range vs v4-mapped-v6 peer");
+        assert!(!v4.contains(&"2001:db8::1".parse().unwrap()), "v4 range vs v6 peer");
+        let v6 = TrustedProxies::parse(&["2001:db8::/32".into()]).unwrap();
+        assert!(v6.contains(&"2001:db8:dead::1".parse().unwrap()), "v6 in range");
+        assert!(!v6.contains(&"2001:dead::1".parse().unwrap()), "v6 out of range");
+        assert!(!v6.contains(&IpAddr::from([10, 0, 0, 1])), "v6 range vs v4 peer");
+    }
+
+    /// A /0 catch-all is honored only when EXPLICITLY entered (a blank/malformed entry
+    /// is rejected, never widened to /0), and a v4 /0 still does not span v6.
+    #[test]
+    fn trusted_cidr_prefix_zero_is_explicit_catch_all() {
+        let t = TrustedProxies::parse(&["0.0.0.0/0".into()]).unwrap();
+        assert!(t.contains(&IpAddr::from([8, 8, 8, 8])), "/0 trusts any v4");
+        assert!(t.contains(&IpAddr::from([10, 0, 0, 1])));
+        assert!(!t.contains(&"2001:db8::1".parse().unwrap()), "v4 /0 does not span v6");
+    }
+
+    /// SECURITY end-to-end: a peer INSIDE a trusted CIDR honors XFF exactly as a listed
+    /// exact IP does, while a peer OUTSIDE stays untrusted and keys on itself — so the
+    /// CIDR only widens the trust gate, it does not let an out-of-range peer spoof.
+    #[test]
+    fn resolve_cidr_trusted_peer_honors_xff() {
+        let t = TrustedProxies::parse(&["10.0.0.0/8".into()]).unwrap();
+        let inside = IpAddr::from([10, 9, 9, 9]);
+        assert_eq!(resolve_source_ip(inside, &xff("203.0.113.7"), &t), ip4(203, 0, 113, 7));
+        let outside = IpAddr::from([11, 0, 0, 1]);
+        assert_eq!(resolve_source_ip(outside, &xff("203.0.113.7"), &t), outside);
+    }
+
     fn xff(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", value.parse().unwrap());
