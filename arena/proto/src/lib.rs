@@ -257,6 +257,61 @@ pub struct Observation {
     pub visible: Vec<VisibleEntity>,
 }
 
+/// One entity in a [`Broadcast`] — the PUBLIC, on-stage state of a single pawn as
+/// a non-participant spectator sees it.
+///
+/// This is the spectator counterpart to [`VisibleEntity`], and the difference is
+/// deliberate. A `VisibleEntity` is parity-bounded — only what one seat can perceive
+/// this tick — and carries no health or score. A `BroadcastEntity` is the
+/// caster-camera view: it is reported for EVERY pawn (a spectator watching the
+/// rendered match sees the whole battlefield), and it carries the health bar and
+/// scoreboard a broadcast shows — `health`/`max_health`/`score`/`alive`. But it
+/// stops at what is *on screen*: there is deliberately NO `ammo` or `cooldown`
+/// field, so the feed is not a tactical x-ray of every player's private HUD. That
+/// exclusion is the broadcast's security line — a spectator must learn no more than
+/// a viewer of the stream would — and is pinned by a wire-shape test; widening it
+/// with a private field is a regression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BroadcastEntity {
+    pub entity_id: u32,
+    pub kind: EntityKind,
+    pub team: TeamId,
+    /// Ground-plane position (see [`POSITION_SCALE`]).
+    pub position: Vec2,
+    /// Elevation in [`POSITION_SCALE`] units; `0` on a planar arena.
+    pub z: i32,
+    pub facing: Bam,
+    pub health: u16,
+    pub max_health: u16,
+    /// Cumulative damage dealt — the match score, as shown on the broadcast
+    /// scoreboard.
+    pub score: i32,
+    pub alive: bool,
+}
+
+/// A spectator's whole-battlefield snapshot at one tick — the broadcast (caster)
+/// view, NOT any seat's [`Observation`].
+///
+/// Where an [`Observation`] is one seat's parity-bounded, player-perspective slice
+/// (its own state plus only what it perceives), a `Broadcast` is the
+/// omniscient-over-PUBLIC-state view a spectator/caster gets: every pawn's on-stage
+/// state ([`BroadcastEntity`]), in ascending `entity_id` order so the frame is
+/// canonical. It is intentionally a SEPARATE type from `Observation` — a spectator
+/// feed must never be wired from a seat's private observation, which would either
+/// leak one seat's hidden state to every viewer or, conversely, withhold the
+/// whole-map view a broadcast needs. It carries no `deadline_micros`, no `own`, and
+/// no per-seat `visible`: a spectator is not a participant, cannot act, and has no
+/// tick to answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Broadcast {
+    pub protocol_version: u32,
+    pub match_id: MatchId,
+    pub tick: u64,
+    pub phase: MatchPhase,
+    /// Every pawn's public on-stage state, ascending by `entity_id` (canonical).
+    pub entities: Vec<BroadcastEntity>,
+}
+
 /// The length of a full-speed move request: a [`ActionIntent::move_dir`] whose
 /// magnitude is `MOVE_INTENT_SCALE` asks for full speed, and the server clamps
 /// anything longer. Integer fixed-point, so the clamp is exact and identical on
@@ -578,6 +633,27 @@ pub enum AgentMsg {
     Leave { reason: String },
 }
 
+/// Server → spectator messages — the read-only spectator side of the protocol,
+/// consumed by a caster UI or the eventual UE5 spectator client. Internally tagged
+/// on `type`, like [`GatewayMsg`].
+///
+/// The spectator protocol is one-directional BY CONSTRUCTION: this is the only
+/// spectator message enum, and there is no spectator → server counterpart — no
+/// `Act`, no input of any kind. A spectator connection can only RECEIVE a stream of
+/// [`Frame`](SpectatorMsg::Frame)s and a terminal [`End`](SpectatorMsg::End); it has
+/// no message it can send that the server would interpret, so a spectator can never
+/// inject an action or otherwise influence a ranked match. Read-only here is the
+/// *absence* of an inbound type, not a runtime check that could be forgotten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpectatorMsg {
+    /// One per-tick whole-battlefield broadcast frame.
+    Frame(Broadcast),
+    /// The match is over; the canonical, attestable result — the same value seats
+    /// receive at [`GatewayMsg::End`].
+    End(MatchResult),
+}
+
 /// Canonical digest an agent signs at [`AgentMsg::Join`] to prove control of the
 /// key behind `agent_id` — the arena analogue of mesh's hello digest. The server
 /// recovers the signer from this digest plus the Join's `signature_hex` and
@@ -826,6 +902,99 @@ mod tests {
         });
         let parsed: Observation = serde_json::from_value(canonical.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "Observation wire shape drifted");
+    }
+
+    #[test]
+    fn broadcast_entity_exposes_no_private_hud_state() {
+        // FM1: the broadcast is the on-stage view, not a tactical x-ray. Pin the
+        // exact public key set so adding a private-HUD field (ammo, cooldown, intent)
+        // — anything a viewer of the stream could not see — fails CI. It DOES carry
+        // health + score (the broadcast health bar + scoreboard); that is the
+        // deliberate difference from the parity-bounded VisibleEntity, which has
+        // neither.
+        let e = BroadcastEntity {
+            entity_id: 3,
+            kind: EntityKind::Player,
+            team: 1,
+            position: Vec2 { x: 1000, y: -2000 },
+            z: 0,
+            facing: 0x4000,
+            health: 80,
+            max_health: 100,
+            score: 42,
+            alive: true,
+        };
+        let json = serde_json::to_value(e).unwrap();
+        assert_eq!(
+            object_keys(&json),
+            ["alive", "entity_id", "facing", "health", "kind", "max_health", "position", "score", "team", "z"],
+            "BroadcastEntity gained or lost a field — the public broadcast surface is a security contract"
+        );
+        for forbidden in ["ammo", "cooldown", "intent", "velocity"] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "BroadcastEntity must not leak private HUD field `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_is_a_whole_field_snapshot_distinct_from_observation() {
+        // FM1: a Broadcast is a SEPARATE type from Observation — no seat, no `own`,
+        // no per-seat `visible`, no deadline. Pin the top-level key set so the
+        // spectator frame can never be silently reshaped into — or sourced from — a
+        // seat's parity-bounded observation.
+        let b = sample_broadcast();
+        let json = serde_json::to_value(&b).unwrap();
+        assert_eq!(
+            object_keys(&json),
+            ["entities", "match_id", "phase", "protocol_version", "tick"],
+            "Broadcast gained or lost a top-level field"
+        );
+        for forbidden in ["seat", "own", "visible", "deadline_micros"] {
+            assert!(
+                json.get(forbidden).is_none(),
+                "Broadcast must not carry seat-observation field `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn broadcast_wire_shape_is_stable() {
+        let canonical = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "match_id": FIXED_MATCH,
+            "tick": 64,
+            "phase": "live",
+            "entities": [{
+                "entity_id": 0, "kind": "player", "team": 1,
+                "position": { "x": -1000, "y": 500 }, "z": 0,
+                "facing": 16384, "health": 80, "max_health": 100, "score": 42, "alive": true
+            }]
+        });
+        let parsed: Broadcast = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "Broadcast wire shape drifted");
+    }
+
+    #[test]
+    fn spectator_msg_wire_shapes_are_stable() {
+        // Frame — newtype variant: the Broadcast fields flatten next to "type".
+        let mut frame = serde_json::to_value(sample_broadcast()).unwrap();
+        frame.as_object_mut().unwrap().insert("type".into(), "frame".into());
+        assert_round::<SpectatorMsg>(&frame, "SpectatorMsg::Frame");
+
+        // End — newtype variant: the MatchResult fields flatten next to "type", the
+        // same terminal result a seat gets at GatewayMsg::End.
+        let result = MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: FIXED_MATCH.parse().unwrap(),
+            final_tick: 2,
+            outcomes: vec![SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true }],
+            replay_hash: hex::encode(sample_replay().digest()),
+        };
+        let mut end = serde_json::to_value(&result).unwrap();
+        end.as_object_mut().unwrap().insert("type".into(), "end".into());
+        assert_round::<SpectatorMsg>(&end, "SpectatorMsg::End");
     }
 
     #[test]
@@ -1149,6 +1318,27 @@ mod tests {
                 z: 0,
                 facing: 0x4000,
                 in_line_of_sight: true,
+            }],
+        }
+    }
+
+    fn sample_broadcast() -> Broadcast {
+        Broadcast {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: FIXED_MATCH.parse().unwrap(),
+            tick: 64,
+            phase: MatchPhase::Live,
+            entities: vec![BroadcastEntity {
+                entity_id: 0,
+                kind: EntityKind::Player,
+                team: 1,
+                position: Vec2 { x: -1000, y: 500 },
+                z: 0,
+                facing: 0x4000,
+                health: 80,
+                max_health: 100,
+                score: 42,
+                alive: true,
             }],
         }
     }
