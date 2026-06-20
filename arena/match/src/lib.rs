@@ -559,7 +559,14 @@ pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError
         record.replay.seats.clone(),
         record.replay.seed,
     );
-    let mut frames = Vec::with_capacity(record.replay.ticks.len() + 1);
+    // Do NOT pre-size from `record.replay.ticks.len()`: `verify` accepts a record
+    // padded with canonical post-terminal ticks (they are scanned but never
+    // simulated — `replay_match` breaks at the terminal phase), so an adversarial
+    // record can inflate that length to millions while the match really ran a
+    // handful of ticks. The loop below breaks at the terminal phase too, so it
+    // pushes only the frames actually simulated; let the Vec grow to that real
+    // count instead of eagerly reserving memory for attacker-controlled padding.
+    let mut frames = Vec::new();
     frames.push(m.broadcast());
     for tr in &record.replay.ticks {
         if m.phase() != MatchPhase::Live {
@@ -947,6 +954,29 @@ mod tests {
         let mut tampered = finished_record();
         tampered.result.final_tick += 1;
         assert!(matches!(replay_frames(&tampered), Err(ReplayError::ResultMismatch)));
+    }
+
+    #[test]
+    fn replay_frames_does_not_allocate_for_post_terminal_padding() {
+        // FM3 (memory-DoS): a record padded with canonical post-terminal ticks still
+        // passes verify() (they are scanned but never simulated), so replay_frames
+        // must NOT pre-size its output from ticks.len(). It returns only the frames
+        // actually simulated, and its buffer tracks that real count — not the
+        // attacker-controlled padding length.
+        let mut padded = finished_record();
+        let real_ticks = padded.replay.ticks.len();
+        let next = real_ticks as u64;
+        for k in 0..20_000u64 {
+            padded.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new() });
+        }
+        let frames = replay_frames(&padded).expect("a post-terminal-padded record still verifies + replays");
+        assert_eq!(frames.len(), real_ticks + 1, "frames track the SIMULATED ticks, not the padded length");
+        assert!(
+            frames.capacity() < 1024,
+            "output buffer must track simulated frames, not the {}-tick padded length (cap {})",
+            padded.replay.ticks.len(),
+            frames.capacity()
+        );
     }
 
     #[test]

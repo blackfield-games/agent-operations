@@ -378,18 +378,27 @@ impl Match {
     /// Project the whole-battlefield SPECTATOR view — every pawn's public on-stage
     /// state — as an [`arena_proto::Broadcast`]. This is the caster-camera feed a
     /// non-participant watches, the deliberate counterpart to
-    /// [`observe`](Match::observe), and the two never reach each other:
+    /// [`observe`](Match::observe):
     ///
     /// - `observe` is one seat's PARITY-BOUNDED slice — its own full state plus only
-    ///   the enemies it can perceive — and is the gameplay security boundary, left
-    ///   untouched. A participant still learns nothing it could not perceive, so
-    ///   adding this feed widens no agent's view.
+    ///   the enemies it can perceive — and is the gameplay security boundary. This
+    ///   method does not touch it: adding `broadcast` changes nothing an agent sees,
+    ///   because the Gateway still answers a participant's connection only with
+    ///   `observe`.
     /// - `broadcast` is omniscient over PUBLIC state only: it reports EVERY pawn
     ///   (alive or dead, in or out of anyone's perception) because a spectator sees
     ///   the whole stage, but it carries only what is on screen — position, team,
     ///   facing, the health bar, and the scoreboard `score`. It deliberately omits
     ///   the private HUD internals (`ammo`, `cooldown`) the parity bound also hides,
     ///   so the feed is not a tactical x-ray.
+    ///
+    /// SECURITY: `observe` and `broadcast` are two separate methods on the same
+    /// `Match`; the parity bound holds only as long as a *participant's* gameplay
+    /// connection is served `observe` and never `broadcast`. Keeping `broadcast` off
+    /// the participant path — serving it solely to non-participant spectator
+    /// connections — is a service-layer access-control obligation this method cannot
+    /// enforce. A live ranked participant handed `broadcast` would gain omniscience
+    /// and defeat the parity bound.
     ///
     /// Entities are in ascending `entity_id` (== seat) order, so the frame is
     /// canonical and replay-stable like every other record.
