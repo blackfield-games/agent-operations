@@ -209,6 +209,36 @@ async def test_run_rejects_a_wrong_typed_metric_value(tmp_path):
     assert _failing_specialist(verdict.issues) == "optimization"
 
 
+async def test_run_marks_over_budget_terminal_and_blames_no_specialist(tmp_path):
+    # over_budget>0 is the genuine budget-exceeded REJECTION (the case the nan/missing/
+    # garbage tests above deliberately make the gate SKIP). Optimization is the last,
+    # deterministic LOD authority, so a re-run recomputes the same sum — the verdict is
+    # terminal and names NO failing specialist (re-running can't help). With nothing
+    # fixable left, route-back ENDs instead of looping to MAX_ROUNDS.
+    opt = _layer(tmp_path, "optimization", metrics={"over_budget": 1.0})
+    verdict = await validator.run(_brief(), _with_override(tmp_path, "optimization", opt), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert verdict.terminal
+    assert any("triangle budget" in i for i in verdict.issues)
+    assert verdict.failing_specialists == []  # over_budget blames nobody — not optimization
+    assert _route_back_target(verdict) is None  # terminal + no fixable → END
+
+
+async def test_run_over_budget_with_co_occurring_fixable_still_routes_back(tmp_path):
+    # FM2: a fixable issue co-occurring with over_budget must NOT be short-circuited.
+    # A missing biome layer (re-runnable) alongside an over-budget world: the verdict
+    # is terminal AND blames biome; route-back repairs the fixable biome first, so the
+    # terminal flag never strands the recoverable issue.
+    opt = _layer(tmp_path, "optimization", metrics={"over_budget": 1.0})
+    layers = [layer for layer in _with_override(tmp_path, "optimization", opt) if layer.specialist != "biome"]
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert verdict.terminal
+    assert "biome" in verdict.failing_specialists
+    assert "optimization" not in verdict.failing_specialists
+    assert _route_back_target(verdict) == "biome"
+
+
 async def test_run_accepts_int_valued_metrics(tmp_path):
     # FM3 discriminator: int metrics must NOT be flagged against the float contract.
     # Bypass Pydantic (which coerces int->float) so the values are genuinely int.
