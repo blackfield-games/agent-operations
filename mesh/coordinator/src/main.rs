@@ -1010,9 +1010,6 @@ fn parse_forwarded_element(element: &str) -> Option<IpAddr> {
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("for"))?
         .1;
     let v = raw.trim().trim_matches('"').trim();
-    if v.is_empty() || v.starts_with('_') || v.eq_ignore_ascii_case("unknown") {
-        return None;
-    }
     if let Some(inner) = v.strip_prefix('[') {
         return inner.split(']').next()?.parse::<IpAddr>().ok();
     }
