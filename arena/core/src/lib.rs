@@ -696,6 +696,12 @@ pub enum ReplayError {
     /// The roster is empty, or `config.seats` disagrees with the roster length, or
     /// two seats share an id — the record cannot describe a real match.
     InvalidRoster,
+    /// `config` or `rules` carry a value the live sim never produces — a negative
+    /// arena bound or a negative spawn radius/jitter. Beyond being nonsensical,
+    /// re-running such a setup would panic (a `min > max` clamp, a negated
+    /// `i32::MIN`), so the record is rejected before any simulation rather than
+    /// crashing the verifier.
+    MalformedSetup,
     /// A recorded action names a seat that is not in the roster.
     UnknownSeat { tick: u64, seat: SeatId },
     /// A tick's actions are not in canonical ascending-unique seat order.
@@ -723,6 +729,9 @@ impl std::fmt::Display for ReplayError {
                 write!(f, "invalid replay: match id mismatch (replay {replay}, result {result})")
             }
             ReplayError::InvalidRoster => write!(f, "invalid replay: malformed roster"),
+            ReplayError::MalformedSetup => {
+                write!(f, "invalid replay: config or rules out of the well-formed range")
+            }
             ReplayError::UnknownSeat { tick, seat } => {
                 write!(f, "invalid replay: tick {tick} names seat {seat} not in the roster")
             }
@@ -784,6 +793,19 @@ impl MatchRecord {
             || !seats.iter().all(|s| roster.insert(s.seat))
         {
             return Err(ReplayError::InvalidRoster);
+        }
+
+        // Arena bounds and spawn geometry are non-negative half-extents in any
+        // match the live sim produces. Reject a hand-crafted setup that breaks
+        // that here — before Match::new — because re-running it would panic (a
+        // `min > max` clamp on a negative bound, a negated `i32::MIN` jitter)
+        // rather than fail cleanly, turning a corrupt record into a verifier DoS.
+        if self.config.bounds.x < 0
+            || self.config.bounds.y < 0
+            || self.rules.spawn_radius < 0
+            || self.rules.spawn_jitter < 0
+        {
+            return Err(ReplayError::MalformedSetup);
         }
 
         // The live sim records exactly one tick per simulated tick, in order, each
@@ -1400,6 +1422,31 @@ mod tests {
     }
 
     #[test]
+    fn an_adversarial_setup_is_rejected_without_panicking() {
+        // FM3: re-running a record with a negative arena bound or a negated
+        // i32::MIN spawn jitter would panic the sim (a `min > max` clamp, a
+        // negation overflow). verify must reject these as MalformedSetup BEFORE
+        // simulating — the test completing instead of panicking is the assertion.
+        let good = play(1).to_record().unwrap();
+
+        let mut r = good.clone();
+        r.config.bounds.x = -1;
+        assert_eq!(r.verify(), Err(ReplayError::MalformedSetup), "negative x bound");
+
+        let mut r = good.clone();
+        r.config.bounds.y = -1;
+        assert_eq!(r.verify(), Err(ReplayError::MalformedSetup), "negative y bound");
+
+        let mut r = good.clone();
+        r.rules.spawn_jitter = i32::MIN;
+        assert_eq!(r.verify(), Err(ReplayError::MalformedSetup), "negated-i32::MIN jitter");
+
+        let mut r = good.clone();
+        r.rules.spawn_radius = -1;
+        assert_eq!(r.verify(), Err(ReplayError::MalformedSetup), "negative spawn radius");
+    }
+
+    #[test]
     fn verify_rejects_structural_corruption_cleanly() {
         // FM3: every malformed shape is a typed Err, never a panic — a verifier
         // (settlement, grader, spectator) cannot be DoS'd by a bad record. The
@@ -1461,6 +1508,7 @@ mod tests {
             ReplayError::Version(VersionMismatch { ours: 1, theirs: 2 }),
             ReplayError::MatchIdMismatch { replay: MID.parse().unwrap(), result: MID.parse().unwrap() },
             ReplayError::InvalidRoster,
+            ReplayError::MalformedSetup,
             ReplayError::UnknownSeat { tick: 3, seat: 9 },
             ReplayError::SeatOrder { tick: 3 },
             ReplayError::TickOrder { index: 2, tick: 5 },
