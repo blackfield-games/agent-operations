@@ -22,11 +22,15 @@
 //!   completes a match pulls its whole roster under that lock — no concurrent join
 //!   can double-seat a participant or start a match a seat short.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
-use arena_core::{Match, Rules};
-use arena_proto::{ControllerKind, MatchConfig, MatchMode, SeatId, SeatInfo, TeamId, Vec2, POSITION_SCALE};
+use arena_core::{Match, MatchRecord, ReplayError, Rules};
+use arena_proto::{
+    ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode, MatchPhase, MatchResult, SeatId,
+    SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
+};
 use uuid::Uuid;
 
 /// Verifies that a ranked seat controls the on-chain identity it claims.
@@ -401,6 +405,174 @@ fn composition_ok(mode: MatchMode, roster: &[Seated]) -> bool {
     }
 }
 
+/// The shared buffer behind one [`Spectator`]: a bounded ring of pending messages.
+/// When it is full the OLDEST message is dropped (and counted) so a slow consumer
+/// can never backpressure the publisher.
+struct SpectatorInner {
+    ring: Mutex<VecDeque<SpectatorMsg>>,
+    capacity: usize,
+    dropped: AtomicU64,
+}
+
+/// A read-only subscription to a [`SpectatorFeed`].
+///
+/// A spectator can ONLY pull messages: it holds no reference to the match and
+/// exposes no method that sends anything back, so it can never inject an action or
+/// otherwise influence a ranked match. That read-only property (FM2) is enforced by
+/// construction — the absence of a send path — not by a runtime check that could be
+/// forgotten. Dropping the handle unsubscribes; the feed reclaims the slot on its
+/// next publish or [`subscribe`](SpectatorFeed::subscribe).
+pub struct Spectator {
+    inner: Arc<SpectatorInner>,
+}
+
+impl Spectator {
+    /// Pull the oldest buffered message, or `None` if the spectator is caught up.
+    /// Read-only: there is deliberately no method on a [`Spectator`] that mutates
+    /// the match.
+    pub fn recv(&self) -> Option<SpectatorMsg> {
+        self.inner.ring.lock().expect("spectator ring poisoned").pop_front()
+    }
+
+    /// How many messages this spectator missed because it fell behind — its ring
+    /// filled and the oldest were dropped. A lossy feed never blocks the sim, so a
+    /// slow consumer observes drops here instead of stalling the match.
+    pub fn dropped(&self) -> u64 {
+        self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// How many messages are buffered and unread.
+    pub fn buffered(&self) -> usize {
+        self.inner.ring.lock().expect("spectator ring poisoned").len()
+    }
+}
+
+/// A read-only, bounded, lossy spectator feed, decoupled from the simulation.
+///
+/// The authoritative side (the match driver) calls [`publish_frame`] /
+/// [`publish_end`] after each tick; spectators [`subscribe`] and pull at their own
+/// pace. The feed NEVER blocks the publisher: each spectator has a bounded ring,
+/// and when a slow consumer's ring is full the oldest message is dropped (counted),
+/// so neither a slow consumer nor an unbounded subscriber count can backpressure or
+/// stall the tick loop (FM3). Spectating is one-directional — a [`Spectator`] has no
+/// way to send anything back (FM2).
+///
+/// [`publish_frame`]: SpectatorFeed::publish_frame
+/// [`publish_end`]: SpectatorFeed::publish_end
+/// [`subscribe`]: SpectatorFeed::subscribe
+pub struct SpectatorFeed {
+    subscribers: Mutex<Vec<Weak<SpectatorInner>>>,
+    /// Each spectator's ring size — frames buffered before the oldest is dropped.
+    capacity: usize,
+    /// Admission cap on concurrently LIVE spectators, so an unbounded number of
+    /// subscribers can't exhaust memory.
+    max_spectators: usize,
+}
+
+impl SpectatorFeed {
+    /// `capacity` is each spectator's ring size (messages buffered before the oldest
+    /// is dropped); `max_spectators` caps concurrently live subscribers. Both must
+    /// be non-zero — a zero ring would drop every message, and a zero cap would
+    /// admit no one.
+    pub fn new(capacity: usize, max_spectators: usize) -> Self {
+        assert!(capacity > 0, "spectator ring capacity must be > 0");
+        assert!(max_spectators > 0, "max_spectators must be > 0");
+        Self { subscribers: Mutex::new(Vec::new()), capacity, max_spectators }
+    }
+
+    /// Admit a new read-only spectator, or `None` if the live-subscriber cap is
+    /// reached. Prunes dropped subscribers first, so a disconnected spectator frees
+    /// its slot for a newcomer.
+    pub fn subscribe(&self) -> Option<Spectator> {
+        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        subs.retain(|w| w.strong_count() > 0);
+        if subs.len() >= self.max_spectators {
+            return None;
+        }
+        let inner = Arc::new(SpectatorInner {
+            ring: Mutex::new(VecDeque::with_capacity(self.capacity)),
+            capacity: self.capacity,
+            dropped: AtomicU64::new(0),
+        });
+        subs.push(Arc::downgrade(&inner));
+        Some(Spectator { inner })
+    }
+
+    /// Fan one per-tick [`Broadcast`] out to every live spectator as a
+    /// [`SpectatorMsg::Frame`]. NON-BLOCKING: a full ring drops its oldest message.
+    /// Returns the number of live spectators it reached.
+    pub fn publish_frame(&self, frame: Broadcast) -> usize {
+        self.fan_out(SpectatorMsg::Frame(frame))
+    }
+
+    /// Fan the terminal [`MatchResult`] out as a [`SpectatorMsg::End`] — the last
+    /// message a spectator receives. Same non-blocking, lossy delivery.
+    pub fn publish_end(&self, result: MatchResult) -> usize {
+        self.fan_out(SpectatorMsg::End(result))
+    }
+
+    /// How many spectators are currently live (prunes dropped ones first).
+    pub fn spectator_count(&self) -> usize {
+        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        subs.retain(|w| w.strong_count() > 0);
+        subs.len()
+    }
+
+    /// Deliver `msg` to every live spectator's ring without ever blocking: a full
+    /// ring sheds its oldest entry. The only locks held are the brief subscriber and
+    /// per-ring mutexes — no consumer is awaited, so the caller (the tick loop)
+    /// returns immediately regardless of how far behind any spectator is.
+    fn fan_out(&self, msg: SpectatorMsg) -> usize {
+        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        subs.retain(|w| w.strong_count() > 0);
+        for w in subs.iter() {
+            if let Some(inner) = w.upgrade() {
+                let mut ring = inner.ring.lock().expect("spectator ring poisoned");
+                if ring.len() == inner.capacity {
+                    ring.pop_front();
+                    inner.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                ring.push_back(msg.clone());
+            }
+        }
+        subs.len()
+    }
+}
+
+/// Re-run a finished [`MatchRecord`] (arena-05) into the sequence of [`Broadcast`]
+/// frames a spectator would have seen — the "watch a finished match" path, the
+/// replay counterpart to the live [`SpectatorFeed`].
+///
+/// The record is VERIFIED first ([`MatchRecord::verify`]), so a truncated, tampered,
+/// or non-reproducing record is rejected as a typed [`ReplayError`] and NEVER panics
+/// the playback — the same anti-DoS guarantee arena-05 gives a settlement verifier,
+/// reused here because a spectator/replay feed parses untrusted records too. On
+/// success the verified record is re-run from its determinants, capturing the
+/// broadcast at the opening tick and after every simulated tick — `ticks.len() + 1`
+/// frames, the last carrying the terminal `phase == Ended`.
+pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError> {
+    record.verify()?;
+    let mut m = Match::new(
+        record.replay.match_id,
+        record.config,
+        record.rules,
+        record.replay.seats.clone(),
+        record.replay.seed,
+    );
+    let mut frames = Vec::with_capacity(record.replay.ticks.len() + 1);
+    frames.push(m.broadcast());
+    for tr in &record.replay.ticks {
+        if m.phase() != MatchPhase::Live {
+            break;
+        }
+        let intents: BTreeMap<SeatId, ActionIntent> =
+            tr.actions.iter().map(|a| (a.seat, a.intent)).collect();
+        m.step(&intents);
+        frames.push(m.broadcast());
+    }
+    Ok(frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,5 +875,170 @@ mod tests {
             matches!(mm.join(MatchMode::Agent, empty()), Err(JoinError::Unauthenticated { .. })),
             "an empty token is not a ranked claim, so Agent mode rejects it"
         );
+    }
+
+    const FIXED_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    /// A deterministic 2-seat / 2-team match that ends at a small tick cap (both
+    /// teams stay alive under forfeits), reproducible from its fixed id + seed.
+    fn scripted_match() -> Match {
+        let config = MatchConfig {
+            tick_hz: 30,
+            max_ticks: 5,
+            bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+            seats: 2,
+        };
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
+            SeatInfo { seat: 1, team: 1, controller: "0xbbbb".into() },
+        ];
+        Match::new(FIXED_ID.parse().unwrap(), config, Rules::default(), seats, 42)
+    }
+
+    /// Drive a match to its terminal state with both seats forfeiting every tick.
+    fn run_to_end(mut m: Match) -> Match {
+        while m.phase() == MatchPhase::Live {
+            m.step(&BTreeMap::new());
+        }
+        m
+    }
+
+    fn finished_record() -> MatchRecord {
+        run_to_end(scripted_match()).to_record().expect("a finished match yields a record")
+    }
+
+    fn frame_at(tick: u64) -> Broadcast {
+        Broadcast {
+            protocol_version: arena_proto::PROTOCOL_VERSION,
+            match_id: FIXED_ID.parse().unwrap(),
+            tick,
+            phase: MatchPhase::Live,
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn replay_frames_reproduces_a_finished_match() {
+        let record = finished_record();
+        let frames = replay_frames(&record).expect("a valid record replays");
+        // One opening frame plus one after each simulated tick.
+        assert_eq!(frames.len(), record.replay.ticks.len() + 1);
+        assert_eq!(frames.first().unwrap().tick, 0);
+        assert_eq!(frames.first().unwrap().phase, MatchPhase::Live);
+        let last = frames.last().unwrap();
+        assert_eq!(last.phase, MatchPhase::Ended, "the final frame is the terminal state");
+        let ids: Vec<u32> = last.entities.iter().map(|e| e.entity_id).collect();
+        assert_eq!(ids, vec![0, 1], "the broadcast shows the whole roster");
+        // Deterministic: replaying the same record twice yields identical frames.
+        assert_eq!(frames, replay_frames(&record).unwrap(), "replay is deterministic");
+    }
+
+    #[test]
+    fn replay_frames_rejects_a_corrupt_record_without_panicking() {
+        // FM3 safety: a malformed setup (negative arena bound) would PANIC a naive
+        // re-run (a `min > max` clamp); replay_frames verifies first, so it is a clean
+        // typed error — a corrupt record can't crash a spectator/replay feed.
+        let mut malformed = finished_record();
+        malformed.config.bounds.x = -1;
+        assert!(matches!(replay_frames(&malformed), Err(ReplayError::MalformedSetup)));
+
+        // A record whose committed result no longer matches the re-run is rejected,
+        // not silently played to a divergent outcome.
+        let mut tampered = finished_record();
+        tampered.result.final_tick += 1;
+        assert!(matches!(replay_frames(&tampered), Err(ReplayError::ResultMismatch)));
+    }
+
+    #[test]
+    fn spectator_feed_drops_oldest_when_a_consumer_falls_behind() {
+        // FM3: a slow consumer must never stall the publisher. With a ring of 3, a
+        // spectator that never reads keeps only the NEWEST 3 frames; the rest are
+        // dropped (counted), and every publish returns without blocking.
+        let feed = SpectatorFeed::new(3, 8);
+        let spec = feed.subscribe().expect("under cap");
+        for i in 0..10u64 {
+            let reached = feed.publish_frame(frame_at(i));
+            assert_eq!(reached, 1, "publish reaches the one live spectator and returns");
+        }
+        assert_eq!(spec.buffered(), 3, "the ring is bounded to its capacity");
+        assert_eq!(spec.dropped(), 7, "the 7 oldest frames were shed");
+        // What remains is the most-recent window (ticks 7,8,9), oldest-first.
+        let ticks: Vec<u64> = std::iter::from_fn(|| spec.recv())
+            .map(|m| match m {
+                SpectatorMsg::Frame(b) => b.tick,
+                SpectatorMsg::End(_) => u64::MAX,
+            })
+            .collect();
+        assert_eq!(ticks, vec![7, 8, 9], "the buffer holds the most recent frames");
+    }
+
+    #[test]
+    fn a_caught_up_spectator_drops_nothing_while_a_slow_one_does() {
+        // The rings are independent: from ONE publish stream, a spectator that drains
+        // keeps every frame (0 dropped) while one that ignores the feed sheds the
+        // overflow — a slow consumer never penalizes a fast one or the publisher.
+        let feed = SpectatorFeed::new(2, 4);
+        let fast = feed.subscribe().unwrap();
+        let slow = feed.subscribe().unwrap();
+        for i in 0..6u64 {
+            feed.publish_frame(frame_at(i));
+            // `fast` drains immediately; `slow` never reads.
+            assert!(fast.recv().is_some());
+        }
+        assert_eq!(fast.dropped(), 0, "a drained spectator misses nothing");
+        assert_eq!(slow.dropped(), 4, "the ignored spectator shed the overflow");
+        assert_eq!(slow.buffered(), 2, "bounded to its ring");
+    }
+
+    #[test]
+    fn spectating_cannot_alter_the_match_outcome() {
+        // FM2: a spectator is read-only — it cannot inject an action or influence the
+        // match. Run the SAME deterministic match with no feed, and again while fanning
+        // every tick to several spectators (one draining, one ignoring); the result is
+        // identical, so spectating has no side effect on the authoritative sim.
+        let result_no_feed = run_to_end(scripted_match()).result().unwrap().clone();
+
+        let feed = SpectatorFeed::new(2, 4);
+        let drainer = feed.subscribe().unwrap();
+        let _idler = feed.subscribe().unwrap(); // never reads; its ring just drops
+        let mut m = scripted_match();
+        while m.phase() == MatchPhase::Live {
+            feed.publish_frame(m.broadcast());
+            let _ = drainer.recv(); // a spectator pulling frames mid-match
+            m.step(&BTreeMap::new());
+        }
+        let result_with_feed = m.result().unwrap().clone();
+        feed.publish_end(result_with_feed.clone());
+
+        assert_eq!(result_no_feed, result_with_feed, "spectating must not change the match");
+    }
+
+    #[test]
+    fn spectator_feed_caps_concurrent_subscribers_and_reclaims_dropped_slots() {
+        // FM3: an unbounded number of spectators can't be admitted. At the cap,
+        // subscribe returns None; dropping a spectator frees its slot for a newcomer.
+        let feed = SpectatorFeed::new(4, 2);
+        let a = feed.subscribe().expect("1st under cap");
+        let b = feed.subscribe().expect("2nd under cap");
+        assert_eq!(feed.spectator_count(), 2);
+        assert!(feed.subscribe().is_none(), "the 3rd is refused at the cap");
+        drop(a);
+        assert_eq!(feed.spectator_count(), 1, "a dropped spectator frees its slot");
+        let _c = feed.subscribe().expect("a slot reopened");
+        assert_eq!(feed.spectator_count(), 2);
+        let _ = b;
+    }
+
+    #[test]
+    fn spectator_receives_frames_then_terminal_end() {
+        let feed = SpectatorFeed::new(8, 2);
+        let spec = feed.subscribe().unwrap();
+        feed.publish_frame(frame_at(0));
+        feed.publish_frame(frame_at(1));
+        feed.publish_end(run_to_end(scripted_match()).result().unwrap().clone());
+        assert!(matches!(spec.recv(), Some(SpectatorMsg::Frame(b)) if b.tick == 0));
+        assert!(matches!(spec.recv(), Some(SpectatorMsg::Frame(b)) if b.tick == 1));
+        assert!(matches!(spec.recv(), Some(SpectatorMsg::End(_))));
+        assert!(spec.recv().is_none(), "nothing follows the terminal End");
     }
 }
