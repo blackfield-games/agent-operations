@@ -970,3 +970,105 @@ contract MatchSettlementReentrancyTest is Test {
         assertEq(token.balanceOf(address(settlement)), 0, "no escrow drained beyond the pot");
     }
 }
+
+/// @notice A registered agent that reenters refundExpired when it receives its expired
+///         refund. refundExpired is permissionless, so reentering it isolates the
+///         _refundBoth CEI fence shared by cancelMatch and refundExpired: the only thing
+///         stopping a second refund is that the helper flips the match terminal and
+///         clears the funded flags BEFORE the token transfer. Fails if those effects
+///         move after the transfer.
+contract ReentrantRefundClaimer is IPayoutReceiver {
+    MatchSettlement settlement;
+    AgentRegistry registry;
+    HookToken token;
+    bytes32 matchId;
+    bool public reentered;
+    bool public reentryReverted;
+
+    constructor(MatchSettlement settlement_, AgentRegistry registry_, HookToken token_) {
+        settlement = settlement_;
+        registry = registry_;
+        token = token_;
+    }
+
+    function setup(bytes32 matchId_) external {
+        matchId = matchId_;
+        token.approve(address(registry), type(uint256).max);
+        token.approve(address(settlement), type(uint256).max);
+        registry.register(bytes32("refund-bot"), 0);
+    }
+
+    function fund() external {
+        settlement.fund(matchId);
+    }
+
+    function onPayout() external {
+        reentered = true;
+        try settlement.refundExpired(matchId) {}
+        catch {
+            reentryReverted = true;
+        }
+    }
+}
+
+contract MatchSettlementRefundReentrancyTest is Test {
+    MatchSettlement settlement;
+    AgentRegistry registry;
+    HookToken token;
+    ReentrantRefundClaimer attacker;
+
+    address owner = address(0xA11CE);
+    address attester = address(0xA77E57E5);
+    address bob = address(0xB0B);
+
+    uint256 constant STAKE = 100 ether;
+    uint256 constant REP_DELTA = 10 ether;
+    bytes32 constant MATCH = bytes32("match-refund-evil");
+
+    function setUp() public {
+        token = new HookToken();
+        registry = new AgentRegistry(address(token), 0, owner);
+        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        attacker = new ReentrantRefundClaimer(settlement, registry, token);
+
+        vm.startPrank(owner);
+        registry.setReputationWriter(address(settlement), true);
+        settlement.setAttester(attester, true);
+        vm.stopPrank();
+
+        token.transfer(bob, 10_000 ether);
+        vm.startPrank(bob);
+        token.approve(address(registry), type(uint256).max);
+        token.approve(address(settlement), type(uint256).max);
+        registry.register(bytes32("bob-bot"), 0);
+        vm.stopPrank();
+
+        token.transfer(address(attacker), 10_000 ether);
+        attacker.setup(MATCH);
+
+        vm.prank(attester);
+        settlement.openMatch(MATCH, address(attacker), bob, STAKE);
+        attacker.fund();
+        vm.prank(bob);
+        settlement.fund(MATCH);
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE);
+    }
+
+    function test_refundExpired_reentrantClaimerCannotDoubleRefund() public {
+        (,,,,,,,, uint64 deadline) = settlement.matches(MATCH);
+        vm.warp(deadline);
+        uint256 attackerBefore = token.balanceOf(address(attacker));
+        uint256 bobBefore = token.balanceOf(bob);
+
+        token.arm();
+        settlement.refundExpired(MATCH);
+
+        assertTrue(attacker.reentered(), "reentry fired");
+        assertTrue(attacker.reentryReverted(), "reentry blocked by the CEI terminal-state fence");
+        assertEq(
+            token.balanceOf(address(attacker)), attackerBefore + STAKE, "refunded its stake exactly once"
+        );
+        assertEq(token.balanceOf(bob), bobBefore + STAKE, "opponent still refunded after the reentry attempt");
+        assertEq(token.balanceOf(address(settlement)), 0, "no escrow drained beyond the two stakes");
+    }
+}
