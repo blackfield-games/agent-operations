@@ -996,24 +996,44 @@ fn parse_forwarded_node(token: &str) -> Option<IpAddr> {
     t.parse::<SocketAddr>().ok().map(|sa| sa.ip())
 }
 
+/// Walk a forwarded-hop chain NEAREST→FARTHEST (the order a proxy APPENDS in, so
+/// right-to-left) and return the first address that is not itself a trusted proxy
+/// — the IP the trust boundary actually observed the request arrive from. Trusted
+/// hops (our own ingress chain) are skipped; an upstream attacker's forged entries
+/// sit FARTHER along and are never reached past the real client.
+///
+/// Falls back to `peer` when the chain is empty, every hop is trusted (no observed
+/// external client), or the nearest hop is indeterminate (`None`: obfuscated or
+/// unparseable) — each collapses onto the conservative proxy bucket, never a looser
+/// one. Shared by the `X-Forwarded-For` and RFC-7239 `Forwarded` paths so both have
+/// byte-identical selection semantics.
+fn select_untrusted_hop(
+    hops_near_to_far: impl Iterator<Item = Option<IpAddr>>,
+    peer: IpAddr,
+    trusted: &TrustedProxies,
+) -> IpAddr {
+    for hop in hops_near_to_far {
+        match hop {
+            Some(ip) if trusted.contains(&ip) => continue,
+            Some(ip) => return ip,
+            None => return peer,
+        }
+    }
+    peer
+}
+
 /// Resolve the client IP the per-source registration limiter should key on, from
 /// the connection `peer` and the request's `X-Forwarded-For`, trusting XFF ONLY
 /// when `peer` is itself a configured trusted proxy.
 ///
 /// A direct (untrusted) peer can write anything in XFF, so its XFF is ignored and
 /// the limiter keys on the peer — a direct attacker cannot forge a different
-/// source. When `peer` is trusted, walk the XFF chain RIGHT-TO-LEFT: a proxy
-/// APPENDS the address it observed, so the rightmost entries are the nearest hops.
-/// Skip hops that are themselves trusted proxies (our own ingress chain) and
-/// return the first non-trusted address — the IP the trust boundary actually saw
-/// the request arrive from. An upstream attacker can prepend forged entries, but
-/// they sit LEFT of that boundary and are never selected.
-///
-/// Falls back to `peer` when XFF is absent, empty, every hop is trusted (no
-/// observed external client), or the nearest hop is unparseable (indeterminate) —
-/// each collapses onto the conservative proxy bucket, never a looser one. This
-/// rests on the operator's contract that a *listed* proxy appends the observed IP;
-/// a proxy that forwards client-supplied XFF without appending must not be listed.
+/// source. When `peer` is trusted, walk the XFF chain RIGHT-TO-LEFT via
+/// [`select_untrusted_hop`]: a proxy APPENDS the address it observed, so the
+/// rightmost entries are the nearest hops, and the first non-trusted one is the IP
+/// the trust boundary saw. This rests on the operator's contract that a *listed*
+/// proxy appends the observed IP; a proxy that forwards client-supplied XFF without
+/// appending must not be listed.
 fn resolve_source_ip(peer: IpAddr, headers: &HeaderMap, trusted: &TrustedProxies) -> IpAddr {
     if !trusted.contains(&peer) {
         return peer;
@@ -1021,14 +1041,7 @@ fn resolve_source_ip(peer: IpAddr, headers: &HeaderMap, trusted: &TrustedProxies
     let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
         return peer;
     };
-    for token in xff.rsplit(',') {
-        match parse_forwarded_node(token) {
-            Some(ip) if trusted.contains(&ip) => continue,
-            Some(ip) => return ip,
-            None => return peer,
-        }
-    }
-    peer
+    select_untrusted_hop(xff.rsplit(',').map(parse_forwarded_node), peer, trusted)
 }
 
 /// Per-job absolute wall-clock TTL, as a multiple of the job's own
