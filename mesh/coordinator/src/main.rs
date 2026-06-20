@@ -10194,6 +10194,55 @@ mod tests {
         );
     }
 
+    /// A legacy ROW-shaped earner_faults (one row per fault, pre-counter) migrates
+    /// to the counter on open: each earner's row COUNT rolls into `fault_count`,
+    /// preserving every lifetime total EXACTLY, and the table collapses to one row
+    /// per earner. The rebuild is idempotent — reopening does NOT re-run it or
+    /// double-count (it is guarded on the now-absent `job_id` column).
+    #[test]
+    fn legacy_earner_faults_rows_migrate_to_the_counter_idempotently() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        // Seed the pre-counter table shape directly: 3 rows for aaa, 1 for bbb.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE earner_faults (
+                     earner     TEXT NOT NULL,
+                     job_id     TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO earner_faults (earner, job_id, created_at) VALUES
+                     ('0xaaa', 'job-1', 100),
+                     ('0xaaa', 'job-1', 101),
+                     ('0xaaa', 'job-2', 102),
+                     ('0xbbb', 'job-3', 103);",
+            )
+            .unwrap();
+        }
+
+        // Open with the current code → init() runs the rebuild migration.
+        let store = Store::open(&db_path).unwrap();
+        let by = store.faults_by_earner().unwrap();
+        assert_eq!(by.get("0xaaa").copied(), Some(3), "aaa: 3 legacy rows -> fault_count 3");
+        assert_eq!(by.get("0xbbb").copied(), Some(1), "bbb: 1 legacy row -> fault_count 1");
+        assert_eq!(
+            store.earner_faults_row_count().unwrap(),
+            2,
+            "the table collapses to one counter row per earner"
+        );
+        drop(store);
+
+        // Reopen: the guard sees no job_id column, so the migration does not re-run
+        // and the totals are unchanged (not doubled).
+        let reopened = Store::open(&db_path).unwrap();
+        let by2 = reopened.faults_by_earner().unwrap();
+        assert_eq!(by2.get("0xaaa").copied(), Some(3), "reopen does not re-run the migration");
+        assert_eq!(by2.get("0xbbb").copied(), Some(1));
+        assert_eq!(reopened.earner_faults_row_count().unwrap(), 2);
+    }
+
     // ---- GET /jobs/{id} full detail ----
 
     /// `GET /jobs/{id}` returns the full spec; `result` is null while the job is
