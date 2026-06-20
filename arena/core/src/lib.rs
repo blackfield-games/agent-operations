@@ -1315,4 +1315,161 @@ mod tests {
             "a downed seat's intent is never recorded"
         );
     }
+
+    #[test]
+    fn a_finished_match_record_verifies_and_returns_its_result() {
+        // The happy path: a match played to the end re-runs from its record ALONE
+        // back to the same result + committed hash.
+        let rec = play(1).to_record().unwrap();
+        let verified = rec.verify().expect("a faithful record verifies");
+        assert_eq!(verified, rec.result, "verify returns the reproduced result");
+        assert_eq!(verified.replay_hash.len(), 64, "the committed hash is 32-byte hex");
+    }
+
+    #[test]
+    fn to_record_only_commits_a_finished_match() {
+        // No terminal result yet → nothing to settle, so no record.
+        let mut live = close_match(1);
+        step_with(&mut live, &[]);
+        assert_eq!(live.phase(), MatchPhase::Live);
+        assert!(live.to_record().is_none(), "an in-progress match has no record");
+        assert!(play(1).to_record().is_some(), "a finished match yields a record");
+    }
+
+    #[test]
+    fn the_committed_hash_is_stable_across_independent_runs() {
+        // FM2: the same seed drives a byte-identical record on two independent
+        // runs, and its serde form round-trips and re-verifies unchanged — this is
+        // what makes the on-chain commitment meaningful across platforms.
+        let a = play(7).to_record().unwrap();
+        let b = play(7).to_record().unwrap();
+        assert_eq!(a, b, "same seed → identical record");
+        assert_eq!(a.verify().unwrap(), a.result);
+
+        let json = serde_json::to_string(&a).unwrap();
+        let parsed: MatchRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, a, "record round-trips through JSON");
+        assert_eq!(parsed.verify().unwrap(), a.result, "the persisted form re-verifies");
+    }
+
+    #[test]
+    fn a_swapped_seed_is_rejected_via_the_committed_hash() {
+        // The seed is bound into the replay digest even in this jitter-free match
+        // where it does not change combat, so swapping it breaks the committed
+        // hash — a record cannot be re-settled under a seed it was not played on.
+        let mut rec = play(1).to_record().unwrap();
+        rec.replay.seed ^= 0xABCD;
+        assert!(matches!(rec.verify(), Err(ReplayError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn tampered_rules_fail_to_reproduce() {
+        // FM1: rules are a determinant the replay stream does not carry. Quadruple
+        // the damage and the same actions re-run to a different match — rejected,
+        // not silently accepted under a hash that no longer describes it.
+        let mut rec = play(1).to_record().unwrap();
+        rec.rules.damage = rec.rules.damage.saturating_mul(4);
+        assert!(rec.verify().is_err(), "altered rules must not reproduce the record");
+    }
+
+    #[test]
+    fn a_tampered_action_fails_to_reproduce() {
+        // FM1: alter one recorded action (stop every seat firing on a tick) and
+        // the re-run diverges — the stream must be the one that was played.
+        let mut rec = play(1).to_record().unwrap();
+        let tick = rec
+            .replay
+            .ticks
+            .iter_mut()
+            .find(|t| t.actions.iter().any(|a| a.intent.buttons.fire))
+            .expect("a tick where someone fires");
+        for a in &mut tick.actions {
+            a.intent.buttons.fire = false;
+        }
+        assert!(rec.verify().is_err(), "a doctored action stream must not reproduce");
+    }
+
+    #[test]
+    fn a_truncated_record_is_not_terminal() {
+        // FM3: a record cut short does not drive the match to an end. It must fail
+        // cleanly as NotTerminal, never hang or panic the verifier.
+        let mut rec = play(1).to_record().unwrap();
+        assert!(rec.replay.ticks.len() > 1, "the match ran multiple ticks");
+        rec.replay.ticks.truncate(1);
+        assert_eq!(rec.verify(), Err(ReplayError::NotTerminal));
+    }
+
+    #[test]
+    fn verify_rejects_structural_corruption_cleanly() {
+        // FM3: every malformed shape is a typed Err, never a panic — a verifier
+        // (settlement, grader, spectator) cannot be DoS'd by a bad record. The
+        // test running to completion is itself the no-panic assertion.
+        let good = play(1).to_record().unwrap();
+
+        let mut r = good.clone();
+        r.replay.protocol_version += 1;
+        assert!(matches!(r.verify(), Err(ReplayError::Version(_))), "stale replay version");
+
+        let mut r = good.clone();
+        r.result.protocol_version += 1;
+        assert!(matches!(r.verify(), Err(ReplayError::Version(_))), "stale result version");
+
+        let mut r = good.clone();
+        r.result.match_id = "11111111-1111-1111-1111-111111111111".parse().unwrap();
+        assert!(matches!(r.verify(), Err(ReplayError::MatchIdMismatch { .. })), "spliced match id");
+
+        let mut r = good.clone();
+        r.config.seats += 1;
+        assert!(matches!(r.verify(), Err(ReplayError::InvalidRoster)), "seat count disagrees");
+
+        let mut r = good.clone();
+        r.replay.seats.clear();
+        r.config.seats = 0;
+        assert!(matches!(r.verify(), Err(ReplayError::InvalidRoster)), "empty roster");
+
+        let mut r = good.clone();
+        r.replay.seats[1] = r.replay.seats[0].clone();
+        assert!(matches!(r.verify(), Err(ReplayError::InvalidRoster)), "duplicate seat id");
+
+        let mut r = good.clone();
+        r.replay.ticks[0].actions[0].seat = 9;
+        assert!(matches!(r.verify(), Err(ReplayError::UnknownSeat { seat: 9, .. })), "unknown seat");
+
+        let mut r = good.clone();
+        let multi = r.replay.ticks.iter().position(|t| t.actions.len() >= 2).expect("a two-actor tick");
+        r.replay.ticks[multi].actions.reverse();
+        assert!(matches!(r.verify(), Err(ReplayError::SeatOrder { .. })), "non-canonical seat order");
+
+        let mut r = good.clone();
+        r.replay.ticks[0].tick = 5;
+        assert!(matches!(r.verify(), Err(ReplayError::TickOrder { index: 0, tick: 5 })), "tick order");
+
+        let mut r = good.clone();
+        r.result.outcomes[0].score += 1;
+        assert!(matches!(r.verify(), Err(ReplayError::ResultMismatch)), "tampered outcome");
+
+        let mut r = good.clone();
+        r.result.replay_hash = "0".repeat(64);
+        assert!(matches!(r.verify(), Err(ReplayError::HashMismatch { .. })), "tampered commitment");
+    }
+
+    #[test]
+    fn replay_errors_render_a_message() {
+        // Every ReplayError prints a stable, prefixed diagnostic — exercises the
+        // Display arms so they cannot silently rot.
+        let errs = [
+            ReplayError::Version(VersionMismatch { ours: 1, theirs: 2 }),
+            ReplayError::MatchIdMismatch { replay: MID.parse().unwrap(), result: MID.parse().unwrap() },
+            ReplayError::InvalidRoster,
+            ReplayError::UnknownSeat { tick: 3, seat: 9 },
+            ReplayError::SeatOrder { tick: 3 },
+            ReplayError::TickOrder { index: 2, tick: 5 },
+            ReplayError::NotTerminal,
+            ReplayError::ResultMismatch,
+            ReplayError::HashMismatch { expected: "aa".into(), recomputed: "bb".into() },
+        ];
+        for e in &errs {
+            assert!(e.to_string().starts_with("invalid replay:"), "{e:?}");
+        }
+    }
 }
