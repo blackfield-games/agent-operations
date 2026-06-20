@@ -996,6 +996,46 @@ fn parse_forwarded_node(token: &str) -> Option<IpAddr> {
     t.parse::<SocketAddr>().ok().map(|sa| sa.ip())
 }
 
+/// Parse one RFC-7239 forwarded-element — a `;`-separated list of `token=value`
+/// pairs (`for=`/`by=`/`proto=`/`host=`) — into the client IP its `for=` names.
+/// Only `for` identifies the client. The value may be a bare token or a
+/// quoted-string; an IPv6 address is bracketed (`for="[2001:db8::1]:443"`) and may
+/// carry a port. Returns `None` (an indeterminate hop, like `parse_forwarded_node`
+/// for XFF) when the element has no `for=`, or its value is obfuscated (`_hidden`),
+/// `unknown`, empty, or unparseable — the caller then falls back to the peer.
+fn parse_forwarded_element(element: &str) -> Option<IpAddr> {
+    let raw = element
+        .split(';')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("for"))?
+        .1;
+    let v = raw.trim().trim_matches('"').trim();
+    if v.is_empty() || v.starts_with('_') || v.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    if let Some(inner) = v.strip_prefix('[') {
+        return inner.split(']').next()?.parse::<IpAddr>().ok();
+    }
+    parse_forwarded_node(v)
+}
+
+/// Parse the RFC-7239 `Forwarded` header(s) into the ordered `for=` client hops,
+/// left-to-right (farthest→nearest, since a proxy APPENDS its element — the same
+/// ordering as `X-Forwarded-For`). Multiple header lines are flattened in order,
+/// then each comma-separated forwarded-element yields one entry: its parsed `for=`
+/// client, or `None` for a missing/obfuscated/unparseable hop. Empty when no
+/// `Forwarded` header is present, which is the signal `resolve_source_ip` uses to
+/// fall through to the XFF path.
+fn parse_forwarded_for_nodes(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
+    headers
+        .get_all("forwarded")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|line| line.split(','))
+        .map(parse_forwarded_element)
+        .collect()
+}
+
 /// Walk a forwarded-hop chain NEAREST→FARTHEST (the order a proxy APPENDS in, so
 /// right-to-left) and return the first address that is not itself a trusted proxy
 /// — the IP the trust boundary actually observed the request arrive from. Trusted
@@ -1023,20 +1063,31 @@ fn select_untrusted_hop(
 }
 
 /// Resolve the client IP the per-source registration limiter should key on, from
-/// the connection `peer` and the request's `X-Forwarded-For`, trusting XFF ONLY
+/// the connection `peer` and the request's forwarded headers, trusting them ONLY
 /// when `peer` is itself a configured trusted proxy.
 ///
-/// A direct (untrusted) peer can write anything in XFF, so its XFF is ignored and
-/// the limiter keys on the peer — a direct attacker cannot forge a different
-/// source. When `peer` is trusted, walk the XFF chain RIGHT-TO-LEFT via
-/// [`select_untrusted_hop`]: a proxy APPENDS the address it observed, so the
+/// A direct (untrusted) peer can write anything in either header, so they are
+/// ignored and the limiter keys on the peer — a direct attacker cannot forge a
+/// different source. When `peer` is trusted, walk the forwarded chain RIGHT-TO-LEFT
+/// via [`select_untrusted_hop`]: a proxy APPENDS the address it observed, so the
 /// rightmost entries are the nearest hops, and the first non-trusted one is the IP
-/// the trust boundary saw. This rests on the operator's contract that a *listed*
-/// proxy appends the observed IP; a proxy that forwards client-supplied XFF without
-/// appending must not be listed.
+/// the trust boundary saw.
+///
+/// PRECEDENCE: the standardized RFC-7239 `Forwarded` header wins when present, else
+/// `X-Forwarded-For`, else the peer — a single deterministic source of truth, so an
+/// attacker behind the proxy cannot supply the *other* header to obtain a looser
+/// key. This holds an operator contract: a *listed* proxy appends the observed
+/// address to the header it emits, and overwrites/strips any inbound client copy of
+/// the header it does NOT emit (a proxy that forwards client-supplied forwarded
+/// headers verbatim must not be listed). The right-to-left walk already neutralizes
+/// prepended entries in the header the proxy DOES append.
 fn resolve_source_ip(peer: IpAddr, headers: &HeaderMap, trusted: &TrustedProxies) -> IpAddr {
     if !trusted.contains(&peer) {
         return peer;
+    }
+    let forwarded = parse_forwarded_for_nodes(headers);
+    if !forwarded.is_empty() {
+        return select_untrusted_hop(forwarded.into_iter().rev(), peer, trusted);
     }
     let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
         return peer;
