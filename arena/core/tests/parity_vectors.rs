@@ -7,7 +7,7 @@
 //! conventions cannot drift without an intentional golden update. It does NOT
 //! prove any second implementation agrees — there is no UE5 consumer yet.
 
-use arena_core::{parity_vectors, ParityVectors, PerceptionVerdict, WeaponMode};
+use arena_core::{parity_vectors, AimMode, ParityVectors, PerceptionVerdict, WeaponMode};
 use arena_proto::Vec2;
 
 const EAST: u16 = 0;
@@ -114,18 +114,21 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(miss.ticks_to_hit, None, "an off-line shot never reaches the target");
 
     // Full matches: every committed record re-runs to its own committed result
-    // (self-consistency); the digest commits the INPUTS, so the octant and fine
-    // matches share a digest under the same action stream; and the rules bind the
-    // OUTCOMES, so the projectile match diverges. Tampering either determinant must
-    // break verification.
+    // (self-consistency); the v4 digest commits the inputs AND the rules. The octant
+    // and fine matches run the IDENTICAL action stream and differ ONLY in aim_mode, so
+    // the tuning difference alone now separates their hashes — where before the rules
+    // binding they shared one. Tampering any determinant must break verification.
     for c in &v.matches {
         assert!(c.record.verify().is_ok(), "committed match {} does not self-verify", c.label);
     }
     let pick = |label: &str| &v.matches.iter().find(|c| c.label == label).unwrap().record;
     let (octant, fine, proj) = (pick("octant_hitscan"), pick("fine_hitscan"), pick("projectile"));
-    assert_eq!(
+    assert_eq!(octant.replay.ticks, fine.replay.ticks, "octant and fine run the identical action stream");
+    assert_ne!(octant.rules.aim_mode, fine.rules.aim_mode, "octant and fine differ only by aim_mode");
+    assert_eq!(octant.rules.aim_mode, AimMode::Octant);
+    assert_ne!(
         octant.result.replay_hash, fine.result.replay_hash,
-        "same action stream -> same digest, regardless of aim mode (the digest commits inputs)"
+        "the rules now bind the digest -> aim_mode alone changes the hash (the gap this closed)"
     );
     assert_ne!(octant.result.replay_hash, proj.result.replay_hash, "the projectile stream differs -> a different digest");
     assert_ne!(octant.result.final_tick, proj.result.final_tick, "weapon mode is an outcome determinant");

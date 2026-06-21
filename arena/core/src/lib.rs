@@ -1387,6 +1387,7 @@ impl Match {
             seats: self.seats.clone(),
             blockers: self.blockers.clone(),
             pickups: self.pickup_config.clone(),
+            rules_commit: self.rules.canonical_encoding(),
             ticks: self.ticks.clone(),
         }
     }
@@ -1424,6 +1425,7 @@ impl Match {
             protocol_version: PROTOCOL_VERSION,
             match_id: self.match_id,
             seed: self.seed,
+            rules_commit: self.rules.canonical_encoding(),
             seats: self.seats,
             blockers: self.blockers,
             pickups: self.pickup_config,
@@ -4135,6 +4137,7 @@ mod tests {
             seats: two_seats(),
             blockers: Vec::new(),
             pickups: Vec::new(),
+            rules_commit: Rules::default().canonical_encoding(),
             ticks: vec![TickRecord {
                 tick: 0,
                 actions: vec![SeatAction { seat: 0, intent: intent(Vec2 { x: 1_000_000, y: 0 }, EAST, false) }],
@@ -4234,6 +4237,23 @@ mod tests {
         let mut rec = play(1).to_record().unwrap();
         rec.rules.damage = rec.rules.damage.saturating_mul(4);
         assert!(rec.verify().is_err(), "altered rules must not reproduce the record");
+    }
+
+    #[test]
+    fn an_outcome_neutral_rules_tamper_breaks_the_hash() {
+        // The binding's core win. action_deadline_micros is carried ONLY on the
+        // Observation (a live agent's wall-clock answer budget) and never consulted by
+        // the headless re-run, so tampering it leaves every outcome bit-identical.
+        // Before Rules entered the digest this doctored record VERIFIED — the outcomes
+        // reproduced and the hash ignored the tuning; now the hash commits the tuning,
+        // so the re-run reproduces the SAME outcomes yet a DIFFERENT hash, caught as a
+        // HashMismatch rather than slipped through.
+        let mut rec = play(1).to_record().unwrap();
+        rec.rules.action_deadline_micros ^= 1;
+        match rec.verify() {
+            Err(ReplayError::HashMismatch { .. }) => {}
+            other => panic!("an outcome-neutral rules tamper must fail as HashMismatch, got {other:?}"),
+        }
     }
 
     #[test]

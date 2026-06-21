@@ -593,6 +593,16 @@ pub struct ReplayRecord {
     /// to the no-pickup behavior it ran under.
     #[serde(default)]
     pub pickups: Vec<PickupSpawn>,
+    /// The canonical integer encoding of the `Rules` the match ran under — the
+    /// combat tuning (weapon mode, damage, cooldowns, friendly fire, FOV spread, …).
+    /// The producer (arena-core) fills it from `Rules::canonical_encoding`;
+    /// [`digest`](ReplayRecord::digest) folds it so the hash COMMITS the tuning,
+    /// closing the gap where a record presented with swapped rules shared a hash with
+    /// the match it never ran (previously caught only by `verify`'s outcome re-run).
+    /// `serde(default)` (empty) so a record written before this field deserializes to
+    /// the pre-binding behavior it ran under.
+    #[serde(default)]
+    pub rules_commit: Vec<u8>,
     pub ticks: Vec<TickRecord>,
 }
 
@@ -607,14 +617,16 @@ impl ReplayRecord {
     pub fn digest(&self) -> [u8; 32] {
         let mut h = Keccak256::new();
         // v2 folded in the static `blockers` set; v3 folds in the static `pickups`
-        // set. The bump is honest about each encoding change. Blockers occlude
-        // vision only, so they cannot be bound by re-execution alone and committing
-        // them here is what pins a match's perception geometry to its hash; pickups
-        // DO alter the re-run outcome (a collected heal changes who survives), but an
-        // UNCOLLECTED pickup does not, so binding the full item layout here keeps the
-        // digest a complete, self-identifying commitment to the match world — the
-        // same role `blockers` plays.
-        h.update(b"blackfield/arena/replay/v3");
+        // set; v4 folds in the `rules_commit` (the combat tuning). The bump is honest
+        // about each encoding change. Blockers occlude vision only, so they cannot be
+        // bound by re-execution alone and committing them here is what pins a match's
+        // perception geometry to its hash; pickups DO alter the re-run outcome (a
+        // collected heal changes who survives), but an UNCOLLECTED pickup does not;
+        // and the rules drive every outcome yet rode only on the parent record, so a
+        // hash-only consumer could not tell a record's tuning from a swapped one.
+        // Folding all three keeps the digest a complete, self-identifying commitment
+        // to the match world AND the rules it ran under.
+        h.update(b"blackfield/arena/replay/v4");
         h.update(self.protocol_version.to_be_bytes());
         h.update(self.match_id.as_bytes());
         h.update(self.seed.to_be_bytes());
@@ -644,6 +656,8 @@ impl ReplayRecord {
             h.update(p.position.y.to_be_bytes());
             h.update(p.amount.to_be_bytes());
         }
+        h.update((self.rules_commit.len() as u32).to_be_bytes());
+        h.update(&self.rules_commit);
         h.update((self.ticks.len() as u32).to_be_bytes());
         for t in &self.ticks {
             h.update(t.tick.to_be_bytes());
@@ -1442,11 +1456,12 @@ mod tests {
     #[test]
     fn replay_digest_golden() {
         // A fixed record must hash to a fixed value. Any change to the canonical
-        // encoding (field order, prefixing, domain tag, the v2 blockers / v3 pickups
-        // sections) flips this — the hard byte-stability pin for on-chain attestation.
+        // encoding (field order, prefixing, domain tag, the v2 blockers / v3 pickups /
+        // v4 rules_commit sections) flips this — the hard byte-stability pin for
+        // on-chain attestation.
         assert_eq!(
             hex::encode(sample_replay().digest()),
-            "7e4f0d7d72e68f5a5883c31dfad94aec3db40a3ad4e1e751215820469f3cbf94"
+            "66864c0152285acc0db36aea5aa87b221d5d2db44d18ad73010c6817b4702733"
         );
     }
 
@@ -1496,6 +1511,17 @@ mod tests {
         let mut r2 = r.clone();
         r2.pickups[0].amount += 1;
         assert_ne!(with_pickup, r2.digest(), "a pickup's amount must bind");
+        // The rules commitment binds (v4): a record that ran under different combat
+        // tuning hashes differently even with an identical action stream — the gap
+        // that previously let a swapped-rules record share a hash with the real match.
+        let mut r = sample_replay();
+        r.rules_commit.push(0xff);
+        assert_ne!(base, r.digest(), "the rules commitment must bind");
+        // Its length is prefixed, so growing it is not the same as flipping a byte:
+        // [1,2,3,4,0] and [1,2,3,4] -> 0 must not collide.
+        let mut r3 = sample_replay();
+        r3.rules_commit[0] ^= 1;
+        assert_ne!(sample_replay().digest(), r3.digest(), "a rules-commit byte must bind");
     }
 
     #[test]
@@ -1628,6 +1654,7 @@ mod tests {
             ],
             blockers: Vec::new(),
             pickups: Vec::new(),
+            rules_commit: vec![1, 2, 3, 4],
             ticks: vec![
                 TickRecord {
                     tick: 0,

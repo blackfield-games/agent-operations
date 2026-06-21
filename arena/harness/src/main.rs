@@ -369,6 +369,7 @@ mod tests {
             seats,
             blockers: Vec::new(),
             pickups: Vec::new(),
+            rules_commit: Vec::new(),
             ticks: Vec::new(),
         }
     }
