@@ -108,8 +108,10 @@ pub enum SpendError {
     Transient(String),
     /// A non-retryable fault that is NOT a global config problem — e.g. the
     /// contract reverts `InsufficientCredit` for an underfunded buyer. Retrying in
-    /// a hot loop or dropping the debit are both wrong, so the drain stops and
-    /// surfaces it; the row stays pending.
+    /// a hot loop or dropping the debit are both wrong, so the drain DEAD-LETTERS
+    /// this one row (quarantines it — retained + auditable, surfaced at
+    /// `/stats dead_lettered_debits`) and CONTINUES, so one poison debit never blocks
+    /// the rest of the backlog. Unlike `NotAuthorized`, the fault is per-row, not global.
     Permanent(String),
 }
 

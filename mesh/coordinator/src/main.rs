@@ -531,12 +531,19 @@ struct Stats {
     /// pending receipt; this drains once the (operator-gated) on-chain relayer
     /// submits them. Until then it tracks `jobs_completed`.
     pending_attestations: usize,
-    /// Settled jobs whose ComputeMeter debit has not yet been spent on-chain — the
-    /// debit backlog depth (the metering twin of `pending_attestations`). A debit is
-    /// enqueued only for a metered settle (a job with a buyer when `--compute-rate-wei`
-    /// is set), so this is 0 whenever metering is disabled. Drains once the
-    /// (operator-gated) on-chain relayer spends them. Additive and optional.
+    /// Settled jobs whose ComputeMeter debit has not yet been spent on-chain AND is
+    /// still drainable — the debit backlog depth (the metering twin of
+    /// `pending_attestations`). A debit is enqueued only for a metered settle (a job
+    /// with a buyer when `--compute-rate-wei` is set), so this is 0 whenever metering
+    /// is disabled. Drains once the (operator-gated) on-chain relayer spends them.
+    /// Excludes dead-lettered rows (see `dead_lettered_debits`). Additive and optional.
     pending_debits: usize,
+    /// Debits the relayer quarantined after a non-retryable (`Permanent`) spend error
+    /// — e.g. an underfunded buyer's `InsufficientCredit`. The charge is still owed:
+    /// the row is retained (not dropped) but excluded from `pending_debits` so it
+    /// cannot block the backlog. Nonzero here means a stuck charge needs operator
+    /// attention (top-up + replay). 0 on a healthy mesh. Additive and optional.
+    dead_lettered_debits: usize,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -1628,9 +1635,12 @@ fn spawn_debit_relayer<S: Spender + 'static>(state: Arc<AppState>, spender: S, i
 /// re-acquired to mark the result, so settles and `/stats` never stall behind RPC
 /// latency. `AlreadySpent` is an idempotent success (the debit is on-chain after a
 /// recovered crash) so it is marked and the drain continues; `NotAuthorized` is
-/// surfaced loudly + distinctly (the spender key needs `ComputeMeter.setSpender`);
-/// a transient or permanent error stops the batch (backs off to the next tick)
-/// without dropping or double-spending any debit.
+/// surfaced loudly + distinctly and STOPS the batch (a global misconfig — the
+/// spender key needs `ComputeMeter.setSpender` — so every debit would revert); a
+/// transient error stops the batch (backs off to the next tick). A `Permanent`
+/// error is per-row: that one debit is DEAD-LETTERED (quarantined + retained +
+/// surfaced at `/stats dead_lettered_debits`) and the drain CONTINUES, so one poison
+/// debit never blocks the rest of the backlog. No debit is dropped or double-spent.
 async fn drain_debits<S: Spender>(state: &Arc<AppState>, spender: &S) {
     loop {
         let claimed = {
@@ -1661,8 +1671,28 @@ async fn drain_debits<S: Spender>(state: &Arc<AppState>, spender: &S) {
                 return; // back off to the next tick
             }
             Err(SpendError::Permanent(msg)) => {
-                tracing::error!(%job_id, %msg, "spender: permanent spend failure; draining paused (e.g. an underfunded buyer's InsufficientCredit)");
-                return;
+                // A per-row, non-retryable fault (e.g. an underfunded buyer's
+                // InsufficientCredit) — NOT a global config problem like NotAuthorized.
+                // Quarantine THIS debit and keep draining the rest, so one poison row
+                // never blocks the backlog. The row is retained (the charge is still
+                // owed + auditable) and surfaced at `/stats dead_lettered_debits`. On a
+                // mark error the row stays pending, so back off rather than hot-loop.
+                tracing::error!(%job_id, %msg, "spender: permanent spend failure; dead-lettering and continuing (e.g. an underfunded buyer's InsufficientCredit)");
+                let marked = {
+                    let store = state.store.lock().await;
+                    store.mark_debit_dead_lettered(&job_id, now_secs())
+                };
+                match marked {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(%job_id, "spender: debit already settled or dead-lettered; skipping")
+                    }
+                    Err(e) => {
+                        tracing::error!(%job_id, ?e, "spender: mark_debit_dead_lettered failed");
+                        return;
+                    }
+                }
+                continue;
             }
         };
 
@@ -2167,6 +2197,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let dead_lettered_debits = match store.dead_lettered_debit_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: dead_lettered_debit_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -2187,6 +2224,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_faults,
         pending_attestations,
         pending_debits,
+        dead_lettered_debits,
     }))
 }
 
@@ -4709,6 +4747,10 @@ mod tests {
         state.store.lock().await.pending_debit_count().unwrap()
     }
 
+    async fn dead_lettered_debits(state: &Arc<AppState>) -> usize {
+        state.store.lock().await.dead_lettered_debit_count().unwrap()
+    }
+
     #[tokio::test]
     async fn drain_debits_spends_each_pending_once_and_marks_it() {
         let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
@@ -4818,8 +4860,12 @@ mod tests {
         assert_eq!(spender.calls(), 1, "batch stops at the first error — no hot loop");
     }
 
+    /// A permanent error quarantines that one debit (dead-lettered, NOT dropped) and
+    /// the drain finishes: it leaves the drainable backlog (pending → 0), is retained
+    /// + surfaced as a dead-letter, and nothing is spent on-chain. The single
+    /// dead-lettered row is not re-claimed, so there is no hot loop.
     #[tokio::test]
-    async fn drain_debits_does_not_drop_on_a_permanent_error() {
+    async fn drain_debits_dead_letters_a_permanent_error_and_retains_it() {
         let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
         let job = seed_job();
         settle_one_metered(&state, &job).await;
@@ -4827,9 +4873,10 @@ mod tests {
         let spender = MockSpender::permanent();
         drain_debits(&state, &spender).await;
 
-        assert_eq!(pending_debits(&state).await, 1, "permanent error does not drop the debit");
-        assert_eq!(spender.calls(), 1, "no hot loop");
-        assert!(spender.spent().is_empty());
+        assert_eq!(pending_debits(&state).await, 0, "the poison debit leaves the drainable backlog");
+        assert_eq!(dead_lettered_debits(&state).await, 1, "it is quarantined, not dropped");
+        assert_eq!(spender.calls(), 1, "no hot loop — the dead-lettered row is not re-claimed");
+        assert!(spender.spent().is_empty(), "nothing spent on-chain");
     }
 
     /// FM3: a `NotAuthorized` revert (the spender key isn't on
