@@ -1799,12 +1799,17 @@ mod tests {
         out_of_range: usize,
         out_of_cone: usize,
         out_of_los: usize,
+        /// Live projectiles a seat could NOT perceive (out of range/cone/LOS) and so
+        /// correctly did not appear in its observation — summed over seats. A non-zero
+        /// count proves the projectile filter is load-bearing, not vacuous.
+        proj_excluded: usize,
     }
 
     fn assert_parity_bound(m: &Match) -> ParityCounts {
         let perception = m.rules.perception_range;
         let spread = m.rules.fov_octant_spread;
-        let mut counts = ParityCounts { out_of_range: 0, out_of_cone: 0, out_of_los: 0 };
+        let mut counts =
+            ParityCounts { out_of_range: 0, out_of_cone: 0, out_of_los: 0, proj_excluded: 0 };
         for truth in &m.pawns {
             let seat = truth.seat;
             let obs = m.observe(seat);
@@ -1849,6 +1854,32 @@ mod tests {
                     } else if !in_los {
                         counts.out_of_los += 1;
                     }
+                }
+            }
+            // Projectiles obey the IDENTICAL bound — recomputed here from ground truth
+            // (the raw projectile position), not read back from the observation, so the
+            // audit is independent. A perceivable shot appears with exactly its real
+            // position, the neutral team, and the Projectile kind; an out-of-bound shot
+            // is absent and its position never leaks.
+            for proj in &m.projectiles {
+                let in_range = within(truth.pos, proj.pos, perception);
+                let in_cone = in_fov(truth.facing, truth.pos, proj.pos, spread);
+                let in_los = has_line_of_sight(&m.blockers, truth.pos, proj.pos);
+                let perceivable = in_range && in_cone && in_los;
+                let entry = obs.visible.iter().find(|e| e.entity_id == proj.id);
+                assert_eq!(
+                    entry.is_some(),
+                    perceivable,
+                    "seat {seat}: parity violated for projectile {} (perceivable={perceivable})",
+                    proj.id
+                );
+                if let Some(e) = entry {
+                    assert_eq!(e.position, proj.pos, "perceived projectile position must be the real one");
+                    assert_eq!(e.team, 0, "a projectile must be reported neutral");
+                    assert_eq!(e.kind, arena_proto::EntityKind::Projectile);
+                    assert!(e.in_line_of_sight, "a perceived projectile is in sight");
+                } else {
+                    counts.proj_excluded += 1;
                 }
             }
         }
@@ -2216,6 +2247,96 @@ mod tests {
         }
         assert!(ticks > 1, "the match ran multiple ticks");
         assert!(los_excluded > 0, "the wall never occluded anyone — the LOS bound check was vacuous");
+    }
+
+    /// A projectile at a chosen position with a NON-neutral internal team, so a test
+    /// can confirm the wire entry is reported as the neutral team regardless.
+    fn test_projectile(id: u32, pos: Vec2) -> Projectile {
+        Projectile { id, shooter: 0, team: 7, origin: pos, pos, vel: Vec2::ZERO, facing: EAST, age: 0 }
+    }
+
+    #[test]
+    fn parity_bound_holds_for_projectiles_through_their_flight() {
+        // Security (the arena invariant): a projectile obeys the SAME parity bound as
+        // a pawn. Three seats spread wider than the perception range, seat 0 firing
+        // slow shots across the line — so a shot in flight is in some seats' perception
+        // and out of others'. The per-tick audit holds the projectile to the bound for
+        // every seat every tick, and the projectile filter must actually exclude
+        // (`proj_excluded > 0`) or the check is vacuous.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "a".into() },
+            SeatInfo { seat: 1, team: 1, controller: "b".into() },
+            SeatInfo { seat: 2, team: 2, controller: "c".into() },
+        ];
+        let rules = Rules {
+            weapon_mode: WeaponMode::Projectile,
+            spawn_radius: 10 * POSITION_SCALE,
+            spawn_jitter: 0,
+            perception_range: 6 * POSITION_SCALE, // tighter than the seat spacing
+            projectile_speed: POSITION_SCALE,     // 1 m/tick — lingers in flight
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, Vec::new(), 1);
+        let aim = m.observe(0).own.facing;
+        let mut proj_excluded = 0;
+        let mut saw_proj = false;
+        let mut ticks = 0u64;
+        while m.phase() == MatchPhase::Live && ticks < 120 {
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, aim, true))]);
+            let c = assert_parity_bound(&m);
+            proj_excluded += c.proj_excluded;
+            saw_proj |= !m.projectiles.is_empty();
+            ticks += 1;
+        }
+        assert!(saw_proj, "projectiles were in flight");
+        assert!(proj_excluded > 0, "no projectile was ever out of a seat's perception — the audit was vacuous");
+    }
+
+    #[test]
+    fn a_projectile_beyond_perception_is_absent_and_its_position_never_leaks() {
+        // A shot beyond a seat's perception never appears in its observation and its
+        // position never leaks; the SAME shot one unit inside is perceived — as a
+        // neutral Projectile at its real position, even though its internal team is
+        // non-neutral (the shooter affiliation is scrubbed on the wire).
+        let r = 10 * POSITION_SCALE;
+        let rules = Rules {
+            weapon_mode: WeaponMode::Projectile,
+            perception_range: r,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        for p in &mut m.pawns {
+            match p.seat {
+                0 => {
+                    p.pos = Vec2::ZERO;
+                    p.facing = EAST;
+                }
+                1 => p.pos = Vec2 { x: 100 * POSITION_SCALE, y: 0 }, // far away, not under test
+                _ => {}
+            }
+        }
+        let far = Vec2 { x: r + 1, y: 0 };
+        m.projectiles.push(test_projectile(PROJECTILE_ID_BASE, far));
+        let obs = m.observe(0);
+        assert!(
+            obs.visible.iter().all(|e| e.kind != arena_proto::EntityKind::Projectile),
+            "a shot beyond perception is absent"
+        );
+        assert!(obs.visible.iter().all(|e| e.position != far), "an unperceived shot's position must not leak");
+        assert_parity_bound(&m);
+
+        let near = Vec2 { x: r - 1, y: 0 };
+        m.projectiles[0].pos = near;
+        let obs = m.observe(0);
+        let p = obs
+            .visible
+            .iter()
+            .find(|e| e.kind == arena_proto::EntityKind::Projectile)
+            .expect("the in-range shot is perceived");
+        assert_eq!(p.position, near, "perceived at its real position");
+        assert_eq!(p.team, 0, "reported neutral, not the internal shooter team (7)");
+        assert_parity_bound(&m);
     }
 
     #[test]
