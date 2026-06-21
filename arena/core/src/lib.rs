@@ -2667,6 +2667,13 @@ mod tests {
         run_match(close_match(seed), &mut policies)
     }
 
+    /// Like [`play`], but in projectile weapon mode — the same two Seekers, now firing
+    /// traveling shots, driven to a terminal result.
+    fn play_projectiles(seed: u64) -> Match {
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        run_match(projectile_close_match(seed), &mut policies)
+    }
+
     /// Like [`play`] but with static vision blockers riding into the record. The
     /// blockers go off the y=0 combat line ([`off_line_blocker`]) so the quick,
     /// decisive match is byte-identical in OUTCOME — they exercise the
@@ -2720,6 +2727,55 @@ mod tests {
         let b = play(7).into_replay();
         assert_eq!(a.digest(), b.digest());
         assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    }
+
+    #[test]
+    fn a_projectile_match_replays_byte_for_byte() {
+        // FM1: projectiles are derived from the recorded fire actions, never recorded
+        // themselves. A projectile match re-runs from its action stream ALONE on a
+        // fresh same-seed match — the shots respawn and fly identically — to the same
+        // result + digest. This is what keeps a traveling-shot match attestable.
+        let played = play_projectiles(1);
+        assert_eq!(played.phase(), MatchPhase::Ended);
+        let result = played.result().unwrap().clone();
+        let replay = played.into_replay();
+
+        let replayed = replay_match(projectile_close_match(1), &replay);
+        assert_eq!(replayed.phase(), MatchPhase::Ended);
+        assert_eq!(replayed.result().unwrap(), &result, "projectile replay diverged from the live result");
+        assert_eq!(replayed.into_replay().digest(), replay.digest(), "projectile replay digest diverged");
+    }
+
+    #[test]
+    fn a_projectile_match_is_byte_identical_across_runs() {
+        // FM1: the projectile path is float-free (octant velocity, integer swept
+        // collision), so two independent same-seed runs are byte-identical.
+        let a = play_projectiles(7).into_replay();
+        let b = play_projectiles(7).into_replay();
+        assert_eq!(a.digest(), b.digest());
+        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    }
+
+    #[test]
+    fn a_finished_projectile_record_verifies() {
+        // A projectile match played to the end re-runs from its record ALONE back to
+        // the same result + committed hash — verify exercises the whole projectile sim.
+        let rec = play_projectiles(1).to_record().unwrap();
+        let verified = rec.verify().expect("a faithful projectile record verifies");
+        assert_eq!(verified, rec.result, "verify returns the reproduced result");
+    }
+
+    #[test]
+    fn flipping_weapon_mode_fails_to_reproduce() {
+        // FM1: weapon_mode is a Rules determinant bound by RE-EXECUTION, not the digest
+        // (the digest hashes only the action stream). A projectile match's record
+        // re-run as hitscan resolves the same actions instantly instead of in flight,
+        // so the outcome diverges and the record is rejected — it cannot be re-settled
+        // under a weapon mode it was not played on.
+        let mut rec = play_projectiles(1).to_record().unwrap();
+        assert_eq!(rec.rules.weapon_mode, WeaponMode::Projectile);
+        rec.rules.weapon_mode = WeaponMode::Hitscan;
+        assert!(rec.verify().is_err(), "a record re-run under a different weapon mode must not reproduce");
     }
 
     #[test]
