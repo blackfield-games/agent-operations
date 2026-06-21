@@ -433,6 +433,17 @@ pub struct Rules {
     /// combat and fall damage are deferred follow-ups.
     #[serde(default)]
     pub gravity: i32,
+    /// Ticks between dashes — the rate gate for the
+    /// [`ability`](arena_proto::ActionButtons::ability) dash, and its on/off switch.
+    /// `serde(default)` (`0`) DISABLES the dash entirely: an ability press is inert and
+    /// the match plays byte-identically to one without it (the default, and every
+    /// pre-dash record). A non-zero value turns the dash on — a grounded ability press
+    /// with a movement direction bursts the pawn [`DASH_DISTANCE`] units along
+    /// `move_dir` (bounds- and blocker-clamped like a normal step), then this many ticks
+    /// must elapse before the next dash. The burst distance is the fixed [`DASH_DISTANCE`]
+    /// constant; this cooldown is the only dash tuning the digest binds.
+    #[serde(default)]
+    pub dash_cooldown: u16,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -468,6 +479,7 @@ impl Default for Rules {
             melee_cooldown: default_melee_cooldown(),
             max_shield: 0, // shield disabled by default — earned only when configured
             gravity: 0,    // vertical physics off by default — jump inert, z stays 0
+            dash_cooldown: 0, // dash disabled by default — ability press inert
         }
     }
 }
@@ -519,6 +531,7 @@ impl Rules {
         b.extend_from_slice(&self.melee_cooldown.to_be_bytes());
         b.extend_from_slice(&self.max_shield.to_be_bytes());
         b.extend_from_slice(&self.gravity.to_be_bytes());
+        b.extend_from_slice(&self.dash_cooldown.to_be_bytes());
         b
     }
 }
@@ -5095,9 +5108,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 10×i32 + 1×u32 + 8×u16 + 4×u8 = 64 bytes. A new sim field added to the
+        // 10×i32 + 1×u32 + 9×u16 + 4×u8 = 66 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 64, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 66, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -5123,8 +5136,9 @@ mod tests {
             ("melee_cooldown", Rules { melee_cooldown: base.melee_cooldown + 1, ..base }),
             ("max_shield", Rules { max_shield: base.max_shield + 1, ..base }),
             ("gravity", Rules { gravity: base.gravity + 1, ..base }),
+            ("dash_cooldown", Rules { dash_cooldown: base.dash_cooldown + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 23, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 24, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
