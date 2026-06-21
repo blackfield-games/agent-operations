@@ -150,9 +150,16 @@ enum Resolution {
 }
 
 /// In-process [`Settle`] for tests and the `--settle-dev-mock` path. Never touches
-/// a chain: it records each resolution and enforces the SAME per-`match_id` fence
-/// the contract does — a second resolution of ANY kind returns
-/// [`SettleError::AlreadyResolved`], so a crash/retry can never double-settle.
+/// a chain: it records each resolution and models the contract's per-`match_id`
+/// fence — a second resolution of ANY kind returns [`SettleError::AlreadyResolved`],
+/// the same logic the on-chain `Status.Open` check applies.
+///
+/// The map is in-memory, so this guards a retry WITHIN one run, not across a
+/// process crash: the authoritative, crash-durable double-settle guard is the
+/// on-chain fence (a real submitter that crashed mid-settle re-submits and the
+/// chain rejects it). The mock also does NOT re-implement the contract's other
+/// input checks (winner-is-a-participant, distinct agents) — those stay the
+/// contract's job; the mock models only the idempotency boundary.
 #[derive(Default)]
 struct MockSettler {
     resolved: RefCell<BTreeMap<Uuid, Resolution>>,
