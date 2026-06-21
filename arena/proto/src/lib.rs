@@ -1592,6 +1592,19 @@ mod tests {
     }
 
     #[test]
+    fn replay_record_without_config_parses_to_default() {
+        // FM (back-compat): a record written before `config` existed must still PARSE
+        // (serde default), filling the all-zero MatchConfig — the same structural
+        // back-compat the blockers/pickups/rules_commit defaults give. It does NOT
+        // re-verify (the all-zero config disagrees with the real one — a hard cutover),
+        // but it must never fail to deserialize.
+        let mut json = serde_json::to_value(sample_replay()).unwrap();
+        json.as_object_mut().unwrap().remove("config");
+        let parsed: ReplayRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.config, MatchConfig::default(), "a config-less record fills the default config");
+    }
+
+    #[test]
     fn match_result_wire_shape_is_stable_and_commits_to_replay() {
         let rec = sample_replay();
         let canonical = serde_json::json!({
