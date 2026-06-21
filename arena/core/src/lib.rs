@@ -148,6 +148,34 @@ fn default_projectile_speed() -> i32 {
     2 * POSITION_SCALE
 }
 
+/// Entity-id base for projectiles, above the pawn id space (a pawn's `entity_id` is
+/// its `SeatId`, ≤ 255). Each spawn takes the next id from here, so projectile and
+/// pawn ids never collide and the canonical ascending-id visible set lists pawns
+/// first, then projectiles.
+const PROJECTILE_ID_BASE: u32 = 1 << 16;
+
+/// DoS backstop: the most projectiles one match keeps in flight at once. Per-tick
+/// collision is O(live · seats), so an unbounded live set under a fire-every-tick
+/// agent (e.g. a `fire_cooldown == 0` rule) would grow per-tick work without bound; a
+/// fire at the cap spends its ammo but spawns nothing. Generous — default fire
+/// cadence + range-bounded flight keep a real seat to a handful of live shots — so it
+/// never constrains real play, only the worst case.
+pub const MAX_LIVE_PROJECTILES: usize = 1024;
+
+/// Termination backstop: a projectile is force-expired after this many ticks of
+/// flight regardless of range. Range-expiry (past `weapon_range`) is the normal end
+/// and fires far sooner for any sane config; this guarantees a projectile ALWAYS
+/// terminates even when the octant-snapped velocity rounds to zero (a sub-octant-scale
+/// `projectile_speed`), so the live set can never retain a motionless shot forever.
+const MAX_PROJECTILE_LIFETIME: u16 = 600;
+
+/// Overflow guard + sanity clamp on `projectile_speed` at spawn: bounds a projectile's
+/// per-tick travel (hence the swept segment length) so the `i128` segment-vs-disc math
+/// cannot overflow at any in-bounds arena coordinate. ~1048 m/tick — absurdly fast, so
+/// as a clamp it never constrains a real shot; it exists only so a misconfigured (or
+/// hand-crafted record's) extreme speed degrades to a fast-but-finite shot, not a panic.
+const MAX_PROJECTILE_SPEED: i32 = 1 << 20;
+
 /// The combat tuning a match runs under — distinct from `arena_proto::MatchConfig`
 /// (which is the read-only rules summary sent to agents). These are the
 /// server-authoritative constants the sim clamps and resolves against; an agent
@@ -303,6 +331,38 @@ struct Pawn {
     alive: bool,
 }
 
+/// One in-flight projectile — match state derived entirely from a recorded fire
+/// action (a [`WeaponMode::Projectile`] fire spawns it). Because a projectile is a
+/// pure function of the seed + rules + the recorded action stream, it is never itself
+/// recorded; replay re-runs the actions and respawns it identically, so the match
+/// still reproduces bit-for-bit. The agent never sees this struct — a perceivable
+/// projectile reaches it as a parity-bounded [`VisibleEntity`] carrying only its
+/// `id`, `position`, and travel `facing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Projectile {
+    /// Stable per-match id (from [`PROJECTILE_ID_BASE`]) — the wire `entity_id`.
+    id: u32,
+    /// The seat that fired it, credited the damage on a hit. NEVER emitted on the
+    /// wire — it would reveal who fired the shot.
+    shooter: SeatId,
+    /// The shooter's team: a projectile passes through its shooter and allies, the
+    /// same friendly-fire-off rule hitscan uses. NEVER emitted — a projectile is
+    /// reported as the neutral team so its affiliation is not perceivable.
+    team: TeamId,
+    /// Spawn position — the anchor range expiry measures against.
+    origin: Vec2,
+    /// Current position; this tick's swept segment runs from here to `pos + vel`.
+    pos: Vec2,
+    /// Per-tick integer velocity (the firing octant scaled to the clamped
+    /// `projectile_speed`).
+    vel: Vec2,
+    /// Travel heading (the snapped firing octant) — the only orientation a perceiver
+    /// legitimately reads off a shot in flight.
+    facing: Bam,
+    /// Ticks in flight, checked against [`MAX_PROJECTILE_LIFETIME`].
+    age: u16,
+}
+
 /// The arena match: roster, authoritative pawn state, and the lifecycle phase.
 /// A match advances one fixed tick at a time and never moves backward.
 pub struct Match {
@@ -315,6 +375,13 @@ pub struct Match {
     /// hitscan ignore them). Empty means omnidirectional, no-occluder perception.
     blockers: Vec<Blocker>,
     pawns: Vec<Pawn>,
+    /// Projectiles in flight, ascending by id (spawn order). Always empty in
+    /// [`WeaponMode::Hitscan`], so the per-tick advance is a no-op and a hitscan match
+    /// is byte-identical. Derived state — never recorded; recomputed on replay from
+    /// the action stream.
+    projectiles: Vec<Projectile>,
+    /// Monotonic projectile id source; a spawn takes this value, then increments.
+    next_projectile_id: u32,
     tick: u64,
     phase: MatchPhase,
     seed: u64,
@@ -388,6 +455,8 @@ impl Match {
             seats,
             blockers,
             pawns,
+            projectiles: Vec::new(),
+            next_projectile_id: PROJECTILE_ID_BASE,
             tick: 0,
             phase: MatchPhase::Live,
             seed,
@@ -441,10 +510,12 @@ impl Match {
     /// `perception_range`, inside the seat's forward FOV cone
     /// ([`Rules::fov_octant_spread`]; the default full circle imposes no angular
     /// bound), AND with a clear line of sight — not occluded by a vision
-    /// [`Blocker`] — never itself), in ascending `entity_id` order so the snapshot
-    /// is canonical. The absence of any other field is the security bound — there
-    /// is no path here to full world state. Each filter only ever REMOVES a
-    /// perceivable enemy, so none can widen the bound.
+    /// [`Blocker`] — never itself, PLUS any in-flight projectile under the SAME
+    /// range + cone + line-of-sight bound), in ascending `entity_id` order so the
+    /// snapshot is canonical. The absence of any other field is the security bound —
+    /// there is no path here to full world state. Each filter only ever REMOVES a
+    /// perceivable entity, so none can widen the bound; a projectile is reported as
+    /// the neutral team and carries no shooter/target, so it leaks no hidden state.
     pub fn observe(&self, seat: SeatId) -> arena_proto::Observation {
         let me = self.pawn(seat);
         let mut visible: Vec<arena_proto::VisibleEntity> = self
@@ -469,6 +540,26 @@ impl Match {
                 in_line_of_sight: true,
             })
             .collect();
+        // Perceivable in-flight projectiles, under the IDENTICAL range + cone + LOS
+        // bound the pawn filter uses, so a projectile is held to the same parity
+        // contract. It is reported as the neutral team and carries no shooter/target,
+        // so an observed shot reveals only its position and travel heading.
+        for proj in &self.projectiles {
+            if within(me.pos, proj.pos, self.rules.perception_range)
+                && in_fov(me.facing, me.pos, proj.pos, self.rules.fov_octant_spread)
+                && has_line_of_sight(&self.blockers, me.pos, proj.pos)
+            {
+                visible.push(arena_proto::VisibleEntity {
+                    entity_id: proj.id,
+                    kind: arena_proto::EntityKind::Projectile,
+                    team: 0,
+                    position: proj.pos,
+                    z: 0,
+                    facing: proj.facing,
+                    in_line_of_sight: true,
+                });
+            }
+        }
         visible.sort_by_key(|e| e.entity_id);
         arena_proto::Observation {
             protocol_version: arena_proto::PROTOCOL_VERSION,
@@ -665,9 +756,18 @@ impl Match {
             if intent.buttons.fire && self.pawns[i].cooldown == 0 && self.pawns[i].ammo > 0 {
                 self.pawns[i].ammo -= 1;
                 self.pawns[i].cooldown = self.rules.fire_cooldown;
-                self.resolve_fire(i);
+                match self.rules.weapon_mode {
+                    WeaponMode::Hitscan => self.resolve_fire(i),
+                    WeaponMode::Projectile => self.spawn_projectile(i),
+                }
             }
         }
+
+        // Advance in-flight projectiles AFTER this tick's moves and fires: existing
+        // shots collide against pawns at their post-move positions (so a strafe
+        // dodges), and a shot spawned this tick takes its first step too. A no-op in
+        // hitscan mode (the live set is always empty), so the hitscan path is unchanged.
+        self.advance_projectiles();
 
         let actions = accepted.iter().map(|(&seat, &intent)| SeatAction { seat, intent }).collect();
         self.ticks.push(TickRecord { tick: current, actions });
@@ -722,6 +822,108 @@ impl Match {
             }
             self.pawns[shooter].score += dmg as i32;
         }
+    }
+
+    /// Spawn a projectile for `shooter`'s fire in [`WeaponMode::Projectile`]. It
+    /// launches from the shooter along the snapped firing octant at the clamped
+    /// `projectile_speed`, taking the next stable id. At the live cap nothing spawns —
+    /// the trigger pull is wasted (ammo was already charged by the caller), the DoS
+    /// backstop that bounds per-tick work.
+    fn spawn_projectile(&mut self, shooter: usize) {
+        if self.projectiles.len() >= MAX_LIVE_PROJECTILES {
+            return;
+        }
+        let s = self.pawns[shooter];
+        let oct = octant_index(s.facing);
+        let (ox, oy) = OCTANTS[oct];
+        // Clamp the speed to a sane non-negative bound: a negative speed becomes a
+        // motionless shot (expires by lifetime) and an extreme one is capped so the
+        // swept i128 math stays overflow-free. Scale in i64 (octant · speed before the
+        // /OCTANT_SCALE divide) so the intermediate never overflows i32.
+        let speed = self.rules.projectile_speed.clamp(0, MAX_PROJECTILE_SPEED) as i64;
+        let vel = Vec2 {
+            x: (ox as i64 * speed / OCTANT_SCALE as i64) as i32,
+            y: (oy as i64 * speed / OCTANT_SCALE as i64) as i32,
+        };
+        let id = self.next_projectile_id;
+        self.next_projectile_id += 1;
+        self.projectiles.push(Projectile {
+            id,
+            shooter: s.seat,
+            team: s.team,
+            origin: s.pos,
+            pos: s.pos,
+            vel,
+            facing: (oct as u32 * 8192) as Bam, // each octant spans 8192 BAM (65536 / 8)
+            age: 0,
+        });
+    }
+
+    /// Advance every live projectile one tick, resolve hits, and drop the spent ones.
+    /// A no-op while nothing is in flight (every hitscan tick, and a projectile match
+    /// before its first fire), so it never perturbs a hitscan match. Each projectile
+    /// sweeps the segment from its previous to its new position and damages the nearest
+    /// enemy body that segment crosses — swept, so a fast shot cannot tunnel through a
+    /// pawn between ticks. A hit consumes the shot and credits its shooter (even if the
+    /// shooter has since died — a shot already in the air still lands); a clean shot
+    /// expires once it has travelled past `weapon_range` or hits the lifetime backstop.
+    /// A simultaneous mutual exchange can down both seats (each shot is independent of
+    /// its shooter's fate), unlike hitscan's seat-ordered decisiveness.
+    fn advance_projectiles(&mut self) {
+        if self.projectiles.is_empty() {
+            return;
+        }
+        let range2 = (self.rules.weapon_range as i128).pow(2);
+        let radius = self.rules.hit_radius;
+        let flying = std::mem::take(&mut self.projectiles);
+        let mut survivors = Vec::with_capacity(flying.len());
+        for mut proj in flying {
+            let from = proj.pos;
+            let to = Vec2 {
+                x: from.x.saturating_add(proj.vel.x),
+                y: from.y.saturating_add(proj.vel.y),
+            };
+            // The nearest enemy body the swept segment reaches, by distance from the
+            // launch end of the sweep (seat order breaks an exact tie) — the same
+            // nearest-target rule hitscan uses.
+            let mut hit: Option<usize> = None;
+            let mut best = i128::MAX;
+            for (j, t) in self.pawns.iter().enumerate() {
+                if !t.alive || t.seat == proj.shooter || t.team == proj.team {
+                    continue;
+                }
+                if !segment_hits_disc(from, to, t.pos, radius) {
+                    continue;
+                }
+                let dx = t.pos.x as i128 - from.x as i128;
+                let dy = t.pos.y as i128 - from.y as i128;
+                let d2 = dx * dx + dy * dy;
+                if d2 < best {
+                    best = d2;
+                    hit = Some(j);
+                }
+            }
+            if let Some(j) = hit {
+                let dmg = self.rules.damage.min(self.pawns[j].health);
+                self.pawns[j].health -= dmg;
+                if self.pawns[j].health == 0 {
+                    self.pawns[j].alive = false;
+                }
+                if let Some(sp) = self.pawns.iter_mut().find(|p| p.seat == proj.shooter) {
+                    sp.score += dmg as i32;
+                }
+                continue; // consumed on hit
+            }
+            proj.pos = to;
+            proj.age += 1;
+            let dx = proj.pos.x as i128 - proj.origin.x as i128;
+            let dy = proj.pos.y as i128 - proj.origin.y as i128;
+            if dx * dx + dy * dy > range2 || proj.age >= MAX_PROJECTILE_LIFETIME {
+                continue; // expired by range or the lifetime backstop
+            }
+            survivors.push(proj);
+        }
+        self.projectiles = survivors;
     }
 
     /// End the match when at most one team still has an alive pawn (a winner, or
@@ -1265,6 +1467,39 @@ fn segment_intersects_aabb(from: Vec2, to: Vec2, b: &Blocker) -> bool {
     lo <= 0 && hi >= 0
 }
 
+/// `true` if the closed segment `a → b` passes within `radius` of point `c` — the
+/// swept collision of a projectile's per-tick travel against a pawn body (a disc of
+/// `radius`). Integer point-to-segment squared distance, `i128` throughout (a squared
+/// planar distance exceeds `i64` at extreme arena coordinates), no float and no
+/// division, so it is exact and replay-stable. Because it tests the WHOLE segment, a
+/// fast shot whose endpoints both miss but whose path crosses the body still hits — no
+/// tunneling. `projectile_speed` is clamped at spawn, so the segment length (and these
+/// products) cannot overflow `i128` at any in-bounds coordinate.
+fn segment_hits_disc(a: Vec2, b: Vec2, c: Vec2, radius: i32) -> bool {
+    let (ax, ay) = (a.x as i128, a.y as i128);
+    let (bx, by) = (b.x as i128, b.y as i128);
+    let (cx, cy) = (c.x as i128, c.y as i128);
+    let r2 = (radius as i128) * (radius as i128);
+    let (abx, aby) = (bx - ax, by - ay);
+    let (apx, apy) = (cx - ax, cy - ay);
+    let seg_len2 = abx * abx + aby * aby; // |AB|²
+    let proj = apx * abx + apy * aby; // dot(AP, AB)
+    if seg_len2 == 0 || proj <= 0 {
+        // Closest point is A — a zero-length sweep, or C projects "behind" the launch.
+        return apx * apx + apy * apy <= r2;
+    }
+    if proj >= seg_len2 {
+        // Closest point is B — C projects past the far end.
+        let (bpx, bpy) = (cx - bx, cy - by);
+        return bpx * bpx + bpy * bpy <= r2;
+    }
+    // The perpendicular foot falls inside the segment: compare the perpendicular
+    // squared distance |AP|² − proj²/|AB|² to r² by multiplying through by |AB|² (> 0),
+    // keeping the whole test in exact integers.
+    let ap2 = apx * apx + apy * apy;
+    ap2 * seg_len2 - proj * proj <= r2 * seg_len2
+}
+
 /// How a finished match resolves for on-chain settlement, derived from its
 /// canonical [`MatchResult`] outcomes.
 ///
@@ -1359,6 +1594,47 @@ mod tests {
     fn close_match(seed: u64) -> Match {
         let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
         Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), seed)
+    }
+
+    /// [`close_match`], but in projectile weapon mode — the same exact geometry, so
+    /// the traveling-shot path is tested against known positions.
+    fn projectile_close_match(seed: u64) -> Match {
+        let rules = Rules {
+            weapon_mode: WeaponMode::Projectile,
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), seed)
+    }
+
+    #[test]
+    fn a_projectile_travels_and_downs_an_enemy() {
+        // The end-to-end projectile path: seat 0 fires across the gap, the shots fly
+        // and damage the still enemy until it is downed, and the shooter is credited
+        // — proving spawn → advance → swept collision → score all wire up.
+        let mut m = projectile_close_match(1);
+        let aim = m.observe(0).own.facing; // seat 0 spawned facing the enemy (EAST)
+        let mut saw_projectile = false;
+        while m.phase() == MatchPhase::Live {
+            // A shot in flight and perceivable shows as a neutral Projectile carrying
+            // only its position and travel heading — no shooter, no team.
+            if let Some(p) =
+                m.observe(0).visible.iter().find(|e| e.kind == arena_proto::EntityKind::Projectile)
+            {
+                saw_projectile = true;
+                assert_eq!(p.team, 0, "a projectile is reported neutral, not its shooter's team");
+                assert!(p.entity_id >= PROJECTILE_ID_BASE, "projectile ids sit above the pawn id space");
+                assert_eq!(p.facing, EAST, "the shot's heading is its travel octant");
+            }
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, aim, true))]);
+        }
+        let r = m.result().unwrap();
+        let s1 = r.outcomes.iter().find(|o| o.seat == 1).unwrap();
+        assert!(!s1.alive_at_end, "the projectiles downed the still enemy");
+        let s0 = r.outcomes.iter().find(|o| o.seat == 0).unwrap();
+        assert!(s0.score >= Rules::default().start_health as i32, "the shooter is credited the damage");
+        assert!(saw_projectile, "a shot was perceptible in flight");
     }
 
     #[test]
