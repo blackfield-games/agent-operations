@@ -237,8 +237,12 @@ pub struct VisibleEntity {
     /// Last perceived elevation (see [`POSITION_SCALE`]).
     pub z: i32,
     pub facing: Bam,
-    /// `true` if in the seat's line of sight this tick; `false` if this is a
-    /// last-known position the seat has since lost sight of.
+    /// `true` if in the seat's line of sight this tick. The reference core occludes
+    /// by EXCLUSION — an entity whose sightline crosses a vision [`Blocker`] is
+    /// dropped from the visible set entirely (it never widens perception), so every
+    /// entry it emits is in sight and this field is `true`. The `false` value is
+    /// reserved for a future perception-memory model that would surface a
+    /// last-known, since-lost position; the first-cut core produces no such entry.
     pub in_line_of_sight: bool,
 }
 
