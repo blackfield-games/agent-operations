@@ -1874,6 +1874,52 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_an_over_budget_tick_stream() {
+        // A crafted record with more ticks than the budget is rejected BEFORE the
+        // structural scan and the re-run, so it cannot become a CPU-DoS. Padding
+        // with empty ticks keeps the test cheap; the cap reads only `len()`.
+        let good = play(1).to_record().unwrap();
+        let mut r = good.clone();
+        let mut filler = r.replay.ticks[0].clone();
+        filler.actions.clear();
+        r.replay.ticks.resize(MAX_REPLAY_TICKS + 1, filler);
+        assert_eq!(
+            r.verify(),
+            Err(ReplayError::TooManyTicks { ticks: MAX_REPLAY_TICKS + 1, max: MAX_REPLAY_TICKS }),
+        );
+
+        // Boundary: exactly at the cap is NOT rejected by the budget (the guard is
+        // `>`, not `>=`) — it fails later for a different reason, never TooManyTicks.
+        let mut at = good.clone();
+        let mut filler = at.replay.ticks[0].clone();
+        filler.actions.clear();
+        at.replay.ticks.resize(MAX_REPLAY_TICKS, filler);
+        assert!(!matches!(at.verify(), Err(ReplayError::TooManyTicks { .. })));
+    }
+
+    #[test]
+    fn verify_rejects_an_over_budget_roster() {
+        // A crafted oversized roster (O(seats²) combat per re-run tick) is rejected
+        // before the roster scan and the re-run. The seat cap is checked before the
+        // roster's duplicate-id check, so padding with clones still trips it.
+        let good = play(1).to_record().unwrap();
+        let mut r = good.clone();
+        let filler = r.replay.seats[0].clone();
+        r.replay.seats.resize(MAX_REPLAY_SEATS + 1, filler);
+        assert_eq!(
+            r.verify(),
+            Err(ReplayError::TooManySeats { seats: MAX_REPLAY_SEATS + 1, max: MAX_REPLAY_SEATS }),
+        );
+
+        // Boundary: exactly at the cap is NOT a budget rejection (it fails the
+        // roster check on the duplicate ids instead) — pins `>` not `>=`.
+        let mut at = good.clone();
+        let filler = at.replay.seats[0].clone();
+        at.replay.seats.resize(MAX_REPLAY_SEATS, filler);
+        assert!(!matches!(at.verify(), Err(ReplayError::TooManySeats { .. })));
+    }
+
+    #[test]
     fn replay_errors_render_a_message() {
         // Every ReplayError prints a stable, prefixed diagnostic — exercises the
         // Display arms so they cannot silently rot.
@@ -1882,6 +1928,8 @@ mod tests {
             ReplayError::MatchIdMismatch { replay: MID.parse().unwrap(), result: MID.parse().unwrap() },
             ReplayError::InvalidRoster,
             ReplayError::MalformedSetup,
+            ReplayError::TooManyTicks { ticks: 1_000_000, max: MAX_REPLAY_TICKS },
+            ReplayError::TooManySeats { seats: 500, max: MAX_REPLAY_SEATS },
             ReplayError::UnknownSeat { tick: 3, seat: 9 },
             ReplayError::SeatOrder { tick: 3 },
             ReplayError::TickOrder { index: 2, tick: 5 },
