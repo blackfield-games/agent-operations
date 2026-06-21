@@ -316,6 +316,15 @@ const MELEE_ARC_SPREAD: u8 = 1;
 /// inert by default.
 pub const JUMP_VELOCITY: i32 = 1200;
 
+/// Distance a dash bursts along `move_dir`, in position units (3 m at
+/// [`POSITION_SCALE`] — roughly fifteen times a default `max_speed` walk step). The
+/// fixed burst impulse for every dash — only [`Rules::dash_cooldown`] (the digest-bound
+/// knob) tunes the cadence, so the distance stays a compile-time constant the UE5 twin
+/// mirrors exactly (the same discipline as [`JUMP_VELOCITY`]/[`MELEE_ARC_SPREAD`]),
+/// adding no digest surface. The dash is off unless `dash_cooldown > 0`, so this is
+/// inert by default.
+pub const DASH_DISTANCE: i32 = 3000;
+
 /// The combat tuning a match runs under — distinct from `arena_proto::MatchConfig`
 /// (which is the read-only rules summary sent to agents). These are the
 /// server-authoritative constants the sim clamps and resolves against; an agent
@@ -610,6 +619,10 @@ struct Pawn {
     ammo: u16,
     /// Ticks remaining before this pawn may fire again.
     cooldown: u16,
+    /// Ticks remaining before this pawn may dash again. `0` when the dash is ready (or
+    /// disabled). Never recorded (derived from the action stream like `cooldown`/`vel`),
+    /// so replay rebuilds it bit-for-bit; always `0` when `dash_cooldown == 0`.
+    dash_cooldown: u16,
     /// Cumulative damage this pawn has dealt to enemies — the match score.
     score: i32,
     alive: bool,
@@ -939,6 +952,7 @@ impl Match {
                     shield: 0,
                     ammo: rules.mag_size,
                     cooldown: 0,
+                    dash_cooldown: 0,
                     score: 0,
                     alive: true,
                 }
@@ -1255,6 +1269,7 @@ impl Match {
 
         for p in self.pawns.iter_mut().filter(|p| p.alive) {
             p.cooldown = p.cooldown.saturating_sub(1);
+            p.dash_cooldown = p.dash_cooldown.saturating_sub(1);
         }
 
         // Move + aim, in seat order. A forfeited seat holds still.
@@ -1276,9 +1291,29 @@ impl Match {
             // is byte-identical. Surface-snap and wall-sliding are deferred follow-ups.
             let from = self.pawns[i].pos;
             let to = self.slide(from, intent.move_dir, self.rules.max_speed);
-            self.pawns[i].vel = Vec2 { x: to.x - from.x, y: to.y - from.y };
-            self.pawns[i].pos = to;
             self.pawns[i].facing = intent.aim;
+
+            // Dash: an ability press bursts the pawn an extra DASH_DISTANCE along
+            // move_dir, on its own cooldown. Gated default-off (dash_cooldown == 0
+            // disables it). It reuses slide() from the POST-walk position, so the burst
+            // clamps to bounds and is refused by a blocker exactly like the walk — no
+            // tunnel, no out-of-bounds. A zero-move_dir press is a no-op that does NOT
+            // consume the cooldown (no direction to dash); otherwise the cooldown is
+            // consumed on trigger, even when a wall refuses the burst (the ability was
+            // committed — a wall is not a free retry). vel reports the whole tick's
+            // applied delta (walk + dash) from the pre-walk origin.
+            let dashing = self.rules.dash_cooldown > 0
+                && self.pawns[i].dash_cooldown == 0
+                && intent.buttons.ability
+                && intent.move_dir != Vec2::ZERO;
+            let landed = if dashing {
+                self.pawns[i].dash_cooldown = self.rules.dash_cooldown;
+                self.slide(to, intent.move_dir, DASH_DISTANCE)
+            } else {
+                to
+            };
+            self.pawns[i].vel = Vec2 { x: landed.x - from.x, y: landed.y - from.y };
+            self.pawns[i].pos = landed;
         }
 
         // Vertical (z-axis) movement: a grounded jump launches at JUMP_VELOCITY and
