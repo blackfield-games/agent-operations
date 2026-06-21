@@ -192,6 +192,12 @@ pub enum WeaponMode {
     /// A traveling projectile — the shot spawns and flies, hitting only when its
     /// swept path crosses an enemy body on a later (or the same point-blank) tick.
     Projectile,
+    /// A close-quarters swing — a fire press instantly strikes EVERY enemy within
+    /// [`Rules::melee_range`] and the frontal arc (a cleave, not the beam's
+    /// nearest-only hit), needs no ammunition, and is gated on
+    /// [`Rules::melee_cooldown`]. The always-available option when out of ammo or in
+    /// someone's face.
+    Melee,
 }
 
 /// How finely a fire's beam direction tracks the seat's aim — a match-level
@@ -277,6 +283,31 @@ fn default_pickup_respawn_cooldown() -> u16 {
     300
 }
 
+/// The serde/`Default` value for [`Rules::melee_range`] — a 2 m reach (only read in
+/// [`WeaponMode::Melee`]).
+fn default_melee_range() -> i32 {
+    2 * POSITION_SCALE
+}
+
+/// The serde/`Default` value for [`Rules::melee_damage`] — 50, so two swings down a
+/// full-health pawn.
+fn default_melee_damage() -> u16 {
+    50
+}
+
+/// The serde/`Default` value for [`Rules::melee_cooldown`] — 15 ticks, a slower
+/// cadence than the default ranged [`fire_cooldown`](Rules::fire_cooldown).
+fn default_melee_cooldown() -> u16 {
+    15
+}
+
+/// Frontal half-width of a [`WeaponMode::Melee`] swing as an octant spread, reusing
+/// the perception-cone geometry ([`in_fov`]): a fixed `1` (~135° arc, the facing
+/// octant ± its two neighbours) — wider than the nearest-only beam but not the full
+/// 180° a `dot > 0` half-plane would sweep. A const, not a `Rules` field, so it adds
+/// no digest surface.
+const MELEE_ARC_SPREAD: u8 = 1;
+
 /// The combat tuning a match runs under — distinct from `arena_proto::MatchConfig`
 /// (which is the read-only rules summary sent to agents). These are the
 /// server-authoritative constants the sim clamps and resolves against; an agent
@@ -358,6 +389,22 @@ pub struct Rules {
     /// back-compat. A pickup match with no pickups never consults it.
     #[serde(default = "default_pickup_respawn_cooldown")]
     pub pickup_respawn_cooldown: u16,
+    /// Reach of a [`WeaponMode::Melee`] swing, in position units: the swing strikes
+    /// every enemy whose centre is within this distance AND inside the frontal arc.
+    /// Consulted only in melee mode; `serde(default)` (2 m) so a pre-melee record
+    /// deserializes unchanged.
+    #[serde(default = "default_melee_range")]
+    pub melee_range: i32,
+    /// Damage one [`WeaponMode::Melee`] swing deals to each enemy it cleaves (clamped
+    /// to the target's health). `serde(default)` (50 — two swings down a full pawn,
+    /// rewarding the closed distance).
+    #[serde(default = "default_melee_damage")]
+    pub melee_damage: u16,
+    /// Ticks between [`WeaponMode::Melee`] swings (the melee analogue of
+    /// [`fire_cooldown`](Rules::fire_cooldown); melee consumes no ammo, so this is its
+    /// only rate gate). `serde(default)` (15 — a slower cadence than a ranged shot).
+    #[serde(default = "default_melee_cooldown")]
+    pub melee_cooldown: u16,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -388,6 +435,9 @@ impl Default for Rules {
             action_deadline_micros: 50_000,
             pickup_radius: default_pickup_radius(),
             pickup_respawn_cooldown: default_pickup_respawn_cooldown(),
+            melee_range: default_melee_range(),
+            melee_damage: default_melee_damage(),
+            melee_cooldown: default_melee_cooldown(),
         }
     }
 }
@@ -415,6 +465,7 @@ impl Rules {
         b.push(match self.weapon_mode {
             WeaponMode::Hitscan => 0,
             WeaponMode::Projectile => 1,
+            WeaponMode::Melee => 2,
         });
         b.extend_from_slice(&self.projectile_speed.to_be_bytes());
         b.push(match self.aim_mode {
@@ -433,6 +484,9 @@ impl Rules {
         b.extend_from_slice(&self.action_deadline_micros.to_be_bytes());
         b.extend_from_slice(&self.pickup_radius.to_be_bytes());
         b.extend_from_slice(&self.pickup_respawn_cooldown.to_be_bytes());
+        b.extend_from_slice(&self.melee_range.to_be_bytes());
+        b.extend_from_slice(&self.melee_damage.to_be_bytes());
+        b.extend_from_slice(&self.melee_cooldown.to_be_bytes());
         b
     }
 }
@@ -1178,12 +1232,27 @@ impl Match {
                 self.pawns[i].cooldown = self.rules.fire_cooldown;
                 continue;
             }
-            if intent.buttons.fire && self.pawns[i].cooldown == 0 && self.pawns[i].ammo > 0 {
-                self.pawns[i].ammo -= 1;
-                self.pawns[i].cooldown = self.rules.fire_cooldown;
+            if intent.buttons.fire && self.pawns[i].cooldown == 0 {
                 match self.rules.weapon_mode {
-                    WeaponMode::Hitscan => self.resolve_fire(i),
-                    WeaponMode::Projectile => self.spawn_projectile(i),
+                    // Melee needs no ammunition — the always-available close-quarters
+                    // swing, gated only by its own cooldown.
+                    WeaponMode::Melee => {
+                        self.pawns[i].cooldown = self.rules.melee_cooldown;
+                        self.resolve_melee(i);
+                    }
+                    // Ranged modes draw a round from the magazine; an empty mag is a
+                    // no-op (byte-identical to the pre-melee `ammo > 0` gate).
+                    WeaponMode::Hitscan if self.pawns[i].ammo > 0 => {
+                        self.pawns[i].ammo -= 1;
+                        self.pawns[i].cooldown = self.rules.fire_cooldown;
+                        self.resolve_fire(i);
+                    }
+                    WeaponMode::Projectile if self.pawns[i].ammo > 0 => {
+                        self.pawns[i].ammo -= 1;
+                        self.pawns[i].cooldown = self.rules.fire_cooldown;
+                        self.spawn_projectile(i);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1267,6 +1336,50 @@ impl Match {
             }
             // A friendly hit (only reachable under `friendly_fire`) deals damage but
             // never scores — a team hit is never rewarded.
+            if !friendly {
+                self.pawns[shooter].score += dmg as i32;
+            }
+        }
+    }
+
+    /// Resolve one [`WeaponMode::Melee`] swing from `shooter`: a CLEAVE that strikes
+    /// EVERY enemy within [`melee_range`](Rules::melee_range), inside the frontal arc
+    /// ([`MELEE_ARC_SPREAD`] octants of facing, the same integer cone perception
+    /// uses), and with a clear sightline — never the shooter, and an ally only under
+    /// [`friendly_fire`](Rules::friendly_fire). Unlike the nearest-only beam, all
+    /// matched targets take damage. Targets are collected in seat order, then damaged,
+    /// so a same-tick multi-hit is deterministic and the immutable scan can't alias the
+    /// mutation. All integer: a squared planar range compare + the octant arc test.
+    fn resolve_melee(&mut self, shooter: usize) {
+        let s = self.pawns[shooter];
+        let range2 = (self.rules.melee_range as i128).pow(2);
+        let mut hits: Vec<usize> = Vec::new();
+        for (j, t) in self.pawns.iter().enumerate() {
+            if j == shooter || !t.alive || (!self.rules.friendly_fire && t.team == s.team) {
+                continue;
+            }
+            let dx = t.pos.x as i128 - s.pos.x as i128;
+            let dy = t.pos.y as i128 - s.pos.y as i128;
+            if dx * dx + dy * dy > range2 {
+                continue;
+            }
+            if !in_fov(s.facing, s.pos, t.pos, MELEE_ARC_SPREAD) {
+                continue;
+            }
+            if !has_line_of_sight(&self.blockers, s.pos, t.pos) {
+                continue;
+            }
+            hits.push(j);
+        }
+        for j in hits {
+            let friendly = self.pawns[j].team == s.team;
+            let dmg = self.rules.melee_damage.min(self.pawns[j].health);
+            self.pawns[j].health -= dmg;
+            if self.pawns[j].health == 0 {
+                self.pawns[j].alive = false;
+            }
+            // A friendly hit (only under `friendly_fire`) deals damage but never
+            // scores — mirrors resolve_fire.
             if !friendly {
                 self.pawns[shooter].score += dmg as i32;
             }
@@ -4721,9 +4834,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 8×i32 + 1×u32 + 5×u16 + 4×u8 = 50 bytes. A new sim field added to the
+        // 9×i32 + 1×u32 + 7×u16 + 4×u8 = 58 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 50, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 58, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -4744,11 +4857,21 @@ mod tests {
             ("action_deadline_micros", Rules { action_deadline_micros: base.action_deadline_micros + 1, ..base }),
             ("pickup_radius", Rules { pickup_radius: base.pickup_radius + 1, ..base }),
             ("pickup_respawn_cooldown", Rules { pickup_respawn_cooldown: base.pickup_respawn_cooldown + 1, ..base }),
+            ("melee_range", Rules { melee_range: base.melee_range + 1, ..base }),
+            ("melee_damage", Rules { melee_damage: base.melee_damage + 1, ..base }),
+            ("melee_cooldown", Rules { melee_cooldown: base.melee_cooldown + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 18, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 21, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
+        // The three WeaponMode bytes are distinct (Hitscan=0/Projectile=1/Melee=2),
+        // so the digest tells the weapon apart — the Melee byte is part of the contract.
+        let modes = [WeaponMode::Hitscan, WeaponMode::Projectile, WeaponMode::Melee];
+        let encs: Vec<_> = modes.iter().map(|&m| Rules { weapon_mode: m, ..base }.canonical_encoding()).collect();
+        assert_ne!(encs[0], encs[1]);
+        assert_ne!(encs[0], encs[2]);
+        assert_ne!(encs[1], encs[2]);
     }
 
     #[test]
