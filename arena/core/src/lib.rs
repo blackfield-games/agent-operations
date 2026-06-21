@@ -1024,7 +1024,7 @@ impl Match {
         let radius2 = (self.rules.hit_radius as i128).pow(2);
         let mut best: Option<(usize, i128)> = None;
         for (j, t) in self.pawns.iter().enumerate() {
-            if j == shooter || !t.alive || t.team == s.team {
+            if j == shooter || !t.alive || (!self.rules.friendly_fire && t.team == s.team) {
                 continue;
             }
             let dx = t.pos.x as i128 - s.pos.x as i128;
@@ -1047,12 +1047,17 @@ impl Match {
             }
         }
         if let Some((j, _)) = best {
+            let friendly = self.pawns[j].team == s.team;
             let dmg = self.rules.damage.min(self.pawns[j].health);
             self.pawns[j].health -= dmg;
             if self.pawns[j].health == 0 {
                 self.pawns[j].alive = false;
             }
-            self.pawns[shooter].score += dmg as i32;
+            // A friendly hit (only reachable under `friendly_fire`) deals damage but
+            // never scores — a team hit is never rewarded.
+            if !friendly {
+                self.pawns[shooter].score += dmg as i32;
+            }
         }
     }
 
