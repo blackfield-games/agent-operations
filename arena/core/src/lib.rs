@@ -2073,7 +2073,8 @@ pub fn parity_vectors() -> ParityVectors {
                 jittered,
                 vec![parity_seat(0, 0), parity_seat(1, 1), parity_seat(2, 2), parity_seat(3, 3)],
             ),
-            spawn_case("single_seat_centred", 7, jittered, vec![parity_seat(0, 0)]),
+            // A lone seat takes the n<=1 branch (base x = 0, no spread), then jitters.
+            spawn_case("single_seat_no_spread", 7, jittered, vec![parity_seat(0, 0)]),
         ],
         perception: vec![perception_case(
             "range_cone_los_edges",

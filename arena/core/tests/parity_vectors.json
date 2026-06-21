@@ -101,7 +101,7 @@
       ]
     },
     {
-      "label": "single_seat_centred",
+      "label": "single_seat_no_spread",
       "seed": 7,
       "config": {
         "tick_hz": 30,
