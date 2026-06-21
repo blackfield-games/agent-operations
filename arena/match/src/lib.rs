@@ -1189,6 +1189,21 @@ mod tests {
     }
 
     #[test]
+    fn replay_frames_rejects_an_over_budget_record() {
+        // The arena-core verifier cost-budget protects the spectator/replay endpoint:
+        // replay_frames calls verify() first, so a record padded past MAX_REPLAY_TICKS
+        // is a typed rejection — it never re-runs an attacker-sized tick stream. (The
+        // 20k-padding test above stays under the cap, so it still replays.)
+        let mut over = finished_record();
+        let next = over.replay.ticks.len() as u64;
+        for k in 0..=arena_core::MAX_REPLAY_TICKS as u64 {
+            over.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new() });
+        }
+        assert!(over.replay.ticks.len() > arena_core::MAX_REPLAY_TICKS);
+        assert!(matches!(replay_frames(&over), Err(ReplayError::TooManyTicks { .. })));
+    }
+
+    #[test]
     fn spectator_feed_drops_oldest_when_a_consumer_falls_behind() {
         // FM3: a slow consumer must never stall the publisher. With a ring of 3, a
         // spectator that never reads keeps only the NEWEST 3 frames; the rest are
