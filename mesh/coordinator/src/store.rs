@@ -1579,34 +1579,56 @@ impl Store {
     }
 
     /// Number of settled jobs whose ComputeMeter debit has not yet been spent
-    /// on-chain — the debit backlog depth, surfaced at `/stats` (the metering twin
-    /// of [`pending_attestation_count`](Self::pending_attestation_count)). A row is
-    /// pending while its `tx_hash` is NULL; the relayer drains the backlog by
-    /// writing the spend `tx_hash`, so this count falls as debits land.
+    /// on-chain AND is still drainable — the debit backlog depth, surfaced at
+    /// `/stats` (the metering twin of
+    /// [`pending_attestation_count`](Self::pending_attestation_count)). A row is
+    /// drainable while its `tx_hash` is NULL and it is not dead-lettered; the relayer
+    /// drains the backlog by writing the spend `tx_hash`, so this count falls as
+    /// debits land. A dead-lettered (quarantined) row is excluded here and counted
+    /// separately by [`dead_lettered_debit_count`](Self::dead_lettered_debit_count),
+    /// so a poison debit drains this metric to 0 rather than wedging it.
     pub fn pending_debit_count(&self) -> Result<usize> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM pending_debits WHERE tx_hash IS NULL",
+            "SELECT COUNT(*) FROM pending_debits WHERE tx_hash IS NULL AND dead_lettered_at IS NULL",
             [],
             |row| row.get(0),
         )?;
         Ok(count as usize)
     }
 
-    /// The oldest still-pending debit (`tx_hash IS NULL`), oldest-first by insert
-    /// order, as `(job_id, PendingDebit)` — or `None` when the backlog is empty.
-    /// The metering twin of [`claim_oldest_pending`](Self::claim_oldest_pending): a
-    /// pure read that does NOT reserve or mutate the row, so the drain loop drops
-    /// the store lock before the slow on-chain `spend` and only re-acquires it to
-    /// `mark_debit_submitted`. A single drain task is the only caller and settles
-    /// only ever INSERT new pending rows, so no reservation is needed to avoid a
-    /// double-claim.
+    /// Number of debits quarantined by the relayer after a non-retryable
+    /// (`Permanent`) spend error — the dead-letter depth, surfaced at `/stats`. The
+    /// charge is still owed: the row is retained (never deleted, `tx_hash` stays
+    /// NULL so retention keeps it auditable) but excluded from the drainable backlog
+    /// ([`pending_debit_count`](Self::pending_debit_count)) so it cannot block it.
+    /// Operator-visible so a stuck charge surfaces instead of vanishing.
+    pub fn dead_lettered_debit_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_debits WHERE dead_lettered_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// The oldest still-drainable debit (`tx_hash IS NULL` and not dead-lettered),
+    /// oldest-first by insert order, as `(job_id, PendingDebit)` — or `None` when the
+    /// drainable backlog is empty. The metering twin of
+    /// [`claim_oldest_pending`](Self::claim_oldest_pending): a pure read that does
+    /// NOT reserve or mutate the row, so the drain loop drops the store lock before
+    /// the slow on-chain `spend` and only re-acquires it to `mark_debit_submitted`.
+    /// A single drain task is the only caller and settles only ever INSERT new
+    /// pending rows, so no reservation is needed to avoid a double-claim. The
+    /// `dead_lettered_at IS NULL` filter is what unblocks the head-of-line: a
+    /// quarantined poison debit is skipped, never re-claimed, so the drain advances
+    /// to the next charge instead of hot-looping on the failure.
     pub fn claim_oldest_pending_debit(
         &self,
     ) -> Result<Option<(uuid::Uuid, crate::meter::PendingDebit)>> {
         let row = self.conn.query_row(
             "SELECT job_id, buyer, amount_wei, job_id_b32
              FROM pending_debits
-             WHERE tx_hash IS NULL
+             WHERE tx_hash IS NULL AND dead_lettered_at IS NULL
              ORDER BY created_at ASC, rowid ASC
              LIMIT 1",
             [],
@@ -1650,6 +1672,24 @@ impl Store {
             "UPDATE pending_debits SET tx_hash = ?1, submitted_at = ?2
              WHERE job_id = ?3 AND tx_hash IS NULL",
             (tx_hash, now_secs, job_id.to_string()),
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Quarantine a pending debit after a non-retryable (`Permanent`) spend error by
+    /// stamping `dead_lettered_at`, but ONLY while it is still pending and not
+    /// already dead-lettered (`tx_hash IS NULL AND dead_lettered_at IS NULL`).
+    /// Returns whether a row was updated. The row is RETAINED (never deleted — the
+    /// charge is still owed and stays auditable); it just leaves the drainable
+    /// backlog so it cannot block downstream debits. The double guard makes this
+    /// idempotent: a re-driven row that already settled (`tx_hash` set) or was
+    /// already quarantined is a no-op, so an operator replay never double-marks and —
+    /// paired with `ComputeMeter.spendOnce`'s per-`jobId` fence — never double-spends.
+    pub fn mark_debit_dead_lettered(&self, job_id: &uuid::Uuid, now_secs: i64) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_debits SET dead_lettered_at = ?1
+             WHERE job_id = ?2 AND tx_hash IS NULL AND dead_lettered_at IS NULL",
+            (now_secs, job_id.to_string()),
         )?;
         Ok(updated > 0)
     }
