@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pydantic
@@ -560,3 +562,58 @@ def test_baseline_vs_baseline_runs_a_real_decisive_deterministic_match():
     # (not a fixed script): the replay hash differs.
     other = run_local_match(harness, [0, 1], policies, seed=seed + 1, match_id=match_id)
     assert other[0].replay_hash != r0.replay_hash
+
+
+def test_e2e_match_is_required_in_ci_not_skipped(monkeypatch):
+    # FM1: with the harness absent but ARENA_E2E_REQUIRED set (CI / validate.sh),
+    # the e2e match MUST be a hard failure, never a silent skip — else a broken A2A
+    # path passes CI unnoticed.
+    monkeypatch.setattr(sys.modules[__name__], "_arena_harness", lambda: None)
+
+    monkeypatch.setenv("ARENA_E2E_REQUIRED", "1")
+    try:
+        _require_or_skip_harness()
+    except pytest.skip.Exception:
+        pytest.fail("required harness was skipped, not failed (FM1 regression)")
+    except pytest.fail.Exception:
+        pass
+    else:
+        pytest.fail("a missing required harness must raise")
+
+    # Unset (a plain local pytest with no Rust toolchain): skip for dev ergonomics.
+    monkeypatch.delenv("ARENA_E2E_REQUIRED", raising=False)
+    with pytest.raises(pytest.skip.Exception):
+        _require_or_skip_harness()
+
+
+def test_subprocess_gateway_reaps_the_harness_when_the_match_body_raises():
+    # FM3: a failure mid-match must not leak the harness subprocess. The gateway is a
+    # context manager whose __exit__ closes stdin then waits/kills, so the process is
+    # reaped even when the with-body raises. A portable dummy stdin-reader stands in
+    # for the harness (no cargo needed), so this guard runs everywhere.
+    from arena_client.sdk import SubprocessGateway
+
+    proc = None
+    with pytest.raises(RuntimeError):
+        with SubprocessGateway([sys.executable, "-c", "import sys; sys.stdin.read()"]) as gw:
+            proc = gw._proc
+            assert proc.poll() is None  # alive inside the block
+            raise RuntimeError("match body blew up")
+    assert proc is not None
+    assert proc.poll() is not None  # reaped on __exit__, not leaked
+
+
+def test_subprocess_gateway_watchdog_kills_a_silent_harness():
+    # FM2 / anti-hang: readiness is the first frame on the pipe, awaited by a blocking
+    # readline (never a sleep), and a watchdog Timer kills a harness that never speaks
+    # so a wedged handshake fails loudly instead of blocking forever. A dummy that
+    # sleeps without writing stands in for a hung harness.
+    from arena_client.sdk import GatewayClosed, SubprocessGateway
+
+    with SubprocessGateway([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5) as gw:
+        start = time.monotonic()
+        with pytest.raises(GatewayClosed):
+            gw.recv(0)
+        # The 0.5s watchdog must fire — not the dummy's 30s sleep. The wide bound
+        # keeps it non-flaky while still failing loudly if the watchdog is removed.
+        assert time.monotonic() - start < 10.0
