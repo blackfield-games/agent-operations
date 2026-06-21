@@ -1349,7 +1349,9 @@ impl Match {
     /// [`friendly_fire`](Rules::friendly_fire). Unlike the nearest-only beam, all
     /// matched targets take damage. Targets are collected in seat order, then damaged,
     /// so a same-tick multi-hit is deterministic and the immutable scan can't alias the
-    /// mutation. All integer: a squared planar range compare + the octant arc test.
+    /// mutation. All integer: a squared planar range compare + the octant arc test. A
+    /// point-blank enemy (exactly on the shooter) is always struck regardless of facing,
+    /// since `in_fov` treats a zero offset as in-arc — the same edge perception uses.
     fn resolve_melee(&mut self, shooter: usize) {
         let s = self.pawns[shooter];
         let range2 = (self.rules.melee_range as i128).pow(2);
