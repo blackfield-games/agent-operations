@@ -2938,6 +2938,44 @@ mod tests {
     }
 
     #[test]
+    fn fine_lut_matches_an_exact_trig_reference() {
+        // The finer-aim table is the integer core's only "trig", so it is pinned
+        // against f64 cos/sin — test-only float; the runtime stays integer. Each of
+        // the 64 directions must equal the rounded unit vector exactly, the four axes
+        // must be exact, the quarter table must climb strictly from 0 to FINE_SCALE,
+        // and every entry must sit a hair off the unit circle (tighter than the octant
+        // diagonal it replaces).
+        use std::f64::consts::TAU;
+        let scale2 = FINE_SCALE as i64 * FINE_SCALE as i64;
+        for (i, &(cx, cy)) in FINE_LUT.iter().enumerate() {
+            let ang = TAU * i as f64 / FINE_DIRS as f64;
+            let tc = (FINE_SCALE as f64 * ang.cos()).round() as i32;
+            let ts = (FINE_SCALE as f64 * ang.sin()).round() as i32;
+            assert_eq!((cx, cy), (tc, ts), "direction {i} diverged from the trig reference");
+            let norm2 = cx as i64 * cx as i64 + cy as i64 * cy as i64;
+            assert!((norm2 - scale2).abs() <= 50_000, "direction {i} off the unit circle by {}", norm2 - scale2);
+        }
+        assert_eq!(FINE_LUT[0], (FINE_SCALE, 0), "east");
+        assert_eq!(FINE_LUT[FINE_QUARTER], (0, FINE_SCALE), "north");
+        assert_eq!(FINE_LUT[2 * FINE_QUARTER], (-FINE_SCALE, 0), "west");
+        assert_eq!(FINE_LUT[3 * FINE_QUARTER], (0, -FINE_SCALE), "south");
+        assert_eq!(FINE_QSIN[0], 0);
+        assert_eq!(FINE_QSIN[FINE_QUARTER], FINE_SCALE);
+        for k in 1..=FINE_QUARTER {
+            assert!(FINE_QSIN[k] > FINE_QSIN[k - 1], "the quarter sine must strictly increase at {k}");
+        }
+        // Quadrant symmetry, independent of rounding: reflecting a direction across the
+        // X axis (i ↔ −i) negates sin and keeps cos; across the Y axis (i ↔ N/2−i)
+        // negates cos and keeps sin. A future table edit that breaks the mirror — the
+        // directional-bias failure mode — trips here.
+        for i in 0..FINE_DIRS {
+            let (cx, cy) = FINE_LUT[i];
+            assert_eq!(FINE_LUT[(FINE_DIRS - i) % FINE_DIRS], (cx, -cy), "X-axis mirror broke at {i}");
+            assert_eq!(FINE_LUT[(2 * FINE_QUARTER + FINE_DIRS - i) % FINE_DIRS], (-cx, cy), "Y-axis mirror broke at {i}");
+        }
+    }
+
+    #[test]
     fn a_kill_ends_the_match_with_a_decisive_result() {
         let mut m = close_match(1);
         for _ in 0..200 {
