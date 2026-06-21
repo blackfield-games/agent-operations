@@ -1571,6 +1571,12 @@ pub enum ReplayError {
     /// inconsistency re-execution alone would miss; rejected so every accepted record
     /// hashes (for a re-run-free consumer) exactly as its rules say.
     RulesCommitMismatch,
+    /// The record's stored `replay.config` does not match its `config` — the same
+    /// self-contradiction as [`RulesCommitMismatch`], for the arena configuration. The
+    /// re-run is built from `config` (not `replay.config`), so a doctored `replay.config`
+    /// re-runs clean yet makes the stored `replay` hash differently for a re-run-free
+    /// consumer; rejected so every accepted record hashes exactly as its config says.
+    ConfigMismatch,
 }
 
 impl std::fmt::Display for ReplayError {
@@ -1619,6 +1625,9 @@ impl std::fmt::Display for ReplayError {
             }
             ReplayError::RulesCommitMismatch => {
                 write!(f, "invalid replay: stored rules commitment does not match the record's rules")
+            }
+            ReplayError::ConfigMismatch => {
+                write!(f, "invalid replay: stored config does not match the record's config")
             }
         }
     }
@@ -1805,6 +1814,15 @@ impl MatchRecord {
         // this is exact: post-terminal tick padding is tolerated, a lying commit is not.)
         if self.replay.rules_commit != self.rules.canonical_encoding() {
             return Err(ReplayError::RulesCommitMismatch);
+        }
+        // Same self-consistency pin for the config: the re-run is built from
+        // `self.config` (NOT `self.replay.config`), so `self.replay.config` is the
+        // other field re-execution reconstructs rather than consumes — a doctored copy
+        // re-runs clean here yet makes `self.replay` hash differently for a hash-only
+        // consumer. Exact equality (post-terminal tick padding is still tolerated; a
+        // lying config copy is not), matching the `rules_commit` check above.
+        if self.replay.config != self.config {
+            return Err(ReplayError::ConfigMismatch);
         }
         Ok(reproduced.clone())
     }
@@ -4583,6 +4601,25 @@ mod tests {
         assert!(!rec.replay.rules_commit.is_empty(), "the record carries a rules commitment");
         rec.replay.rules_commit[0] ^= 0xff;
         assert_eq!(rec.verify(), Err(ReplayError::RulesCommitMismatch));
+    }
+
+    #[test]
+    fn a_tampered_stored_config_is_rejected() {
+        // config is the other replay field verify RECONSTRUCTS (the re-run is built
+        // from self.config, not self.replay.config), so a doctored STORED replay.config
+        // with an honest self.config + result re-runs to the same outcomes and the same
+        // reconstructed hash — yet a hash-only consumer digesting the stored replay gets
+        // a different hash. verify must reject it too. A determinant tamper (bounds) and
+        // a non-determinant one (tick_hz, which the digest does not fold) both make the
+        // STORED copy inconsistent with self.config, so both are caught by the exact
+        // equality even though only the determinant would move a hash.
+        let mut rec = play(1).to_record().unwrap();
+        assert_eq!(rec.replay.config, rec.config, "the record's stored config matches its config");
+        rec.replay.config.bounds.x ^= 1;
+        assert_eq!(rec.verify(), Err(ReplayError::ConfigMismatch), "a doctored stored bound is rejected");
+        let mut rec = play(1).to_record().unwrap();
+        rec.replay.config.tick_hz ^= 1;
+        assert_eq!(rec.verify(), Err(ReplayError::ConfigMismatch), "even a non-folded field must stay consistent");
     }
 
     #[test]
