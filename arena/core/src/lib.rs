@@ -1436,10 +1436,11 @@ impl Match {
 
 /// A complete, self-determining record of one finished match.
 ///
-/// A bare [`ReplayRecord`] carries the seed, roster, and action stream — but NOT
-/// the [`MatchConfig`] (arena bounds, tick cap) or the [`Rules`] (all combat
-/// tuning) the sim also consumes, so a `ReplayRecord` alone does not determine a
-/// match: replayed under different bounds or damage it yields a different result.
+/// A bare [`ReplayRecord`] carries the seed, roster, world, action stream, and a
+/// COMMITMENT to the [`Rules`] (its `rules_commit`, which the digest folds) — but
+/// not the [`MatchConfig`] (arena bounds, tick cap) nor the typed [`Rules`] the sim
+/// re-execution consumes, so a `ReplayRecord` alone cannot be RE-RUN: its hash
+/// commits the tuning, but reproducing the match still needs the rules themselves.
 /// A `MatchRecord` closes that gap by bundling the full determinant set (the
 /// `config`, the `rules`, the `replay` inputs, and the terminal `result` they
 /// produced), so [`verify`](MatchRecord::verify) re-runs it from the record
@@ -2380,8 +2381,10 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// to be load-bearing, not happy-path: spawn determinism (PRNG + spread + jitter
 /// order + facing rule), the perception range/cone/line-of-sight exclusion edges,
 /// the octant-vs-fine sub-octant hit boundary, a swept fast projectile that must
-/// not tunnel, and three full-match records proving the digest commits the inputs
-/// while the rules bind the outcomes.
+/// not tunnel, and four full-match records proving the digest commits the inputs
+/// AND the rules (v4) — the octant and fine cases run the identical action stream
+/// yet hash differently because their aim_mode differs — while the rules also bind
+/// the outcomes a re-run reproduces.
 ///
 /// The generator is pure integer, ordered, and float/map-free, so the set is
 /// byte-stable on every platform and the same on every run. It realizes the
