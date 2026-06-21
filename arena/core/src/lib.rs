@@ -967,6 +967,48 @@ fn within(a: Vec2, b: Vec2, range: i32) -> bool {
     dx * dx + dy * dy <= r * r
 }
 
+/// How a finished match resolves for on-chain settlement, derived from its
+/// canonical [`MatchResult`] outcomes.
+///
+/// This is the gameplay interpretation that picks `MatchSettlement.settle` vs
+/// `settleDraw`: a [`Win`](Settlement::Win) is the single seat that placed first,
+/// a [`Draw`](Settlement::Draw) is any tie for first. A `cancelMatch` is NOT a
+/// match *outcome* — it is the recovery path for a match that produced no result
+/// at all — so it is never derived here; the caller drives a cancel directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settlement {
+    /// Exactly one seat finished at placement 1 — a decisive winner.
+    Win { seat: SeatId },
+    /// Two or more seats tied for placement 1 (equal alive-flag and score, or an
+    /// all-down match with a shared top score) — no decisive winner.
+    Draw,
+}
+
+/// Classify a finished match for settlement from its outcomes alone.
+///
+/// `placement` is 1-based with tied seats sharing a rank (see [`SeatOutcome`]):
+/// the ordering already folds alive-over-dead then higher-score, so a *single*
+/// seat at placement 1 is the decisive winner and two-or-more sharing it is a
+/// draw. Keying on placement (not `alive_at_end`) is deliberate — an all-down
+/// match still has a higher-score winner that placement ranks first, and that is
+/// the result the on-chain record commits.
+pub fn settlement(result: &MatchResult) -> Settlement {
+    let mut winner: Option<SeatId> = None;
+    for o in &result.outcomes {
+        if o.placement != 1 {
+            continue;
+        }
+        if winner.is_some() {
+            return Settlement::Draw;
+        }
+        winner = Some(o.seat);
+    }
+    match winner {
+        Some(seat) => Settlement::Win { seat },
+        None => Settlement::Draw,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
