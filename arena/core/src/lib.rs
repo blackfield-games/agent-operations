@@ -1257,6 +1257,13 @@ impl Match {
                 if !segment_hits_disc(from, to, t.pos, radius) {
                     continue;
                 }
+                // Physical cover: a body behind a wall is not hit through it. The
+                // same shooter->target sightline test hitscan and perception use, so
+                // a pawn IN FRONT of a wall (clear sightline from the shot) still
+                // takes the hit while one behind it is spared.
+                if !has_line_of_sight(&self.blockers, from, t.pos) {
+                    continue;
+                }
                 let dx = t.pos.x as i128 - from.x as i128;
                 let dy = t.pos.y as i128 - from.y as i128;
                 let d2 = dx * dx + dy * dy;
@@ -1279,6 +1286,14 @@ impl Match {
                     }
                 }
                 continue; // consumed on hit
+            }
+            // No body in front: a swept step that runs into a wall is spent against
+            // it (no damage past cover), reusing the crosses-a-blocker predicate
+            // movement uses so a shot and a pawn agree on what a wall stops. A pawn
+            // in front of the wall was already hit above; only a clean step reaching
+            // a wall lands here, and a no-blocker match never does.
+            if path_hits_blocker(&self.blockers, from, to) {
+                continue; // absorbed by the blocker
             }
             proj.pos = to;
             proj.age += 1;
