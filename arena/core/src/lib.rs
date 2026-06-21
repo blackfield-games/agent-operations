@@ -308,6 +308,14 @@ fn default_melee_cooldown() -> u16 {
 /// no digest surface.
 const MELEE_ARC_SPREAD: u8 = 1;
 
+/// Upward velocity a grounded jump launches with, in position units per tick (1.2 m
+/// at [`POSITION_SCALE`]). The fixed impulse for every jump — only [`Rules::gravity`]
+/// (the digest-bound knob) tunes the resulting arc, so this stays a compile-time
+/// constant the UE5 twin mirrors exactly (the same discipline as [`MELEE_ARC_SPREAD`]),
+/// adding no digest surface. Vertical physics are off unless `gravity > 0`, so this is
+/// inert by default.
+pub const JUMP_VELOCITY: i32 = 1200;
+
 /// The combat tuning a match runs under — distinct from `arena_proto::MatchConfig`
 /// (which is the read-only rules summary sent to agents). These are the
 /// server-authoritative constants the sim clamps and resolves against; an agent
@@ -413,6 +421,18 @@ pub struct Rules {
     /// turns shield pickups on.
     #[serde(default)]
     pub max_shield: u16,
+    /// Downward velocity a jump loses per tick, in position units per tick — the
+    /// integer gravity for vertical (z-axis) movement. `serde(default)` (`0`) DISABLES
+    /// vertical physics: a [`ActionButtons::jump`](arena_proto::ActionButtons) press is
+    /// inert, every pawn's `z` stays `0`, and the match plays byte-identically to a
+    /// purely 2D one (the default, and every pre-jump record). A positive value turns
+    /// jumping on — a grounded jump launches at the fixed [`JUMP_VELOCITY`] and this
+    /// gravity pulls it back to the ground. Higher gravity ⇒ a lower, shorter arc.
+    /// This slice keeps `z` OUT of hit/LOS/perception (combat stays planar), so gravity
+    /// changes only the observable z trajectory, never a combat outcome — z-coupled
+    /// combat and fall damage are deferred follow-ups.
+    #[serde(default)]
+    pub gravity: i32,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -447,6 +467,7 @@ impl Default for Rules {
             melee_damage: default_melee_damage(),
             melee_cooldown: default_melee_cooldown(),
             max_shield: 0, // shield disabled by default — earned only when configured
+            gravity: 0,    // vertical physics off by default — jump inert, z stays 0
         }
     }
 }
@@ -497,6 +518,7 @@ impl Rules {
         b.extend_from_slice(&self.melee_damage.to_be_bytes());
         b.extend_from_slice(&self.melee_cooldown.to_be_bytes());
         b.extend_from_slice(&self.max_shield.to_be_bytes());
+        b.extend_from_slice(&self.gravity.to_be_bytes());
         b
     }
 }
@@ -4888,9 +4910,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 9×i32 + 1×u32 + 8×u16 + 4×u8 = 60 bytes. A new sim field added to the
+        // 10×i32 + 1×u32 + 8×u16 + 4×u8 = 64 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 60, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 64, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -4915,8 +4937,9 @@ mod tests {
             ("melee_damage", Rules { melee_damage: base.melee_damage + 1, ..base }),
             ("melee_cooldown", Rules { melee_cooldown: base.melee_cooldown + 1, ..base }),
             ("max_shield", Rules { max_shield: base.max_shield + 1, ..base }),
+            ("gravity", Rules { gravity: base.gravity + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 22, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 23, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
