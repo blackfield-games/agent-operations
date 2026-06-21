@@ -551,6 +551,11 @@ struct Pawn {
     vel: Vec2,
     health: u16,
     max_health: u16,
+    /// Damage-absorbing armor pool, drained BEFORE health on every hit (overflow
+    /// spills to health). Starts at `0` — earned by collecting a
+    /// [`PickupKind::Shield`], capped at [`Rules::max_shield`] — so a match with no
+    /// shield pickups (or `max_shield == 0`) never has any and plays byte-identically.
+    shield: u16,
     ammo: u16,
     /// Ticks remaining before this pawn may fire again.
     cooldown: u16,
@@ -879,6 +884,7 @@ impl Match {
                     vel: Vec2::ZERO,
                     health: rules.start_health,
                     max_health: rules.start_health,
+                    shield: 0,
                     ammo: rules.mag_size,
                     cooldown: 0,
                     score: 0,
@@ -1270,6 +1276,31 @@ impl Match {
         self.maybe_finish();
     }
 
+    /// Apply `raw` incoming damage to pawn `idx`: drain its [`shield`](Pawn::shield)
+    /// pool first, then spill the remainder to health, downing the pawn if health
+    /// reaches `0`. Returns the EFFECTIVE damage dealt — shield absorbed plus health
+    /// removed, never more than the pawn's effective HP — which the caller credits as
+    /// score for an enemy hit. This is the single place the shield/health split lives,
+    /// so every weapon (hitscan, melee, projectile) and the UE5 twin share ONE
+    /// absorption rule.
+    ///
+    /// With no shield (the default `max_shield == 0` ⇒ every pawn's `shield == 0`)
+    /// this is exactly `raw.min(health)` removed from health and returned, the clean
+    /// generalization of the prior per-site clamp — so a shieldless match is
+    /// byte-identical. All saturating/clamped integer math: `absorbed <= raw` and
+    /// `to_health <= raw - absorbed`, so the return never overflows `u16`.
+    fn damage_pawn(&mut self, idx: usize, raw: u16) -> u16 {
+        let p = &mut self.pawns[idx];
+        let absorbed = raw.min(p.shield);
+        p.shield -= absorbed;
+        let to_health = (raw - absorbed).min(p.health);
+        p.health -= to_health;
+        if p.health == 0 {
+            p.alive = false;
+        }
+        absorbed + to_health
+    }
+
     /// Resolve one beam-hitscan shot from `shooter`: damage the nearest body within
     /// the beam (in range, in front, within the lateral `hit_radius`) — an enemy by
     /// default, or an ally too under [`Rules::friendly_fire`], never the shooter.
@@ -1329,15 +1360,12 @@ impl Match {
         }
         if let Some((j, _)) = best {
             let friendly = self.pawns[j].team == s.team;
-            let dmg = self.rules.damage.min(self.pawns[j].health);
-            self.pawns[j].health -= dmg;
-            if self.pawns[j].health == 0 {
-                self.pawns[j].alive = false;
-            }
+            let raw = self.rules.damage;
+            let dealt = self.damage_pawn(j, raw);
             // A friendly hit (only reachable under `friendly_fire`) deals damage but
             // never scores — a team hit is never rewarded.
             if !friendly {
-                self.pawns[shooter].score += dmg as i32;
+                self.pawns[shooter].score += dealt as i32;
             }
         }
     }
@@ -1375,15 +1403,12 @@ impl Match {
         }
         for j in hits {
             let friendly = self.pawns[j].team == s.team;
-            let dmg = self.rules.melee_damage.min(self.pawns[j].health);
-            self.pawns[j].health -= dmg;
-            if self.pawns[j].health == 0 {
-                self.pawns[j].alive = false;
-            }
+            let raw = self.rules.melee_damage;
+            let dealt = self.damage_pawn(j, raw);
             // A friendly hit (only under `friendly_fire`) deals damage but never
             // scores — mirrors resolve_fire.
             if !friendly {
-                self.pawns[shooter].score += dmg as i32;
+                self.pawns[shooter].score += dealt as i32;
             }
         }
     }
@@ -1477,15 +1502,12 @@ impl Match {
             }
             if let Some(j) = hit {
                 let friendly = self.pawns[j].team == proj.team;
-                let dmg = self.rules.damage.min(self.pawns[j].health);
-                self.pawns[j].health -= dmg;
-                if self.pawns[j].health == 0 {
-                    self.pawns[j].alive = false;
-                }
+                let raw = self.rules.damage;
+                let dealt = self.damage_pawn(j, raw);
                 // A friendly hit deals damage but never scores — mirrors resolve_fire.
                 if !friendly {
                     if let Some(sp) = self.pawns.iter_mut().find(|p| p.seat == proj.shooter) {
-                        sp.score += dmg as i32;
+                        sp.score += dealt as i32;
                     }
                 }
                 continue; // consumed on hit
