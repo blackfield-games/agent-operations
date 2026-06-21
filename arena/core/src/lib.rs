@@ -997,9 +997,10 @@ impl Match {
         self.maybe_finish();
     }
 
-    /// Resolve one beam-hitscan shot from `shooter`: damage the nearest enemy
-    /// whose body lies within the beam (in range, in front, within the lateral
-    /// `hit_radius`). All integer: the beam direction is the aim-mode unit vector
+    /// Resolve one beam-hitscan shot from `shooter`: damage the nearest body within
+    /// the beam (in range, in front, within the lateral `hit_radius`) — an enemy by
+    /// default, or an ally too under [`Rules::friendly_fire`], never the shooter.
+    /// All integer: the beam direction is the aim-mode unit vector
     /// (the 8-way [`octant_unit`] or the finer [`fine_unit`]), the in-front test is
     /// a dot-product sign, and the lateral offset is a squared perpendicular
     /// distance — no trig anywhere. The unit vector's scale divides `dot` back to a
@@ -1100,8 +1101,9 @@ impl Match {
     /// A no-op while nothing is in flight (every hitscan tick, and a projectile match
     /// before its first fire), so it never perturbs a hitscan match. Each projectile
     /// sweeps the segment from its previous to its new position and damages the nearest
-    /// enemy body that segment crosses — swept, so a fast shot cannot tunnel through a
-    /// pawn between ticks. A hit consumes the shot and credits its shooter (even if the
+    /// body that segment crosses (an enemy, or an ally under [`Rules::friendly_fire`];
+    /// never its own shooter) — swept, so a fast shot cannot tunnel through a pawn
+    /// between ticks. A hit consumes the shot and credits its shooter (even if the
     /// shooter has since died — a shot already in the air still lands); a clean shot
     /// expires once it has travelled past `weapon_range` or hits the lifetime backstop.
     /// A simultaneous mutual exchange can down both seats (each shot is independent of
@@ -1120,8 +1122,8 @@ impl Match {
                 x: from.x.saturating_add(proj.vel.x),
                 y: from.y.saturating_add(proj.vel.y),
             };
-            // The nearest enemy body the swept segment reaches, by distance from the
-            // launch end of the sweep (seat order breaks an exact tie) — the same
+            // The nearest body the swept segment reaches, by distance from the launch
+            // end of the sweep (seat order breaks an exact tie) — the same
             // nearest-target rule hitscan uses.
             let mut hit: Option<usize> = None;
             let mut best = i128::MAX;
