@@ -2340,6 +2340,160 @@ mod tests {
     }
 
     #[test]
+    fn segment_hits_disc_geometry_is_exact() {
+        // The swept primitive's exact integer cases: endpoint-inside, perpendicular
+        // interior (the tunneling-catcher), the inclusive boundary, and the misses.
+        let v = |x, y| Vec2 { x, y };
+        let r = 1000;
+        // Zero-length sweep with the point at the centre — hit.
+        assert!(segment_hits_disc(v(0, 0), v(0, 0), v(0, 0), r));
+        // The nearer endpoint is inside the disc — hit.
+        assert!(segment_hits_disc(v(0, 0), v(5000, 0), v(500, 0), r));
+        // Perpendicular interior: the segment sweeps broadside within r though BOTH
+        // endpoints are far past the target on the axis (perp distance 800 < 1000).
+        assert!(segment_hits_disc(v(-5000, 800), v(5000, 800), v(0, 0), r));
+        // Boundary is inclusive (conservative): a parallel sweep exactly r away hits.
+        assert!(segment_hits_disc(v(-5000, 1000), v(5000, 1000), v(0, 0), r));
+        // One unit further is a clean miss.
+        assert!(!segment_hits_disc(v(-5000, 1001), v(5000, 1001), v(0, 0), r));
+        // Both endpoints past the target on the same side — closest point is an
+        // endpoint, and both are out of range, so it misses.
+        assert!(!segment_hits_disc(v(2000, 0), v(5000, 0), v(0, 0), r));
+    }
+
+    #[test]
+    fn a_fast_projectile_sweeps_through_a_target_without_tunneling() {
+        // FM2: a shot fast enough to overshoot the target in a single tick still hits,
+        // because the collision is the SWEPT segment, not a per-tick point. Both the
+        // pre-move and post-move points miss the target (a naive point check tunnels),
+        // yet the segment between them passes through it.
+        let target = Vec2 { x: 5000, y: 0 };
+        let radius = Rules::default().hit_radius; // 1500
+        let before = Vec2 { x: 0, y: 0 };
+        let after = Vec2 { x: 20_000, y: 0 }; // one 20 m/tick step overshoots a 5 m target
+        assert!(!within(before, target, radius), "the launch point alone misses");
+        assert!(!within(after, target, radius), "the post-move point alone misses");
+        assert!(segment_hits_disc(before, after, target, radius), "the swept segment hits");
+
+        // The same in the live sim: the shot spawns, advances 20 m across the 5 m
+        // target in one tick, and damages it — no tunneling on the real path.
+        let rules = Rules {
+            weapon_mode: WeaponMode::Projectile,
+            projectile_speed: 20 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        for p in &mut m.pawns {
+            match p.seat {
+                0 => {
+                    p.pos = before;
+                    p.facing = EAST;
+                }
+                1 => p.pos = target,
+                _ => {}
+            }
+        }
+        let before_hp = m.pawns.iter().find(|p| p.seat == 1).unwrap().health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        let after_hp = m.pawns.iter().find(|p| p.seat == 1).unwrap().health;
+        assert!(after_hp < before_hp, "the fast shot hit the target it swept through");
+    }
+
+    #[test]
+    fn a_clean_shot_expires_past_weapon_range() {
+        // FM4: a shot that hits nothing flies until it has travelled past weapon_range,
+        // then leaves the live set — it does not accumulate forever.
+        let rules = Rules { weapon_mode: WeaponMode::Projectile, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        for p in &mut m.pawns {
+            match p.seat {
+                0 => {
+                    p.pos = Vec2::ZERO;
+                    p.facing = EAST;
+                }
+                1 => p.pos = Vec2 { x: 0, y: 100 * POSITION_SCALE }, // far off the shot's line
+                _ => {}
+            }
+        }
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.projectiles.len(), 1, "the shot is in flight");
+        let mut ticks = 0;
+        while !m.projectiles.is_empty() && ticks < 200 {
+            step_with(&mut m, &[]); // everyone idle; the shot flies on
+            ticks += 1;
+        }
+        assert!(m.projectiles.is_empty(), "the shot expired");
+        // 30 m range at 2 m/tick clears in ~15 ticks — range expiry, far short of the
+        // lifetime backstop.
+        assert!(ticks < 30, "expired promptly by range, not the lifetime backstop");
+    }
+
+    #[test]
+    fn a_motionless_shot_expires_by_the_lifetime_backstop() {
+        // FM4: a sub-octant-scale speed rounds the octant velocity to zero, so the shot
+        // never moves and never exceeds range. The lifetime backstop still terminates
+        // it, so the live set can never retain a motionless shot forever.
+        let rules =
+            Rules { weapon_mode: WeaponMode::Projectile, projectile_speed: 0, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        for p in &mut m.pawns {
+            if p.seat == 1 {
+                p.pos = Vec2 { x: 0, y: 100 * POSITION_SCALE }; // nothing to hit
+            }
+        }
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.projectiles.len(), 1);
+        let start = m.projectiles[0].pos;
+        // age reaches 1 on the spawn tick; it expires when age >= MAX_PROJECTILE_LIFETIME.
+        for _ in 0..(MAX_PROJECTILE_LIFETIME as usize - 2) {
+            step_with(&mut m, &[]);
+        }
+        assert_eq!(m.projectiles.len(), 1, "still alive just before the backstop");
+        assert_eq!(m.projectiles[0].pos, start, "a zero-speed shot never moves");
+        step_with(&mut m, &[]); // age hits the backstop
+        assert!(m.projectiles.is_empty(), "the lifetime backstop expired the motionless shot");
+    }
+
+    #[test]
+    fn swept_collision_does_not_panic_at_extreme_coordinates() {
+        // The i128 swept math must not overflow at any in-bounds coordinate, given the
+        // spawn-time speed clamp that bounds the segment length. Drive the geometry
+        // with i32 extremes and a max-length (clamped) sweep; completing without a
+        // panic is the assertion.
+        let seg = MAX_PROJECTILE_SPEED;
+        let _ = segment_hits_disc(
+            Vec2 { x: i32::MAX, y: i32::MAX },
+            Vec2 { x: i32::MAX - seg, y: i32::MAX },
+            Vec2 { x: i32::MIN, y: i32::MIN },
+            i32::MAX,
+        );
+        let _ = segment_hits_disc(
+            Vec2 { x: i32::MIN, y: i32::MIN },
+            Vec2 { x: i32::MIN + seg, y: i32::MIN + seg },
+            Vec2 { x: i32::MAX, y: i32::MAX },
+            i32::MAX,
+        );
+        // The live spawn clamps an over-max speed to a finite, bounded velocity instead
+        // of overflowing the octant scaling.
+        let rules = Rules {
+            weapon_mode: WeaponMode::Projectile,
+            projectile_speed: i32::MAX,
+            weapon_range: i32::MAX,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        for p in &mut m.pawns {
+            if p.seat == 1 {
+                p.pos = Vec2 { x: 0, y: 40 * POSITION_SCALE }; // off the shot's line
+            }
+        }
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.projectiles[0].vel.x, MAX_PROJECTILE_SPEED, "an over-max speed is clamped at spawn");
+    }
+
+    #[test]
     fn a_pawn_spawned_inside_a_blocker_is_neither_blind_nor_invisible() {
         // FM4: the seed-driven spawn can land a pawn inside a vision blocker. The
         // endpoint exemption makes that safe with no setup rejection: the occupant
