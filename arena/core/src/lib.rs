@@ -5254,6 +5254,10 @@ mod tests {
         PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x, y }, amount }
     }
 
+    fn shield_pickup(x: i32, y: i32, amount: u16) -> PickupSpawn {
+        PickupSpawn { kind: PickupKind::Shield, position: Vec2 { x, y }, amount }
+    }
+
     /// A 2-seat match with a configured pickup set, tight collection radius, seats
     /// not jittered so the geometry is exact.
     fn pickup_match(pickups: Vec<PickupSpawn>, rules: Rules) -> Match {
@@ -5425,6 +5429,155 @@ mod tests {
             !matches!(at.verify(), Err(ReplayError::TooManyPickups { .. })),
             "the budget itself is processed, not size-rejected — the bound is non-vacuous"
         );
+    }
+
+    #[test]
+    fn damage_pawn_drains_shield_then_spills_to_health() {
+        // FM1: damage drains shield first, then spills the remainder to health; the
+        // return is the EFFECTIVE HP removed (shield + health), capped at what the pawn
+        // had — the score basis. Exercised directly on the one shared damage path.
+        let mut m = new_match(1);
+        // Overflow spill: shield 10 vs 25 dmg → 10 absorbed, 15 to health, 25 effective.
+        m.pawns[1].shield = 10;
+        m.pawns[1].health = 100;
+        assert_eq!(m.damage_pawn(1, 25), 25, "effective = shield absorbed + health spill");
+        assert_eq!(m.pawns[1].shield, 0, "shield fully drained");
+        assert_eq!(m.pawns[1].health, 85, "the 15 overflow spilled to health");
+        assert!(m.pawns[1].alive);
+        // Under-shield: a hit smaller than the pool costs no health.
+        m.pawns[1].shield = 50;
+        m.pawns[1].health = 100;
+        assert_eq!(m.damage_pawn(1, 25), 25);
+        assert_eq!(m.pawns[1].shield, 25, "only the shield drained");
+        assert_eq!(m.pawns[1].health, 100, "no health lost under the shield");
+        // Exact-deplete: a hit equal to the pool zeroes shield, leaves health intact.
+        m.pawns[1].shield = 25;
+        m.pawns[1].health = 100;
+        assert_eq!(m.damage_pawn(1, 25), 25);
+        assert_eq!(m.pawns[1].shield, 0);
+        assert_eq!(m.pawns[1].health, 100, "an exactly-depleting hit costs no health");
+        // Lethal spill: shield 10 + health 5 vs 25 → downed; overkill (10) not in the
+        // effective return, mirroring the prior damage.min(health) clamp.
+        m.pawns[1].shield = 10;
+        m.pawns[1].health = 5;
+        assert_eq!(m.damage_pawn(1, 25), 15, "effective HP removed caps at what the pawn had");
+        assert_eq!(m.pawns[1].shield, 0);
+        assert_eq!(m.pawns[1].health, 0);
+        assert!(!m.pawns[1].alive, "health reached 0 → downed");
+    }
+
+    #[test]
+    fn a_shield_absorbs_a_real_shot_and_can_save_a_pawn() {
+        // FM1: end-to-end through a real fire. Control: a low-health pawn with no shield
+        // is downed by one shot. With more shield than the shot, the same pawn survives
+        // (health untouched) and the shield drains by exactly the damage — so the shield
+        // is load-bearing, not vacuous.
+        let dmg = Rules::default().damage;
+        let mut control = close_match(1);
+        control.pawns[1].health = dmg - 5;
+        control.pawns[1].shield = 0;
+        step_with(&mut control, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert!(!control.observe(1).own.alive, "no shield: one shot downs the low-health pawn");
+
+        let mut m = close_match(1);
+        m.pawns[1].health = dmg - 5;
+        m.pawns[1].shield = dmg + 10;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        let own = m.observe(1).own;
+        assert!(own.alive, "the shield absorbed the otherwise-lethal shot");
+        assert_eq!(own.health, dmg - 5, "health untouched under the shield");
+        assert_eq!(own.shield, 10, "the shield drained by exactly the shot's damage");
+    }
+
+    #[test]
+    fn a_shield_pickup_fills_the_pool_capped_at_max_shield() {
+        // FM3/FM4: a Shield pickup adds to the pool with the same atomic, saturating,
+        // capped collect as health/ammo. One fills the empty pool; collecting past
+        // max_shield saturates with no overflow.
+        let rules = Rules { max_shield: 100, ..pickup_rules() };
+        let mut one = pickup_match(vec![shield_pickup(0, 0, 60)], rules);
+        one.pawns[0].pos = Vec2::ZERO;
+        one.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 }; // far, no combat
+        assert_eq!(one.pawns[0].shield, 0, "a pawn starts with no shield");
+        step_with(&mut one, &[]);
+        assert_eq!(one.pawns[0].shield, 60, "the shield pickup filled the pool");
+        // Two 60-shield pickups on one pad, collected the same tick: the pool saturates
+        // at the 100 cap (not 120) — capped, no overflow.
+        let mut capped = pickup_match(vec![shield_pickup(0, 0, 60), shield_pickup(0, 0, 60)], rules);
+        capped.pawns[0].pos = Vec2::ZERO;
+        capped.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 };
+        step_with(&mut capped, &[]);
+        assert_eq!(capped.pawns[0].shield, 100, "collecting past max_shield is capped");
+    }
+
+    #[test]
+    fn friendly_fire_drains_an_allys_shield_first() {
+        // FM4: a friendly_fire hit drains shield by the SAME rule (one shared damage
+        // path) — the ally's shield absorbs first, health is spared under it, and the
+        // shooter is still never credited for a team hit.
+        let mut m = ally_match(true, WeaponMode::Hitscan);
+        let dmg = Rules::default().damage;
+        m.pawns[1].shield = dmg + 5;
+        let full = m.pawns[1].health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.pawns[1].shield, 5, "the friendly hit drained the ally's shield");
+        assert_eq!(m.pawns[1].health, full, "health spared under the shield");
+        assert_eq!(m.pawns[0].score, 0, "a friendly hit is never rewarded");
+    }
+
+    #[test]
+    fn shield_is_never_perceived_by_an_enemy_or_a_spectator() {
+        // FM2: a pawn's shield is private-HUD — own-state only. Give seat 1 a distinctive
+        // shield, then prove it shows in seat 1's OWN observation but in NEITHER seat 0's
+        // perception of it NOR the public broadcast (the same x-ray bound as ammo).
+        let mut m = close_match(1);
+        m.pawns[1].shield = 4242;
+        assert_eq!(m.observe(1).own.shield, 4242, "a pawn sees its own shield");
+        let obs0 = serde_json::to_value(m.observe(0)).unwrap();
+        assert!(
+            obs0["visible"].as_array().unwrap().iter().any(|e| e["entity_id"] == 1),
+            "seat 0 perceives seat 1 in this close match"
+        );
+        for e in obs0["visible"].as_array().unwrap() {
+            assert!(e.get("shield").is_none(), "a perceived enemy must carry no shield field");
+        }
+        let bc = serde_json::to_value(m.broadcast()).unwrap();
+        for e in bc["entities"].as_array().unwrap() {
+            assert!(e.get("shield").is_none(), "the broadcast must expose no pawn's shield");
+        }
+        // The distinctive value appears nowhere a non-owner can read.
+        assert!(!obs0.to_string().contains("4242"), "the enemy's shield must not leak into seat 0's view");
+        assert!(!bc.to_string().contains("4242"), "the enemy's shield must not leak into the broadcast");
+    }
+
+    #[test]
+    fn a_max_shield_zero_match_never_materializes_shield() {
+        // FM4: with max_shield == 0 (the default) no pawn can hold shield, so damage
+        // resolves health-only exactly as before. The full match plays out with every
+        // pawn at shield 0 throughout — the runtime half of the default-0 byte-identity
+        // guarantee (the parity golden's zero outcome drift is the digest-level half).
+        assert_eq!(Rules::default().max_shield, 0, "shield is disabled by default");
+        let played = play(1);
+        assert_eq!(played.phase(), MatchPhase::Ended);
+        assert!(played.pawns.iter().all(|p| p.shield == 0), "no shield materializes when disabled");
+    }
+
+    #[test]
+    fn a_shield_match_replays_and_a_shield_spawn_binds_the_digest() {
+        // FM3: shield is LIVE state (derived from pickups + actions, never recorded), so
+        // a shield match re-runs from its record alone bit-for-bit; and a Shield spawn is
+        // committed in the digest (its kind byte), so dropping it breaks the hash.
+        let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, max_shield: 100, ..Default::default() };
+        let m = Match::new_with_pickups(
+            MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), vec![shield_pickup(0, 0, 50)], 1,
+        );
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        let record = run_match(m, &mut policies).to_record().unwrap();
+        assert_eq!(record.replay.pickups[0].kind, PickupKind::Shield, "the shield spawn rode into the record");
+        assert!(record.verify().is_ok(), "a shield match re-derives its shield timeline and re-runs to its own hash");
+        let mut dropped = record.clone();
+        dropped.replay.pickups.pop();
+        assert!(dropped.verify().is_err(), "dropping the shield spawn breaks the committed hash");
     }
 
     #[test]
