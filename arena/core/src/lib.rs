@@ -2362,6 +2362,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "exhaustive ~12M-case differential; run with `cargo test --release -- --ignored`"]
+    fn segment_hits_disc_matches_an_independent_oracle_exhaustively() {
+        // Adversarial cross-review of the swept-collision primitive (FM2): a bug here
+        // silently DROPS hits (tunneling) or invents them. Brute-force segment_hits_disc
+        // over a dense integer grid against a STRUCTURALLY INDEPENDENT oracle:
+        //   - it checks BOTH endpoints unconditionally (the impl picks ONE region by
+        //     where the foot lands, so a wrong branch/sign/axis diverges here), and
+        //   - its interior perpendicular test uses the cross-product form
+        //     (AP × AB)² ≤ r²·|AB|² — exact by Lagrange's identity but computed
+        //     differently from the impl's |AP|²·|AB|² − (AP·AB)², so a bug in that
+        //     formula is caught too.
+        // All i128, no float, exact.
+        fn oracle(a: Vec2, b: Vec2, c: Vec2, r: i32) -> bool {
+            let r2 = (r as i128) * (r as i128);
+            let ax = a.x as i128;
+            let ay = a.y as i128;
+            let bx = b.x as i128;
+            let by = b.y as i128;
+            let cx = c.x as i128;
+            let cy = c.y as i128;
+            let ac2 = (cx - ax) * (cx - ax) + (cy - ay) * (cy - ay);
+            let bc2 = (cx - bx) * (cx - bx) + (cy - by) * (cy - by);
+            if ac2 <= r2 || bc2 <= r2 {
+                return true; // an endpoint lies in the disc — a hit regardless of the foot
+            }
+            let dx = bx - ax;
+            let dy = by - ay;
+            let seg2 = dx * dx + dy * dy;
+            if seg2 == 0 {
+                return false; // zero-length sweep; the A==B endpoint was already tested
+            }
+            let apx = cx - ax;
+            let apy = cy - ay;
+            let proj = apx * dx + apy * dy;
+            if proj <= 0 || proj >= seg2 {
+                return false; // closest point is an endpoint, both already out of range
+            }
+            let cross = apx * dy - apy * dx; // AP × AB
+            cross * cross <= r2 * seg2
+        }
+
+        let (lo, hi) = (-5i32, 5i32);
+        let mut cases = 0u64;
+        for ax in lo..=hi {
+            for ay in lo..=hi {
+                for bx in lo..=hi {
+                    for by in lo..=hi {
+                        let a = Vec2 { x: ax, y: ay };
+                        let b = Vec2 { x: bx, y: by };
+                        for cx in lo..=hi {
+                            for cy in lo..=hi {
+                                let c = Vec2 { x: cx, y: cy };
+                                for r in 0..=6 {
+                                    cases += 1;
+                                    assert_eq!(
+                                        segment_hits_disc(a, b, c, r),
+                                        oracle(a, b, c, r),
+                                        "swept-collision disagreement at a={a:?} b={b:?} c={c:?} r={r}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 12_000_000, "the differential must cover the full grid (was {cases})");
+    }
+
+    #[test]
     fn a_fast_projectile_sweeps_through_a_target_without_tunneling() {
         // FM2: a shot fast enough to overshoot the target in a single tick still hits,
         // because the collision is the SWEPT segment, not a per-tick point. Both the
