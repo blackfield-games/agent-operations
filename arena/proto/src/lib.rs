@@ -234,6 +234,14 @@ pub struct SelfState {
     /// HUD-equivalent of a human's "weapon ready" indicator, so an agent times its
     /// shots on the same information a human player has.
     pub cooldown: u16,
+    /// Ticks until this pawn may dash again, as the next action sees it: `0` means an
+    /// [`ability`](ActionButtons::ability) dash submitted for THIS observation's tick is
+    /// honored (subject to a non-zero `move_dir`). Like `cooldown`, it already accounts
+    /// for the start-of-tick decrement, so the dash-ready predicate is simply
+    /// `dash_cooldown == 0`. `0` whenever the dash is disabled (`Rules::dash_cooldown ==
+    /// 0`). Own state only — never on [`VisibleEntity`]/[`BroadcastEntity`], since an
+    /// enemy's dash readiness is the same tactical x-ray as its ammo or fire timing.
+    pub dash_cooldown: u16,
     pub alive: bool,
 }
 
@@ -1248,12 +1256,13 @@ mod tests {
             shield: 40,
             ammo: 30,
             cooldown: 5,
+            dash_cooldown: 3,
             alive: true,
         };
         let json = serde_json::to_value(s).unwrap();
         assert_eq!(
             object_keys(&json),
-            ["alive", "ammo", "cooldown", "facing", "health", "max_health", "position", "seat", "shield", "team", "velocity", "z"],
+            ["alive", "ammo", "cooldown", "dash_cooldown", "facing", "health", "max_health", "position", "seat", "shield", "team", "velocity", "z"],
             "SelfState gained or lost a field — the observable self-surface is a security contract"
         );
         for forbidden in ["enemies", "visible", "all_pawns", "rng_state", "world", "world_state"] {
@@ -1298,7 +1307,7 @@ mod tests {
                 "position": { "x": 0, "y": 0 }, "z": 0,
                 "facing": 16384,
                 "velocity": { "x": 0, "y": 0 },
-                "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 5, "alive": true
+                "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 5, "dash_cooldown": 0, "alive": true
             },
             "visible": [{
                 "entity_id": 7, "kind": "player", "team": 2,
@@ -1800,6 +1809,7 @@ mod tests {
                 shield: 0,
                 ammo: 30,
                 cooldown: 5,
+                dash_cooldown: 0,
                 alive: true,
             },
             visible: vec![VisibleEntity {

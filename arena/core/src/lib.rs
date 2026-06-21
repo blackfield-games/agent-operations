@@ -1120,6 +1120,10 @@ impl Match {
                 // value `0` exactly when a fire is honored, so the agent's predicate
                 // is the clean `cooldown == 0` with no off-by-one to model.
                 cooldown: me.cooldown.saturating_sub(1),
+                // The dash cooldown decrements at the same tick start as `cooldown`, so
+                // it carries the identical pending-decrement adjustment — the agent's
+                // dash-ready predicate is the clean `dash_cooldown == 0`.
+                dash_cooldown: me.dash_cooldown.saturating_sub(1),
                 alive: me.alive,
             },
             visible,
