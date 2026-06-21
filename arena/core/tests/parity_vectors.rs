@@ -185,6 +185,23 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let mut dropped = pickup.clone();
     dropped.replay.pickups.clear();
     assert!(dropped.verify().is_err(), "dropping the committed pickup must break the hash");
+
+    // Config (v5): every committed match carries the arena config, and the digest
+    // folds its DETERMINANTS — so the UE5 twin must fold bounds + max_ticks too, or its
+    // match hashes diverge. An arena-bound or tick-cap tamper on the stored replay moves
+    // the digest; a stored config inconsistent with the record fails verification.
+    let octant_rec = octant.clone();
+    assert_eq!(octant_rec.replay.config, octant_rec.config, "the committed replay carries its match config");
+    let base_hash = octant_rec.replay.digest();
+    let mut bound_tampered = octant_rec.clone();
+    bound_tampered.replay.config.bounds.x += 1;
+    assert_ne!(base_hash, bound_tampered.replay.digest(), "an arena bound binds the match digest (v5)");
+    let mut cap_tampered = octant_rec.clone();
+    cap_tampered.replay.config.max_ticks += 1;
+    assert_ne!(base_hash, cap_tampered.replay.digest(), "the tick cap binds the match digest (v5)");
+    let mut inconsistent = octant_rec.clone();
+    inconsistent.replay.config.bounds.y += 1;
+    assert!(inconsistent.verify().is_err(), "a stored config inconsistent with the record must not verify");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
