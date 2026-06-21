@@ -652,6 +652,7 @@ pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError
 mod tests {
     use super::*;
     use arena_proto::MatchPhase;
+    use arena_proto::{ActionButtons, PickupKind, PickupSpawn};
     use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
     #[test]
@@ -1320,5 +1321,99 @@ mod tests {
         assert!(matches!(spec.recv(), Some(SpectatorMsg::Frame(b)) if b.tick == 1));
         assert!(matches!(spec.recv(), Some(SpectatorMsg::End(_))));
         assert!(spec.recv().is_none(), "nothing follows the terminal End");
+    }
+
+    /// Form a 2-seat Human match on `arena` and hand back the built [`Match`].
+    fn form_on(arena: &'static str) -> Match {
+        let mm = Matchmaker::new(StubIdentityVerifier::new(), MatchParams { arena, ..MatchParams::default() });
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        mm.join(MatchMode::Human, b"", JoinRequest::human("b")).unwrap().into_formed().unwrap()
+    }
+
+    #[test]
+    fn a_default_arena_forms_a_match_with_no_geometry() {
+        // FM1: an unconfigured matchmaker (arena "") forms a match byte-identical to
+        // the pre-map-loading path — no blockers, no pickups.
+        let replay = form_on("").into_replay();
+        assert!(replay.blockers.is_empty(), "the default arena has no blockers");
+        assert!(replay.pickups.is_empty(), "the default arena has no pickups");
+    }
+
+    #[test]
+    fn a_named_arena_loads_its_geometry_into_the_formed_match() {
+        // FM3: build() routes the configured arena's map through new_with_pickups, so
+        // a formed match carries that arena's EXACT blockers + pickups — not the
+        // empty set the old Match::new path dropped them to.
+        let map = arena_map("reference");
+        let replay = form_on("reference").into_replay();
+        assert_eq!(replay.blockers, map.blockers, "the reference blockers reached the match");
+        assert_eq!(replay.pickups, map.pickups, "the reference pickups reached the match");
+    }
+
+    #[test]
+    fn an_unknown_arena_forms_a_match_with_no_geometry() {
+        // FM4: an unrecognised arena key degrades safe to the empty arena — never a
+        // panic, never a stray map.
+        let replay = form_on("no-such-arena").into_replay();
+        assert!(replay.blockers.is_empty() && replay.pickups.is_empty(), "an unknown arena is empty");
+    }
+
+    #[test]
+    fn replay_frames_rebuilds_pickups_so_the_feed_matches_the_live_match() {
+        // FM2: world pickups are a broadcast determinant — seat 0 survives this match
+        // ONLY by repeatedly healing on a pickup it stands on while seat 1 shoots it.
+        // replay_frames must rebuild those pickups, or the re-run kills seat 0 early
+        // and the spectator feed diverges from (and runs shorter than) the real match.
+        let rules = Rules {
+            spawn_radius: 5 * POSITION_SCALE,
+            spawn_jitter: 0,
+            fire_cooldown: 0,
+            damage: 25,
+            start_health: 100,
+            weapon_range: 50 * POSITION_SCALE,
+            pickup_respawn_cooldown: 1,
+            ..Default::default()
+        };
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "p0".into() },
+            SeatInfo { seat: 1, team: 1, controller: "p1".into() },
+        ];
+        let pickups = vec![PickupSpawn {
+            kind: PickupKind::Health,
+            position: Vec2 { x: -5 * POSITION_SCALE, y: 0 },
+            amount: 100,
+        }];
+        let config = MatchConfig {
+            tick_hz: 30,
+            max_ticks: 10,
+            bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+            seats: 2,
+        };
+        let mut m = Match::new_with_pickups(Uuid::new_v4(), config, rules, seats, Vec::new(), pickups, 1);
+
+        // Seat 1 fires WEST (0x8000, toward seat 0) every tick; seat 0 forfeits its
+        // action and just stands on the pickup, healing as it respawns.
+        let fire_west = ActionIntent {
+            move_dir: Vec2 { x: 0, y: 0 },
+            aim: 0x8000,
+            buttons: ActionButtons { fire: true, jump: false, ability: false, reload: false },
+        };
+        let mut live = vec![m.broadcast()];
+        while m.phase() == MatchPhase::Live {
+            let intents = BTreeMap::from([(1u8, fire_west)]);
+            m.step(&intents);
+            live.push(m.broadcast());
+        }
+
+        let seat0_alive = |b: &Broadcast| b.entities.iter().find(|e| e.entity_id == 0).unwrap().alive;
+        assert!(
+            seat0_alive(live.last().unwrap()),
+            "seat 0 must survive via heals — otherwise the test cannot catch the bug"
+        );
+
+        let record = m.to_record().unwrap();
+        assert!(!record.replay.pickups.is_empty(), "the record carries the pickup");
+        let replayed = replay_frames(&record).expect("a valid pickup record replays");
+        assert_eq!(live, replayed, "the spectator feed must reproduce the live match's pickup heals");
     }
 }
