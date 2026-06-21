@@ -691,17 +691,18 @@ pub fn arena_map(key: &str) -> ArenaMap {
 
 /// A minimal, symmetric reference arena: one central square vision occluder and
 /// two health pickups mirrored east/west, so neither seat of a 2-seat
-/// free-for-all opens with a sightline or item edge. Integer position units. A
-/// path-exercising demo, deliberately NOT a tuned production map.
+/// free-for-all opens with a sightline or item edge. A path-exercising demo,
+/// deliberately NOT a tuned production map.
+///
+/// It is itself authored as the data-driven map format (`maps/reference.json`,
+/// embedded at compile time) and loaded through [`ArenaMap::from_json`] — the same
+/// path content-authored arenas take — so the format is dogfooded end to end and
+/// there is one source of truth for the reference geometry. The asset is a
+/// compile-time constant, so a malformed embedded map is a build/programmer error,
+/// hence the `expect`.
 fn reference_arena() -> ArenaMap {
-    let m = POSITION_SCALE;
-    ArenaMap {
-        blockers: vec![Blocker { min: Vec2 { x: -3 * m, y: -3 * m }, max: Vec2 { x: 3 * m, y: 3 * m } }],
-        pickups: vec![
-            PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: -20 * m, y: 0 }, amount: 50 },
-            PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: 20 * m, y: 0 }, amount: 50 },
-        ],
-    }
+    ArenaMap::from_json(include_str!("../maps/reference.json"))
+        .expect("the embedded reference arena is a valid map")
 }
 
 /// The arena match: roster, authoritative pawn state, and the lifecycle phase.
@@ -5424,6 +5425,22 @@ mod tests {
         let a = arena_map("reference");
         assert!(!a.blockers.is_empty() && !a.pickups.is_empty(), "the reference arena has geometry");
         assert_eq!(a, arena_map("reference"), "arena_map must be deterministic for a key");
+    }
+
+    #[test]
+    fn reference_arena_loads_byte_identical_from_embedded_json() {
+        // FM3 (hard equality): dogfooding reference_arena() through include_str! must
+        // reproduce the EXACT prior hardcoded geometry (POSITION_SCALE-resolved ints),
+        // or arena_map("reference") shifts value and the matchmaker + any record drift.
+        let m = POSITION_SCALE;
+        let expected = ArenaMap {
+            blockers: vec![Blocker { min: Vec2 { x: -3 * m, y: -3 * m }, max: Vec2 { x: 3 * m, y: 3 * m } }],
+            pickups: vec![
+                PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: -20 * m, y: 0 }, amount: 50 },
+                PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: 20 * m, y: 0 }, amount: 50 },
+            ],
+        };
+        assert_eq!(arena_map("reference"), expected, "the embedded JSON reference arena matches the prior hardcoded value byte-for-byte");
     }
 
     #[test]

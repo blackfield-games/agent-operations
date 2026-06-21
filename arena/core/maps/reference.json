@@ -1,0 +1,9 @@
+{
+  "blockers": [
+    { "min": { "x": -3000, "y": -3000 }, "max": { "x": 3000, "y": 3000 } }
+  ],
+  "pickups": [
+    { "kind": "health", "position": { "x": -20000, "y": 0 }, "amount": 50 },
+    { "kind": "health", "position": { "x": 20000, "y": 0 }, "amount": 50 }
+  ]
+}
