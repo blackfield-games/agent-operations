@@ -327,3 +327,132 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arena_proto::SeatOutcome;
+
+    const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn id() -> Uuid {
+        Uuid::parse_str(MID).unwrap()
+    }
+
+    fn roster(n: u8) -> Vec<SeatInfo> {
+        (0..n).map(|i| SeatInfo { seat: i, team: u16::from(i), controller: format!("agent-{i}") }).collect()
+    }
+
+    fn replay_for(seats: Vec<SeatInfo>) -> ReplayRecord {
+        ReplayRecord { protocol_version: PROTOCOL_VERSION, match_id: id(), seed: 0, seats, ticks: Vec::new() }
+    }
+
+    fn outcome(seat: SeatId, placement: u16, score: i32, alive: bool) -> SeatOutcome {
+        SeatOutcome { seat, team: u16::from(seat), placement, score, alive_at_end: alive }
+    }
+
+    fn result_for(outcomes: Vec<SeatOutcome>) -> MatchResult {
+        MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: id(),
+            final_tick: 1,
+            outcomes,
+            replay_hash: "00".repeat(32),
+        }
+    }
+
+    #[test]
+    fn win_settles_once_with_the_winner_identity_and_core_digest() {
+        // Seat 1 — NOT the first outcome — wins, so this also pins that the driver
+        // resolves the placement-1 seat's controller rather than `outcomes[0]`.
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 2, 1, false), outcome(1, 1, 5, true)]);
+        let settler = MockSettler::default();
+
+        let chosen = settle_match(&settler, &result, &replay).expect("settles");
+        assert_eq!(chosen, Settlement::Win { seat: 1 });
+        assert_eq!(
+            settler.resolution(id()),
+            Some(Resolution::Win { winner: "agent-1".into(), replay_digest: replay.digest() }),
+        );
+    }
+
+    #[test]
+    fn retry_is_a_no_op_and_never_double_settles() {
+        // FM1: a crash/retry after the match ends must not settle twice. The second
+        // submit hits the per-matchId fence (AlreadyResolved) and leaves the
+        // recorded resolution untouched.
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 1, false)]);
+        let settler = MockSettler::default();
+
+        settle_match(&settler, &result, &replay).expect("first settles");
+        let first = settler.resolution(id());
+        assert!(matches!(
+            settle_match(&settler, &result, &replay),
+            Err(SettleError::AlreadyResolved)
+        ));
+        assert_eq!(settler.resolution(id()), first, "the retry changes nothing");
+    }
+
+    #[test]
+    fn a_tie_settles_as_a_draw_not_a_win() {
+        // FM3: a draw must take settleDraw, never settle(winner). Both seats share
+        // placement 1, so a win-only mapping would wrongly record a Win.
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 1, 4, true), outcome(1, 1, 4, true)]);
+        let settler = MockSettler::default();
+
+        let chosen = settle_match(&settler, &result, &replay).expect("settles");
+        assert_eq!(chosen, Settlement::Draw);
+        assert_eq!(settler.resolution(id()), Some(Resolution::Draw { replay_digest: replay.digest() }));
+    }
+
+    #[test]
+    fn cancel_records_a_cancel_and_fences_a_later_settle() {
+        // FM3 cancel mapping + FM1 fence across kinds: a cancelled match is
+        // Cancelled (no winner, no committed digest) and can never then be settled.
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 1, false)]);
+        let settler = MockSettler::default();
+
+        settler.cancel(id()).expect("cancels");
+        assert_eq!(settler.resolution(id()), Some(Resolution::Cancelled));
+        assert!(matches!(settler.cancel(id()), Err(SettleError::AlreadyResolved)), "retry cancel is a no-op");
+        assert!(
+            matches!(settle_match(&settler, &result, &replay), Err(SettleError::AlreadyResolved)),
+            "a cancelled match can never be settled",
+        );
+        assert_eq!(settler.resolution(id()), Some(Resolution::Cancelled), "still cancelled");
+    }
+
+    #[test]
+    fn committed_digest_equals_the_core_replay_digest() {
+        // FM2: the digest committed toward settlement is byte-identical to
+        // arena-core's canonical ReplayRecord.digest() of the played match — and to
+        // the hex in the published MatchResult — so the on-chain commitment verifies
+        // against the recorded replay. Driven by a really-simulated match, not a
+        // fixture.
+        let config = MatchConfig {
+            tick_hz: 30,
+            max_ticks: 2,
+            bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+            seats: 2,
+        };
+        let mut m = Match::new(id(), config, Rules::default(), roster(2), 0);
+        while m.phase() == MatchPhase::Live {
+            m.step(&BTreeMap::new());
+        }
+        let result = m.result().expect("ended").clone();
+        let replay = m.into_replay();
+        let settler = MockSettler::default();
+
+        settle_match(&settler, &result, &replay).expect("settles");
+        let committed = match settler.resolution(id()).expect("resolved") {
+            Resolution::Win { replay_digest, .. } | Resolution::Draw { replay_digest } => replay_digest,
+            Resolution::Cancelled => panic!("a played match is never a cancel"),
+        };
+        assert_eq!(committed, replay.digest(), "commits the exact core digest");
+        assert_eq!(hex::encode(committed), result.replay_hash, "matches the published result hash");
+    }
+}
