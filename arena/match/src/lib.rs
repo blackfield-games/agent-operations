@@ -224,8 +224,8 @@ pub struct MatchParams {
     pub max_ticks: u64,
     pub bounds: Vec2,
     /// The builtin arena key whose static geometry — vision blockers + world
-    /// pickups — every formed match plays under, resolved through
-    /// [`arena_map`](arena_core::arena_map). The default `""` is the empty arena
+    /// pickups — every formed match plays under, resolved through [`arena_map`].
+    /// The default `""` is the empty arena
     /// (no occlusion, no items), so an unconfigured matchmaker forms matches
     /// byte-identical to the pre-map-loading behaviour; an unknown key degrades to
     /// that same empty arena rather than failing a formation.
