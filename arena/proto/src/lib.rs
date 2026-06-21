@@ -73,7 +73,10 @@ pub type TeamId = u16;
 /// A 2D integer fixed-point point on the arena plane (see [`POSITION_SCALE`]).
 /// The combat core is plane-plus-height; the vertical axis rides on the entity
 /// records that need it, keeping the common case two integers wide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is the origin (`ZERO`), present so a `serde(default)` container field
+/// of this type fills in for an older record that predates it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vec2 {
     pub x: i32,
     pub y: i32,
@@ -716,7 +719,12 @@ pub struct MatchResult {
 /// The rules a match is played under, sent to every seat at [`GatewayMsg::Start`]
 /// so an agent knows the tick rate, the time limit, and the arena bounds it must
 /// stay within. Read-only; the server is authoritative.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is the all-zero config — a sentinel only ever used as the
+/// `serde(default)` fill-in for a [`ReplayRecord`] written before it carried the
+/// config (such a record fails to re-verify, the same hard cutover every digest-tag
+/// bump makes); no live match runs an all-zero config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchConfig {
     /// Simulation ticks per second.
     pub tick_hz: u16,
