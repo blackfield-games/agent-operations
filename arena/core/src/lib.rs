@@ -1624,6 +1624,74 @@ mod tests {
         assert!(in_fov(EAST, o, o, 0), "a co-located entity is always in view");
     }
 
+    fn box_of(min: (i32, i32), max: (i32, i32)) -> Blocker {
+        Blocker { min: Vec2 { x: min.0, y: min.1 }, max: Vec2 { x: max.0, y: max.1 } }
+    }
+
+    #[test]
+    fn segment_vs_aabb_is_exact_at_the_boundary() {
+        // FM2: the integer segment-vs-AABB test must classify the adversarial cases
+        // — dead behind, grazing a corner, edge-on, just-missing — correctly, or a
+        // blocked enemy leaks (a security regression) or a clear shot is hidden.
+        let o = Vec2::ZERO;
+
+        // A wall squarely between observer and an enemy 10 m to the east occludes.
+        let wall = box_of((5, -2), (6, 2));
+        assert!(segment_intersects_aabb(o, Vec2 { x: 10, y: 0 }, &wall), "a wall on the sightline blocks");
+        // The same wall does not block an enemy off to the side (segment misses on Y).
+        assert!(!segment_intersects_aabb(o, Vec2 { x: 10, y: 100 }, &wall), "an off-axis sightline is clear");
+        // A wall BEYOND the enemy (both endpoints on the near side) does not block.
+        assert!(!segment_intersects_aabb(o, Vec2 { x: 3, y: 0 }, &wall), "a wall past the target is clear");
+
+        // Grazing: the sightline passing exactly through a corner counts as blocked
+        // (the conservative, parity-tightening direction). The diagonal y=x clips
+        // the corner (5,5).
+        let corner = box_of((5, 5), (9, 9));
+        assert!(segment_intersects_aabb(o, Vec2 { x: 20, y: 20 }, &corner), "a grazed corner blocks");
+        // Shift the box one unit up-left so the y=x line passes just outside the
+        // nearest corner (6,5) → no longer blocked. (At the box, x in [4,5]: the
+        // line is at y=x≤5 while the box floor is y=6, so it clears.)
+        let near_miss = box_of((4, 6), (5, 9));
+        assert!(!segment_intersects_aabb(o, Vec2 { x: 20, y: 20 }, &near_miss), "a near-missed corner is clear");
+
+        // Edge-on: a zero-width thin wall (a degenerate AABB) on the sightline
+        // still blocks — no divide-by-zero, no panic.
+        let thin = box_of((5, -3), (5, 3));
+        assert!(segment_intersects_aabb(o, Vec2 { x: 10, y: 0 }, &thin), "a thin wall on the sightline blocks");
+    }
+
+    #[test]
+    fn occlusion_exempts_a_blocker_containing_an_endpoint() {
+        // FM4: a pawn standing in (or pressed against) an occluder must be neither
+        // blind nor invisible — its own enclosing blocker is exempt, every other
+        // still occludes.
+        let b = box_of((-5, -5), (5, 5));
+        let inside = Vec2 { x: 0, y: 0 };
+        let on_edge = Vec2 { x: 5, y: 0 };
+        let outside = Vec2 { x: 20, y: 0 };
+        assert!(blocker_contains(&b, inside) && blocker_contains(&b, on_edge));
+        // Observer inside the box: not occluded by it (would otherwise be blind).
+        assert!(!occludes(&b, inside, outside), "the enclosing blocker does not blind its occupant");
+        // Target on the box boundary: not occluded by the box it touches.
+        assert!(!occludes(&b, outside, on_edge), "a target against a blocker is not hidden by it");
+        // A DIFFERENT blocker still occludes the same pair.
+        let between = box_of((10, -3), (11, 3));
+        assert!(occludes(&between, outside, inside), "an unrelated blocker still occludes");
+    }
+
+    #[test]
+    fn has_line_of_sight_is_clear_only_when_no_blocker_occludes() {
+        // The set-level predicate: a sightline is clear iff NO blocker occludes it,
+        // and an empty blocker set is always clear (the no-occlusion default).
+        let from = Vec2::ZERO;
+        let to = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
+        assert!(has_line_of_sight(&[], from, to), "no blockers means a clear sightline");
+        let off_axis = box_of((5 * POSITION_SCALE, 5 * POSITION_SCALE), (6 * POSITION_SCALE, 6 * POSITION_SCALE));
+        let on_axis = box_of((5 * POSITION_SCALE, -POSITION_SCALE), (6 * POSITION_SCALE, POSITION_SCALE));
+        assert!(has_line_of_sight(&[off_axis], from, to), "an off-axis blocker leaves the sightline clear");
+        assert!(!has_line_of_sight(&[off_axis, on_axis], from, to), "any blocker on the sightline occludes");
+    }
+
     #[test]
     fn observe_applies_the_fov_cone_and_does_not_leak_the_excluded_position() {
         // Integration: an enemy in range but directly behind is perceived under the
