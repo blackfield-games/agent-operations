@@ -4847,4 +4847,48 @@ mod tests {
             assert_eq!(off.observe(seat), on.observe(seat), "the flag must not touch perception");
         }
     }
+
+    #[test]
+    fn arena_map_default_and_unknown_keys_resolve_empty() {
+        // FM4: the empty/default key AND any unrecognised key degrade safe to the
+        // empty arena — no geometry, no panic, no guessing.
+        assert_eq!(arena_map(""), ArenaMap::empty());
+        assert_eq!(arena_map("does-not-exist"), ArenaMap::empty());
+        let empty = arena_map("");
+        assert!(empty.blockers.is_empty() && empty.pickups.is_empty(), "default is no geometry");
+    }
+
+    #[test]
+    fn arena_map_reference_is_non_empty_and_deterministic() {
+        // FM4: the reference arena carries real geometry, and arena_map is a pure
+        // function — the same key always yields the identical map.
+        let a = arena_map("reference");
+        assert!(!a.blockers.is_empty() && !a.pickups.is_empty(), "the reference arena has geometry");
+        assert_eq!(a, arena_map("reference"), "arena_map must be deterministic for a key");
+    }
+
+    #[test]
+    fn a_reference_arena_match_round_trips_from_its_record() {
+        // FM2 + FM3: a match built from a named arena's map carries that EXACT
+        // geometry into its record and re-runs from the record ALONE to its
+        // committed result — the formation->replay parity the matchmaker relies on.
+        let map = arena_map("reference");
+        let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let m = Match::new_with_pickups(
+            MID.parse().unwrap(),
+            config(2),
+            rules,
+            two_seats(),
+            map.blockers.clone(),
+            map.pickups.clone(),
+            1,
+        );
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        let played = run_match(m, &mut policies);
+        assert_eq!(played.phase(), MatchPhase::Ended);
+        let record = played.to_record().unwrap();
+        assert_eq!(record.replay.blockers, map.blockers, "the arena's blockers rode into the record");
+        assert_eq!(record.replay.pickups, map.pickups, "the arena's pickups rode into the record");
+        assert!(record.verify().is_ok(), "a reference-arena match re-runs to its committed result");
+    }
 }
