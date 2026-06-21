@@ -4503,6 +4503,7 @@ mod tests {
         assert_eq!(m.pawns[0].pos, Vec2 { x: -2000, y: 0 }, "seat 0 spawns at -spawn_radius");
         step_with(&mut m, &[(0, dash_intent(east))]);
         assert_eq!(m.pawns[0].pos, Vec2 { x: -1800, y: 0 }, "the dash is refused by the wall — only the walk applied, no tunnel");
+        assert_eq!(m.pawns[0].dash_cooldown, 10, "consume-on-trigger: the wall refusing the burst is not a free retry");
 
         // (b) Bounds: in a ±2500 arena seat 1 starts at (2000,0), walks to (2200,0),
         // then the dash toward +x clamps to the boundary instead of escaping to 5200.
