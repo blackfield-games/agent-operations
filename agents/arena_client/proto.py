@@ -131,6 +131,11 @@ class SelfState(_Wire):
     # server already subtracts the start-of-tick decrement, so the fire-ready
     # predicate is simply `cooldown == 0`. Own state only — never on VisibleEntity.
     cooldown: U16
+    # Ticks until this pawn may dash again as the next action sees it: 0 means an
+    # ability dash submitted for this tick is honored (subject to a non-zero
+    # move_dir). Same start-of-tick adjustment as cooldown, so the dash-ready
+    # predicate is simply `dash_cooldown == 0`. Own state only — never on VisibleEntity.
+    dash_cooldown: U16
     alive: bool
 
 
