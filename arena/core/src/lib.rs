@@ -4391,6 +4391,24 @@ mod tests {
     }
 
     #[test]
+    fn negative_gravity_is_inert_like_disabled() {
+        // FM2 (defensive): the vertical gate is `gravity > 0`, NOT `!= 0`, so a negative
+        // gravity is treated as DISABLED — not as a velocity-amplifying runaway (a `-=`
+        // of a negative gravity would ADD velocity every tick and launch a pawn off the
+        // top of the world). A held jump under negative gravity must leave every z at 0,
+        // exactly like gravity 0. This pins the strict `> 0` gate against a regression
+        // that loosened it to `!= 0`, which would compile and pass every other test.
+        let mut m = jump_match(-500, 1);
+        for _ in 0..10 {
+            step_with(&mut m, &[(0, jump_press())]);
+        }
+        assert!(
+            m.pawns.iter().all(|p| p.z == 0 && p.z_vel == 0),
+            "negative gravity is inert — no pawn leaves the ground"
+        );
+    }
+
+    #[test]
     fn ingest_accepts_well_formed_and_clamps_overlong_move() {
         let m = new_match(1);
         // FM2: a crafted 3-4-5 vector of magnitude 5000 is accepted but clamped to
