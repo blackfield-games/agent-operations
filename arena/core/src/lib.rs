@@ -1620,24 +1620,38 @@ impl Match {
         }
     }
 
-    /// Per-seat outcomes, ascending by seat. Placement ranks alive over dead,
-    /// then higher score, then lower seat; seats with the same alive flag and
-    /// score share a placement.
+    /// Per-seat outcomes, ascending by seat. Placement is by TEAM: every seat on a
+    /// team shares one placement, so teammates never contend as rivals. Teams rank
+    /// by survivors, then total score, then lowest seat (a stable, deterministic
+    /// tiebreak); teams with an equal (survivors, total score) share a placement.
+    /// With each seat its own team — the free-for-all default — this reduces
+    /// exactly to the per-seat alive>score>seat ranking (survivors is the seat's
+    /// 0/1 alive flag, total score is its own), so FFA outcomes stay byte-identical.
     fn outcomes(&self) -> Vec<SeatOutcome> {
-        let mut ranked: Vec<&Pawn> = self.pawns.iter().collect();
-        ranked.sort_by(|a, b| {
-            b.alive.cmp(&a.alive).then(b.score.cmp(&a.score)).then(a.seat.cmp(&b.seat))
+        // (survivors, total score, lowest seat) per team.
+        let mut teams: BTreeMap<TeamId, (u32, i64, SeatId)> = BTreeMap::new();
+        for p in &self.pawns {
+            let (survivors, total, low_seat) = teams.entry(p.team).or_insert((0, 0, p.seat));
+            *survivors += p.alive as u32;
+            *total += p.score as i64;
+            *low_seat = (*low_seat).min(p.seat);
+        }
+        let mut ranked: Vec<(TeamId, u32, i64, SeatId)> =
+            teams.into_iter().map(|(t, (surv, total, seat))| (t, surv, total, seat)).collect();
+        // Best first: more survivors, then higher total score, then lowest seat.
+        ranked.sort_by(|&(_, a_surv, a_sc, a_seat), &(_, b_surv, b_sc, b_seat)| {
+            b_surv.cmp(&a_surv).then(b_sc.cmp(&a_sc)).then(a_seat.cmp(&b_seat))
         });
-        let mut placement_of: BTreeMap<SeatId, u16> = BTreeMap::new();
+        let mut placement_of_team: BTreeMap<TeamId, u16> = BTreeMap::new();
         let mut place = 0u16;
-        let mut prev: Option<(bool, i32)> = None;
-        for (i, p) in ranked.iter().enumerate() {
-            let key = (p.alive, p.score);
+        let mut prev: Option<(u32, i64)> = None;
+        for (i, &(team, surv, sc, _)) in ranked.iter().enumerate() {
+            let key = (surv, sc);
             if prev != Some(key) {
                 place = (i + 1) as u16;
                 prev = Some(key);
             }
-            placement_of.insert(p.seat, place);
+            placement_of_team.insert(team, place);
         }
         let mut outcomes: Vec<SeatOutcome> = self
             .pawns
@@ -1645,7 +1659,7 @@ impl Match {
             .map(|p| SeatOutcome {
                 seat: p.seat,
                 team: p.team,
-                placement: placement_of[&p.seat],
+                placement: placement_of_team[&p.team],
                 score: p.score,
                 alive_at_end: p.alive,
             })
