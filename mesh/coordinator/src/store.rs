@@ -294,8 +294,13 @@ impl Store {
              -- Fields mirror the contract's registered schema (see eas.rs). A row
              -- is PENDING while `uid IS NULL`; the relayer flips it by writing the
              -- returned attestation `uid` + `submitted_at` once issueReceipt lands.
+             -- `job_id` is NOT NULL (SQLite would otherwise permit a NULL in a TEXT
+             -- PRIMARY KEY): the retention sweep gates on `id NOT IN (SELECT job_id
+             -- ... WHERE uid IS NULL)`, and a single NULL in that subquery makes the
+             -- NOT IN evaluate NULL for every candidate, silently stalling pruning —
+             -- so the column the gate reads must never be NULL.
              CREATE TABLE IF NOT EXISTS pending_attestations (
-                 job_id         TEXT PRIMARY KEY,
+                 job_id         TEXT PRIMARY KEY NOT NULL,
                  earner         TEXT NOT NULL,
                  job_id_b32     TEXT NOT NULL,
                  render_seconds INTEGER NOT NULL,
@@ -314,8 +319,11 @@ impl Store {
              -- never an INTEGER (a 1e18-scale value overflows i64). A row is
              -- PENDING while `tx_hash IS NULL`; the (operator-gated) relayer flips
              -- it by writing the spend tx_hash + submitted_at.
+             -- `job_id` NOT NULL for the same reason as pending_attestations above:
+             -- the retention `NOT IN (... WHERE tx_hash IS NULL)` gate must read a
+             -- NULL-free column or a NULL would stall every prune.
              CREATE TABLE IF NOT EXISTS pending_debits (
-                 job_id       TEXT PRIMARY KEY,
+                 job_id       TEXT PRIMARY KEY NOT NULL,
                  buyer        TEXT NOT NULL,
                  amount_wei   TEXT NOT NULL,
                  job_id_b32   TEXT NOT NULL,
