@@ -614,12 +614,17 @@ impl SpectatorFeed {
 /// frames, the last carrying the terminal `phase == Ended`.
 pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError> {
     record.verify()?;
-    let mut m = Match::new(
+    // new_with_pickups, not new: a recorded match's world pickups are a
+    // determinant of its broadcasts, so rebuilding without them would diverge the
+    // spectator feed from the real match (the core verify() re-run already loads
+    // them).
+    let mut m = Match::new_with_pickups(
         record.replay.match_id,
         record.config,
         record.rules,
         record.replay.seats.clone(),
         record.replay.blockers.clone(),
+        record.replay.pickups.clone(),
         record.replay.seed,
     );
     // Do NOT pre-size from `record.replay.ticks.len()`: `verify` accepts a record
