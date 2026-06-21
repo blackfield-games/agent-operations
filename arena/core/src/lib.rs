@@ -405,9 +405,9 @@ pub struct Rules {
     /// only rate gate). `serde(default)` (15 — a slower cadence than a ranged shot).
     #[serde(default = "default_melee_cooldown")]
     pub melee_cooldown: u16,
-    /// Cap on a pawn's damage-absorbing [`shield`](Pawn::shield) pool. A pawn starts
-    /// with `0` shield and earns it by collecting a [`PickupKind::Shield`], clamped to
-    /// this ceiling; incoming damage drains shield before health. `serde(default)`
+    /// Cap on a pawn's damage-absorbing shield pool. A pawn starts with `0` shield and
+    /// earns it by collecting a [`PickupKind::Shield`], clamped to this ceiling;
+    /// incoming damage drains shield before health. `serde(default)`
     /// (`0`) DISABLES shield — no pawn can hold any, so a match without it (the
     /// default, and every pre-shield record) plays byte-identically. A non-zero value
     /// turns shield pickups on.
