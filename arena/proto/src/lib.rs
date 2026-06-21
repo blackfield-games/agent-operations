@@ -1514,14 +1514,14 @@ mod tests {
         // The rules commitment binds (v4): a record that ran under different combat
         // tuning hashes differently even with an identical action stream — the gap
         // that previously let a swapped-rules record share a hash with the real match.
+        // Growing it binds (length prefix + new byte both move)...
         let mut r = sample_replay();
         r.rules_commit.push(0xff);
         assert_ne!(base, r.digest(), "the rules commitment must bind");
-        // Its length is prefixed, so growing it is not the same as flipping a byte:
-        // [1,2,3,4,0] and [1,2,3,4] -> 0 must not collide.
+        // ...and an in-place byte flip binds (length unchanged, one byte differs).
         let mut r3 = sample_replay();
         r3.rules_commit[0] ^= 1;
-        assert_ne!(sample_replay().digest(), r3.digest(), "a rules-commit byte must bind");
+        assert_ne!(base, r3.digest(), "a rules-commit byte must bind");
     }
 
     #[test]
