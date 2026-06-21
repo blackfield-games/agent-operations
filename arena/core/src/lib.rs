@@ -1258,22 +1258,21 @@ impl Match {
         if !path_hits_blocker(&self.blockers, from, to) {
             return to;
         }
-        // The full move is refused. With wall_slide on, retry the axis-separated
-        // components (X-only, then Y-only) so a grazing step slides along the wall
-        // instead of dead-stopping; an inside corner (both refused) holds. Off keeps
-        // the historical stop-at-origin, byte-identical.
-        if self.rules.wall_slide {
-            if dx != 0 {
-                let slid = target(dx, 0);
-                if !path_hits_blocker(&self.blockers, from, slid) {
-                    return slid;
-                }
+        // The full move is refused. With wall_slide on, a genuinely diagonal step
+        // retries the axis-separated components (X-only first, then Y-only) through the
+        // same segment test + clamp, so a pawn grazing a wall slides along the unblocked
+        // axis; an inside corner (both refused) holds, and a pure-axis move — no
+        // perpendicular component to slide along — simply holds too. Off keeps the
+        // historical stop-at-origin, byte-identical. Each retry is a strict single-axis
+        // subset of the full step, so it can no more tunnel than the full move can.
+        if self.rules.wall_slide && dx != 0 && dy != 0 {
+            let slide_x = target(dx, 0);
+            if !path_hits_blocker(&self.blockers, from, slide_x) {
+                return slide_x;
             }
-            if dy != 0 {
-                let slid = target(0, dy);
-                if !path_hits_blocker(&self.blockers, from, slid) {
-                    return slid;
-                }
+            let slide_y = target(0, dy);
+            if !path_hits_blocker(&self.blockers, from, slide_y) {
+                return slide_y;
             }
         }
         from
