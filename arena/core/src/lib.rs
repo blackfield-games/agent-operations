@@ -16,9 +16,9 @@
 //! one of those would make a replay diverge and break grading.
 
 use arena_proto::{
-    check_version, Action, ActionError, ActionIntent, Bam, MatchConfig, MatchPhase, MatchResult,
-    Observation, ReplayRecord, SeatAction, SeatId, SeatOutcome, TeamId, TickRecord, Vec2,
-    VersionMismatch, MOVE_INTENT_SCALE, POSITION_SCALE, PROTOCOL_VERSION,
+    check_version, Action, ActionError, ActionIntent, Bam, Blocker, MatchConfig, MatchPhase,
+    MatchResult, Observation, ReplayRecord, SeatAction, SeatId, SeatOutcome, TeamId, TickRecord,
+    Vec2, VersionMismatch, MOVE_INTENT_SCALE, POSITION_SCALE, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -262,6 +262,10 @@ pub struct Match {
     config: arena_proto::MatchConfig,
     rules: Rules,
     seats: Vec<arena_proto::SeatInfo>,
+    /// Static vision blockers; consulted only by [`observe`](Match::observe) for
+    /// line-of-sight occlusion (vision-only in this first cut — movement and
+    /// hitscan ignore them). Empty means omnidirectional, no-occluder perception.
+    blockers: Vec<Blocker>,
     pawns: Vec<Pawn>,
     tick: u64,
     phase: MatchPhase,
@@ -282,6 +286,10 @@ impl Match {
     /// in `[-spawn_radius, +spawn_radius]`, each jittered by the PRNG and facing
     /// the arena centre. `config.seats` must equal `seats.len()`.
     ///
+    /// `blockers` are the static vision occluders the match plays under (empty for
+    /// no occlusion). They are not validated here — a record-driven re-run gates
+    /// well-formed geometry in [`MatchRecord::verify`] before construction.
+    ///
     /// [`Live`]: MatchPhase::Live
     /// [`Lobby`]: MatchPhase::Lobby
     /// [`Starting`]: MatchPhase::Starting
@@ -290,6 +298,7 @@ impl Match {
         config: arena_proto::MatchConfig,
         rules: Rules,
         seats: Vec<arena_proto::SeatInfo>,
+        blockers: Vec<Blocker>,
         seed: u64,
     ) -> Self {
         let n = seats.len();
@@ -329,6 +338,7 @@ impl Match {
             config,
             rules,
             seats,
+            blockers,
             pawns,
             tick: 0,
             phase: MatchPhase::Live,
@@ -721,6 +731,7 @@ impl Match {
             match_id: self.match_id,
             seed: self.seed,
             seats: self.seats.clone(),
+            blockers: self.blockers.clone(),
             ticks: self.ticks.clone(),
         }
     }
@@ -759,6 +770,7 @@ impl Match {
             match_id: self.match_id,
             seed: self.seed,
             seats: self.seats,
+            blockers: self.blockers,
             ticks: self.ticks,
         }
     }
@@ -998,6 +1010,7 @@ impl MatchRecord {
             self.config,
             self.rules,
             self.replay.seats.clone(),
+            self.replay.blockers.clone(),
             self.replay.seed,
         );
         let rerun = replay_match(fresh, &self.replay);
@@ -1168,7 +1181,7 @@ mod tests {
     }
 
     fn new_match(seed: u64) -> Match {
-        Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), seed)
+        Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), Vec::new(), seed)
     }
 
     fn intent(move_dir: Vec2, aim: Bam, fire: bool) -> ActionIntent {
@@ -1192,7 +1205,7 @@ mod tests {
     /// tests are exact.
     fn close_match(seed: u64) -> Match {
         let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
-        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), seed)
+        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), seed)
     }
 
     #[test]
@@ -1227,7 +1240,7 @@ mod tests {
             spawn_jitter: 0,
             ..Default::default()
         };
-        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), 1);
+        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
 
         assert!(m.observe(0).visible.is_empty(), "seat 0 perceives no enemy at this range");
         assert!(m.observe(1).visible.is_empty(), "seat 1 perceives no enemy at this range");
@@ -1310,7 +1323,7 @@ mod tests {
     fn perception_range_hides_distant_entities() {
         // Spawn far apart with a tiny perception range: no one is visible.
         let rules = Rules { perception_range: 1, ..Default::default() };
-        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), 5);
+        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 5);
         assert!(m.observe(0).visible.is_empty());
         assert!(m.observe(1).visible.is_empty());
     }
@@ -1406,7 +1419,7 @@ mod tests {
             perception_range: 3 * POSITION_SCALE,
             ..Default::default()
         };
-        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, Vec::new(), 1);
         let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
         let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker), Box::new(Seeker)];
 
@@ -1451,7 +1464,7 @@ mod tests {
             fov_octant_spread: 1,
             ..Default::default()
         };
-        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, Vec::new(), 1);
         let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
         let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker), Box::new(Seeker)];
 
@@ -1523,7 +1536,7 @@ mod tests {
                 spawn_jitter: 0,
                 ..Default::default()
             };
-            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, seats.clone(), 1);
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, seats.clone(), Vec::new(), 1);
             for p in &mut m.pawns {
                 match p.seat {
                     0 => {
@@ -1561,7 +1574,7 @@ mod tests {
             SeatInfo { seat: 1, team: 1, controller: "edge".into() },
             SeatInfo { seat: 2, team: 2, controller: "beyond".into() },
         ];
-        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, Vec::new(), 1);
         let beyond_pos = Vec2 { x: r + 1, y: 0 };
         for p in &mut m.pawns {
             match p.seat {
@@ -1587,7 +1600,7 @@ mod tests {
         let r = 10 * POSITION_SCALE;
         let rules =
             Rules { perception_range: r, spawn_jitter: 0, max_speed: POSITION_SCALE, ..Default::default() };
-        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), 1);
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
         for p in &mut m.pawns {
             match p.seat {
                 0 => p.pos = Vec2 { x: 0, y: 0 },
@@ -1735,7 +1748,7 @@ mod tests {
         let bounds = Vec2 { x: 21 * POSITION_SCALE, y: 50 * POSITION_SCALE };
         let cfg = MatchConfig { bounds, ..config(2) };
         let rules = Rules { spawn_jitter: 0, ..Default::default() };
-        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), 1);
+        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), Vec::new(), 1);
         for _ in 0..100 {
             step_with(&mut m, &[(1, intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, WEST, false))]);
         }
@@ -1752,7 +1765,7 @@ mod tests {
         let edge = i32::MAX;
         let cfg = MatchConfig { bounds: Vec2 { x: edge, y: edge }, ..config(2) };
         let rules = Rules { spawn_radius: edge, spawn_jitter: 0, ..Default::default() };
-        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), 1);
+        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), Vec::new(), 1);
         let before = m.observe(1).own.health;
         // Seats spawn at opposite i32 extremes; firing must not panic, and the
         // far target is out of range, so no hit lands — the point is no panic.
@@ -1921,6 +1934,7 @@ mod tests {
             match_id: MID.parse().unwrap(),
             seed,
             seats: two_seats(),
+            blockers: Vec::new(),
             ticks: vec![TickRecord {
                 tick: 0,
                 actions: vec![SeatAction { seat: 0, intent: intent(Vec2 { x: 1_000_000, y: 0 }, EAST, false) }],
@@ -1944,7 +1958,7 @@ mod tests {
             SeatInfo { seat: 2, team: 2, controller: "c".into() },
         ];
         let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
-        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, Vec::new(), 1);
         // Seat 0 (left) guns down seat 1 (centre); seats 1 and 2 forfeit.
         while m.observe(1).own.alive && m.phase() == MatchPhase::Live {
             step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);

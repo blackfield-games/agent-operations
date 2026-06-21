@@ -378,7 +378,7 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             bounds: self.params.bounds,
             seats: seats.len() as u8,
         };
-        Match::new(match_id, config, Rules::default(), seats, seed_for_match(match_id))
+        Match::new(match_id, config, Rules::default(), seats, Vec::new(), seed_for_match(match_id))
     }
 
     /// How many participants are waiting in `mode`'s queue — for observability and
@@ -599,6 +599,7 @@ pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError
         record.config,
         record.rules,
         record.replay.seats.clone(),
+        record.replay.blockers.clone(),
         record.replay.seed,
     );
     // Do NOT pre-size from `record.replay.ticks.len()`: `verify` accepts a record
@@ -1108,7 +1109,7 @@ mod tests {
             SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
             SeatInfo { seat: 1, team: 1, controller: "0xbbbb".into() },
         ];
-        Match::new(FIXED_ID.parse().unwrap(), config, Rules::default(), seats, 42)
+        Match::new(FIXED_ID.parse().unwrap(), config, Rules::default(), seats, Vec::new(), 42)
     }
 
     /// Drive a match to its terminal state with both seats forfeiting every tick.

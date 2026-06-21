@@ -245,7 +245,7 @@ fn main() {
         bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
         seats: n,
     };
-    let mut m = Match::new(args.match_id, config, Rules::default(), roster, args.seed);
+    let mut m = Match::new(args.match_id, config, Rules::default(), roster, Vec::new(), args.seed);
 
     // The off-chain settlement seam: a finished match (or a pre-play abort) maps to
     // a MatchSettlement resolution through this settler. Mock-only and opt-in here;
@@ -362,7 +362,14 @@ mod tests {
     }
 
     fn replay_for(seats: Vec<SeatInfo>) -> ReplayRecord {
-        ReplayRecord { protocol_version: PROTOCOL_VERSION, match_id: id(), seed: 0, seats, ticks: Vec::new() }
+        ReplayRecord {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: id(),
+            seed: 0,
+            seats,
+            blockers: Vec::new(),
+            ticks: Vec::new(),
+        }
     }
 
     fn outcome(seat: SeatId, placement: u16, score: i32, alive: bool) -> SeatOutcome {
@@ -474,7 +481,7 @@ mod tests {
             bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
             seats: 2,
         };
-        let mut m = Match::new(id(), config, Rules::default(), roster(2), 0);
+        let mut m = Match::new(id(), config, Rules::default(), roster(2), Vec::new(), 0);
         while m.phase() == MatchPhase::Live {
             m.step(&BTreeMap::new());
         }

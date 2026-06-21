@@ -531,6 +531,13 @@ pub struct ReplayRecord {
     /// The seed the sim ran from; replay re-runs from this exact value.
     pub seed: u64,
     pub seats: Vec<SeatInfo>,
+    /// Static vision blockers the match ran under, in declared order. A match
+    /// determinant of perception (not of movement/combat in this first cut), so
+    /// it is committed by [`digest`](ReplayRecord::digest) — a tampered blocker
+    /// set yields a different hash. `serde(default)` so a record written before
+    /// this field existed deserializes to the no-occluder behavior it ran under.
+    #[serde(default)]
+    pub blockers: Vec<Blocker>,
     pub ticks: Vec<TickRecord>,
 }
 
@@ -544,7 +551,11 @@ impl ReplayRecord {
     /// [`MatchResult::replay_hash`].
     pub fn digest(&self) -> [u8; 32] {
         let mut h = Keccak256::new();
-        h.update(b"blackfield/arena/replay/v1");
+        // v2 folds in the static `blockers` set. The bump is honest about the
+        // encoding change: blockers occlude vision only, so they do not alter the
+        // re-run outcome and could not be bound by re-execution alone — committing
+        // them here is what pins a match's perception geometry to its hash.
+        h.update(b"blackfield/arena/replay/v2");
         h.update(self.protocol_version.to_be_bytes());
         h.update(self.match_id.as_bytes());
         h.update(self.seed.to_be_bytes());
@@ -554,6 +565,13 @@ impl ReplayRecord {
             h.update(s.team.to_be_bytes());
             h.update((s.controller.len() as u32).to_be_bytes());
             h.update(s.controller.as_bytes());
+        }
+        h.update((self.blockers.len() as u32).to_be_bytes());
+        for b in &self.blockers {
+            h.update(b.min.x.to_be_bytes());
+            h.update(b.min.y.to_be_bytes());
+            h.update(b.max.x.to_be_bytes());
+            h.update(b.max.y.to_be_bytes());
         }
         h.update((self.ticks.len() as u32).to_be_bytes());
         for t in &self.ticks {
@@ -1353,11 +1371,11 @@ mod tests {
     #[test]
     fn replay_digest_golden() {
         // A fixed record must hash to a fixed value. Any change to the canonical
-        // encoding (field order, prefixing, domain tag) flips this — the
-        // hard byte-stability pin for on-chain attestation.
+        // encoding (field order, prefixing, domain tag, the v2 blockers section)
+        // flips this — the hard byte-stability pin for on-chain attestation.
         assert_eq!(
             hex::encode(sample_replay().digest()),
-            "35f5283a7492c4e72534fd6e40dad73996571ffe8d17972f0bf8cd9497bca005"
+            "ccf44bcac02a2e32bebb1c07f012ce89ad931fa525f27859e3b8d5897c0ea177"
         );
     }
 
@@ -1380,6 +1398,17 @@ mod tests {
         let mut r = sample_replay();
         r.seats[0].controller.push('x');
         assert_ne!(base, r.digest(), "roster must bind");
+        // An added vision blocker -> different commitment: the perception geometry
+        // is bound even though it does not alter the re-run outcome (FM1).
+        let mut r = sample_replay();
+        r.blockers.push(Blocker { min: Vec2 { x: 1, y: 2 }, max: Vec2 { x: 3, y: 4 } });
+        assert_ne!(base, r.digest(), "a blocker must bind");
+        // A moved blocker corner -> different commitment.
+        let mut r = sample_replay();
+        r.blockers.push(Blocker { min: Vec2 { x: 1, y: 2 }, max: Vec2 { x: 3, y: 4 } });
+        let with_blocker = r.digest();
+        r.blockers[0].max.x += 1;
+        assert_ne!(with_blocker, r.digest(), "a blocker's geometry must bind");
     }
 
     #[test]
@@ -1510,6 +1539,7 @@ mod tests {
                 SeatInfo { seat: 0, team: 1, controller: "0xaaaa".into() },
                 SeatInfo { seat: 1, team: 2, controller: "0xbbbb".into() },
             ],
+            blockers: Vec::new(),
             ticks: vec![
                 TickRecord {
                     tick: 0,
