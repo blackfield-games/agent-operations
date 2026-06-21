@@ -364,6 +364,43 @@ def test_deadline_not_enforced_still_answers():
     assert [a["tick"] for a in t.sent if a["type"] == "act"] == [0]
 
 
+def test_forfeit_does_not_livelock_the_next_tick_acts():
+    # FM3: a dropped (late) action must not wedge the agent — the receive loop
+    # resumes and the next observation is answered normally. obs0's policy runs over
+    # budget (forfeit); obs1's runs within budget (sent).
+    from arena_client.sdk import ArenaClient
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0, deadline=1000), _observe_frame(tick=1, deadline=1000),
+               _end_frame()]
+    t = MockTransport(inbound)
+    # obs0: 0.0 -> 1.0 (1s elapsed >> 1000us, forfeit); obs1: 1.0 -> 1.0 (0 elapsed, on time).
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 1.0, 1.0, 1.0]))
+    c.run(_fixed_policy)
+    assert c.forfeits == 1
+    assert [a["tick"] for a in t.sent if a["type"] == "act"] == [1], (
+        "the dropped tick sends nothing, but the next tick still acts"
+    )
+
+
+def test_deadline_is_relative_to_the_observation_not_a_fixed_threshold():
+    # FM2: enforcement is measured against each observation's own deadline_micros,
+    # not a constant. The SAME 1s policy time is on time under a 2s budget (sent) but
+    # late under a 1ms budget (forfeit) — a fixed threshold could not produce this
+    # split, so this pins enforcement to the observation's deadline field.
+    from arena_client.sdk import ArenaClient
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0, deadline=2_000_000), _observe_frame(tick=1, deadline=1000),
+               _end_frame()]
+    t = MockTransport(inbound)
+    # obs0: 0.0 -> 1.0 (1s elapsed < 2s budget, sent); obs1: 1.0 -> 2.0 (1s elapsed >> 1ms, forfeit).
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 1.0, 1.0, 2.0]))
+    c.run(_fixed_policy)
+    assert c.forfeits == 1
+    assert [a["tick"] for a in t.sent if a["type"] == "act"] == [0], (
+        "the large-deadline tick is sent; the same elapsed forfeits under the small deadline"
+    )
+
+
 def test_downed_seat_answers_with_passive_hold():
     from arena_client.sdk import ArenaClient
     inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
