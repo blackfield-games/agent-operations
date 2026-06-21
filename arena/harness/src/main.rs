@@ -19,13 +19,14 @@
 //!   then each tick  server -> Observe ; agent -> Act|Leave ;
 //!   and at the end  server -> End(MatchResult).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
-use arena_core::{Match, Rules};
+use arena_core::{settlement, Match, Rules, Settlement};
 use arena_proto::{
-    check_version, ActionIntent, AgentMsg, GatewayMsg, MatchConfig, MatchPhase, SeatId, SeatInfo,
-    Vec2, POSITION_SCALE, PROTOCOL_VERSION,
+    check_version, ActionIntent, AgentMsg, GatewayMsg, MatchConfig, MatchPhase, MatchResult,
+    ReplayRecord, SeatId, SeatInfo, Vec2, POSITION_SCALE, PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -38,6 +39,11 @@ struct Args {
     seed: u64,
     seats: u8,
     max_ticks: u64,
+    /// Drive the off-chain settlement path through a [`MockSettler`] after the
+    /// match (logging to stderr), mirroring mesh's `--relay-dev-mock`. Off by
+    /// default so the loopback's stdout — and its replay determinism — is
+    /// byte-identical; the live Base settler is operator-gated.
+    settle_dev_mock: bool,
 }
 
 fn parse_args() -> Args {
@@ -45,6 +51,7 @@ fn parse_args() -> Args {
     let mut seed: u64 = 0;
     let mut seats: u8 = 2;
     let mut max_ticks: u64 = 3600;
+    let mut settle_dev_mock = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -54,6 +61,7 @@ fn parse_args() -> Args {
             "--max-ticks" => {
                 max_ticks = it.next().expect("--max-ticks needs a value").parse().expect("max-ticks is a u64")
             }
+            "--settle-dev-mock" => settle_dev_mock = true,
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -62,6 +70,7 @@ fn parse_args() -> Args {
         seed,
         seats,
         max_ticks,
+        settle_dev_mock,
     }
 }
 
@@ -100,6 +109,112 @@ fn next_line(lines: &mut impl Iterator<Item = io::Result<String>>) -> String {
     }
 }
 
+/// Why a settlement submission recorded no fresh resolution.
+#[derive(Debug)]
+enum SettleError {
+    /// This `match_id` is already resolved — the on-chain `MatchSettlement` fence
+    /// (every resolution requires `Status.Open`) reverted `MatchNotOpen`. An
+    /// *idempotent* outcome: a crash/retry after the match ended re-submitted a
+    /// settlement that already landed. The caller treats it as benign (the terminal
+    /// state already holds) instead of double-applying reputation or escrow.
+    AlreadyResolved,
+}
+
+/// The off-chain → on-chain settlement boundary for a finished match. Mirrors the
+/// three `MatchSettlement` resolutions — `settle` (decisive winner), `settleDraw`,
+/// and `cancelMatch` — and, except for a cancel, commits the canonical
+/// [`ReplayRecord`] digest of the exact match being settled.
+///
+/// The trait is transport-agnostic: it takes plain data, never a key, RPC URL, or
+/// signer, so [`MockSettler`] drives the whole flow offline. The live Base
+/// implementation (an RPC provider plus an authorized attester key with gas and
+/// real-fund custody) is operator-gated and not built here — it slots in behind
+/// this trait, the same Relay/Spender split mesh uses.
+trait Settle {
+    fn settle(&self, match_id: Uuid, winner: &str, replay_digest: [u8; 32]) -> Result<(), SettleError>;
+    fn settle_draw(&self, match_id: Uuid, replay_digest: [u8; 32]) -> Result<(), SettleError>;
+    fn cancel(&self, match_id: Uuid) -> Result<(), SettleError>;
+}
+
+/// One recorded resolution, mirroring the terminal state the contract would hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Resolution {
+    Win { winner: String, replay_digest: [u8; 32] },
+    Draw { replay_digest: [u8; 32] },
+    Cancelled,
+}
+
+/// In-process [`Settle`] for tests and the `--settle-dev-mock` path. Never touches
+/// a chain: it records each resolution and enforces the SAME per-`match_id` fence
+/// the contract does — a second resolution of ANY kind returns
+/// [`SettleError::AlreadyResolved`], so a crash/retry can never double-settle.
+#[derive(Default)]
+struct MockSettler {
+    resolved: RefCell<BTreeMap<Uuid, Resolution>>,
+}
+
+impl MockSettler {
+    /// Apply the per-`match_id` fence, then record. Reads the map (the fence) and
+    /// writes it, so a replay of any resolution is rejected exactly as the on-chain
+    /// `Status.Open` check rejects a second settle/draw/cancel.
+    fn record(&self, match_id: Uuid, resolution: Resolution) -> Result<(), SettleError> {
+        let mut resolved = self.resolved.borrow_mut();
+        if resolved.contains_key(&match_id) {
+            return Err(SettleError::AlreadyResolved);
+        }
+        resolved.insert(match_id, resolution);
+        Ok(())
+    }
+
+    fn resolution(&self, match_id: Uuid) -> Option<Resolution> {
+        self.resolved.borrow().get(&match_id).cloned()
+    }
+}
+
+impl Settle for MockSettler {
+    fn settle(&self, match_id: Uuid, winner: &str, replay_digest: [u8; 32]) -> Result<(), SettleError> {
+        self.record(match_id, Resolution::Win { winner: winner.to_string(), replay_digest })
+    }
+
+    fn settle_draw(&self, match_id: Uuid, replay_digest: [u8; 32]) -> Result<(), SettleError> {
+        self.record(match_id, Resolution::Draw { replay_digest })
+    }
+
+    fn cancel(&self, match_id: Uuid) -> Result<(), SettleError> {
+        self.record(match_id, Resolution::Cancelled)
+    }
+}
+
+/// Drive one finished match through the settler: classify it, then submit the
+/// matching resolution carrying the canonical `replay.digest()`. The digest is
+/// taken straight from [`ReplayRecord::digest`] (not re-derived from the result's
+/// hex), so the on-chain commitment is byte-identical to the recorded replay. The
+/// winner identity is the winning seat's roster `controller` — the harness
+/// stand-in for the on-chain agent address. Returns the chosen [`Settlement`] for
+/// the caller to report. A cancel is NOT produced here: a finished match always
+/// has a result; `cancel` is the pre-play abort path.
+fn settle_match(
+    settler: &impl Settle,
+    result: &MatchResult,
+    replay: &ReplayRecord,
+) -> Result<Settlement, SettleError> {
+    let digest = replay.digest();
+    let outcome = settlement(result);
+    match outcome {
+        Settlement::Win { seat } => {
+            let winner = replay
+                .seats
+                .iter()
+                .find(|s| s.seat == seat)
+                .map(|s| s.controller.as_str())
+                .expect("the winning seat is in the roster");
+            settler.settle(result.match_id, winner, digest)?;
+        }
+        Settlement::Draw => settler.settle_draw(result.match_id, digest)?,
+    }
+    Ok(outcome)
+}
+
 fn main() {
     let args = parse_args();
     let n = args.seats;
@@ -113,6 +228,11 @@ fn main() {
         seats: n,
     };
     let mut m = Match::new(args.match_id, config, Rules::default(), roster, args.seed);
+
+    // The off-chain settlement seam: a finished match (or a pre-play abort) maps to
+    // a MatchSettlement resolution through this settler. Mock-only and opt-in here;
+    // the live Base submitter is operator-gated.
+    let settler = args.settle_dev_mock.then(MockSettler::default);
 
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -145,6 +265,15 @@ fn main() {
                 },
             );
             out.flush().expect("flush reject");
+            if let Some(s) = &settler {
+                // An opened match that can never be played voids as a cancel —
+                // refund, no result committed — exactly MatchSettlement.cancelMatch.
+                eprintln!(
+                    "[settle-dev-mock] {} cancel (handshake version mismatch): {:?}",
+                    m.match_id(),
+                    s.cancel(m.match_id())
+                );
+            }
             std::process::exit(1);
         }
         emit(
@@ -186,4 +315,15 @@ fn main() {
         emit(&mut out, seat, &GatewayMsg::End(result.clone()));
     }
     out.flush().expect("flush results");
+
+    if let Some(s) = &settler {
+        let match_id = m.match_id();
+        let replay = m.into_replay();
+        match settle_match(s, &result, &replay) {
+            Ok(outcome) => {
+                eprintln!("[settle-dev-mock] {match_id} settled as {outcome:?}: {:?}", s.resolution(match_id))
+            }
+            Err(e) => eprintln!("[settle-dev-mock] {match_id} settle failed: {e:?}"),
+        }
+    }
 }
