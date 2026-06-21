@@ -180,8 +180,15 @@ pub fn check_version(theirs: u32) -> Result<(), VersionMismatch> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
+    /// A pawn — a seat's controllable body.
     Player,
+    /// A traveling shot in flight. Produced by a projectile-weapon-mode match as a
+    /// parity-bounded [`VisibleEntity`]: it carries only its perceivable facets
+    /// (position, travel `facing`) and is reported as the neutral team, so it leaks
+    /// neither the shooter's nor the target's identity. A pure-hitscan match never
+    /// produces one.
     Projectile,
+    /// A world pickup (reserved; not yet produced by the reference core).
     Pickup,
 }
 
