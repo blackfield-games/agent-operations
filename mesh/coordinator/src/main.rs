@@ -97,6 +97,21 @@ struct Args {
     /// (aggressive — a job a legitimate redispatch would finish may be reaped).
     #[arg(long, env = "COORDINATOR_TTL_DEADLINE_MULTIPLE", default_value_t = JOB_TTL_DEADLINE_MULTIPLE)]
     ttl_deadline_multiple: u32,
+    /// Seconds a TERMINAL (done/failed) job's record is retained before the
+    /// background sweep deletes it (with its result + already-relayed
+    /// attestation/debit rows). The asymptotic bound on the otherwise-unbounded
+    /// `jobs` history: the covering `/stats` indexes only shrank the constant
+    /// factor, retention caps the row count itself. A job is pruned only once it is
+    /// older than this AND its on-chain receipt/debit have been relayed (a still-
+    /// pending obligation keeps the record; with no relayer configured, settled jobs
+    /// are retained and only failed jobs prune). Generous default (~30 days) — a
+    /// storage backstop, not a tuned limit; widen it if `/stats` must report a
+    /// longer window. UNDER RETENTION the `/stats` lifetime aggregates (completed/
+    /// failed counts, attempts/faults, render-seconds, payout) and the `/earners`
+    /// economics reflect the RETAINED WINDOW, not all-time, and no longer only grow.
+    /// Must be >= 1 (0 would delete every terminal record on the first sweep).
+    #[arg(long, env = "COORDINATOR_RETENTION_SECS", default_value_t = DEFAULT_RETENTION_SECS)]
+    retention_secs: u64,
     /// Seconds the coordinator waits for a connecting ws client to complete the
     /// registration handshake (read the challenge, send a valid Hello) before
     /// closing the socket. Bounds an unauthenticated slowloris that would
@@ -257,6 +272,11 @@ struct AppState {
     /// `created_at + deadline_secs * ttl_deadline_multiple`. Mirrors
     /// `--ttl-deadline-multiple` / `COORDINATOR_TTL_DEADLINE_MULTIPLE`.
     ttl_deadline_multiple: u32,
+    /// Seconds a terminal (done/failed) job's record is retained before the
+    /// retention sweep deletes it and its dependents. Read by the reaper's
+    /// `prune_terminal_history`. Validated >= 1 in `with_store`. Mirrors
+    /// `--retention-secs` / `COORDINATOR_RETENTION_SECS`.
+    retention_secs: i64,
     /// Wall-clock bound on the ws registration handshake (challenge→Hello). The
     /// gate that closes a slowloris connection; read by `recv_hello`. Mirrors
     /// `--handshake-timeout-secs` / `COORDINATOR_HANDSHAKE_TIMEOUT_SECS`.
@@ -301,6 +321,7 @@ struct StoreConfig {
     max_faults: u32,
     earner_ttl_secs: i64,
     ttl_deadline_multiple: u32,
+    retention_secs: i64,
     handshake_timeout: Duration,
     ingest_token: Option<String>,
     max_queued_jobs: usize,
@@ -317,11 +338,17 @@ impl StoreConfig {
     /// connection before its Hello; a blank `ingest_token` matches `Authorization:
     /// Bearer ` and so authenticates every caller (leave it UNSET for the dev-open
     /// posture, not blank); a 0 `max_queued_jobs`/`max_earners`/`max_registrations`
-    /// sheds all ingestion/registration the moment the first job/earner/bucket lands.
+    /// sheds all ingestion/registration the moment the first job/earner/bucket lands;
+    /// a 0 `retention_secs` sets the cutoff to `now`, so the first retention sweep
+    /// deletes every terminal job record.
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.ttl_deadline_multiple > 0,
             "ttl_deadline_multiple must be >= 1 (0 would dead-letter every job on the first reap tick)"
+        );
+        anyhow::ensure!(
+            self.retention_secs > 0,
+            "retention_secs must be >= 1 (0 would delete every terminal job record on the first retention sweep)"
         );
         anyhow::ensure!(
             !self.handshake_timeout.is_zero(),
@@ -374,6 +401,7 @@ impl AppState {
             max_faults: cfg.max_faults,
             earner_ttl_secs: cfg.earner_ttl_secs,
             ttl_deadline_multiple: cfg.ttl_deadline_multiple,
+            retention_secs: cfg.retention_secs,
             handshake_timeout: cfg.handshake_timeout,
             ingest_token: cfg.ingest_token,
             max_queued_jobs: cfg.max_queued_jobs,
@@ -555,6 +583,7 @@ async fn main() -> Result<()> {
             max_faults: args.max_faults,
             earner_ttl_secs: args.earner_ttl_secs as i64,
             ttl_deadline_multiple: args.ttl_deadline_multiple,
+            retention_secs: args.retention_secs as i64,
             handshake_timeout: Duration::from_secs(args.handshake_timeout_secs),
             ingest_token: args.ingest_token,
             max_queued_jobs: args.max_queued_jobs,
@@ -1214,6 +1243,18 @@ fn resolve_source_ip(peer: IpAddr, headers: &HeaderMap, trusted: &TrustedProxies
 /// with long-deadline jobs can tighten the bound — without a rebuild.
 const JOB_TTL_DEADLINE_MULTIPLE: u32 = 1440;
 
+/// Default retention horizon for terminal-job history: ~30 days. Terminal
+/// (done/failed) jobs older than this whose on-chain receipt/debit have been
+/// relayed are deleted by the background sweep, bounding the otherwise-unbounded
+/// `jobs` history (and its `results` / `pending_*` dependents). A generous
+/// backstop, not a tuned limit: far longer than any job's wall-clock TTL
+/// (`deadline_secs * ttl_deadline_multiple`), so only long-settled history ages
+/// out and `/stats` reports an honest month-long window. Backs
+/// `Args::retention_secs` (`--retention-secs` / `COORDINATOR_RETENTION_SECS`); the
+/// reaper reads the configured `AppState::retention_secs` at runtime. An operator
+/// who needs a longer lifetime window widens it — without a rebuild.
+const DEFAULT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Default wall-clock bound on the ws registration handshake: the coordinator
 /// closes a connection that hasn't completed the challenge→Hello exchange within
 /// this window. An honest earner replies within milliseconds of reading the
@@ -1337,6 +1378,17 @@ const DEFAULT_MAX_REGISTRATIONS: u32 = 4096;
 /// the map stays bounded. A const, not a knob: a backstop on a backstop.
 const MAX_REGISTRATION_BUCKETS: usize = 65_536;
 
+/// Retention sweep: max terminal jobs deleted per batch. The store lock is held
+/// for just one bounded delete before the reaper releases it, so a large aged
+/// backlog cannot stall dispatch/settle behind a single long `DELETE` (FM2).
+const RETENTION_BATCH: usize = 256;
+
+/// Retention sweep: max batches per reap tick. `RETENTION_BATCH * this` caps the
+/// rows pruned per tick (the lock is released between each batch); a larger aged
+/// backlog drains over several ticks rather than monopolizing one. A backstop on
+/// a backstop — in steady state a tick prunes only what just aged out.
+const RETENTION_MAX_BATCHES_PER_TICK: usize = 16;
+
 /// Spawn the deadline reaper: every `interval_secs`, requeue any in-flight job
 /// whose deadline has elapsed (or dead-letter it when it has exhausted all
 /// attempts), then dead-letter any job — queued or in-flight — past its absolute
@@ -1432,8 +1484,46 @@ fn spawn_reaper(state: Arc<AppState>, interval_secs: u64) {
             if removed > 0 {
                 tracing::info!(removed, "pruned stale earners");
             }
+
+            // Retention: delete aged terminal-job history in bounded batches, with
+            // the store lock released between batches so a large aged backlog never
+            // stalls dispatch/settle. Runs on the same tick as the reaps; in steady
+            // state it prunes only what just aged past `retention_secs`.
+            let pruned = prune_terminal_history(&state).await;
+            if pruned > 0 {
+                tracing::info!(pruned, "pruned aged terminal jobs (retention)");
+            }
         }
     });
+}
+
+/// One retention sweep: delete aged terminal jobs (past `retention_secs`, with no
+/// still-pending on-chain obligation) and their dependent rows, in bounded batches
+/// with the store lock RELEASED between batches so dispatch/settle never stall
+/// behind a large delete (FM2). Prunes at most
+/// `RETENTION_BATCH * RETENTION_MAX_BATCHES_PER_TICK` jobs per call; a larger aged
+/// backlog finishes over subsequent ticks. Mirrors `drain_attestations`'
+/// claim-release-reacquire rhythm. Returns the number of jobs pruned.
+async fn prune_terminal_history(state: &Arc<AppState>) -> usize {
+    let horizon = state.retention_secs;
+    let mut total = 0;
+    for _ in 0..RETENTION_MAX_BATCHES_PER_TICK {
+        let pruned = {
+            let mut store = state.store.lock().await;
+            match store.prune_terminal_jobs(now_secs(), horizon, RETENTION_BATCH) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(?e, "retention: prune_terminal_jobs failed");
+                    break;
+                }
+            }
+        }; // store lock dropped here, between batches
+        total += pruned;
+        if pruned < RETENTION_BATCH {
+            break; // backlog drained this tick
+        }
+    }
+    total
 }
 
 /// Marker `uid` stored when the contract reports the receipt is already on-chain
@@ -3148,6 +3238,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -3172,6 +3263,7 @@ mod tests {
                 max_faults: 7,
                 earner_ttl_secs: 99,
                 ttl_deadline_multiple: 4,
+                retention_secs: 222,
                 handshake_timeout: Duration::from_secs(11),
                 ingest_token: Some("map-probe-token".to_string()),
                 max_queued_jobs: 123,
@@ -3185,6 +3277,7 @@ mod tests {
         assert_eq!(state.max_faults, 7);
         assert_eq!(state.earner_ttl_secs, 99);
         assert_eq!(state.ttl_deadline_multiple, 4);
+        assert_eq!(state.retention_secs, 222);
         assert_eq!(state.handshake_timeout, Duration::from_secs(11));
         assert_eq!(state.ingest_token.as_deref(), Some("map-probe-token"));
         assert_eq!(state.max_queued_jobs, 123);
@@ -9111,6 +9204,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -10215,6 +10309,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -10703,6 +10798,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -10758,6 +10854,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -10818,6 +10915,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -10841,6 +10939,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -10937,6 +11036,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11049,6 +11149,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11099,6 +11200,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11162,6 +11264,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11219,6 +11322,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11267,6 +11371,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11328,6 +11433,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11395,6 +11501,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
@@ -11461,6 +11568,7 @@ mod tests {
             max_faults: 10,
             earner_ttl_secs: 60,
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,

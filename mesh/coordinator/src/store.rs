@@ -1127,6 +1127,93 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Delete a bounded batch of aged terminal jobs and every row that hangs off
+    /// them, bounding the otherwise-unbounded growth of the `jobs` history (and its
+    /// `results` / `pending_attestations` / `pending_debits` dependents). The
+    /// covering indexes made the `/stats` aggregates a smaller constant factor but
+    /// left them O(rows-ever); retention is the asymptotic fix — it caps the row
+    /// count itself.
+    ///
+    /// A job is pruned only when ALL hold, so the sweep can never drop a row still
+    /// needed for correctness or accounting:
+    /// * its status is terminal (`done` or `failed`) — a `queued`/`in_flight` job is
+    ///   live work and is left to the reapers, never deleted by retention;
+    /// * `created_at <= now_secs - horizon_secs` — it has aged past the retention
+    ///   window, anchored to the immutable enqueue time (like
+    ///   [`reap_ttl_expired`](Self::reap_ttl_expired)). A terminal job never mutates
+    ///   again and the horizon is far longer than any job's wall-clock TTL, so
+    ///   `created_at` is within a bounded margin of the true terminal time — close
+    ///   enough for a storage backstop, with no new column or terminal-transition
+    ///   stamp to maintain;
+    /// * it carries NO still-pending on-chain obligation — no `pending_attestations`
+    ///   row with `uid IS NULL` and no `pending_debits` row with `tx_hash IS NULL`.
+    ///   A settled job's EAS receipt / ComputeMeter debit must land on chain before
+    ///   its record may be discarded; until the relayer drains them the job is kept
+    ///   (so with no relayer configured — the dev default — settled jobs are
+    ///   retained regardless of age, and only `failed` jobs prune).
+    ///
+    /// All four tables are keyed by the job id, so the dependent `results` /
+    /// `pending_attestations` / `pending_debits` rows are deleted in the SAME
+    /// transaction as the job — `/stats` aggregates that read across them
+    /// (`payout_wei_by_earner` joins results↔jobs; `completed_count` counts results)
+    /// stay mutually consistent, never left with an orphan that skews one total.
+    /// Under retention those lifetime aggregates therefore report the retained
+    /// window, not all-time.
+    ///
+    /// Bounded to `batch` jobs per call so the caller can release the store lock
+    /// between batches (dispatch/settle never stall behind a large delete); the
+    /// caller loops until a call prunes `< batch` (the backlog is drained) or a
+    /// per-tick batch cap is hit. The candidate scan is served by
+    /// `idx_jobs_status_created_at` (a range over only the aged terminal rows), so a
+    /// tick that finds nothing to prune costs an index seek, not a full scan of the
+    /// history it exists to bound. Returns the number of jobs pruned.
+    pub fn prune_terminal_jobs(
+        &mut self,
+        now_secs: i64,
+        horizon_secs: i64,
+        batch: usize,
+    ) -> Result<usize> {
+        let cutoff = now_secs.saturating_sub(horizon_secs);
+        let tx = self.conn.transaction()?;
+        // Collect a bounded batch of prunable ids first (the NOT IN subqueries
+        // exclude jobs whose receipt/debit is still pending), then delete each job
+        // and its dependents. Selecting ids up front keeps the candidate statement
+        // and the delete statements from co-borrowing the transaction.
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM jobs
+                 WHERE status IN (?1, ?2)
+                   AND created_at IS NOT NULL
+                   AND created_at <= ?3
+                   AND id NOT IN (SELECT job_id FROM pending_attestations WHERE uid IS NULL)
+                   AND id NOT IN (SELECT job_id FROM pending_debits WHERE tx_hash IS NULL)
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![STATUS_DONE, STATUS_FAILED, cutoff, batch as i64],
+                |r| r.get::<_, String>(0),
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        {
+            let mut del_results = tx.prepare("DELETE FROM results WHERE job_id = ?1")?;
+            let mut del_att = tx.prepare("DELETE FROM pending_attestations WHERE job_id = ?1")?;
+            let mut del_debit = tx.prepare("DELETE FROM pending_debits WHERE job_id = ?1")?;
+            let mut del_job = tx.prepare("DELETE FROM jobs WHERE id = ?1")?;
+            for id in &ids {
+                del_results.execute([id])?;
+                del_att.execute([id])?;
+                del_debit.execute([id])?;
+                del_job.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(ids.len())
+    }
+
     /// Test-only: overwrite a job's `created_at` anchor so a test can build a
     /// deterministic age ordering that disagrees with `rowid` (the live `enqueue`
     /// stamps wall-clock seconds, which tie within a fast test). Returns whether a
