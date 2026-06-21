@@ -836,6 +836,14 @@ pub enum ReplayError {
     /// `i32::MIN`), so the record is rejected before any simulation rather than
     /// crashing the verifier.
     MalformedSetup,
+    /// A vision blocker at `index` is inverted (`min` greater than `max` on an
+    /// axis) — geometry the live sim never produces. Rejected before the re-run so
+    /// a corrupt occluder is a clean error, not a degenerate sightline test.
+    MalformedBlocker { index: usize },
+    /// The record carries more vision blockers than the verifier will process.
+    /// Every blocker is hashed into the digest, so an oversized list is a CPU-DoS;
+    /// rejected here, before the re-run. A generous backstop, far above any real map.
+    TooManyBlockers { blockers: usize, max: usize },
     /// The record carries more recorded ticks than the verifier will process.
     /// `verify` re-executes the whole match, so an attacker-controlled record with
     /// a huge tick stream is a CPU-DoS; it is rejected here, before the structural
@@ -875,6 +883,12 @@ impl std::fmt::Display for ReplayError {
             ReplayError::InvalidRoster => write!(f, "invalid replay: malformed roster"),
             ReplayError::MalformedSetup => {
                 write!(f, "invalid replay: config or rules out of the well-formed range")
+            }
+            ReplayError::MalformedBlocker { index } => {
+                write!(f, "invalid replay: blocker {index} is inverted (min greater than max)")
+            }
+            ReplayError::TooManyBlockers { blockers, max } => {
+                write!(f, "invalid replay: {blockers} blockers exceeds the verifier budget of {max}")
             }
             ReplayError::TooManyTicks { ticks, max } => {
                 write!(f, "invalid replay: {ticks} recorded ticks exceeds the verifier budget of {max}")
@@ -918,6 +932,13 @@ pub const MAX_REPLAY_TICKS: usize = 100_000;
 /// Per-tick combat is O(seats²), so this bounds the re-run cost. Far above any real
 /// match (settlement is 1v1; arenas seat a handful) — a DoS backstop, not a limit.
 pub const MAX_REPLAY_SEATS: usize = 64;
+
+/// Verifier cost backstop: the most vision blockers [`MatchRecord::verify`] will
+/// process. `verify` hashes every blocker into the digest (and any consumer that
+/// observes a re-run pays O(seats · blockers) per tick), so an attacker-controlled
+/// record with a huge blocker list is a CPU-DoS; it is rejected before the re-run.
+/// Far above any real arena's occluder count — a DoS backstop, not a map limit.
+pub const MAX_REPLAY_BLOCKERS: usize = 1024;
 
 impl MatchRecord {
     /// Re-derive the match from this record ALONE and confirm it is a faithful,
@@ -967,6 +988,12 @@ impl MatchRecord {
                 max: MAX_REPLAY_TICKS,
             });
         }
+        if self.replay.blockers.len() > MAX_REPLAY_BLOCKERS {
+            return Err(ReplayError::TooManyBlockers {
+                blockers: self.replay.blockers.len(),
+                max: MAX_REPLAY_BLOCKERS,
+            });
+        }
 
         // A real match has at least one seat, `config.seats` agrees with the
         // roster length, and no two seats share an id. `roster` doubles as the
@@ -991,6 +1018,17 @@ impl MatchRecord {
             || self.rules.spawn_jitter < 0
         {
             return Err(ReplayError::MalformedSetup);
+        }
+
+        // A blocker is a closed AABB, so `min <= max` on each axis is the
+        // well-formed invariant. An inverted box is geometry the live sim never
+        // produces; reject it here so the sightline test only ever sees a
+        // well-formed occluder. (A zero-extent box — a thin wall — is well-formed
+        // and intentionally allowed.)
+        for (index, b) in self.replay.blockers.iter().enumerate() {
+            if b.min.x > b.max.x || b.min.y > b.max.y {
+                return Err(ReplayError::MalformedBlocker { index });
+            }
         }
 
         // The live sim records exactly one tick per simulated tick, in order, each
@@ -2264,8 +2302,10 @@ mod tests {
             ReplayError::MatchIdMismatch { replay: MID.parse().unwrap(), result: MID.parse().unwrap() },
             ReplayError::InvalidRoster,
             ReplayError::MalformedSetup,
+            ReplayError::MalformedBlocker { index: 2 },
             ReplayError::TooManyTicks { ticks: 1_000_000, max: MAX_REPLAY_TICKS },
             ReplayError::TooManySeats { seats: 500, max: MAX_REPLAY_SEATS },
+            ReplayError::TooManyBlockers { blockers: 5000, max: MAX_REPLAY_BLOCKERS },
             ReplayError::UnknownSeat { tick: 3, seat: 9 },
             ReplayError::SeatOrder { tick: 3 },
             ReplayError::TickOrder { index: 2, tick: 5 },
