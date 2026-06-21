@@ -136,6 +136,19 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let mut reseeded = octant.clone();
     reseeded.replay.seed ^= 1;
     assert!(reseeded.verify().is_err(), "the committed digest binds the seed");
+
+    // Pickups: the pickup match carries a configured item layout that the digest
+    // commits (v3), so its hash differs from the same-script no-pickup octant match —
+    // and dropping the pickup from the committed record breaks verification.
+    let pickup = pick("pickup_collected");
+    assert!(!pickup.replay.pickups.is_empty(), "the pickup match records its item layout");
+    assert_ne!(
+        pickup.result.replay_hash, octant.result.replay_hash,
+        "the pickup layout binds the digest — a pickup match differs from the bare one"
+    );
+    let mut dropped = pickup.clone();
+    dropped.replay.pickups.clear();
+    assert!(dropped.verify().is_err(), "dropping the committed pickup must break the hash");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it

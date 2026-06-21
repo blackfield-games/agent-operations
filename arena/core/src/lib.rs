@@ -2209,8 +2209,23 @@ fn projectile_case(
 /// idles. A hitscan match ends on the kill; a projectile match runs on until the
 /// shot arrives — so the weapon mode is an outcome determinant the record commits.
 fn match_case(label: &str, rules: Rules) -> MatchCase {
+    match_case_with_pickups(label, rules, Vec::new())
+}
+
+/// [`match_case`], plus a configured pickup set — seat 0 collects a pickup at its
+/// spawn on the opening tick (the item layout binds the v3 digest and the collect
+/// is reproduced by re-execution), so the case pins the pickup pipeline end to end.
+fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>) -> MatchCase {
     let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
-    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), PARITY_MATCH_SEED);
+    let mut m = Match::new_with_pickups(
+        parity_match_id(),
+        parity_config(2),
+        rules,
+        roster,
+        Vec::new(),
+        pickups,
+        PARITY_MATCH_SEED,
+    );
     let mut tick = 0u64;
     while m.phase() == MatchPhase::Live && tick < 64 {
         let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
@@ -2307,6 +2322,14 @@ pub fn parity_vectors() -> ParityVectors {
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("projectile", Rules { damage: 100, weapon_mode: WeaponMode::Projectile, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
+            // Same script as octant_hitscan, plus an ammo pickup at seat 0's spawn it
+            // collects on the opening tick: the item layout binds the v3 digest (so this
+            // differs from octant_hitscan) and the collect is reproduced bit-for-bit.
+            match_case_with_pickups(
+                "pickup_collected",
+                Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, pickup_radius: 1500, ..Default::default() },
+                vec![PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x: -2 * POSITION_SCALE, y: 0 }, amount: 5 }],
+            ),
         ],
     }
 }
