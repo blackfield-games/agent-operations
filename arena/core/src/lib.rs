@@ -139,6 +139,31 @@ pub enum WeaponMode {
     Projectile,
 }
 
+/// How finely a fire's beam direction tracks the seat's aim — a match-level
+/// [`Rules`] field (server-authoritative, never sent to agents, the same posture as
+/// every other combat constant).
+///
+/// [`Octant`](AimMode::Octant) is the default: hit resolution snaps the full-resolution
+/// [`Bam`] facing to the nearest of eight 45° octants ([`octant_unit`]), so a match
+/// left at the default is byte-identical to every match and replay that predates this
+/// field. [`Fine`](AimMode::Fine) instead derives the beam from a 64-way (5.625°)
+/// integer unit-vector table ([`fine_unit`]), so the in-front and lateral-offset
+/// tests use the true aim within integer precision and a sub-octant lead lands the
+/// shot the octant snap would have missed. The mode changes which shots connect, so
+/// it is a determinant of the outcome: it rides in the [`Rules`] a [`MatchRecord`]
+/// commits, and a record re-run under a different mode replays to a different result
+/// and is rejected by [`verify`](MatchRecord::verify), exactly as a tampered `damage` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AimMode {
+    /// Beam snapped to the nearest of eight octants (45° steps) — coarse by design,
+    /// the original reference behavior.
+    #[default]
+    Octant,
+    /// Beam taken from the 64-way Q15 unit-vector table — aim resolved to 5.625°.
+    Fine,
+}
+
 /// The default projectile travel speed ([`Rules::projectile_speed`]): 2 m/tick,
 /// faster than the default `max_speed` so a shot outruns a strafing pawn yet is
 /// slow enough to dodge over its flight. The `serde(default)` for the field, so a
@@ -208,6 +233,12 @@ pub struct Rules {
     /// could overflow the swept-collision integer math.
     #[serde(default = "default_projectile_speed")]
     pub projectile_speed: i32,
+    /// How finely a fire's beam tracks the seat's aim: the 8-way [`AimMode::Octant`]
+    /// (the default, byte-identical to every pre-finer-aim match) or the 64-way
+    /// [`AimMode::Fine`]. `serde(default)` resolves to `Octant` so a record written
+    /// before this field replays under the quantization it actually ran.
+    #[serde(default)]
+    pub aim_mode: AimMode,
     /// Damage one landed shot deals.
     pub damage: u16,
     /// Ticks between shots; a pawn may fire only when its cooldown is `0`.
@@ -250,6 +281,7 @@ impl Default for Rules {
             hit_radius: 1500,           // 1.5 m beam radius
             weapon_mode: WeaponMode::Hitscan,
             projectile_speed: default_projectile_speed(),
+            aim_mode: AimMode::Octant,
             damage: 25,                 // four shots to down a full-health pawn
             fire_cooldown: 6,           // five shots/sec at 30 Hz
             mag_size: 30,
