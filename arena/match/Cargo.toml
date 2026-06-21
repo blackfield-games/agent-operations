@@ -7,3 +7,7 @@ edition.workspace = true
 arena-proto = { workspace = true }
 arena-core = { path = "../core" }
 uuid = { workspace = true }
+
+[dev-dependencies]
+k256 = { workspace = true }
+hex = { workspace = true }

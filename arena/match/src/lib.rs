@@ -626,6 +626,7 @@ pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError
 mod tests {
     use super::*;
     use arena_proto::MatchPhase;
+    use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
     #[test]
     fn stub_verifier_admits_only_the_authorized_token() {
@@ -717,9 +718,9 @@ mod tests {
     #[test]
     fn human_mode_forms_an_all_human_match() {
         let mm = open_mm();
-        assert!(mm.join(MatchMode::Human, b"",JoinRequest::human("alice")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Human, b"", JoinRequest::human("alice")).unwrap().is_queued());
         let m = mm
-            .join(MatchMode::Human, b"",JoinRequest::human("bob"))
+            .join(MatchMode::Human, b"", JoinRequest::human("bob"))
             .unwrap()
             .into_formed()
             .expect("the second human completes the 2-seat match");
@@ -732,7 +733,7 @@ mod tests {
     fn human_mode_rejects_an_agent_seat() {
         // FM1: a Human ranked match must never admit an agent seat.
         let mm = open_mm();
-        let r = mm.join(MatchMode::Human, b"",JoinRequest::casual_agent("0xbot"));
+        let r = mm.join(MatchMode::Human, b"", JoinRequest::casual_agent("0xbot"));
         assert!(matches!(
             r,
             Err(JoinError::WrongKindForMode { mode: MatchMode::Human, kind: ControllerKind::Agent })
@@ -743,7 +744,7 @@ mod tests {
     #[test]
     fn agent_mode_rejects_a_human_seat() {
         let mm = open_mm();
-        let r = mm.join(MatchMode::Agent, b"",JoinRequest::human("alice"));
+        let r = mm.join(MatchMode::Agent, b"", JoinRequest::human("alice"));
         assert!(matches!(
             r,
             Err(JoinError::WrongKindForMode { mode: MatchMode::Agent, kind: ControllerKind::Human })
@@ -753,9 +754,9 @@ mod tests {
     #[test]
     fn agent_mode_forms_from_authorized_agents() {
         let mm = ranked_mm(&[("0xa", "siga"), ("0xb", "sigb")]);
-        assert!(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xa", "siga")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xa", "siga")).unwrap().is_queued());
         let m = mm
-            .join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xb", "sigb"))
+            .join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xb", "sigb"))
             .unwrap()
             .into_formed()
             .expect("two authorized agents form a ranked match");
@@ -767,13 +768,13 @@ mod tests {
     fn mixed_needs_both_kinds_to_form() {
         // FM1: a Mixed match must not start all-one-kind. Humans alone never form…
         let humans = open_mm();
-        assert!(humans.join(MatchMode::Mixed, b"",JoinRequest::human("h1")).unwrap().is_queued());
-        assert!(humans.join(MatchMode::Mixed, b"",JoinRequest::human("h2")).unwrap().is_queued());
+        assert!(humans.join(MatchMode::Mixed, b"", JoinRequest::human("h1")).unwrap().is_queued());
+        assert!(humans.join(MatchMode::Mixed, b"", JoinRequest::human("h2")).unwrap().is_queued());
         assert_eq!(humans.waiting(MatchMode::Mixed), 2, "no Mixed match from humans alone");
         // …and casual agents alone never form.
         let agents = open_mm();
-        assert!(agents.join(MatchMode::Mixed, b"",JoinRequest::casual_agent("a1")).unwrap().is_queued());
-        assert!(agents.join(MatchMode::Mixed, b"",JoinRequest::casual_agent("a2")).unwrap().is_queued());
+        assert!(agents.join(MatchMode::Mixed, b"", JoinRequest::casual_agent("a1")).unwrap().is_queued());
+        assert!(agents.join(MatchMode::Mixed, b"", JoinRequest::casual_agent("a2")).unwrap().is_queued());
         assert_eq!(agents.waiting(MatchMode::Mixed), 2, "no Mixed match from agents alone");
     }
 
@@ -782,10 +783,10 @@ mod tests {
         // Selection takes one-of-each first, so even a queue stacked with humans
         // forms a Mixed match around the single agent — never an all-human one.
         let mm = open_mm();
-        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::human("h1")).unwrap().is_queued());
-        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::human("h2")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Mixed, b"", JoinRequest::human("h1")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Mixed, b"", JoinRequest::human("h2")).unwrap().is_queued());
         let m = mm
-            .join(MatchMode::Mixed, b"",JoinRequest::casual_agent("a1"))
+            .join(MatchMode::Mixed, b"", JoinRequest::casual_agent("a1"))
             .unwrap()
             .into_formed()
             .expect("the agent completes a Mixed match");
@@ -813,8 +814,8 @@ mod tests {
     #[test]
     fn a_formed_match_starts_on_the_real_core() {
         let mm = open_mm();
-        mm.join(MatchMode::Human, b"",JoinRequest::human("p0")).unwrap();
-        let m = mm.join(MatchMode::Human, b"",JoinRequest::human("p1")).unwrap().into_formed().unwrap();
+        mm.join(MatchMode::Human, b"", JoinRequest::human("p0")).unwrap();
+        let m = mm.join(MatchMode::Human, b"", JoinRequest::human("p1")).unwrap().into_formed().unwrap();
         // A real arena-02 match: Live at tick 0, two seats on distinct teams (a
         // free-for-all, so it does not end instantly), reproducible from its id.
         assert_eq!(m.phase(), MatchPhase::Live);
@@ -854,7 +855,7 @@ mod tests {
                 let mm = Arc::clone(&mm);
                 let formed = Arc::clone(&formed);
                 thread::spawn(move || {
-                    let outcome = mm.join(MatchMode::Human, b"",JoinRequest::human(format!("p{i}"))).unwrap();
+                    let outcome = mm.join(MatchMode::Human, b"", JoinRequest::human(format!("p{i}"))).unwrap();
                     if let Some(m) = outcome.into_formed() {
                         let roster = m.seats().iter().map(|s| s.controller.clone()).collect::<Vec<_>>();
                         formed.lock().unwrap().push(roster);
@@ -887,15 +888,15 @@ mod tests {
             _ => panic!("expected Unauthenticated for {who}"),
         };
         // No token — every Agent-mode seat is ranked.
-        rejected(mm.join(MatchMode::Agent, b"",JoinRequest::casual_agent("0xa")), "0xa");
+        rejected(mm.join(MatchMode::Agent, b"", JoinRequest::casual_agent("0xa")), "0xa");
         // A wrong token for a known agent.
-        rejected(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xa", "badsig")), "0xa");
+        rejected(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xa", "badsig")), "0xa");
         // A valid-looking token for an unregistered agent.
-        rejected(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xb", "goodsig")), "0xb");
+        rejected(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xb", "goodsig")), "0xb");
         assert_eq!(mm.waiting(MatchMode::Agent), 0, "no unauthenticated agent entered the ranked queue");
 
         // The authorized identity is admitted.
-        assert!(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xa", "goodsig")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xa", "goodsig")).unwrap().is_queued());
         assert_eq!(mm.waiting(MatchMode::Agent), 1);
     }
 
@@ -905,10 +906,10 @@ mod tests {
         // token is a ranked claim — a forged one is rejected, so a bad ranked claim
         // cannot slip in disguised as casual play.
         let mm = ranked_mm(&[("0xgood", "goodsig")]);
-        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::casual_agent("0xcasual")).unwrap().is_queued());
-        let forged = mm.join(MatchMode::Mixed, b"",JoinRequest::ranked_agent("0xevil", "forged"));
+        assert!(mm.join(MatchMode::Mixed, b"", JoinRequest::casual_agent("0xcasual")).unwrap().is_queued());
+        let forged = mm.join(MatchMode::Mixed, b"", JoinRequest::ranked_agent("0xevil", "forged"));
         assert!(matches!(forged, Err(JoinError::Unauthenticated { .. })));
-        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::ranked_agent("0xgood", "goodsig")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Mixed, b"", JoinRequest::ranked_agent("0xgood", "goodsig")).unwrap().is_queued());
         // Two agents, no human → no match formed; the forged join never queued.
         assert_eq!(mm.waiting(MatchMode::Mixed), 2);
     }
@@ -921,10 +922,174 @@ mod tests {
         // claim against an empty signature.
         let empty = || JoinRequest { agent_id: "0xbot".into(), kind: ControllerKind::Agent, token: Some(String::new()) };
         let mm = open_mm();
-        assert!(mm.join(MatchMode::Mixed, b"",empty()).unwrap().is_queued(), "an empty token is a casual Mixed seat");
+        assert!(mm.join(MatchMode::Mixed, b"", empty()).unwrap().is_queued(), "an empty token is a casual Mixed seat");
         assert!(
-            matches!(mm.join(MatchMode::Agent, b"",empty()), Err(JoinError::Unauthenticated { .. })),
+            matches!(mm.join(MatchMode::Agent, b"", empty()), Err(JoinError::Unauthenticated { .. })),
             "an empty token is not a ranked claim, so Agent mode rejects it"
+        );
+    }
+
+    // --- Ranked admission under real signature recovery (SignatureVerifier) ---
+
+    /// A deterministic signing key (the dev vector mesh + proto share).
+    fn agent_key() -> SigningKey {
+        let bytes =
+            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318").unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    /// A second, distinct key whose address differs from `agent_key`.
+    fn other_key() -> SigningKey {
+        let bytes =
+            hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    fn agent_addr(sk: &SigningKey) -> String {
+        arena_proto::address_from_verifying_key(sk.verifying_key())
+    }
+
+    /// Sign a join the way the agent SDK will: `[r||s||v]` hex over
+    /// `join_digest(version, agent_id, nonce)`.
+    fn sign_join(sk: &SigningKey, version: u32, agent_id: &str, nonce: &[u8]) -> String {
+        let digest = arena_proto::join_digest(version, agent_id, nonce);
+        let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let mut out = sig.to_bytes().to_vec();
+        out.push(recid.to_byte());
+        hex::encode(out)
+    }
+
+    fn signed_mm() -> Matchmaker<SignatureVerifier> {
+        Matchmaker::new(SignatureVerifier, MatchParams::default())
+    }
+
+    #[test]
+    fn signature_verifier_admits_the_key_holder_over_the_connection_nonce() {
+        let sk = agent_key();
+        let addr = agent_addr(&sk);
+        let nonce: &[u8] = b"connection-1-challenge";
+        let sig = sign_join(&sk, PROTOCOL_VERSION, &addr, nonce);
+        assert!(SignatureVerifier.verify(&addr, nonce, &sig), "the key holder is admitted");
+    }
+
+    #[test]
+    fn signature_verifier_rejects_a_wrong_key() {
+        // A valid signature by a DIFFERENT key claiming the victim's address recovers
+        // the attacker's address, not the claim, so it is not ranked.
+        let victim = agent_addr(&agent_key());
+        let nonce: &[u8] = b"connection-1-challenge";
+        let forged = sign_join(&other_key(), PROTOCOL_VERSION, &victim, nonce);
+        assert!(!SignatureVerifier.verify(&victim, nonce, &forged));
+    }
+
+    #[test]
+    fn signature_verifier_rejects_a_replayed_nonce() {
+        // A signature captured over connection A's challenge fails against connection
+        // B's — the nonce binds the proof to one connection.
+        let sk = agent_key();
+        let addr = agent_addr(&sk);
+        let sig = sign_join(&sk, PROTOCOL_VERSION, &addr, b"connection-A");
+        assert!(!SignatureVerifier.verify(&addr, b"connection-B", &sig), "replay rejected");
+        assert!(SignatureVerifier.verify(&addr, b"connection-A", &sig), "valid over its own nonce");
+    }
+
+    #[test]
+    fn signature_verifier_rejects_a_tampered_version() {
+        // A proof made under a different protocol_version does not verify under the
+        // build's PROTOCOL_VERSION (the digest binds the version).
+        let sk = agent_key();
+        let addr = agent_addr(&sk);
+        let nonce: &[u8] = b"connection-1";
+        let sig = sign_join(&sk, PROTOCOL_VERSION + 1, &addr, nonce);
+        assert!(!SignatureVerifier.verify(&addr, nonce, &sig));
+    }
+
+    #[test]
+    fn signature_verifier_rejects_an_empty_signature_without_erroring() {
+        // An empty signature is never ranked and never panics; the matchmaker treats
+        // it as a casual seat upstream.
+        let addr = agent_addr(&agent_key());
+        assert!(!SignatureVerifier.verify(&addr, b"connection-1", ""));
+    }
+
+    #[test]
+    fn agent_mode_forms_a_ranked_match_from_signed_seats() {
+        // End to end on the real verifier: two key holders each sign their OWN
+        // connection challenge and form a ranked Agent match.
+        let (a, b) = (agent_key(), other_key());
+        let (addr_a, addr_b) = (agent_addr(&a), agent_addr(&b));
+        let (nonce_a, nonce_b): (&[u8], &[u8]) = (b"chal-a", b"chal-b");
+        let sig_a = sign_join(&a, PROTOCOL_VERSION, &addr_a, nonce_a);
+        let sig_b = sign_join(&b, PROTOCOL_VERSION, &addr_b, nonce_b);
+        let mm = signed_mm();
+        assert!(mm
+            .join(MatchMode::Agent, nonce_a, JoinRequest::ranked_agent(addr_a.as_str(), sig_a))
+            .unwrap()
+            .is_queued());
+        let m = mm
+            .join(MatchMode::Agent, nonce_b, JoinRequest::ranked_agent(addr_b.as_str(), sig_b))
+            .unwrap()
+            .into_formed()
+            .expect("two signed agents form a ranked match");
+        let mut expected = vec![addr_a, addr_b];
+        expected.sort();
+        assert_eq!(controllers(&m), expected, "the recovered identities seat the match");
+        assert_eq!(m.phase(), MatchPhase::Live);
+    }
+
+    #[test]
+    fn agent_mode_rejects_a_wrong_key_signature() {
+        // FM1: a present-but-unverified signature must not seat a ranked agent. The
+        // attacker holds other_key but claims the victim's address.
+        let mm = signed_mm();
+        let victim = agent_addr(&agent_key());
+        let nonce: &[u8] = b"chal";
+        let forged = sign_join(&other_key(), PROTOCOL_VERSION, &victim, nonce);
+        assert!(matches!(
+            mm.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(victim.as_str(), forged)),
+            Err(JoinError::Unauthenticated { .. })
+        ));
+        assert_eq!(mm.waiting(MatchMode::Agent), 0, "the forged claim never entered the ranked queue");
+    }
+
+    #[test]
+    fn agent_mode_rejects_a_signature_replayed_from_another_connection() {
+        // FM2: a signature captured on connection A, replayed on connection B (a
+        // fresh challenge), is verified against B's nonce, fails recovery, and is
+        // rejected — never seating a ranked agent on a stale proof.
+        let mm = signed_mm();
+        let sk = agent_key();
+        let addr = agent_addr(&sk);
+        let sig_for_a = sign_join(&sk, PROTOCOL_VERSION, &addr, b"connection-A");
+        assert!(matches!(
+            mm.join(
+                MatchMode::Agent,
+                b"connection-B",
+                JoinRequest::ranked_agent(addr.as_str(), sig_for_a.clone())
+            ),
+            Err(JoinError::Unauthenticated { .. })
+        ));
+        // Sanity: on its own connection the same proof is admitted.
+        assert!(mm
+            .join(MatchMode::Agent, b"connection-A", JoinRequest::ranked_agent(addr.as_str(), sig_for_a))
+            .unwrap()
+            .is_queued());
+    }
+
+    #[test]
+    fn an_empty_signature_is_casual_not_ranked_under_real_verification() {
+        // FM4: an empty signature_hex is unranked — admitted as casual in Mixed,
+        // rejected (ranked-required) in Agent — never an error, never ranked, even
+        // under the real recovering verifier.
+        let mm = signed_mm();
+        let casual = || JoinRequest::casual_agent("0xobserver");
+        assert!(
+            mm.join(MatchMode::Mixed, b"chal", casual()).unwrap().is_queued(),
+            "an empty signature is a casual Mixed seat"
+        );
+        assert!(
+            matches!(mm.join(MatchMode::Agent, b"chal", casual()), Err(JoinError::Unauthenticated { .. })),
+            "an empty signature is not a ranked claim"
         );
     }
 

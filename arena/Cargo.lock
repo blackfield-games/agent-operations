@@ -30,6 +30,8 @@ version = "0.0.1"
 dependencies = [
  "arena-core",
  "arena-proto",
+ "hex",
+ "k256",
  "uuid",
 ]
 
