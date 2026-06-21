@@ -1234,26 +1234,49 @@ impl Match {
     }
 
     /// Apply a clamped, blocker-respecting displacement from `from`: scale `move_dir`
-    /// (in [`MOVE_INTENT_SCALE`] units) by `magnitude` position units, clamp the
-    /// destination to the arena bounds, and refuse the whole step — holding at `from`
-    /// — if its swept path crosses a blocker. The shared movement-safety primitive for
-    /// both the per-tick walk (`magnitude == max_speed`) and the dash burst
-    /// (`magnitude == DASH_DISTANCE`), so a dash can no more tunnel a wall or leave the
-    /// arena than a walk can: both go through this one clamp + [`path_hits_blocker`].
+    /// (in [`MOVE_INTENT_SCALE`] units) by `magnitude` position units and clamp the
+    /// destination to the arena bounds. If the full swept path crosses a blocker the
+    /// step is refused; with [`Rules::wall_slide`] off (the default) the pawn holds at
+    /// `from`, and with it on the axis-separated components are retried — X-only, then
+    /// Y-only — through the SAME [`path_hits_blocker`] test + clamp, so a pawn grazing a
+    /// wall slides along the unblocked axis while an inside corner (both axes refused)
+    /// still holds. The shared movement-safety primitive for both the per-tick walk
+    /// (`magnitude == max_speed`) and the dash burst (`magnitude == DASH_DISTANCE`), so
+    /// a dash can no more tunnel a wall or leave the arena than a walk can; each
+    /// axis-separated retry is a strict single-axis subset of the full step, so it
+    /// cannot tunnel either.
     fn slide(&self, from: Vec2, move_dir: Vec2, magnitude: i32) -> Vec2 {
         let dx = move_dir.x as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
         let dy = move_dir.y as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
         let bx = self.config.bounds.x as i64;
         let by = self.config.bounds.y as i64;
-        let to = Vec2 {
-            x: (from.x as i64 + dx).clamp(-bx, bx) as i32,
-            y: (from.y as i64 + dy).clamp(-by, by) as i32,
+        let target = |ddx: i64, ddy: i64| Vec2 {
+            x: (from.x as i64 + ddx).clamp(-bx, bx) as i32,
+            y: (from.y as i64 + ddy).clamp(-by, by) as i32,
         };
-        if path_hits_blocker(&self.blockers, from, to) {
-            from
-        } else {
-            to
+        let to = target(dx, dy);
+        if !path_hits_blocker(&self.blockers, from, to) {
+            return to;
         }
+        // The full move is refused. With wall_slide on, retry the axis-separated
+        // components (X-only, then Y-only) so a grazing step slides along the wall
+        // instead of dead-stopping; an inside corner (both refused) holds. Off keeps
+        // the historical stop-at-origin, byte-identical.
+        if self.rules.wall_slide {
+            if dx != 0 {
+                let slid = target(dx, 0);
+                if !path_hits_blocker(&self.blockers, from, slid) {
+                    return slid;
+                }
+            }
+            if dy != 0 {
+                let slid = target(0, dy);
+                if !path_hits_blocker(&self.blockers, from, slid) {
+                    return slid;
+                }
+            }
+        }
+        from
     }
 
     /// Advance the match exactly one tick from the given intents. A seat absent
