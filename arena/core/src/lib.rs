@@ -1790,6 +1790,328 @@ pub struct ParityVectors {
     pub matches: Vec<MatchCase>,
 }
 
+/// Domain tag for the parity-vector set — see [`ParityVectors::domain`].
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v1";
+/// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
+/// random id would hash into the digest and make the set non-canonical).
+const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
+/// The seed the full-match cases run from — fixed, so the spawns and the digest
+/// are stable.
+const PARITY_MATCH_SEED: u64 = 0x0102_0304_0506_0708;
+
+fn parity_match_id() -> Uuid {
+    PARITY_MATCH_ID.parse().expect("a valid fixed v4 match id")
+}
+
+fn parity_config(seats: u8) -> MatchConfig {
+    MatchConfig {
+        tick_hz: 30,
+        max_ticks: 3600,
+        bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+        seats,
+    }
+}
+
+/// A roster seat with a fixed, byte-stable controller label (the label is hashed
+/// into the digest, so it must be deterministic, not a uuid).
+fn parity_seat(seat: SeatId, team: TeamId) -> arena_proto::SeatInfo {
+    arena_proto::SeatInfo { seat, team, controller: format!("0x{seat:02x}") }
+}
+
+fn parity_intent(move_dir: Vec2, aim: Bam, fire: bool) -> ActionIntent {
+    ActionIntent {
+        move_dir,
+        aim,
+        buttons: arena_proto::ActionButtons { fire, jump: false, ability: false, reload: false },
+    }
+}
+
+/// Build a spawn case: construct the match and read each seat's spawn state back
+/// through the public `observe(seat).own`, exactly the surface the twin exposes.
+fn spawn_case(label: &str, seed: u64, rules: Rules, roster: Vec<arena_proto::SeatInfo>) -> SpawnCase {
+    let config = parity_config(roster.len() as u8);
+    let m = Match::new(parity_match_id(), config, rules, roster.clone(), Vec::new(), seed);
+    let spawns = roster
+        .iter()
+        .map(|s| {
+            let own = m.observe(s.seat).own;
+            SpawnVector {
+                seat: own.seat,
+                team: own.team,
+                position: own.position,
+                facing: own.facing,
+                health: own.health,
+                ammo: own.ammo,
+            }
+        })
+        .collect();
+    SpawnCase { label: label.to_string(), seed, config, rules, roster, spawns }
+}
+
+/// The verdict for one candidate, in the IDENTICAL filter order [`Match::observe`]
+/// applies (range → cone → line of sight) — the first failing filter is the
+/// reason, so the annotation is the real load-bearing convention, not a guess.
+fn perception_verdict(
+    observer: Vec2,
+    facing: Bam,
+    range: i32,
+    spread: u8,
+    blockers: &[Blocker],
+    candidate: Vec2,
+) -> PerceptionVerdict {
+    if !within(observer, candidate, range) {
+        return PerceptionVerdict::OutOfRange;
+    }
+    if !in_fov(facing, observer, candidate, spread) {
+        return PerceptionVerdict::OutOfCone;
+    }
+    if !has_line_of_sight(blockers, observer, candidate) {
+        return PerceptionVerdict::Occluded;
+    }
+    PerceptionVerdict::Visible
+}
+
+/// Build a perception case: place the observer (seat 0) and the candidate enemies
+/// at explicit positions, then read the observer's real visible set. The
+/// engineered geometry is realized by direct state construction — the reference's
+/// in-crate privilege — but the case records the explicit positions, so the twin
+/// reproduces the same scenario through its own core with no private access.
+fn perception_case(
+    label: &str,
+    observer: Vec2,
+    facing: Bam,
+    range: i32,
+    spread: u8,
+    blockers: Vec<Blocker>,
+    candidates: Vec<(SeatId, TeamId, Vec2)>,
+) -> PerceptionCase {
+    let mut roster = vec![parity_seat(0, 0)];
+    for &(seat, team, _) in &candidates {
+        roster.push(parity_seat(seat, team));
+    }
+    let rules = Rules { perception_range: range, fov_octant_spread: spread, spawn_jitter: 0, ..Default::default() };
+    let config = parity_config(roster.len() as u8);
+    let mut m = Match::new(parity_match_id(), config, rules, roster, blockers.clone(), 1);
+    for p in &mut m.pawns {
+        if p.seat == 0 {
+            p.pos = observer;
+            p.facing = facing;
+        } else if let Some(&(_, _, pos)) = candidates.iter().find(|&&(s, _, _)| s == p.seat) {
+            p.pos = pos;
+        }
+    }
+    let visible: Vec<u32> = m.observe(0).visible.iter().map(|e| e.entity_id).collect();
+    let candidates = candidates
+        .iter()
+        .map(|&(seat, team, position)| PerceptionCandidate {
+            seat,
+            team,
+            position,
+            alive: true,
+            verdict: perception_verdict(observer, facing, range, spread, &blockers, position),
+        })
+        .collect();
+    PerceptionCase {
+        label: label.to_string(),
+        observer_position: observer,
+        observer_facing: facing,
+        perception_range: range,
+        fov_octant_spread: spread,
+        blockers,
+        candidates,
+        visible,
+    }
+}
+
+/// Build a hitscan case: place shooter (seat 0) and target (seat 1), fire once,
+/// and record the damage dealt.
+fn hit_case(
+    label: &str,
+    shooter: Vec2,
+    facing: Bam,
+    target: Vec2,
+    weapon_range: i32,
+    hit_radius: i32,
+    aim_mode: AimMode,
+) -> HitCase {
+    let rules = Rules { weapon_range, hit_radius, aim_mode, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = shooter;
+    m.pawns[0].facing = facing;
+    m.pawns[1].pos = target;
+    let before = m.pawns[1].health;
+    m.resolve_fire(0);
+    HitCase {
+        label: label.to_string(),
+        shooter_position: shooter,
+        shooter_facing: facing,
+        target_position: target,
+        weapon_range,
+        hit_radius,
+        aim_mode,
+        damage: before - m.pawns[1].health,
+    }
+}
+
+/// Build a projectile case: launch one shot and sweep it tick by tick until it
+/// hits, expires, or reaches the lifetime backstop, recording when (if ever) the
+/// swept path first reached the target.
+fn projectile_case(
+    label: &str,
+    shooter: Vec2,
+    facing: Bam,
+    target: Vec2,
+    projectile_speed: i32,
+    weapon_range: i32,
+    hit_radius: i32,
+) -> ProjectileCase {
+    let rules = Rules {
+        weapon_mode: WeaponMode::Projectile,
+        projectile_speed,
+        weapon_range,
+        hit_radius,
+        spawn_jitter: 0,
+        ..Default::default()
+    };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = shooter;
+    m.pawns[0].facing = facing;
+    m.pawns[1].pos = target;
+    let start_health = m.pawns[1].health;
+    m.spawn_projectile(0);
+    let mut ticks_to_hit = None;
+    let mut age = 0u16;
+    while !m.projectiles.is_empty() && age < MAX_PROJECTILE_LIFETIME {
+        let before = m.pawns[1].health;
+        m.advance_projectiles();
+        age += 1;
+        if m.pawns[1].health < before {
+            ticks_to_hit = Some(age);
+            break;
+        }
+    }
+    ProjectileCase {
+        label: label.to_string(),
+        shooter_position: shooter,
+        shooter_facing: facing,
+        target_position: target,
+        projectile_speed,
+        weapon_range,
+        hit_radius,
+        ticks_to_hit,
+        damage: start_health - m.pawns[1].health,
+        target_downed: !m.pawns[1].alive,
+    }
+}
+
+/// Build a full-match case under a fixed, tiny scripted action stream: seat 0
+/// steps east on the opening tick, fires due east on the next, then everyone
+/// idles. A hitscan match ends on the kill; a projectile match runs on until the
+/// shot arrives — so the weapon mode is an outcome determinant the record commits.
+fn match_case(label: &str, rules: Rules) -> MatchCase {
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), PARITY_MATCH_SEED);
+    let mut tick = 0u64;
+    while m.phase() == MatchPhase::Live && tick < 64 {
+        let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+        let action = match tick {
+            0 => Some(parity_intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false)),
+            1 => Some(parity_intent(Vec2::ZERO, EAST, true)),
+            _ => None,
+        };
+        if let Some(a) = action {
+            intents.insert(0, a);
+        }
+        m.step(&intents);
+        tick += 1;
+    }
+    let record = m.to_record().expect("the scripted parity match reaches a terminal state");
+    MatchCase { label: label.to_string(), record }
+}
+
+/// Generate the canonical cross-implementation parity-vector set from this
+/// reference core.
+///
+/// This is the headless half of the UE5-twin conformance contract. Every existing
+/// parity audit checks the core against ITSELF (recomputing the same predicate);
+/// this instead emits a small, versioned set of `inputs -> exact integer outputs`
+/// vectors that a SECOND implementation — the UE5 dedicated server that also
+/// implements the arena Gateway — must reproduce bit-for-bit. The cases are chosen
+/// to be load-bearing, not happy-path: spawn determinism (PRNG + spread + jitter
+/// order + facing rule), the perception range/cone/line-of-sight exclusion edges,
+/// the octant-vs-fine sub-octant hit boundary, a swept fast projectile that must
+/// not tunnel, and three full-match records proving the digest commits the inputs
+/// while the rules bind the outcomes.
+///
+/// The generator is pure integer, ordered, and float/map-free, so the set is
+/// byte-stable on every platform and the same on every run. It realizes the
+/// engineered hit/perception geometries by direct state construction (the
+/// reference's in-crate privilege) but records the explicit inputs, so a twin with
+/// only the public protocol reproduces every case through its own core.
+///
+/// SCOPE: a passing self-check proves this reference is self-consistent and
+/// PINNED — that the conventions cannot silently drift — NOT that any second
+/// implementation agrees. There is no UE5 consumer yet; building and conforming it
+/// is operator-gated. Treat this as the committed spec the twin is held to, the
+/// way the contracts ABI-drift gate pins a wire shape no off-chain caller has yet
+/// consumed.
+pub fn parity_vectors() -> ParityVectors {
+    let default = Rules::default();
+    let (range, radius) = (default.weapon_range, default.hit_radius);
+    let jittered = Rules { spawn_radius: 20 * POSITION_SCALE, spawn_jitter: 2 * POSITION_SCALE, ..Default::default() };
+    let wall = Blocker { min: Vec2 { x: 8_000, y: 800 }, max: Vec2 { x: 12_000, y: 2_200 } };
+
+    ParityVectors {
+        domain: PARITY_VECTORS_DOMAIN.to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        spawns: vec![
+            spawn_case(
+                "four_seats_jittered",
+                0x1234_5678_9abc_def0,
+                jittered,
+                vec![parity_seat(0, 0), parity_seat(1, 1), parity_seat(2, 2), parity_seat(3, 3)],
+            ),
+            spawn_case("single_seat_centred", 7, jittered, vec![parity_seat(0, 0)]),
+        ],
+        perception: vec![perception_case(
+            "range_cone_los_edges",
+            Vec2::ZERO,
+            EAST,
+            30 * POSITION_SCALE,
+            1,
+            vec![wall],
+            vec![
+                (1, 1, Vec2 { x: 20_000, y: -3_000 }), // in range + cone + clear LOS -> visible
+                (2, 2, Vec2 { x: -20_000, y: 0 }),     // in range, behind the facing -> out of cone
+                (3, 3, Vec2 { x: 40_000, y: 0 }),      // dead ahead but past perception -> out of range
+                (4, 4, Vec2 { x: 20_000, y: 3_000 }),  // in range + cone, behind the wall -> occluded
+            ],
+        )],
+        hits: vec![
+            hit_case("dead_on_octant", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, AimMode::Octant),
+            hit_case("dead_on_fine", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, AimMode::Fine),
+            // 11.25 degrees: a fine direction that snaps to the East octant. The
+            // octant beam misses the off-axis target; the finer beam lands it.
+            hit_case("sub_octant_octant_misses", Vec2::ZERO, 2048, Vec2 { x: 19_617, y: 3_902 }, range, radius, AimMode::Octant),
+            hit_case("sub_octant_fine_hits", Vec2::ZERO, 2048, Vec2 { x: 19_617, y: 3_902 }, range, radius, AimMode::Fine),
+        ],
+        projectiles: vec![
+            // 20 m/tick overshoots a 5 m target in one step: the endpoints both miss,
+            // the swept segment hits.
+            projectile_case("fast_sweep_no_tunnel", Vec2::ZERO, EAST, Vec2 { x: 5 * POSITION_SCALE, y: 0 }, 20 * POSITION_SCALE, range, radius),
+            // Off the firing line: the sweep never reaches it, so the shot expires clean.
+            projectile_case("off_line_clean_miss", Vec2::ZERO, EAST, Vec2 { x: 0, y: 5 * POSITION_SCALE }, 2 * POSITION_SCALE, range, radius),
+        ],
+        matches: vec![
+            match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
+            match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
+            match_case("projectile", Rules { damage: 100, weapon_mode: WeaponMode::Projectile, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
