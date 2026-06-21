@@ -203,9 +203,9 @@ pub enum EntityKind {
 /// own health, ammo, weapon cooldown, position and facing — this is the one place
 /// full internal state appears in an [`Observation`], and it is always the
 /// receiver's own, so it grants no perception advantage. The private-HUD fields
-/// here (`ammo`, `cooldown`) are the receiver's own and so appear ONLY in this
-/// type, never in a [`VisibleEntity`] or [`BroadcastEntity`] — reading another
-/// pawn's ammo or fire timing would be a tactical x-ray.
+/// here (`ammo`, `cooldown`, `shield`) are the receiver's own and so appear ONLY in
+/// this type, never in a [`VisibleEntity`] or [`BroadcastEntity`] — reading another
+/// pawn's ammo, fire timing, or remaining armor would be a tactical x-ray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfState {
     pub seat: SeatId,
@@ -219,6 +219,12 @@ pub struct SelfState {
     pub velocity: Vec2,
     pub health: u16,
     pub max_health: u16,
+    /// Remaining damage-absorbing shield, drained before health on a hit. The
+    /// receiver's own armor reading — a private-HUD field like `ammo`/`cooldown`, so
+    /// it is never exposed for any other pawn (knowing an enemy's exact shield is the
+    /// same down-in-N-shots x-ray as knowing its ammo). `0` whenever shield is
+    /// disabled (`max_shield == 0`) or uncollected.
+    pub shield: u16,
     pub ammo: u16,
     /// Ticks until this pawn may fire again, as the next action sees it: `0` means
     /// a `fire` submitted for THIS observation's tick is honored (subject to
@@ -1217,7 +1223,7 @@ mod tests {
             ["entity_id", "facing", "in_line_of_sight", "kind", "position", "team", "z"],
             "VisibleEntity gained or lost a field — the perceivable set is a security contract"
         );
-        for forbidden in ["health", "ammo", "max_health", "intent", "cooldown", "velocity"] {
+        for forbidden in ["health", "ammo", "max_health", "intent", "cooldown", "velocity", "shield"] {
             assert!(
                 json.get(forbidden).is_none(),
                 "VisibleEntity must not leak hidden state field `{forbidden}`"
@@ -1239,6 +1245,7 @@ mod tests {
             velocity: Vec2 { x: 0, y: 0 },
             health: 100,
             max_health: 100,
+            shield: 40,
             ammo: 30,
             cooldown: 5,
             alive: true,
@@ -1246,7 +1253,7 @@ mod tests {
         let json = serde_json::to_value(s).unwrap();
         assert_eq!(
             object_keys(&json),
-            ["alive", "ammo", "cooldown", "facing", "health", "max_health", "position", "seat", "team", "velocity", "z"],
+            ["alive", "ammo", "cooldown", "facing", "health", "max_health", "position", "seat", "shield", "team", "velocity", "z"],
             "SelfState gained or lost a field — the observable self-surface is a security contract"
         );
         for forbidden in ["enemies", "visible", "all_pawns", "rng_state", "world", "world_state"] {
@@ -1291,7 +1298,7 @@ mod tests {
                 "position": { "x": 0, "y": 0 }, "z": 0,
                 "facing": 16384,
                 "velocity": { "x": 0, "y": 0 },
-                "health": 100, "max_health": 100, "ammo": 30, "cooldown": 5, "alive": true
+                "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 5, "alive": true
             },
             "visible": [{
                 "entity_id": 7, "kind": "player", "team": 2,
@@ -1329,7 +1336,7 @@ mod tests {
             ["alive", "entity_id", "facing", "health", "kind", "max_health", "position", "score", "team", "z"],
             "BroadcastEntity gained or lost a field — the public broadcast surface is a security contract"
         );
-        for forbidden in ["ammo", "cooldown", "intent", "velocity"] {
+        for forbidden in ["ammo", "cooldown", "intent", "velocity", "shield"] {
             assert!(
                 json.get(forbidden).is_none(),
                 "BroadcastEntity must not leak private HUD field `{forbidden}`"
@@ -1790,6 +1797,7 @@ mod tests {
                 velocity: Vec2::ZERO,
                 health: 100,
                 max_health: 100,
+                shield: 0,
                 ammo: 30,
                 cooldown: 5,
                 alive: true,

@@ -1054,6 +1054,7 @@ impl Match {
                 velocity: me.vel,
                 health: me.health,
                 max_health: me.max_health,
+                shield: me.shield,
                 ammo: me.ammo,
                 // Report the fire cooldown as the NEXT action will see it. `step`
                 // decrements `cooldown` at tick start before the fire gate, so the
@@ -3178,6 +3179,7 @@ mod tests {
             assert_eq!(obs.own.seat, seat, "own is the observer's own seat");
             assert_eq!(obs.own.position, truth.pos, "own position is the observer's real one");
             assert_eq!(obs.own.health, truth.health, "own health is the observer's real one");
+            assert_eq!(obs.own.shield, truth.shield, "own shield is the observer's real one");
             assert_eq!(obs.own.alive, truth.alive);
             // The observer never perceives itself.
             assert!(obs.visible.iter().all(|e| e.entity_id != seat as u32), "seat {seat} perceives itself");
