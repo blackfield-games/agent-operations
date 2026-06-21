@@ -28,6 +28,7 @@
 //! Like `mesh/proto`, this is plain serde JSON: the wire form is the serde
 //! representation and transport lives in the arena/UE5 crates.
 
+use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use uuid::Uuid;
@@ -679,6 +680,81 @@ pub fn join_digest(protocol_version: u32, agent_id: &str, nonce: &[u8]) -> [u8; 
     h.update((nonce.len() as u32).to_be_bytes());
     h.update(nonce);
     h.finalize().into()
+}
+
+/// Why a [`AgentMsg::Join`]'s `signature_hex` failed to prove control of the
+/// claimed `agent_id`. Mirrors mesh's earner `VerifyError` so the arena Gateway's
+/// ranked-admission gate reports the same shape of failure as the render mesh.
+#[derive(Debug, PartialEq, Eq)]
+pub enum JoinVerifyError {
+    /// `signature_hex` was not valid hex or not the required 65 bytes (`[r||s||v]`).
+    BadSignatureEncoding,
+    /// Parsed but high-S (non-canonical / malleable per EIP-2). Rejected so a
+    /// given join proof has exactly one valid 65-byte encoding.
+    NonCanonicalSignature,
+    /// No public key could be recovered from the signature over the digest.
+    Unrecoverable,
+    /// A key was recovered, but its address is not the claimed `agent_id` — the
+    /// signer does not control the identity it claims, so the seat is not ranked.
+    AddressMismatch,
+}
+
+/// Ethereum-style address (0x-prefixed, lowercase) from a verifying key:
+/// keccak256(uncompressed_pubkey[1..])[12..]. The same derivation mesh uses, so a
+/// session key recovers to the identical address whether it signs a render result
+/// or an arena join — one agent address spans both subsystems.
+pub fn address_from_verifying_key(vk: &VerifyingKey) -> String {
+    let point = vk.to_encoded_point(false);
+    let hash = Keccak256::digest(&point.as_bytes()[1..]);
+    format!("0x{}", hex::encode(&hash[12..]))
+}
+
+/// Recover the signer of a [`AgentMsg::Join`] and assert it controls the claimed
+/// `agent_id` — the arena analogue of mesh's `verify_hello_signature`.
+///
+/// `signature_hex` is a recoverable secp256k1 `[r||s||v]` over
+/// [`join_digest(protocol_version, agent_id, nonce)`](join_digest); on `Ok` the
+/// recovered address equals `agent_id` (case-insensitive), so the connection
+/// provably holds the key behind the identity it claims and the Gateway may form a
+/// *ranked* seat. `agent_id` feeds the digest *and* is the recovery target, so a
+/// captured signature can't be reattached to a different claimed address — a
+/// forger would have to recover its own (different) address.
+///
+/// `nonce` is the server-issued, per-connection challenge; folding it into the
+/// digest means a Join captured off the wire and replayed on a fresh connection —
+/// which gets a different challenge — recovers a key that no longer matches and is
+/// rejected. The caller passes the nonce IT issued for this connection, never a
+/// client-supplied value.
+///
+/// This proves key *possession* only; whether `agent_id` is a registered, eligible
+/// on-chain agent is a separate check (a later contracts task) that composes on top
+/// of this one.
+pub fn verify_join_signature(
+    protocol_version: u32,
+    agent_id: &str,
+    nonce: &[u8],
+    signature_hex: &str,
+) -> Result<(), JoinVerifyError> {
+    let raw = hex::decode(signature_hex.strip_prefix("0x").unwrap_or(signature_hex))
+        .map_err(|_| JoinVerifyError::BadSignatureEncoding)?;
+    if raw.len() != 65 {
+        return Err(JoinVerifyError::BadSignatureEncoding);
+    }
+    let sig = Signature::from_slice(&raw[..64]).map_err(|_| JoinVerifyError::BadSignatureEncoding)?;
+    // Enforce low-S (EIP-2): `normalize_s` returns `Some` only for the high-S
+    // (malleable) half, so reject it and a join proof has one canonical encoding.
+    if sig.normalize_s().is_some() {
+        return Err(JoinVerifyError::NonCanonicalSignature);
+    }
+    let recid = RecoveryId::from_byte(raw[64]).ok_or(JoinVerifyError::BadSignatureEncoding)?;
+    let digest = join_digest(protocol_version, agent_id, nonce);
+    let vk = VerifyingKey::recover_from_prehash(&digest, &sig, recid)
+        .map_err(|_| JoinVerifyError::Unrecoverable)?;
+    if address_from_verifying_key(&vk).eq_ignore_ascii_case(agent_id) {
+        Ok(())
+    } else {
+        Err(JoinVerifyError::AddressMismatch)
+    }
 }
 
 #[cfg(test)]
