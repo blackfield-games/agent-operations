@@ -1048,10 +1048,23 @@ impl Match {
             let dy = intent.move_dir.y as i64 * max / MOVE_INTENT_SCALE as i64;
             let bx = self.config.bounds.x as i64;
             let by = self.config.bounds.y as i64;
-            let nx = (self.pawns[i].pos.x as i64 + dx).clamp(-bx, bx) as i32;
-            let ny = (self.pawns[i].pos.y as i64 + dy).clamp(-by, by) as i32;
-            self.pawns[i].vel = Vec2 { x: nx - self.pawns[i].pos.x, y: ny - self.pawns[i].pos.y };
-            self.pawns[i].pos = Vec2 { x: nx, y: ny };
+            let from = self.pawns[i].pos;
+            let nx = (from.x as i64 + dx).clamp(-bx, bx) as i32;
+            let ny = (from.y as i64 + dy).clamp(-by, by) as i32;
+            // A blocker is physical cover: a step whose swept path crosses one is
+            // refused outright (the pawn holds position this tick, vel zero) rather
+            // than walking through it. Stopping at the START of the blocked step —
+            // not snapping to the wall surface — keeps the rule a single integer
+            // segment test the UE5 twin reproduces exactly, no rounding to a contact
+            // point. A no-blocker match never reaches this branch (empty set), so it
+            // is byte-identical. Surface-snap and wall-sliding are deferred follow-ups.
+            let to = if path_hits_blocker(&self.blockers, from, Vec2 { x: nx, y: ny }) {
+                from
+            } else {
+                Vec2 { x: nx, y: ny }
+            };
+            self.pawns[i].vel = Vec2 { x: to.x - from.x, y: to.y - from.y };
+            self.pawns[i].pos = to;
             self.pawns[i].facing = intent.aim;
         }
 
@@ -1873,6 +1886,24 @@ fn occludes(b: &Blocker, from: Vec2, to: Vec2) -> bool {
         return false;
     }
     segment_intersects_aabb(from, to, b)
+}
+
+/// `true` if the swept travel `from → to` runs into a physical blocker — the
+/// collision predicate shared by movement and projectile flight, so the two agree
+/// bit-for-bit on "this path crosses a wall". A blocker stops the path unless the
+/// path STARTS inside it: the start-only exemption (vs [`occludes`], which exempts
+/// BOTH endpoints) lets a pawn or shot that begins in or pressed against a wall
+/// leave it — and is the same safety valve that keeps a seat the seed spawned
+/// inside a blocker from being trapped — while any blocker AHEAD still stops it.
+/// Unlike sight, travel is directional: the destination is NOT exempt, so a step
+/// whose endpoint lands inside a wall is blocked rather than walking into it.
+/// Swept (the whole segment, not the endpoints), so a fast mover cannot tunnel a
+/// thin wall in one step; all-integer via [`segment_intersects_aabb`], so it never
+/// panics or divides by zero on a degenerate blocker and is platform-stable.
+fn path_hits_blocker(blockers: &[Blocker], from: Vec2, to: Vec2) -> bool {
+    blockers
+        .iter()
+        .any(|b| !blocker_contains(b, from) && segment_intersects_aabb(from, to, b))
 }
 
 /// Integer segment-vs-AABB intersection by the separating-axis theorem. A segment
