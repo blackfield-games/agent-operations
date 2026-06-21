@@ -3724,6 +3724,136 @@ mod tests {
     }
 
     #[test]
+    fn path_hits_blocker_is_exact_at_the_boundary_and_exempts_only_the_start() {
+        // FM1 (integer determinism): the shared movement/projectile collision
+        // predicate must be exact at the boundary (a graze counts) so two
+        // implementations agree on what a path crosses, and it exempts ONLY the start
+        // corner (a body leaving a wall it is in) — never the destination, so a step
+        // that would END inside a wall is still refused.
+        let wall = Blocker { min: Vec2 { x: 5000, y: -2000 }, max: Vec2 { x: 6000, y: 2000 } };
+        let o = Vec2::ZERO;
+        assert!(path_hits_blocker(&[wall], o, Vec2 { x: 10_000, y: 0 }), "dead-centre through the wall is blocked");
+        assert!(!path_hits_blocker(&[wall], o, Vec2 { x: 3_000, y: 0 }), "a path short of the wall is clear");
+        assert!(!path_hits_blocker(&[wall], o, Vec2 { x: 0, y: 10_000 }), "a parallel path that never reaches it is clear");
+        // Runs along the near (x = 5000) edge — boundary contact counts (conservative).
+        assert!(path_hits_blocker(&[wall], Vec2 { x: 5000, y: -3000 }, Vec2 { x: 5000, y: 3000 }), "a path along the wall edge is blocked");
+        // Ends ON a corner — the destination is NOT exempt, so it is refused.
+        assert!(path_hits_blocker(&[wall], Vec2 { x: 0, y: 4000 }, Vec2 { x: 5000, y: 2000 }), "a step ending on the wall is refused");
+        // Starts INSIDE the wall — exempt, so it can leave even toward a point outside.
+        let inside = Vec2 { x: 5500, y: 0 };
+        assert!(blocker_contains(&wall, inside), "the start point is genuinely inside the wall");
+        assert!(!path_hits_blocker(&[wall], inside, Vec2 { x: 10_000, y: 0 }), "a path starting inside the wall is exempt");
+        // ...but a DIFFERENT wall ahead still stops a path that left the first.
+        let ahead = Blocker { min: Vec2 { x: 8000, y: -2000 }, max: Vec2 { x: 9000, y: 2000 } };
+        assert!(path_hits_blocker(&[wall, ahead], inside, Vec2 { x: 10_000, y: 0 }), "a wall ahead still stops a path that left another");
+    }
+
+    #[test]
+    fn a_pawn_cannot_walk_through_a_blocker() {
+        // FM2 (intended change + no-blocker byte-identity): a step whose swept path
+        // crosses a wall is refused (the pawn holds, velocity zero); the SAME step
+        // with no wall advances by max_speed, so the wall is load-bearing and the
+        // no-blocker path is unchanged.
+        let wall = Blocker { min: Vec2 { x: 50, y: -2 * POSITION_SCALE }, max: Vec2 { x: 150, y: 2 * POSITION_SCALE } };
+        let east = intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false);
+        let place = |blockers: Vec<Blocker>| {
+            let rules = Rules { spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), blockers, 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 }; // far idle, keeps the match Live
+            m
+        };
+        let mut walled = place(vec![wall]);
+        step_with(&mut walled, &[(0, east)]);
+        assert_eq!(walled.pawns[0].pos, Vec2::ZERO, "the step into the wall is refused");
+        assert_eq!(walled.observe(0).own.velocity, Vec2::ZERO, "a refused move reports zero velocity");
+
+        let mut clear = place(vec![]);
+        step_with(&mut clear, &[(0, east)]);
+        assert_eq!(clear.pawns[0].pos.x, Rules::default().max_speed, "with no wall the same step advances");
+    }
+
+    #[test]
+    fn a_blocker_between_two_pawns_stops_the_shot() {
+        // FM2: a wall between shooter and target blocks the beam through the live step
+        // loop — the target takes nothing; remove the wall and the same shot lands.
+        let place = |blockers: Vec<Blocker>| {
+            let rules = Rules { spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), blockers, 1);
+            m.pawns[0].pos = Vec2 { x: -5 * POSITION_SCALE, y: 0 };
+            m.pawns[0].facing = EAST;
+            m.pawns[1].pos = Vec2 { x: 5 * POSITION_SCALE, y: 0 };
+            m
+        };
+        let wall = Blocker { min: Vec2 { x: -500, y: -2 * POSITION_SCALE }, max: Vec2 { x: 500, y: 2 * POSITION_SCALE } };
+        let mut walled = place(vec![wall]);
+        let hp = walled.pawns[1].health;
+        step_with(&mut walled, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(walled.pawns[1].health, hp, "the shot is blocked by the wall");
+
+        let mut clear = place(vec![]);
+        step_with(&mut clear, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(clear.pawns[1].health, hp - Rules::default().damage, "with no wall the same shot lands");
+    }
+
+    #[test]
+    fn a_projectile_is_stopped_by_a_wall_and_cannot_tunnel_it() {
+        // FM3: a fast projectile whose single swept step jumps a THIN wall is still
+        // absorbed (no tunnel) and a target behind the wall is never hit; a target IN
+        // FRONT of the same wall is hit on that step — cover behind it shields nothing.
+        let thin = Blocker { min: Vec2 { x: 5 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 5 * POSITION_SCALE, y: 2 * POSITION_SCALE } };
+        let rules = Rules { weapon_mode: WeaponMode::Projectile, projectile_speed: 20 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let place = |target_x: i32| {
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![thin], 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[0].facing = EAST;
+            m.pawns[1].pos = Vec2 { x: target_x, y: 0 };
+            m
+        };
+        // Behind the thin wall: a point test at the post-step position (past the wall)
+        // would tunnel; the swept step is absorbed at the wall, so no hit.
+        let mut behind = place(10 * POSITION_SCALE);
+        let hp = behind.pawns[1].health;
+        behind.spawn_projectile(0);
+        behind.advance_projectiles();
+        assert_eq!(behind.pawns[1].health, hp, "the shot is absorbed by the thin wall, not tunneled");
+        assert!(behind.projectiles.is_empty(), "the absorbed shot is despawned");
+
+        // In front of the wall: hit on the same swept step.
+        let mut front = place(3 * POSITION_SCALE);
+        let hp2 = front.pawns[1].health;
+        front.spawn_projectile(0);
+        front.advance_projectiles();
+        assert_eq!(front.pawns[1].health, hp2 - Rules::default().damage, "a target in front of the wall is hit");
+    }
+
+    #[test]
+    fn a_pawn_spawned_inside_a_blocker_can_walk_out_and_a_thin_wall_is_safe() {
+        // FM4 (spawn/degenerate safety): a pawn the seed places inside a blocker is
+        // not trapped — it steps out via the start-containment exemption — and a
+        // zero-extent thin wall on the path stops the move without dividing by zero or
+        // panicking the clamp.
+        let around = Blocker { min: Vec2 { x: -2 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 2 * POSITION_SCALE, y: 2 * POSITION_SCALE } };
+        let rules = Rules { max_speed: 5 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let east = intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false);
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![around], 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        assert!(blocker_contains(&around, m.pawns[0].pos), "seat 0 starts inside the blocker");
+        m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 };
+        step_with(&mut m, &[(0, east)]);
+        assert_eq!(m.pawns[0].pos.x, 5 * POSITION_SCALE, "a wall-spawned pawn steps out, not trapped");
+
+        // A zero-extent thin wall (a vertical line at x = 3 m) exactly on the path:
+        // the step is refused deterministically with no panic.
+        let thin = Blocker { min: Vec2 { x: 3 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 3 * POSITION_SCALE, y: 2 * POSITION_SCALE } };
+        let mut d = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![thin], 1);
+        d.pawns[0].pos = Vec2::ZERO;
+        d.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 };
+        step_with(&mut d, &[(0, east)]);
+        assert_eq!(d.pawns[0].pos, Vec2::ZERO, "a thin wall on the path stops the step, no panic");
+    }
+
+    #[test]
     fn an_enemy_just_past_perception_is_absent_everywhere() {
         // Adversarial: an enemy exactly AT the perception edge is perceived
         // (`within` is inclusive); one a single unit BEYOND it is absent, and its
