@@ -966,6 +966,113 @@ mod tests {
     }
 
     #[test]
+    fn assign_teams_ffa_is_the_identity_mapping() {
+        // FM3: team_size 1 is free-for-all — each seat its own team, the exact
+        // pre-team mapping the replay digest folds, so every existing FFA record is
+        // byte-identical. The id is irrelevant here (no shuffle is drawn).
+        for seats in [2usize, 3, 4, 8] {
+            let teams = assign_teams(Uuid::new_v4(), seats, 1);
+            let expected: Vec<TeamId> = (0..seats as TeamId).collect();
+            assert_eq!(teams, expected, "team_size 1 maps seat i to team i for {seats} seats");
+        }
+    }
+
+    fn team_counts(teams: &[TeamId]) -> BTreeMap<TeamId, usize> {
+        let mut counts: BTreeMap<TeamId, usize> = BTreeMap::new();
+        for t in teams {
+            *counts.entry(*t).or_default() += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn assign_teams_is_balanced_and_reproducible_from_the_id() {
+        // FM1: a 2v2 splits four seats into exactly two teams of two, the same way
+        // every time for a given id — reproducible from the id alone (no wall-clock,
+        // no HashMap order) — and the result is a permutation of the balanced labels.
+        let id = Uuid::new_v4();
+        let a = assign_teams(id, 4, 2);
+        assert_eq!(a, assign_teams(id, 4, 2), "the same id yields the same teams");
+        let counts = team_counts(&a);
+        assert_eq!(counts.len(), 2, "exactly two teams: {counts:?}");
+        assert!(counts.values().all(|&c| c == 2), "each team has exactly two seats: {counts:?}");
+    }
+
+    #[test]
+    fn assign_teams_balances_a_3v3() {
+        // FM1: balance holds for larger teams — six seats into two teams of three.
+        let counts = team_counts(&assign_teams(Uuid::new_v4(), 6, 3));
+        assert_eq!(counts.len(), 2, "two teams: {counts:?}");
+        assert!(counts.values().all(|&c| c == 3), "each team has exactly three seats: {counts:?}");
+    }
+
+    #[test]
+    fn assign_teams_varies_with_the_match_id() {
+        // FM1: the id actually steers the split (it is not a fixed function of seat
+        // index), so two ids generally divide the same roster differently — the
+        // property that defeats arrival-order team-stacking. A fixed scheme would
+        // make every id agree; we assert at least one of many differs.
+        let first = assign_teams(Uuid::from_u128(1), 8, 2);
+        let differs = (2u128..256).any(|n| assign_teams(Uuid::from_u128(n), 8, 2) != first);
+        assert!(differs, "team assignment must depend on the match id");
+    }
+
+    #[test]
+    #[should_panic(expected = "divide evenly")]
+    fn a_matchmaker_rejects_an_indivisible_team_size() {
+        // FM1: five seats cannot form whole teams of two.
+        Matchmaker::new(
+            StubIdentityVerifier::new(),
+            MatchParams { seats_per_match: 5, team_size: 2, ..MatchParams::default() },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at least 2 teams")]
+    fn a_matchmaker_rejects_a_single_team_config() {
+        // FM1: seats == team_size is one team, which ends on the first tick — the
+        // team analogue of the sub-two-seat guard.
+        Matchmaker::new(
+            StubIdentityVerifier::new(),
+            MatchParams { seats_per_match: 2, team_size: 2, ..MatchParams::default() },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at least 1")]
+    fn a_matchmaker_rejects_a_zero_team_size() {
+        Matchmaker::new(
+            StubIdentityVerifier::new(),
+            MatchParams { seats_per_match: 4, team_size: 0, ..MatchParams::default() },
+        );
+    }
+
+    #[test]
+    fn a_formed_2v2_seats_two_balanced_teams() {
+        // FM1 end-to-end: a team_size-2 matchmaker forms a four-seat match split into
+        // two teams of two, exactly the id-derived assignment (reproducible from the
+        // minted id alone).
+        let mm = Matchmaker::new(
+            StubIdentityVerifier::new(),
+            MatchParams { seats_per_match: 4, team_size: 2, ..MatchParams::default() },
+        );
+        for p in ["p0", "p1", "p2"] {
+            assert!(mm.join(MatchMode::Human, b"", JoinRequest::human(p)).unwrap().is_queued());
+        }
+        let m = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("p3"))
+            .unwrap()
+            .into_formed()
+            .expect("the fourth human completes the 2v2");
+        assert_eq!(m.config().seats, 4);
+        let counts = team_counts(&m.seats().iter().map(|s| s.team).collect::<Vec<_>>());
+        assert_eq!(counts.len(), 2, "two teams: {counts:?}");
+        assert!(counts.values().all(|&c| c == 2), "two seats each: {counts:?}");
+        let got: Vec<TeamId> = m.seats().iter().map(|s| s.team).collect();
+        assert_eq!(got, assign_teams(m.match_id(), 4, 2), "the formed teams are the id-derived split");
+    }
+
+    #[test]
     fn agent_mode_rejects_unauthenticated_and_admits_authorized() {
         // FM3: the ranked Agent queue must reject a missing/invalid/foreign
         // identity token before it can reach a settle-able match.

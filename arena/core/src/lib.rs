@@ -5610,6 +5610,94 @@ mod tests {
         );
     }
 
+    /// A 2v2 roster: seats {0,1} on team 0, seats {2,3} on team 1 — the shape the
+    /// matchmaker's team formation produces, used to exercise the team win condition
+    /// and team placement directly.
+    fn four_seats_two_teams() -> Vec<SeatInfo> {
+        vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xa".into() },
+            SeatInfo { seat: 1, team: 0, controller: "0xb".into() },
+            SeatInfo { seat: 2, team: 1, controller: "0xc".into() },
+            SeatInfo { seat: 3, team: 1, controller: "0xd".into() },
+        ]
+    }
+
+    #[test]
+    fn team_placement_groups_teammates_and_ranks_teams() {
+        // FM4: placement is by TEAM — teammates SHARE a placement (never contend as
+        // rivals), even with different individual scores and even when one is dead.
+        // Both teams have a survivor (a timeout), so teams rank by total score:
+        // team 0 (10) over team 1 (6). The OLD per-seat rule would rank these four
+        // seats 1/4/2/3 by (alive, score, seat); by team they are 1/1/2/2.
+        let mut m = Match::new(
+            MID.parse().unwrap(),
+            config(4),
+            Rules::default(),
+            four_seats_two_teams(),
+            Vec::new(),
+            1,
+        );
+        for (seat, alive, score) in [(0, true, 10), (1, false, 0), (2, true, 4), (3, false, 2)] {
+            m.pawns[seat].alive = alive;
+            m.pawns[seat].score = score;
+        }
+        let placements: Vec<u16> = m.outcomes().iter().map(|o| o.placement).collect();
+        assert_eq!(placements, vec![1, 1, 2, 2], "teammates share one team placement");
+    }
+
+    #[test]
+    fn a_2v2_ends_only_when_a_whole_team_is_down() {
+        // FM2: the win condition keys on alive TEAMS, not alive players. Downing one
+        // of team 1 leaves both teams represented, so the match stays Live with three
+        // of four players up; only when team 1's LAST pawn falls does it end — and
+        // the whole surviving team shares first place.
+        let mut m = Match::new(
+            MID.parse().unwrap(),
+            config(4),
+            Rules::default(),
+            four_seats_two_teams(),
+            Vec::new(),
+            1,
+        );
+        assert_eq!(m.phase(), MatchPhase::Live);
+        m.pawns[2].alive = false;
+        m.pawns[2].health = 0;
+        m.step(&BTreeMap::new());
+        assert_eq!(m.phase(), MatchPhase::Live, "team 1 still has a survivor");
+        m.pawns[3].alive = false;
+        m.pawns[3].health = 0;
+        m.step(&BTreeMap::new());
+        assert_eq!(m.phase(), MatchPhase::Ended, "team 1 wiped → the match is over");
+        let firsts: Vec<SeatId> = m
+            .result()
+            .expect("ended")
+            .outcomes
+            .iter()
+            .filter(|o| o.placement == 1)
+            .map(|o| o.seat)
+            .collect();
+        assert_eq!(firsts, vec![0, 1], "the whole surviving team shares first place");
+    }
+
+    #[test]
+    fn team_placement_reduces_to_per_seat_for_singletons() {
+        // FM3: with each seat its own team (FFA, the default), team placement IS the
+        // per-seat alive>score>seat rule, so FFA outcomes stay byte-identical. seat 1
+        // (alive, top score) first, seat 0 (alive) second, seat 2 (dead) third.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xa".into() },
+            SeatInfo { seat: 1, team: 1, controller: "0xb".into() },
+            SeatInfo { seat: 2, team: 2, controller: "0xc".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), Rules::default(), seats, Vec::new(), 1);
+        for (seat, alive, score) in [(0, true, 5), (1, true, 9), (2, false, 3)] {
+            m.pawns[seat].alive = alive;
+            m.pawns[seat].score = score;
+        }
+        let placements: Vec<u16> = m.outcomes().iter().map(|o| o.placement).collect();
+        assert_eq!(placements, vec![2, 1, 3], "singleton teams rank exactly per-seat");
+    }
+
     /// A 3-seat match for the friendly-fire tests: seats 0 and 1 are ALLIES
     /// (team 0); seat 2 is a lone enemy (team 1) parked far to the WEST so the match
     /// stays Live (≥2 teams) without ever entering seat 0's eastward line of fire.
