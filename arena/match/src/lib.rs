@@ -13,8 +13,8 @@
 //!
 //! - **Ranked seats are authenticated.** A ranked agent seat must present a
 //!   signature the [`IdentityVerifier`] accepts *before* it is queued, so an
-//!   unauthenticated or duplicate agent can never reach a settle-able ranked
-//!   match. [`SignatureVerifier`] is the real gate: it recovers the secp256k1
+//!   unauthenticated agent can never reach a settle-able ranked match.
+//!   [`SignatureVerifier`] is the real gate: it recovers the secp256k1
 //!   signer from the arena-01 `join_digest` over *this connection's* challenge
 //!   nonce and admits a ranked seat only when the recovered address equals the
 //!   claimed `agent_id` — key possession, not assertion. (Whether that address is
