@@ -390,11 +390,13 @@ impl Match {
 
     /// Build the parity-bounded observation for one seat: its own pawn in full,
     /// plus only the entities it can perceive this tick (alive pawns within
-    /// `perception_range` AND inside the seat's forward FOV cone
+    /// `perception_range`, inside the seat's forward FOV cone
     /// ([`Rules::fov_octant_spread`]; the default full circle imposes no angular
-    /// bound), never itself), in ascending `entity_id` order so the snapshot is
-    /// canonical. The absence of any other field is the security bound — there is
-    /// no path here to full world state.
+    /// bound), AND with a clear line of sight — not occluded by a vision
+    /// [`Blocker`] — never itself), in ascending `entity_id` order so the snapshot
+    /// is canonical. The absence of any other field is the security bound — there
+    /// is no path here to full world state. Each filter only ever REMOVES a
+    /// perceivable enemy, so none can widen the bound.
     pub fn observe(&self, seat: SeatId) -> arena_proto::Observation {
         let me = self.pawn(seat);
         let mut visible: Vec<arena_proto::VisibleEntity> = self
@@ -403,6 +405,7 @@ impl Match {
             .filter(|p| p.seat != seat && p.alive)
             .filter(|p| within(me.pos, p.pos, self.rules.perception_range))
             .filter(|p| in_fov(me.facing, me.pos, p.pos, self.rules.fov_octant_spread))
+            .filter(|p| has_line_of_sight(&self.blockers, me.pos, p.pos))
             .map(|p| arena_proto::VisibleEntity {
                 entity_id: p.seat as u32,
                 kind: arena_proto::EntityKind::Player,
@@ -410,6 +413,11 @@ impl Match {
                 position: p.pos,
                 z: p.z,
                 facing: p.facing,
+                // Exclude-when-occluded: an entry only reaches the visible set if
+                // its sightline is clear, so `in_line_of_sight` carries its honest
+                // meaning — true for everything visible right now. (A last-known,
+                // out-of-sight position would set this false, but that needs a
+                // perception-memory model not in this first cut.)
                 in_line_of_sight: true,
             })
             .collect();
@@ -1110,6 +1118,65 @@ fn in_fov(facing: Bam, from: Vec2, to: Vec2, spread: u8) -> bool {
         return true;
     }
     circular_octant_distance(octant_index(facing), bearing_octant(dx, dy)) <= spread as usize
+}
+
+/// `true` if the sightline from `from` to `to` is clear of every vision blocker.
+/// Occlusion only ever REMOVES a perceivable enemy, so it cannot widen perception
+/// beyond the range+cone set — the parity bound holds a fortiori.
+fn has_line_of_sight(blockers: &[Blocker], from: Vec2, to: Vec2) -> bool {
+    !blockers.iter().any(|b| occludes(b, from, to))
+}
+
+/// `true` if point `p` lies within the closed AABB `b` (boundary inclusive).
+fn blocker_contains(b: &Blocker, p: Vec2) -> bool {
+    b.min.x <= p.x && p.x <= b.max.x && b.min.y <= p.y && p.y <= b.max.y
+}
+
+/// `true` if blocker `b` occludes the sightline from `from` to `to`: the segment
+/// crosses the blocker's closed AABB AND neither endpoint is inside it. The
+/// endpoint exemption is what makes a pawn standing in (or pressed against) an
+/// occluder neither blind nor invisible — its own enclosing blocker is skipped,
+/// while every other blocker still occludes it. Without it a spawn the seed
+/// happened to place inside a blocker would be permanently self-occluded.
+fn occludes(b: &Blocker, from: Vec2, to: Vec2) -> bool {
+    if blocker_contains(b, from) || blocker_contains(b, to) {
+        return false;
+    }
+    segment_intersects_aabb(from, to, b)
+}
+
+/// Integer segment-vs-AABB intersection by the separating-axis theorem. A segment
+/// and an AABB are disjoint iff some axis separates their projections; for this
+/// pair three axes suffice — the two AABB axes (a bounding-box overlap on X and on
+/// Y) and the segment's normal (all four AABB corners strictly on one side of the
+/// segment's supporting line). No separating axis ⇒ they touch or cross, and
+/// boundary contact (a grazed corner or edge) counts as a hit — the conservative,
+/// parity-tightening direction. All `i128`, no trig and no division, so a
+/// degenerate (zero-extent thin-wall) or extreme AABB neither panics nor divides
+/// by zero, and the test is byte-identical on every platform.
+fn segment_intersects_aabb(from: Vec2, to: Vec2, b: &Blocker) -> bool {
+    let (sx0, sx1) = (from.x.min(to.x), from.x.max(to.x));
+    if sx1 < b.min.x || b.max.x < sx0 {
+        return false;
+    }
+    let (sy0, sy1) = (from.y.min(to.y), from.y.max(to.y));
+    if sy1 < b.min.y || b.max.y < sy0 {
+        return false;
+    }
+    let dx = to.x as i128 - from.x as i128;
+    let dy = to.y as i128 - from.y as i128;
+    let (mut lo, mut hi) = (i128::MAX, i128::MIN);
+    for (cx, cy) in [
+        (b.min.x, b.min.y),
+        (b.max.x, b.min.y),
+        (b.min.x, b.max.y),
+        (b.max.x, b.max.y),
+    ] {
+        let cross = dx * (cy as i128 - from.y as i128) - dy * (cx as i128 - from.x as i128);
+        lo = lo.min(cross);
+        hi = hi.max(cross);
+    }
+    lo <= 0 && hi >= 0
 }
 
 /// How a finished match resolves for on-chain settlement, derived from its
