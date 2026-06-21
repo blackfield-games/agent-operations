@@ -3015,6 +3015,70 @@ mod tests {
     }
 
     #[test]
+    fn fine_aim_hit_math_holds_at_extreme_scale() {
+        // FM2: the finer beam's Q15 scale widens the dot/proj/perp products, so the
+        // i128 widening must be preserved. (a) A real hit at a 1.5 Gmm range with a
+        // billion-scale coordinate resolves exactly — i32/i64 intermediates would wrap
+        // computing proj². (b) Seats at opposite i32 extremes fire without an overflow
+        // panic; that far target is out of range, where the dist² pre-gate is the
+        // widening that bites (a squared planar distance there exceeds i64).
+        let cfg = MatchConfig { bounds: Vec2 { x: i32::MAX, y: i32::MAX }, ..config(2) };
+        let rules = Rules { aim_mode: AimMode::Fine, weapon_range: 2_000_000_000, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST; // fine(EAST) = (FINE_SCALE, 0), dead-on the +X target
+        m.pawns[1].pos = Vec2 { x: 1_500_000_000, y: 0 };
+        let before = m.pawns[1].health;
+        m.resolve_fire(0);
+        assert_eq!(m.pawns[1].health, before - Rules::default().damage, "a billion-scale in-range shot lands, no wrap");
+
+        let cfg2 = MatchConfig { bounds: Vec2 { x: i32::MAX, y: i32::MAX }, ..config(2) };
+        let rules2 = Rules { aim_mode: AimMode::Fine, spawn_radius: i32::MAX, spawn_jitter: 0, ..Default::default() };
+        let mut m2 = Match::new(MID.parse().unwrap(), cfg2, rules2, two_seats(), Vec::new(), 1);
+        let h = m2.observe(1).own.health;
+        step_with(&mut m2, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m2.observe(1).own.health, h, "out-of-range extreme fire: no hit, no overflow");
+    }
+
+    /// [`close_match`] in finer-aim mode — the same exact geometry, now resolving the
+    /// hitscan beam through the 64-way table.
+    fn fine_close_match(seed: u64) -> Match {
+        let rules = Rules {
+            aim_mode: AimMode::Fine,
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), seed)
+    }
+
+    fn play_fine(seed: u64) -> Match {
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        run_match(fine_close_match(seed), &mut policies)
+    }
+
+    #[test]
+    fn a_fine_aim_match_replays_byte_for_byte_and_across_runs() {
+        // FM3: the finer beam is a pure integer table lookup, so a fine-aim match is
+        // deterministic — it re-runs from its action stream ALONE to the same result +
+        // digest, and two independent same-seed runs are byte-identical (the basis for
+        // grading and on-chain attestation). aim_mode rides in the record's Rules, so
+        // the re-run resolves under the same resolution it was played on.
+        let played = play_fine(1);
+        assert_eq!(played.phase(), MatchPhase::Ended);
+        let result = played.result().unwrap().clone();
+        let replay = played.into_replay();
+        let replayed = replay_match(fine_close_match(1), &replay);
+        assert_eq!(replayed.result().unwrap(), &result, "fine-aim replay diverged from the live result");
+        assert_eq!(replayed.into_replay().digest(), replay.digest(), "fine-aim replay digest diverged");
+
+        let a = play_fine(7).into_replay();
+        let b = play_fine(7).into_replay();
+        assert_eq!(a.digest(), b.digest(), "two same-seed fine-aim runs diverged");
+        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    }
+
+    #[test]
     fn a_kill_ends_the_match_with_a_decisive_result() {
         let mut m = close_match(1);
         for _ in 0..200 {
