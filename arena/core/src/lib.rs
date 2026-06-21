@@ -1483,6 +1483,48 @@ mod tests {
     }
 
     #[test]
+    fn observed_cooldown_is_zero_exactly_when_a_fire_is_honored() {
+        // FM1: step() decrements cooldown at tick start BEFORE the fire gate, so the
+        // exposed cooldown subtracts that pending decrement — observe().own.cooldown
+        // == 0 IFF a fire submitted for this tick is honored. A raw-counter exposure
+        // breaks the contract (at raw cooldown 1 a fire still lands, decrementing to
+        // 0 first, yet raw != 0), so this pins the saturating_sub(1).
+        let rules = Rules::default();
+        let fc = rules.fire_cooldown;
+        let dmg = rules.damage;
+        let mut m = close_match(1);
+
+        // A fresh pawn reads fire-ready and its shot lands.
+        assert_eq!(m.observe(0).own.cooldown, 0, "a fresh pawn is fire-ready");
+        let start = m.observe(1).own.health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.observe(1).own.health, start - dmg, "the fresh shot lands");
+
+        // After firing, the exposed cooldown counts down fc-1, fc-2, ..., 1, 0 across
+        // the next fc observations, reaching 0 exactly on the re-eligible tick (the
+        // raw counter would read fc..1 and never 0 here). Hold each tick so the
+        // cooldown window is undisturbed.
+        let mut observed = Vec::new();
+        for _ in 0..fc {
+            observed.push(m.observe(0).own.cooldown);
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+        }
+        assert_eq!(
+            observed,
+            (0..fc).rev().collect::<Vec<u16>>(),
+            "exposed cooldown counts down to 0 on the re-eligible tick"
+        );
+
+        // The shot at exposed cooldown 0 lands (a fire one tick earlier, exposed > 0,
+        // was a no-op throughout the window above — the enemy took no damage).
+        assert_eq!(m.observe(0).own.cooldown, 0, "fire-ready after the window");
+        let before = m.observe(1).own.health;
+        assert_eq!(before, start - dmg, "no shot landed while exposed cooldown > 0");
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.observe(1).own.health, before - dmg, "the shot at cooldown==0 lands");
+    }
+
+    #[test]
     fn movement_is_clamped_to_the_arena_bounds() {
         // FM2: drive seat 1 outward every tick; it pins at the edge, never past.
         let bounds = Vec2 { x: 21 * POSITION_SCALE, y: 50 * POSITION_SCALE };
