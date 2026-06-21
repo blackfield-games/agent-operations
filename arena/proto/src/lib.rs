@@ -760,30 +760,170 @@ pub fn verify_join_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
+    use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
-    /// Ethereum-style address (0x-prefixed, lowercase) from a verifying key:
-    /// keccak256(uncompressed_pubkey[1..])[12..]. Same derivation as mesh/proto.
-    fn address_from_verifying_key(vk: &VerifyingKey) -> String {
-        let point = vk.to_encoded_point(false);
-        let hash = Keccak256::digest(&point.as_bytes()[1..]);
-        format!("0x{}", hex::encode(&hash[12..]))
+    /// Produce a hex `[r||s||v]` join signature, mirroring the agent SDK's signer.
+    fn sign_join(sk: &SigningKey, protocol_version: u32, agent_id: &str, nonce: &[u8]) -> String {
+        let digest = join_digest(protocol_version, agent_id, nonce);
+        let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let mut out = sig.to_bytes().to_vec();
+        out.push(recid.to_byte());
+        hex::encode(out)
+    }
+
+    fn dev_key() -> SigningKey {
+        let bytes =
+            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318").unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    /// A second, distinct dev key whose address differs from `dev_key`.
+    fn other_key() -> SigningKey {
+        let bytes =
+            hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    fn dev_address() -> String {
+        address_from_verifying_key(dev_key().verifying_key())
+    }
+
+    const CHAL: &[u8] = b"arena-challenge-nonce";
+
+    #[test]
+    fn verify_join_signature_accepts_the_signing_key() {
+        // The arena analogue of mesh's hello recovery: the agent signs join_digest
+        // with its session key and verify recovers exactly the claimed agent_id, so
+        // a ranked seat is tied to a held key.
+        let sk = dev_key();
+        let addr = dev_address();
+        let sig = sign_join(&sk, PROTOCOL_VERSION, &addr, CHAL);
+        assert_eq!(verify_join_signature(PROTOCOL_VERSION, &addr, CHAL, &sig), Ok(()));
     }
 
     #[test]
-    fn join_digest_sign_then_recover_yields_claimed_address() {
-        // The arena analogue of mesh's hello recovery: the agent signs
-        // join_digest with its session key and the Gateway must recover exactly
-        // the claimed agent_id (so a ranked seat is tied to a held key).
-        let key_bytes =
-            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318").unwrap();
-        let sk = SigningKey::from_slice(&key_bytes).unwrap();
-        let expected = address_from_verifying_key(sk.verifying_key());
+    fn verify_join_signature_rejects_a_forged_signer() {
+        // An attacker signs a Join *claiming* dev's address but with its own key.
+        // Recovery over the claimed-address digest yields the attacker's address,
+        // not dev's, so key possession fails — an identity can't be spoofed by
+        // someone who doesn't hold its key.
+        let forged = sign_join(&other_key(), PROTOCOL_VERSION, &dev_address(), CHAL);
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &dev_address(), CHAL, &forged),
+            Err(JoinVerifyError::AddressMismatch)
+        );
+    }
 
-        let digest = join_digest(PROTOCOL_VERSION, &expected, b"arena-challenge-nonce");
-        let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash_recoverable(&digest).unwrap();
-        let recovered = VerifyingKey::recover_from_prehash(&digest, &sig, recid).unwrap();
-        assert_eq!(address_from_verifying_key(&recovered), expected);
+    #[test]
+    fn verify_join_signature_rejects_a_replayed_challenge_nonce() {
+        // A signature captured over THIS connection's challenge, replayed against a
+        // different connection's challenge, recovers a different key and is rejected
+        // — the nonce binds the proof to one connection (anti-replay).
+        let sk = dev_key();
+        let addr = dev_address();
+        let sig = sign_join(&sk, PROTOCOL_VERSION, &addr, b"connection-A-nonce");
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &addr, b"connection-B-nonce", &sig),
+            Err(JoinVerifyError::AddressMismatch)
+        );
+        // Sanity: the same signature still verifies against its own challenge.
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &addr, b"connection-A-nonce", &sig),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn verify_join_signature_rejects_a_tampered_protocol_version() {
+        // A proof made under one protocol_version must not verify under another:
+        // the digest binds the version, so recovery over the verifier's version
+        // yields a different key. Prevents cross-version replay of an identity proof.
+        let sk = dev_key();
+        let addr = dev_address();
+        let sig = sign_join(&sk, PROTOCOL_VERSION + 1, &addr, CHAL);
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &addr, CHAL, &sig),
+            Err(JoinVerifyError::AddressMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_join_signature_rejects_a_tampered_agent_id() {
+        // A signature over agent A's digest, presented as a claim to agent B's
+        // identity, recovers A's key (≠ B), so the claim to B is rejected.
+        let sk = dev_key();
+        let signed_addr = dev_address();
+        let sig = sign_join(&sk, PROTOCOL_VERSION, &signed_addr, CHAL);
+        let other_addr = address_from_verifying_key(other_key().verifying_key());
+        assert_ne!(signed_addr, other_addr);
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &other_addr, CHAL, &sig),
+            Err(JoinVerifyError::AddressMismatch)
+        );
+    }
+
+    #[test]
+    fn verify_join_signature_rejects_malformed_encoding() {
+        let addr = dev_address();
+        // Non-hex (after the optional 0x strip).
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &addr, CHAL, "0xnothex"),
+            Err(JoinVerifyError::BadSignatureEncoding)
+        );
+        // Valid hex but the wrong length (64, not the required 65 bytes).
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &addr, CHAL, &"00".repeat(64)),
+            Err(JoinVerifyError::BadSignatureEncoding)
+        );
+    }
+
+    /// 256-bit big-endian `a - b` (a >= b) — flip a low-S signature to its
+    /// malleable high-S counterpart `s' = n - s` without pulling in scalar types.
+    fn be_sub(a: &[u8; 32], b: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let mut d = a[i] as i16 - b[i] as i16 - borrow;
+            if d < 0 {
+                d += 256;
+                borrow = 1;
+            } else {
+                borrow = 0;
+            }
+            out[i] = d as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn verify_join_signature_rejects_high_s() {
+        // secp256k1 group order n.
+        const N: [u8; 32] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C,
+            0xD0, 0x36, 0x41, 0x41,
+        ];
+        let sk = dev_key();
+        let addr = dev_address();
+        let low_hex = sign_join(&sk, PROTOCOL_VERSION, &addr, CHAL);
+        assert_eq!(verify_join_signature(PROTOCOL_VERSION, &addr, CHAL, &low_hex), Ok(()));
+
+        // Malleate to the high-S half (s' = n - s, r unchanged): a second valid
+        // encoding of the same proof, rejected so each join proof is canonical.
+        let raw = hex::decode(&low_hex).unwrap();
+        let s_high = be_sub(&N, &raw[32..64]);
+        let mut malleated = Vec::with_capacity(65);
+        malleated.extend_from_slice(&raw[0..32]);
+        malleated.extend_from_slice(&s_high);
+        malleated.push(raw[64]);
+        assert!(
+            Signature::from_slice(&malleated[..64]).unwrap().normalize_s().is_some(),
+            "constructed s must be the high-S half"
+        );
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &addr, CHAL, &hex::encode(&malleated)),
+            Err(JoinVerifyError::NonCanonicalSignature)
+        );
     }
 
     #[test]
