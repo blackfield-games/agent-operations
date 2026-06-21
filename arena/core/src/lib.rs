@@ -49,11 +49,44 @@ const OCTANTS: [(i32, i32); 8] = [
     (OCTANT_DIAG, -OCTANT_DIAG), // SE
 ];
 
-/// The Q12 unit vector for a facing, snapped to the nearest octant. The `+4096`
-/// is half an octant, so the division rounds to nearest rather than truncating.
+/// The octant index (`0..=7`, in [`OCTANTS`] order: E, NE, N, …) a [`Bam`] facing
+/// snaps to. `+4096` is half an octant, so the division rounds to nearest rather
+/// than truncating. Shared by [`octant_unit`] (the beam direction) and the FOV
+/// cone, so a seat's aim and its perception cone are quantized identically.
+fn octant_index(bam: Bam) -> usize {
+    ((((bam as u32) + 4096) >> 13) & 7) as usize
+}
+
+/// The Q12 unit vector for a facing, snapped to the nearest octant.
 fn octant_unit(bam: Bam) -> (i32, i32) {
-    let idx = (((bam as u32) + 4096) >> 13) & 7;
-    OCTANTS[idx as usize]
+    OCTANTS[octant_index(bam)]
+}
+
+/// The octant (an [`OCTANTS`] index) a bearing vector points into — the integer
+/// argmax of the dot product against the eight octant unit vectors, so a direction
+/// is classified into the same partition [`octant_index`] snaps a [`Bam`] into,
+/// with no trig. `i64` keeps the dot exact at any (operator-set) arena coordinate;
+/// ties resolve to the lower index (`>` is strict), a fixed, deterministic
+/// convention. A zero vector returns octant 0 — callers handle the no-bearing case.
+fn bearing_octant(dx: i64, dy: i64) -> usize {
+    let mut best = 0;
+    let mut best_dot = i64::MIN;
+    for (i, &(ox, oy)) in OCTANTS.iter().enumerate() {
+        let dot = dx * ox as i64 + dy * oy as i64;
+        if dot > best_dot {
+            best_dot = dot;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Circular distance between two octant indices on the 8-ring, `0..=4`: the min of
+/// the two ways round, so octants adjacent across the `0/7` seam are distance 1,
+/// not 7.
+fn circular_octant_distance(a: usize, b: usize) -> usize {
+    let diff = (a + 8 - b) % 8;
+    diff.min(8 - diff)
 }
 
 /// A deterministic SplitMix64 PRNG. Pure integer state so spawns (and any future
@@ -109,6 +142,14 @@ pub struct Rules {
     pub mag_size: u16,
     /// How far a seat can perceive another entity, in position units.
     pub perception_range: i32,
+    /// Forward field-of-view half-width as an octant spread (`0..=4`): an enemy in
+    /// `perception_range` is perceived only if its bearing is within this many
+    /// octants of the seat's facing. `4` (the default) is the full circle —
+    /// omnidirectional, byte-identical to range-only perception; `0` is the facing
+    /// octant alone (~45°). `serde(default)` resolves to `4` so a record written
+    /// before this field deserializes to the omnidirectional behavior it ran under.
+    #[serde(default = "full_circle_fov")]
+    pub fov_octant_spread: u8,
     /// Starting (and max) health.
     pub start_health: u16,
     /// Half-width of the spawn line; seats spread across `[-r, +r]` on the X axis.
@@ -118,6 +159,13 @@ pub struct Rules {
     /// Microseconds a seat has to answer an observation before the tick is
     /// forfeited on its behalf — carried on every [`Observation`].
     pub action_deadline_micros: u32,
+}
+
+/// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
+/// serialized before the field existed deserializes to the omnidirectional
+/// perception it actually ran under (not the narrowest cone `u8::default()` would give).
+fn full_circle_fov() -> u8 {
+    4
 }
 
 impl Default for Rules {
@@ -130,6 +178,7 @@ impl Default for Rules {
             fire_cooldown: 6,           // five shots/sec at 30 Hz
             mag_size: 30,
             perception_range: 40 * POSITION_SCALE,
+            fov_octant_spread: full_circle_fov(),
             start_health: 100,
             spawn_radius: 20 * POSITION_SCALE,
             spawn_jitter: 2 * POSITION_SCALE,
@@ -331,9 +380,11 @@ impl Match {
 
     /// Build the parity-bounded observation for one seat: its own pawn in full,
     /// plus only the entities it can perceive this tick (alive pawns within
-    /// `perception_range`, never itself), in ascending `entity_id` order so the
-    /// snapshot is canonical. The absence of any other field is the security
-    /// bound — there is no path here to full world state.
+    /// `perception_range` AND inside the seat's forward FOV cone
+    /// ([`Rules::fov_octant_spread`]; the default full circle imposes no angular
+    /// bound), never itself), in ascending `entity_id` order so the snapshot is
+    /// canonical. The absence of any other field is the security bound — there is
+    /// no path here to full world state.
     pub fn observe(&self, seat: SeatId) -> arena_proto::Observation {
         let me = self.pawn(seat);
         let mut visible: Vec<arena_proto::VisibleEntity> = self
@@ -341,6 +392,7 @@ impl Match {
             .iter()
             .filter(|p| p.seat != seat && p.alive)
             .filter(|p| within(me.pos, p.pos, self.rules.perception_range))
+            .filter(|p| in_fov(me.facing, me.pos, p.pos, self.rules.fov_octant_spread))
             .map(|p| arena_proto::VisibleEntity {
                 entity_id: p.seat as u32,
                 kind: arena_proto::EntityKind::Player,
@@ -1024,6 +1076,27 @@ fn within(a: Vec2, b: Vec2, range: i32) -> bool {
     let dy = b.y as i128 - a.y as i128;
     let r = range as i128;
     dx * dx + dy * dy <= r * r
+}
+
+/// `true` if `to` lies within the observer's forward field-of-view cone. The cone
+/// is the observer's facing octant plus `spread` octants to either side — the same
+/// 8-way quantization the beam uses — so `spread == 4` is the full circle (every
+/// octant is within 4 of the facing on the 8-ring: omnidirectional, the default
+/// that reproduces range-only perception byte-for-byte) and `spread == 0` is just
+/// the facing octant (~45°). A `to` co-located with the observer (zero bearing) is
+/// always in view. All integer: the bearing is classified by [`bearing_octant`]
+/// and compared by [`circular_octant_distance`], no trig — so a configured cone is
+/// as cross-platform-stable as the rest of the sim.
+fn in_fov(facing: Bam, from: Vec2, to: Vec2, spread: u8) -> bool {
+    if spread >= 4 {
+        return true;
+    }
+    let dx = to.x as i64 - from.x as i64;
+    let dy = to.y as i64 - from.y as i64;
+    if dx == 0 && dy == 0 {
+        return true;
+    }
+    circular_octant_distance(octant_index(facing), bearing_octant(dx, dy)) <= spread as usize
 }
 
 /// How a finished match resolves for on-chain settlement, derived from its
