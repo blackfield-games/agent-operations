@@ -2976,6 +2976,45 @@ mod tests {
     }
 
     #[test]
+    fn default_aim_is_octant_and_a_record_without_it_reads_octant() {
+        // FM1: the default is the original 8-way behavior, so every pre-finer-aim
+        // match and replay is byte-identical (the 75 existing combat/replay tests run
+        // under it unchanged). A Rules serialized before the field existed must
+        // deserialize to Octant — not whatever the enum's zero value happens to be.
+        assert_eq!(AimMode::default(), AimMode::Octant);
+        assert_eq!(Rules::default().aim_mode, AimMode::Octant);
+        let mut obj = serde_json::to_value(Rules::default()).unwrap();
+        obj.as_object_mut().unwrap().remove("aim_mode");
+        let back: Rules = serde_json::from_value(obj).unwrap();
+        assert_eq!(back.aim_mode, AimMode::Octant, "absent aim_mode defaults to Octant");
+    }
+
+    #[test]
+    fn fine_aim_lands_a_shot_the_octant_snap_missed() {
+        // The headline win, and the proof aim_mode is an outcome determinant: seat 0
+        // aims 11.25° — a 64-way direction that snaps to due East as an octant — at a
+        // target 11.25° off the East axis, ~20 m out. The octant beam points East and
+        // the target's ~3.9 m lateral offset exceeds the 1.5 m hit radius, so the shot
+        // misses; the finer beam points at the true aim, so the identical shot lands.
+        let aim: Bam = 2048; // 11.25°
+        assert_eq!(octant_index(aim), 0, "the aim snaps to the East octant");
+        let target = Vec2 { x: 19_617, y: 3_902 }; // on the fine index-2 ray, ~20 m, ~3.9 m off East
+
+        let fire_once = |mode: AimMode| {
+            let mut m = close_match(1);
+            m.rules.aim_mode = mode;
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[0].facing = aim;
+            m.pawns[1].pos = target;
+            let before = m.pawns[1].health;
+            m.resolve_fire(0);
+            before - m.pawns[1].health
+        };
+        assert_eq!(fire_once(AimMode::Octant), 0, "the octant snap misses the off-axis target");
+        assert_eq!(fire_once(AimMode::Fine), Rules::default().damage, "finer aim lands the shot the octant missed");
+    }
+
+    #[test]
     fn a_kill_ends_the_match_with_a_decisive_result() {
         let mut m = close_match(1);
         for _ in 0..200 {
