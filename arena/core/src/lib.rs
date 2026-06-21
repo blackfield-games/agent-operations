@@ -569,11 +569,20 @@ struct Pickup {
 ///
 /// Geometry only: combat tuning ([`Rules`]) stays a separate match input, so an
 /// arena's layout and its rules vary independently.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Its serde form is the data-driven arena map format ([`ArenaMap::from_json`]):
+/// `deny_unknown_fields` so an authoring typo (`blocker` for `blockers`) fails
+/// loudly instead of silently yielding an empty arena, and each field is
+/// `serde(default)` so a blockers-only or pickups-only map still loads (an absent
+/// array is empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArenaMap {
     /// Static vision occluders (see [`Blocker`]). Empty = no occlusion.
+    #[serde(default)]
     pub blockers: Vec<Blocker>,
     /// Collectible world-item spawns (see [`PickupSpawn`]). Empty = no items.
+    #[serde(default)]
     pub pickups: Vec<PickupSpawn>,
 }
 

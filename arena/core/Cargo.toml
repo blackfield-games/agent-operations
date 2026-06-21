@@ -8,6 +8,4 @@ arena-proto = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
 serde_json = { workspace = true }
