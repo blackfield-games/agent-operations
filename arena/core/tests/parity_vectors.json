@@ -35,7 +35,8 @@
         "pickup_respawn_cooldown": 300,
         "melee_range": 2000,
         "melee_damage": 50,
-        "melee_cooldown": 15
+        "melee_cooldown": 15,
+        "max_shield": 0
       },
       "roster": [
         {
@@ -139,7 +140,8 @@
         "pickup_respawn_cooldown": 300,
         "melee_range": 2000,
         "melee_damage": 50,
-        "melee_cooldown": 15
+        "melee_cooldown": 15,
+        "max_shield": 0
       },
       "roster": [
         {
@@ -598,7 +600,8 @@
           "pickup_respawn_cooldown": 300,
           "melee_range": 2000,
           "melee_damage": 50,
-          "melee_cooldown": 15
+          "melee_cooldown": 15,
+          "max_shield": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -676,7 +679,9 @@
             0,
             50,
             0,
-            15
+            15,
+            0,
+            0
           ],
           "config": {
             "tick_hz": 30,
@@ -752,7 +757,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "d9a3664d8ad5abc615fbfb26125434d51879cbb1c9dd1c3d5d760b805c6812d6"
+          "replay_hash": "5025f77d3743c6289621e15654e97b86518b1523be26de11cb918f0a5e437a57"
         }
       }
     },
@@ -789,7 +794,8 @@
           "pickup_respawn_cooldown": 300,
           "melee_range": 2000,
           "melee_damage": 50,
-          "melee_cooldown": 15
+          "melee_cooldown": 15,
+          "max_shield": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -867,7 +873,9 @@
             0,
             50,
             0,
-            15
+            15,
+            0,
+            0
           ],
           "config": {
             "tick_hz": 30,
@@ -943,7 +951,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "b61915c752e56401966e3bbed89e2de252739946025e8d574cd6729e0762dc57"
+          "replay_hash": "c991946ac8e281b0978a813b39d3f23c86f76e5f24d19cb753bd74d67f4f31f5"
         }
       }
     },
@@ -980,7 +988,8 @@
           "pickup_respawn_cooldown": 300,
           "melee_range": 2000,
           "melee_damage": 50,
-          "melee_cooldown": 15
+          "melee_cooldown": 15,
+          "max_shield": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1058,7 +1067,9 @@
             0,
             50,
             0,
-            15
+            15,
+            0,
+            0
           ],
           "config": {
             "tick_hz": 30,
@@ -1138,7 +1149,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "b4108cc65a8d985c72ca6fe750d255cf1f2a7dc445b222c6d9210d8d94ae3d6a"
+          "replay_hash": "99fec4ed52f501869dc7a79bef2981f90c4602db39c5178d97e462b83de640cc"
         }
       }
     },
@@ -1175,7 +1186,8 @@
           "pickup_respawn_cooldown": 300,
           "melee_range": 2000,
           "melee_damage": 50,
-          "melee_cooldown": 15
+          "melee_cooldown": 15,
+          "max_shield": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1262,7 +1274,9 @@
             0,
             50,
             0,
-            15
+            15,
+            0,
+            0
           ],
           "config": {
             "tick_hz": 30,
@@ -1338,7 +1352,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "3974bc40d049f389391693d753ad77641f78c790331ae2e1ba8277b441762834"
+          "replay_hash": "bde9b349f9c3fcef49e50b8cf791bf553ee26928e7a1f9c70169845fc8da2cde"
         }
       }
     }

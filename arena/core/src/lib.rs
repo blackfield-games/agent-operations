@@ -405,6 +405,14 @@ pub struct Rules {
     /// only rate gate). `serde(default)` (15 — a slower cadence than a ranged shot).
     #[serde(default = "default_melee_cooldown")]
     pub melee_cooldown: u16,
+    /// Cap on a pawn's damage-absorbing [`shield`](Pawn::shield) pool. A pawn starts
+    /// with `0` shield and earns it by collecting a [`PickupKind::Shield`], clamped to
+    /// this ceiling; incoming damage drains shield before health. `serde(default)`
+    /// (`0`) DISABLES shield — no pawn can hold any, so a match without it (the
+    /// default, and every pre-shield record) plays byte-identically. A non-zero value
+    /// turns shield pickups on.
+    #[serde(default)]
+    pub max_shield: u16,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -438,6 +446,7 @@ impl Default for Rules {
             melee_range: default_melee_range(),
             melee_damage: default_melee_damage(),
             melee_cooldown: default_melee_cooldown(),
+            max_shield: 0, // shield disabled by default — earned only when configured
         }
     }
 }
@@ -487,6 +496,7 @@ impl Rules {
         b.extend_from_slice(&self.melee_range.to_be_bytes());
         b.extend_from_slice(&self.melee_damage.to_be_bytes());
         b.extend_from_slice(&self.melee_cooldown.to_be_bytes());
+        b.extend_from_slice(&self.max_shield.to_be_bytes());
         b
     }
 }
@@ -4858,9 +4868,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 9×i32 + 1×u32 + 7×u16 + 4×u8 = 58 bytes. A new sim field added to the
+        // 9×i32 + 1×u32 + 8×u16 + 4×u8 = 60 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 58, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 60, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -4884,8 +4894,9 @@ mod tests {
             ("melee_range", Rules { melee_range: base.melee_range + 1, ..base }),
             ("melee_damage", Rules { melee_damage: base.melee_damage + 1, ..base }),
             ("melee_cooldown", Rules { melee_cooldown: base.melee_cooldown + 1, ..base }),
+            ("max_shield", Rules { max_shield: base.max_shield + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 21, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 22, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
