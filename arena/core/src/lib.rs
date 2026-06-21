@@ -5646,6 +5646,29 @@ mod tests {
     }
 
     #[test]
+    fn two_whole_teams_tied_on_score_both_take_first() {
+        // FM2 (the draw clause): two whole teams time out with one survivor each and
+        // an equal TOTAL score, so neither team out-ranks the other — both share
+        // first place (a draw the settlement layer reads as `settleDraw`). Team
+        // totals are equal (8 == 8) though no individual seat's score matches, so a
+        // per-seat rule would split them; by team they tie.
+        let mut m = Match::new(
+            MID.parse().unwrap(),
+            config(4),
+            Rules::default(),
+            four_seats_two_teams(),
+            Vec::new(),
+            1,
+        );
+        for (seat, alive, score) in [(0, true, 5), (1, false, 3), (2, true, 6), (3, false, 2)] {
+            m.pawns[seat].alive = alive;
+            m.pawns[seat].score = score;
+        }
+        let placements: Vec<u16> = m.outcomes().iter().map(|o| o.placement).collect();
+        assert_eq!(placements, vec![1, 1, 1, 1], "tied teams share first place");
+    }
+
+    #[test]
     fn a_2v2_ends_only_when_a_whole_team_is_down() {
         // FM2: the win condition keys on alive TEAMS, not alive players. Downing one
         // of team 1 leaves both teams represented, so the match stays Live with three
