@@ -322,14 +322,19 @@ impl Store {
              -- `job_id` NOT NULL for the same reason as pending_attestations above:
              -- the retention `NOT IN (... WHERE tx_hash IS NULL)` gate must read a
              -- NULL-free column or a NULL would stall every prune.
+             -- `dead_lettered_at` quarantines a debit the relayer hit a
+             -- non-retryable (Permanent) error on: still owed + auditable (NOT
+             -- deleted, tx_hash stays NULL so retention keeps it), but excluded
+             -- from the drainable backlog so one poison row never blocks the rest.
              CREATE TABLE IF NOT EXISTS pending_debits (
-                 job_id       TEXT PRIMARY KEY NOT NULL,
-                 buyer        TEXT NOT NULL,
-                 amount_wei   TEXT NOT NULL,
-                 job_id_b32   TEXT NOT NULL,
-                 created_at   INTEGER NOT NULL,
-                 submitted_at INTEGER,
-                 tx_hash      TEXT
+                 job_id          TEXT PRIMARY KEY NOT NULL,
+                 buyer           TEXT NOT NULL,
+                 amount_wei      TEXT NOT NULL,
+                 job_id_b32      TEXT NOT NULL,
+                 created_at      INTEGER NOT NULL,
+                 submitted_at    INTEGER,
+                 tx_hash         TEXT,
+                 dead_lettered_at INTEGER
              );",
         )?;
         // Migrate pre-existing DBs (created before the relayer's `uid` /
@@ -354,6 +359,14 @@ impl Store {
         ignore_duplicate_column(
             conn.execute("ALTER TABLE pending_debits ADD COLUMN tx_hash TEXT", []),
         )?;
+        // Migrate pre-existing DBs (created before the dead-letter quarantine). NULL
+        // on every existing row means "not dead-lettered", which is correct: nothing
+        // had been quarantined yet. Mirrors the submitted_at / tx_hash migrations
+        // above. Swallow only the duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_debits ADD COLUMN dead_lettered_at INTEGER",
+            [],
+        ))?;
         // Migrate pre-existing DBs (created before `started_at` was added). The
         // column already exists on a later boot, so we swallow only that one
         // error and let any other failure propagate.
