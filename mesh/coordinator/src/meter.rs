@@ -143,6 +143,10 @@ struct MockSpenderInner {
     transient_remaining: usize,
     /// Always fail with `Permanent`.
     permanent: bool,
+    /// Fail with `Permanent` ONLY for this specific `job_id` (others succeed) —
+    /// models one poison debit among many, so a test can pin that the drain
+    /// dead-letters it and still drains the rest.
+    permanent_for: Option<String>,
     /// Always fail with `NotAuthorized` (models an unauthorized spender key).
     not_authorized: bool,
     /// Always fail with `AlreadySpent` (models a debit already on-chain).
@@ -163,6 +167,7 @@ impl MockSpender {
             inner: Mutex::new(MockSpenderInner {
                 transient_remaining: 0,
                 permanent: false,
+                permanent_for: None,
                 not_authorized: false,
                 already_spent: false,
                 calls: 0,
@@ -171,6 +176,16 @@ impl MockSpender {
             started: None,
             release: None,
         }
+    }
+
+    /// Fail with `Permanent` only for `job_id` (every other debit succeeds) — a
+    /// single poison row, so a test can drain a backlog where one debit dead-letters
+    /// and the rest still settle in the same pass.
+    #[cfg(test)]
+    pub fn permanent_for(job_id: impl Into<String>) -> Self {
+        let mut m = Self::succeeding();
+        m.inner.get_mut().unwrap().permanent_for = Some(job_id.into());
+        m
     }
 
     /// Fail the first `n` spends with `Transient`, then succeed.
@@ -260,6 +275,9 @@ impl Spender for MockSpender {
         inner.calls += 1;
         if inner.permanent {
             return Err(SpendError::Permanent("mock permanent".into()));
+        }
+        if inner.permanent_for.as_deref() == Some(debit.job_id.as_str()) {
+            return Err(SpendError::Permanent("mock permanent (poison row)".into()));
         }
         if inner.not_authorized {
             return Err(SpendError::NotAuthorized);

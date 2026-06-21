@@ -4834,6 +4834,7 @@ mod tests {
         // First tick: the transient failure leaves the debit pending, not dropped.
         drain_debits(&state, &spender).await;
         assert_eq!(pending_debits(&state).await, 1, "transient failure is not terminal");
+        assert_eq!(dead_lettered_debits(&state).await, 0, "a transient failure is retried, never dead-lettered");
         assert_eq!(spender.calls(), 1);
         assert!(spender.spent().is_empty());
 
@@ -4879,9 +4880,70 @@ mod tests {
         assert!(spender.spent().is_empty(), "nothing spent on-chain");
     }
 
-    /// FM3: a `NotAuthorized` revert (the spender key isn't on
+    /// FM1: a poison debit at the HEAD of the backlog is dead-lettered AND the debit
+    /// behind it still drains in the SAME pass — head-of-line unblocking — while the
+    /// poison row is retained (surfaced as a dead-letter), never dropped.
+    #[tokio::test]
+    async fn drain_debits_dead_letters_the_head_and_drains_the_rest() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let poison = seed_job();
+        let good = seed_job();
+        settle_one_metered(&state, &poison).await; // settled first → claimed first (the head)
+        settle_one_metered(&state, &good).await;
+        assert_eq!(pending_debits(&state).await, 2);
+
+        let spender = MockSpender::permanent_for(eas::job_id_hex(&poison.id));
+        drain_debits(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 0, "the backlog drains past the poison head");
+        assert_eq!(dead_lettered_debits(&state).await, 1, "the poison is quarantined, not dropped");
+        assert_eq!(
+            spender.spent(),
+            vec![eas::job_id_hex(&good.id)],
+            "the debit behind the poison head still settles"
+        );
+        assert_eq!(spender.calls(), 2, "one Permanent on the head, one success on the rest");
+    }
+
+    /// FM3: a dead-lettered debit is never re-driven — a later drain pass does NOT
+    /// re-claim it (no double-submit) and re-marking it is a no-op (no double-mark).
+    /// Paired with `ComputeMeter.spendOnce`'s per-`jobId` fence, an operator replay
+    /// can never double-spend a quarantined charge.
+    #[tokio::test]
+    async fn drain_debits_does_not_redrive_a_dead_lettered_debit() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+
+        // First pass quarantines the poison.
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 1);
+        assert_eq!(pending_debits(&state).await, 0);
+
+        // Second pass with a spender that WOULD settle anything claimed: the
+        // dead-lettered row is not re-claimed, so nothing is spent and the quarantine
+        // is unchanged — no double-submit.
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender).await;
+        assert_eq!(spender.calls(), 0, "a dead-lettered debit is never re-claimed");
+        assert!(spender.spent().is_empty(), "no double-submit on re-drive");
+        assert_eq!(dead_lettered_debits(&state).await, 1, "still quarantined");
+        assert_eq!(pending_debits(&state).await, 0);
+
+        // Re-marking the same row is a no-op (the double guard), so an operator replay
+        // never double-marks.
+        let store = state.store.lock().await;
+        assert!(
+            !store.mark_debit_dead_lettered(&job.id, 123).unwrap(),
+            "re-marking an already-dead-lettered debit is a no-op"
+        );
+    }
+
+    /// FM3 (original): a `NotAuthorized` revert (the spender key isn't on
     /// `ComputeMeter.authorizedSpenders`) is a distinct, loud, non-retrying error —
-    /// the backlog stalls visibly rather than silently looping like progress.
+    /// the backlog stalls visibly rather than silently looping like progress. It is a
+    /// GLOBAL misconfig, so it is NEVER folded into the per-row dead-letter path
+    /// (quarantining it would silently dead-letter every debit on a one-call fix).
     #[tokio::test]
     async fn drain_debits_surfaces_not_authorized_without_dropping() {
         let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
@@ -4892,6 +4954,7 @@ mod tests {
         drain_debits(&state, &spender).await;
 
         assert_eq!(pending_debits(&state).await, 1, "unauthorized spender drops nothing");
+        assert_eq!(dead_lettered_debits(&state).await, 0, "a global misconfig is never per-row dead-lettered");
         assert_eq!(spender.calls(), 1, "no hot loop");
         assert!(spender.spent().is_empty());
     }
