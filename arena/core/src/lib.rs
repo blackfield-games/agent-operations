@@ -1126,7 +1126,7 @@ impl Match {
             let mut hit: Option<usize> = None;
             let mut best = i128::MAX;
             for (j, t) in self.pawns.iter().enumerate() {
-                if !t.alive || t.seat == proj.shooter || t.team == proj.team {
+                if !t.alive || t.seat == proj.shooter || (!self.rules.friendly_fire && t.team == proj.team) {
                     continue;
                 }
                 if !segment_hits_disc(from, to, t.pos, radius) {
@@ -1141,13 +1141,17 @@ impl Match {
                 }
             }
             if let Some(j) = hit {
+                let friendly = self.pawns[j].team == proj.team;
                 let dmg = self.rules.damage.min(self.pawns[j].health);
                 self.pawns[j].health -= dmg;
                 if self.pawns[j].health == 0 {
                     self.pawns[j].alive = false;
                 }
-                if let Some(sp) = self.pawns.iter_mut().find(|p| p.seat == proj.shooter) {
-                    sp.score += dmg as i32;
+                // A friendly hit deals damage but never scores — mirrors resolve_fire.
+                if !friendly {
+                    if let Some(sp) = self.pawns.iter_mut().find(|p| p.seat == proj.shooter) {
+                        sp.score += dmg as i32;
+                    }
                 }
                 continue; // consumed on hit
             }
