@@ -84,6 +84,17 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: agents/pyproject.toml
+      # The end-to-end match test drives the real arena-core through the
+      # arena-harness binary. Build it here and require it via ARENA_E2E_REQUIRED
+      # so the agent-vs-harness A2A path is exercised in CI instead of silently
+      # skipping (which would let a broken seam pass).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: arena
+      - name: build arena-harness
+        working-directory: arena
+        run: cargo build --locked -p arena-harness
       # Minimal install: what the runtime + tests actually import, plus ruff for
       # the lint gate. The heavy infra deps in pyproject (ray, usd-core,
       # temporalio) aren't exercised by the test suite, so we skip them to keep
@@ -91,3 +102,5 @@ jobs:
       - run: pip install langgraph pydantic anyio pytest pytest-asyncio ruff
       - run: ruff check .
       - run: python -m pytest -q
+        env:
+          ARENA_E2E_REQUIRED: "1"
