@@ -369,6 +369,14 @@ impl Match {
                 health: me.health,
                 max_health: me.max_health,
                 ammo: me.ammo,
+                // Report the fire cooldown as the NEXT action will see it. `step`
+                // decrements `cooldown` at tick start before the fire gate, so the
+                // raw value here is one ahead of what a fire submitted for this
+                // observation's tick faces: a raw `1` still fires (it decrements to
+                // `0` first). Subtracting that pending decrement makes the exposed
+                // value `0` exactly when a fire is honored, so the agent's predicate
+                // is the clean `cooldown == 0` with no off-by-one to model.
+                cooldown: me.cooldown.saturating_sub(1),
                 alive: me.alive,
             },
             visible,

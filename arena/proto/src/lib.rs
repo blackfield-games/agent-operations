@@ -186,9 +186,12 @@ pub enum EntityKind {
 }
 
 /// The receiving seat's OWN pawn state, in full. A controller always knows its
-/// own health, ammo, position and facing — this is the one place full internal
-/// state appears in an [`Observation`], and it is always the receiver's own, so
-/// it grants no perception advantage.
+/// own health, ammo, weapon cooldown, position and facing — this is the one place
+/// full internal state appears in an [`Observation`], and it is always the
+/// receiver's own, so it grants no perception advantage. The private-HUD fields
+/// here (`ammo`, `cooldown`) are the receiver's own and so appear ONLY in this
+/// type, never in a [`VisibleEntity`] or [`BroadcastEntity`] — reading another
+/// pawn's ammo or fire timing would be a tactical x-ray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfState {
     pub seat: SeatId,
@@ -203,6 +206,14 @@ pub struct SelfState {
     pub health: u16,
     pub max_health: u16,
     pub ammo: u16,
+    /// Ticks until this pawn may fire again, as the next action sees it: `0` means
+    /// a `fire` submitted for THIS observation's tick is honored (subject to
+    /// `ammo`). It already accounts for the start-of-tick cooldown decrement the
+    /// sim applies before resolving fire, so the fire-ready predicate is simply
+    /// `cooldown == 0` — the controller never has to model the off-by-one. The
+    /// HUD-equivalent of a human's "weapon ready" indicator, so an agent times its
+    /// shots on the same information a human player has.
+    pub cooldown: u16,
     pub alive: bool,
 }
 
@@ -1058,12 +1069,13 @@ mod tests {
             health: 100,
             max_health: 100,
             ammo: 30,
+            cooldown: 5,
             alive: true,
         };
         let json = serde_json::to_value(s).unwrap();
         assert_eq!(
             object_keys(&json),
-            ["alive", "ammo", "facing", "health", "max_health", "position", "seat", "team", "velocity", "z"],
+            ["alive", "ammo", "cooldown", "facing", "health", "max_health", "position", "seat", "team", "velocity", "z"],
             "SelfState gained or lost a field — the observable self-surface is a security contract"
         );
         for forbidden in ["enemies", "visible", "all_pawns", "rng_state", "world", "world_state"] {
@@ -1108,7 +1120,7 @@ mod tests {
                 "position": { "x": 0, "y": 0 }, "z": 0,
                 "facing": 16384,
                 "velocity": { "x": 0, "y": 0 },
-                "health": 100, "max_health": 100, "ammo": 30, "alive": true
+                "health": 100, "max_health": 100, "ammo": 30, "cooldown": 5, "alive": true
             },
             "visible": [{
                 "entity_id": 7, "kind": "player", "team": 2,
@@ -1524,6 +1536,7 @@ mod tests {
                 health: 100,
                 max_health: 100,
                 ammo: 30,
+                cooldown: 5,
                 alive: true,
             },
             visible: vec![VisibleEntity {
