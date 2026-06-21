@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use arena_core::{arena_map, Match, MatchRecord, ReplayError, Rules};
+use arena_core::{arena_map, Match, MatchRecord, ReplayError, Rules, SplitMix64};
 use arena_proto::{
     verify_join_signature, ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode,
     MatchPhase, MatchResult, SeatId, SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
@@ -220,6 +220,12 @@ pub struct MatchParams {
     /// rejects a smaller value rather than queue joins into a match that can never
     /// form or ends the instant it starts.
     pub seats_per_match: u8,
+    /// Seats per team. `1` (the default) is free-for-all — each seat its own team,
+    /// byte-identical to the pre-team formation. A larger value forms symmetric
+    /// teams (2 ⇒ 2v2, 3 ⇒ 3v3); it must divide `seats_per_match` into at least two
+    /// whole teams, which [`Matchmaker::new`] enforces. The sim never reads this —
+    /// it only sees the resulting `team` on each roster seat.
+    pub team_size: u8,
     pub tick_hz: u16,
     pub max_ticks: u64,
     pub bounds: Vec2,
@@ -236,6 +242,7 @@ impl Default for MatchParams {
     fn default() -> Self {
         Self {
             seats_per_match: 2,
+            team_size: 1,
             tick_hz: 30,
             max_ticks: 3600,
             bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
@@ -253,6 +260,41 @@ pub fn seed_for_match(match_id: Uuid) -> u64 {
     let hi = u64::from_be_bytes(b[0..8].try_into().expect("uuid is 16 bytes"));
     let lo = u64::from_be_bytes(b[8..16].try_into().expect("uuid is 16 bytes"));
     hi ^ lo
+}
+
+/// Domain separator folded into the match seed for team assignment, so the team
+/// shuffle and the spawn draws (both seeded from the same id) don't share a PRNG
+/// sequence. Any fixed non-zero constant works; this one spells "team_v01".
+const TEAM_ASSIGN_DOMAIN: u64 = 0x7465_616d_5f76_3031;
+
+/// Assign each of `seats` seats to one of `seats / team_size` teams — balanced
+/// (exactly `team_size` seats per team) and reproducible from `match_id` alone,
+/// the team analogue of [`seed_for_match`]. `team_size == 1` is free-for-all: each
+/// seat is its own team (`team == seat`), the byte-identical default (the replay
+/// digest folds each seat's team, so a reshuffle here would shift every existing
+/// hash for no gameplay gain on singleton teams). For `team_size > 1` a balanced
+/// team-label multiset `[0,0,…,1,1,…]` is Fisher-Yates-shuffled by a [`SplitMix64`]
+/// seeded from the match id, so the assignment is balanced by construction, cannot
+/// be steered by queue arrival order, yet replays identically from the id.
+///
+/// Caller guarantees (via [`Matchmaker::new`]) that `team_size >= 1` and divides
+/// `seats` into at least two whole teams.
+fn assign_teams(match_id: Uuid, seats: usize, team_size: usize) -> Vec<TeamId> {
+    if team_size <= 1 {
+        return (0..seats).map(|i| i as TeamId).collect();
+    }
+    let num_teams = seats / team_size;
+    let mut labels: Vec<TeamId> =
+        (0..num_teams).flat_map(|t| std::iter::repeat_n(t as TeamId, team_size)).collect();
+    let mut rng = SplitMix64::new(seed_for_match(match_id) ^ TEAM_ASSIGN_DOMAIN);
+    // Fisher-Yates over the balanced labels: a permutation preserves the per-team
+    // counts, so the result stays exactly `team_size` seats per team. The small
+    // modulo bias is immaterial — balance is structural, not statistical.
+    for i in (1..labels.len()).rev() {
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        labels.swap(i, j);
+    }
+    labels
 }
 
 /// One admitted participant waiting for a seat. The token is gone by here — it
@@ -306,6 +348,22 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             params.seats_per_match >= 2,
             "a match needs at least 2 seats, got {}",
             params.seats_per_match
+        );
+        assert!(params.team_size >= 1, "team_size must be at least 1, got 0");
+        assert!(
+            params.seats_per_match.is_multiple_of(params.team_size),
+            "seats_per_match ({}) must divide evenly into teams of team_size ({})",
+            params.seats_per_match,
+            params.team_size
+        );
+        // The same single-team reason as seats_per_match >= 2: a roster that forms
+        // one team ends on its first tick, so a match needs at least two teams.
+        assert!(
+            params.seats_per_match / params.team_size >= 2,
+            "a match needs at least 2 teams, got {} (seats {} / team_size {})",
+            params.seats_per_match / params.team_size,
+            params.seats_per_match,
+            params.team_size
         );
         Self { queues: Mutex::new(Queues::default()), verifier, params }
     }
@@ -367,18 +425,20 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     }
 
     /// Build the arena-02 match from a formed roster: seat the participants in
-    /// arrival order, each its own team (a free-for-all, so the match doesn't
-    /// end the instant it starts), and seed it from the freshly minted match id.
+    /// arrival order, assign them to balanced teams derived from the freshly minted
+    /// match id (free-for-all when `team_size == 1`, so the match doesn't end the
+    /// instant it starts), and seed the sim from that same id.
     fn build(&self, mode: MatchMode, roster: Vec<Seated>) -> Match {
         // The mode's composition is guaranteed by selection; assert it before the
         // match starts so a selection bug fails loud rather than starting a match
         // that defeats its own mode (e.g. an all-human "Mixed" match).
         assert!(composition_ok(mode, &roster), "formed a {mode:?} match with an invalid composition");
         let match_id = Uuid::new_v4();
+        let teams = assign_teams(match_id, roster.len(), self.params.team_size as usize);
         let seats: Vec<SeatInfo> = roster
             .iter()
             .enumerate()
-            .map(|(i, s)| SeatInfo { seat: i as SeatId, team: i as TeamId, controller: s.agent_id.clone() })
+            .map(|(i, s)| SeatInfo { seat: i as SeatId, team: teams[i], controller: s.agent_id.clone() })
             .collect();
         let config = MatchConfig {
             tick_hz: self.params.tick_hz,
