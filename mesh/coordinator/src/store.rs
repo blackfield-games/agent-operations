@@ -219,6 +219,37 @@ impl Store {
         Ok(plan)
     }
 
+    /// Test-only: the EXPLAIN QUERY PLAN for the ACTUAL `prune_terminal_jobs`
+    /// candidate SELECT (byte-for-byte), so a test can assert the aged-terminal scan
+    /// is served by `idx_jobs_status_created_at` as a range over only the terminal
+    /// rows past the cutoff — never a full `SCAN jobs` over the very history the
+    /// retention sweep exists to bound (FM1: creation alone doesn't imply use), and
+    /// with no `USE TEMP B-TREE` (the `LIMIT batch` needs no global sort). The bind
+    /// values are placeholders: EXPLAIN plans the statement, it does not delete.
+    #[cfg(test)]
+    pub fn prune_terminal_query_plan(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM jobs
+             WHERE status IN (?1, ?2)
+               AND created_at IS NOT NULL
+               AND created_at <= ?3
+               AND id NOT IN (SELECT job_id FROM pending_attestations WHERE uid IS NULL)
+               AND id NOT IN (SELECT job_id FROM pending_debits WHERE tx_hash IS NULL)
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![STATUS_DONE, STATUS_FAILED, 0i64, 1i64],
+            |r| r.get::<_, String>(3),
+        )?;
+        let mut plan = String::new();
+        for row in rows {
+            plan.push_str(&row?);
+            plan.push('\n');
+        }
+        Ok(plan)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (

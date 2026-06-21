@@ -10547,6 +10547,273 @@ mod tests {
         );
     }
 
+    // ---- retention sweep (prune_terminal_jobs) ----
+
+    /// A terminal job older than the horizon is pruned; one inside the window is
+    /// retained — retention is a sliding window, not a wipe (FM4).
+    #[test]
+    fn retention_prunes_aged_terminal_jobs_and_keeps_recent_ones() {
+        let mut store = Store::open_in_memory().unwrap();
+        let horizon = 1000;
+        let now = now_secs();
+
+        let old = job_with_deadline(60);
+        store.enqueue(&old).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert!(store.requeue(&old, 1).unwrap(), "dead-lettered to failed");
+        store.set_created_at(&old.id, now - horizon - 1).unwrap();
+
+        let fresh = job_with_deadline(60);
+        store.enqueue(&fresh).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert!(store.requeue(&fresh, 1).unwrap());
+        store.set_created_at(&fresh.id, now).unwrap();
+
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 256).unwrap(), 1);
+        assert_eq!(store.job_status(&old.id).unwrap(), None, "aged job deleted");
+        assert_eq!(
+            store.job_status(&fresh.id).unwrap().as_deref(),
+            Some("failed"),
+            "recent terminal job retained"
+        );
+    }
+
+    /// The horizon boundary is inclusive (`created_at <= now - horizon`): a job
+    /// exactly at the cutoff prunes, one a second newer is retained.
+    #[test]
+    fn retention_horizon_boundary_is_inclusive() {
+        let mut store = Store::open_in_memory().unwrap();
+        let horizon = 1000;
+        let now = now_secs();
+
+        let at = job_with_deadline(60);
+        store.enqueue(&at).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert!(store.requeue(&at, 1).unwrap());
+        store.set_created_at(&at.id, now - horizon).unwrap(); // exactly at cutoff
+
+        let inside = job_with_deadline(60);
+        store.enqueue(&inside).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert!(store.requeue(&inside, 1).unwrap());
+        store.set_created_at(&inside.id, now - horizon + 1).unwrap(); // one second newer
+
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 256).unwrap(), 1);
+        assert_eq!(store.job_status(&at.id).unwrap(), None, "at-cutoff pruned");
+        assert_eq!(
+            store.job_status(&inside.id).unwrap().as_deref(),
+            Some("failed"),
+            "one second inside the window retained"
+        );
+    }
+
+    /// FM1: an aged DONE job is kept while its EAS receipt is still pending
+    /// (`uid IS NULL`); once relayed it prunes, taking its result + attestation rows
+    /// with it (no orphan).
+    #[test]
+    fn retention_keeps_a_done_job_until_its_attestation_is_relayed() {
+        let mut store = Store::open_in_memory().unwrap();
+        let horizon = 1000;
+        let now = now_secs();
+
+        let job = seed_job();
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert!(store.record_completed(&signed_result(job.id, "r")).unwrap());
+        store.set_created_at(&job.id, now - horizon - 1).unwrap();
+
+        assert_eq!(
+            store.prune_terminal_jobs(now, horizon, 256).unwrap(),
+            0,
+            "pending attestation retains the aged done job"
+        );
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("done"));
+
+        assert!(store.mark_submitted(&job.id, "uid-1", now).unwrap());
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 256).unwrap(), 1);
+        assert_eq!(store.job_status(&job.id).unwrap(), None);
+        assert!(
+            store.get_result(&job.id).unwrap().is_none(),
+            "result row deleted with the job"
+        );
+        assert!(
+            store.pending_attestation(&job.id).unwrap().is_none(),
+            "attestation row deleted with the job"
+        );
+    }
+
+    /// FM1: a metered DONE job is kept while its ComputeMeter debit is still pending
+    /// (`tx_hash IS NULL`) even after its attestation has been relayed; only once
+    /// BOTH on-chain obligations are discharged does it prune.
+    #[test]
+    fn retention_keeps_a_done_job_until_its_debit_is_relayed() {
+        let rate = 1_000_000_000_000u128;
+        let mut store = Store::open_in_memory().unwrap().with_compute_rate_wei(rate);
+        let horizon = 1000;
+        let now = now_secs();
+
+        let job = seed_job();
+        assert!(store.enqueue_within_cap(&job, 100, Some(TEST_BUYER)).unwrap());
+        store.take_next(|_| true).unwrap();
+        assert!(store.record_completed(&signed_result(job.id, "r")).unwrap());
+        store.set_created_at(&job.id, now - horizon - 1).unwrap();
+
+        // Relay the attestation but leave the debit pending — the unspent charge
+        // still keeps the record.
+        assert!(store.mark_submitted(&job.id, "uid-1", now).unwrap());
+        assert_eq!(
+            store.prune_terminal_jobs(now, horizon, 256).unwrap(),
+            0,
+            "pending debit retains the job"
+        );
+        assert_eq!(store.job_status(&job.id).unwrap().as_deref(), Some("done"));
+
+        assert!(store.mark_debit_submitted(&job.id, "0xtx", now).unwrap());
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 256).unwrap(), 1);
+        assert!(
+            store.pending_debit(&job.id).unwrap().is_none(),
+            "debit row deleted with the job"
+        );
+    }
+
+    /// Retention NEVER deletes live work: an aged `queued` or `in_flight` job is
+    /// the reapers' domain, not the retention sweep's.
+    #[test]
+    fn retention_only_deletes_terminal_jobs() {
+        let mut store = Store::open_in_memory().unwrap();
+        let horizon = 1000;
+        let now = now_secs();
+
+        let in_flight = job_with_deadline(60);
+        store.enqueue(&in_flight).unwrap();
+        store.take_next(|_| true).unwrap();
+        store.set_created_at(&in_flight.id, now - horizon - 1).unwrap();
+
+        let queued = job_with_deadline(60);
+        store.enqueue(&queued).unwrap();
+        store.set_created_at(&queued.id, now - horizon - 1).unwrap();
+
+        assert_eq!(
+            store.prune_terminal_jobs(now, horizon, 256).unwrap(),
+            0,
+            "live work is never pruned by retention"
+        );
+        assert_eq!(
+            store.job_status(&queued.id).unwrap().as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            store.job_status(&in_flight.id).unwrap().as_deref(),
+            Some("in_flight")
+        );
+    }
+
+    /// FM2: each call prunes at most `batch` jobs, so the reaper holds the store
+    /// lock for a bounded delete; the rest drains on the next call.
+    #[test]
+    fn retention_batch_bounds_deletions_per_call() {
+        let mut store = Store::open_in_memory().unwrap();
+        let horizon = 1000;
+        let now = now_secs();
+
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            let j = job_with_deadline(60);
+            store.enqueue(&j).unwrap();
+            store.take_next(|_| true).unwrap();
+            assert!(store.requeue(&j, 1).unwrap());
+            store.set_created_at(&j.id, now - horizon - 1).unwrap();
+            ids.push(j.id);
+        }
+
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 2).unwrap(), 2);
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 2).unwrap(), 2);
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 2).unwrap(), 1);
+        assert_eq!(
+            store.prune_terminal_jobs(now, horizon, 2).unwrap(),
+            0,
+            "backlog drained"
+        );
+        for id in ids {
+            assert_eq!(store.job_status(&id).unwrap(), None);
+        }
+    }
+
+    /// The nextAction's "/stats totals still correct": after a prune the lifetime
+    /// counts drop CONSISTENTLY — the results row goes with its done job, so
+    /// `completed_count` (results) never outlives the job it counted.
+    #[test]
+    fn retention_prune_keeps_stats_counts_consistent() {
+        let mut store = Store::open_in_memory().unwrap();
+        let horizon = 1000;
+        let now = now_secs();
+
+        let done = seed_job();
+        store.enqueue(&done).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert!(store.record_completed(&signed_result(done.id, "r")).unwrap());
+        assert!(store.mark_submitted(&done.id, "uid", now).unwrap());
+        store.set_created_at(&done.id, now - horizon - 1).unwrap();
+
+        let failed = job_with_deadline(60);
+        store.enqueue(&failed).unwrap();
+        store.take_next(|_| true).unwrap();
+        assert!(store.requeue(&failed, 1).unwrap());
+        store.set_created_at(&failed.id, now - horizon - 1).unwrap();
+
+        assert_eq!(store.completed_count().unwrap(), 1);
+        assert_eq!(store.failed_count().unwrap(), 1);
+        assert_eq!(store.total_render_seconds().unwrap(), 1);
+
+        assert_eq!(store.prune_terminal_jobs(now, horizon, 256).unwrap(), 2);
+
+        assert_eq!(
+            store.completed_count().unwrap(),
+            0,
+            "results row pruned with the done job — no orphan inflating the count"
+        );
+        assert_eq!(store.failed_count().unwrap(), 0);
+        assert_eq!(
+            store.total_render_seconds().unwrap(),
+            0,
+            "render-seconds drop with the pruned results"
+        );
+    }
+
+    /// FM1-class: the prune candidate scan is served by the (status, created_at)
+    /// index over only the aged terminal rows — never a full `SCAN jobs` over the
+    /// history it exists to bound, and with no temp-b-tree sort.
+    #[test]
+    fn retention_query_plan_uses_the_index() {
+        let store = Store::open_in_memory().unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+        let plan = store.prune_terminal_query_plan().unwrap();
+        assert!(
+            plan.contains("idx_jobs_status_created_at"),
+            "prune candidate scan must use the index, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN jobs"),
+            "prune candidate scan must not full-scan jobs, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE"),
+            "prune candidate scan needs no global sort (LIMIT batch), got plan: {plan}"
+        );
+    }
+
+    /// FM3: a zero retention horizon is rejected at construction — it would set the
+    /// cutoff to `now` and delete every terminal record on the first sweep.
+    #[test]
+    fn store_config_rejects_zero_retention_secs() {
+        let r = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            StoreConfig { retention_secs: 0, ..test_config() },
+        );
+        assert!(r.is_err(), "zero retention_secs must be rejected at construction");
+    }
+
     // ---- FIFO dispatch fairness (oldest-queued-first) ----
 
     /// Dispatch is oldest-first: two jobs enqueued in sequence are handed out in
