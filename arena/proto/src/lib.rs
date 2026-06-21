@@ -527,6 +527,38 @@ pub struct Blocker {
     pub max: Vec2,
 }
 
+/// What a collectible world pickup grants the pawn that reaches it. The reference
+/// core caps every effect to the pawn's own ceiling (a heal never exceeds
+/// `max_health`, an ammo refill never exceeds the magazine), so a pickup is always
+/// a non-overflowing, server-authoritative effect. The sub-kind is a server-side
+/// match determinant; the parity-bounded [`VisibleEntity`] a perceiver sees carries
+/// only [`EntityKind::Pickup`], not this — an agent learns a pickup's effect by
+/// collecting it, the same empirical posture as the weapon model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickupKind {
+    /// Heals the collector, clamped to `max_health`.
+    Health,
+    /// Refills the collector's ammo, clamped to the magazine size.
+    Ammo,
+}
+
+/// One configured pickup spawn point — a static match determinant (the producer
+/// authors the world's items, never an agent). It is `(kind, position, amount)`;
+/// the live collectible/dormant STATE is derived from this plus the action stream
+/// and never recorded, so the replay re-runs it bit-for-bit. Bound into the
+/// [`ReplayRecord`] and committed by [`digest`](ReplayRecord::digest), so a tampered
+/// item layout yields a different hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickupSpawn {
+    pub kind: PickupKind,
+    /// Where the pickup sits (and respawns), in position units (see [`POSITION_SCALE`]).
+    pub position: Vec2,
+    /// The effect magnitude — health restored, or ammo refilled — clamped to the
+    /// pawn's ceiling at collection so it never overflows.
+    pub amount: u16,
+}
+
 /// The full deterministic record of a match — the PRNG seed, the roster, the
 /// static vision blockers, and the ordered per-tick accepted-action stream —
 /// sufficient to re-run the match bit-for-bit and reproduce its [`MatchResult`].
