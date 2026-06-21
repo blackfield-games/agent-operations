@@ -1585,6 +1585,10 @@ impl Match {
                         let max = self.rules.mag_size;
                         self.pawns[i].ammo = self.pawns[i].ammo.saturating_add(pk.amount).min(max);
                     }
+                    PickupKind::Shield => {
+                        let max = self.rules.max_shield;
+                        self.pawns[i].shield = self.pawns[i].shield.saturating_add(pk.amount).min(max);
+                    }
                 }
                 pk.active = false;
                 pk.respawn_in = cooldown;

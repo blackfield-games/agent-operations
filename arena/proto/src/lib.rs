@@ -555,6 +555,9 @@ pub enum PickupKind {
     Health,
     /// Refills the collector's ammo, clamped to the magazine size.
     Ammo,
+    /// Adds to the collector's damage-absorbing shield pool, clamped to the match's
+    /// shield cap. Shield drains before health, so it is the staple armor pickup.
+    Shield,
 }
 
 /// One configured pickup spawn point — a static match determinant (the producer
@@ -680,6 +683,7 @@ impl ReplayRecord {
             h.update([match p.kind {
                 PickupKind::Health => 0u8,
                 PickupKind::Ammo => 1u8,
+                PickupKind::Shield => 2u8,
             }]);
             h.update(p.position.x.to_be_bytes());
             h.update(p.position.y.to_be_bytes());
@@ -1540,10 +1544,18 @@ mod tests {
         r.pickups.push(PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: 5, y: 6 }, amount: 25 });
         let with_pickup = r.digest();
         assert_ne!(base, with_pickup, "a pickup must bind");
-        // Its kind, position, and amount each bind.
+        // Its kind, position, and amount each bind — and the three kind bytes
+        // (Health=0/Ammo=1/Shield=2) are pairwise distinct, so the digest tells one
+        // item type from another (the wire mapping the twin must reproduce).
         let mut r2 = r.clone();
         r2.pickups[0].kind = PickupKind::Ammo;
-        assert_ne!(with_pickup, r2.digest(), "a pickup's kind must bind");
+        let with_ammo = r2.digest();
+        assert_ne!(with_pickup, with_ammo, "a pickup's kind must bind (Health vs Ammo)");
+        let mut r2 = r.clone();
+        r2.pickups[0].kind = PickupKind::Shield;
+        let with_shield = r2.digest();
+        assert_ne!(with_pickup, with_shield, "a Shield pickup hashes apart from Health");
+        assert_ne!(with_ammo, with_shield, "a Shield pickup hashes apart from Ammo");
         let mut r2 = r.clone();
         r2.pickups[0].position.x += 1;
         assert_ne!(with_pickup, r2.digest(), "a pickup's position must bind");
