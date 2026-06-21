@@ -1,0 +1,678 @@
+{
+  "domain": "blackfield/arena/parity-vectors/v1",
+  "protocol_version": 1,
+  "spawns": [
+    {
+      "label": "four_seats_jittered",
+      "seed": 1311768467463790320,
+      "config": {
+        "tick_hz": 30,
+        "max_ticks": 3600,
+        "bounds": {
+          "x": 50000,
+          "y": 50000
+        },
+        "seats": 4
+      },
+      "rules": {
+        "max_speed": 200,
+        "weapon_range": 30000,
+        "hit_radius": 1500,
+        "weapon_mode": "hitscan",
+        "projectile_speed": 2000,
+        "aim_mode": "octant",
+        "damage": 25,
+        "fire_cooldown": 6,
+        "mag_size": 30,
+        "perception_range": 40000,
+        "fov_octant_spread": 4,
+        "start_health": 100,
+        "spawn_radius": 20000,
+        "spawn_jitter": 2000,
+        "action_deadline_micros": 50000
+      },
+      "roster": [
+        {
+          "seat": 0,
+          "team": 0,
+          "controller": "0x00"
+        },
+        {
+          "seat": 1,
+          "team": 1,
+          "controller": "0x01"
+        },
+        {
+          "seat": 2,
+          "team": 2,
+          "controller": "0x02"
+        },
+        {
+          "seat": 3,
+          "team": 3,
+          "controller": "0x03"
+        }
+      ],
+      "spawns": [
+        {
+          "seat": 0,
+          "team": 0,
+          "position": {
+            "x": -18522,
+            "y": -764
+          },
+          "facing": 0,
+          "health": 100,
+          "ammo": 30
+        },
+        {
+          "seat": 1,
+          "team": 1,
+          "position": {
+            "x": -5856,
+            "y": -996
+          },
+          "facing": 0,
+          "health": 100,
+          "ammo": 30
+        },
+        {
+          "seat": 2,
+          "team": 2,
+          "position": {
+            "x": 6193,
+            "y": 597
+          },
+          "facing": 32768,
+          "health": 100,
+          "ammo": 30
+        },
+        {
+          "seat": 3,
+          "team": 3,
+          "position": {
+            "x": 19399,
+            "y": 1680
+          },
+          "facing": 32768,
+          "health": 100,
+          "ammo": 30
+        }
+      ]
+    },
+    {
+      "label": "single_seat_centred",
+      "seed": 7,
+      "config": {
+        "tick_hz": 30,
+        "max_ticks": 3600,
+        "bounds": {
+          "x": 50000,
+          "y": 50000
+        },
+        "seats": 1
+      },
+      "rules": {
+        "max_speed": 200,
+        "weapon_range": 30000,
+        "hit_radius": 1500,
+        "weapon_mode": "hitscan",
+        "projectile_speed": 2000,
+        "aim_mode": "octant",
+        "damage": 25,
+        "fire_cooldown": 6,
+        "mag_size": 30,
+        "perception_range": 40000,
+        "fov_octant_spread": 4,
+        "start_health": 100,
+        "spawn_radius": 20000,
+        "spawn_jitter": 2000,
+        "action_deadline_micros": 50000
+      },
+      "roster": [
+        {
+          "seat": 0,
+          "team": 0,
+          "controller": "0x00"
+        }
+      ],
+      "spawns": [
+        {
+          "seat": 0,
+          "team": 0,
+          "position": {
+            "x": 758,
+            "y": 1166
+          },
+          "facing": 32768,
+          "health": 100,
+          "ammo": 30
+        }
+      ]
+    }
+  ],
+  "perception": [
+    {
+      "label": "range_cone_los_edges",
+      "observer_position": {
+        "x": 0,
+        "y": 0
+      },
+      "observer_facing": 0,
+      "perception_range": 30000,
+      "fov_octant_spread": 1,
+      "blockers": [
+        {
+          "min": {
+            "x": 8000,
+            "y": 800
+          },
+          "max": {
+            "x": 12000,
+            "y": 2200
+          }
+        }
+      ],
+      "candidates": [
+        {
+          "seat": 1,
+          "team": 1,
+          "position": {
+            "x": 20000,
+            "y": -3000
+          },
+          "alive": true,
+          "verdict": "visible"
+        },
+        {
+          "seat": 2,
+          "team": 2,
+          "position": {
+            "x": -20000,
+            "y": 0
+          },
+          "alive": true,
+          "verdict": "out_of_cone"
+        },
+        {
+          "seat": 3,
+          "team": 3,
+          "position": {
+            "x": 40000,
+            "y": 0
+          },
+          "alive": true,
+          "verdict": "out_of_range"
+        },
+        {
+          "seat": 4,
+          "team": 4,
+          "position": {
+            "x": 20000,
+            "y": 3000
+          },
+          "alive": true,
+          "verdict": "occluded"
+        }
+      ],
+      "visible": [
+        1
+      ]
+    }
+  ],
+  "hits": [
+    {
+      "label": "dead_on_octant",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 10000,
+        "y": 0
+      },
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "aim_mode": "octant",
+      "damage": 25
+    },
+    {
+      "label": "dead_on_fine",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 10000,
+        "y": 0
+      },
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "aim_mode": "fine",
+      "damage": 25
+    },
+    {
+      "label": "sub_octant_octant_misses",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 2048,
+      "target_position": {
+        "x": 19617,
+        "y": 3902
+      },
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "aim_mode": "octant",
+      "damage": 0
+    },
+    {
+      "label": "sub_octant_fine_hits",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 2048,
+      "target_position": {
+        "x": 19617,
+        "y": 3902
+      },
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "aim_mode": "fine",
+      "damage": 25
+    }
+  ],
+  "projectiles": [
+    {
+      "label": "fast_sweep_no_tunnel",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 5000,
+        "y": 0
+      },
+      "projectile_speed": 20000,
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "ticks_to_hit": 1,
+      "damage": 25,
+      "target_downed": false
+    },
+    {
+      "label": "off_line_clean_miss",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 0,
+        "y": 5000
+      },
+      "projectile_speed": 2000,
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "ticks_to_hit": null,
+      "damage": 0,
+      "target_downed": false
+    }
+  ],
+  "matches": [
+    {
+      "label": "octant_hitscan",
+      "record": {
+        "config": {
+          "tick_hz": 30,
+          "max_ticks": 3600,
+          "bounds": {
+            "x": 50000,
+            "y": 50000
+          },
+          "seats": 2
+        },
+        "rules": {
+          "max_speed": 200,
+          "weapon_range": 30000,
+          "hit_radius": 1500,
+          "weapon_mode": "hitscan",
+          "projectile_speed": 2000,
+          "aim_mode": "octant",
+          "damage": 100,
+          "fire_cooldown": 6,
+          "mag_size": 30,
+          "perception_range": 40000,
+          "fov_octant_spread": 4,
+          "start_health": 100,
+          "spawn_radius": 2000,
+          "spawn_jitter": 0,
+          "action_deadline_micros": 50000
+        },
+        "replay": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "seed": 72623859790382856,
+          "seats": [
+            {
+              "seat": 0,
+              "team": 0,
+              "controller": "0x00"
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "controller": "0x01"
+            }
+          ],
+          "blockers": [],
+          "ticks": [
+            {
+              "tick": 0,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 1000,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": false,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "tick": 1,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 0,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": true,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "result": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "final_tick": 2,
+          "outcomes": [
+            {
+              "seat": 0,
+              "team": 0,
+              "placement": 1,
+              "score": 100,
+              "alive_at_end": true
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "placement": 2,
+              "score": 0,
+              "alive_at_end": false
+            }
+          ],
+          "replay_hash": "678f002b2784ecf524c8d71498e968f023ea1a44b1efaf8b30508dc0bcd66a17"
+        }
+      }
+    },
+    {
+      "label": "fine_hitscan",
+      "record": {
+        "config": {
+          "tick_hz": 30,
+          "max_ticks": 3600,
+          "bounds": {
+            "x": 50000,
+            "y": 50000
+          },
+          "seats": 2
+        },
+        "rules": {
+          "max_speed": 200,
+          "weapon_range": 30000,
+          "hit_radius": 1500,
+          "weapon_mode": "hitscan",
+          "projectile_speed": 2000,
+          "aim_mode": "fine",
+          "damage": 100,
+          "fire_cooldown": 6,
+          "mag_size": 30,
+          "perception_range": 40000,
+          "fov_octant_spread": 4,
+          "start_health": 100,
+          "spawn_radius": 2000,
+          "spawn_jitter": 0,
+          "action_deadline_micros": 50000
+        },
+        "replay": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "seed": 72623859790382856,
+          "seats": [
+            {
+              "seat": 0,
+              "team": 0,
+              "controller": "0x00"
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "controller": "0x01"
+            }
+          ],
+          "blockers": [],
+          "ticks": [
+            {
+              "tick": 0,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 1000,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": false,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "tick": 1,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 0,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": true,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "result": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "final_tick": 2,
+          "outcomes": [
+            {
+              "seat": 0,
+              "team": 0,
+              "placement": 1,
+              "score": 100,
+              "alive_at_end": true
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "placement": 2,
+              "score": 0,
+              "alive_at_end": false
+            }
+          ],
+          "replay_hash": "678f002b2784ecf524c8d71498e968f023ea1a44b1efaf8b30508dc0bcd66a17"
+        }
+      }
+    },
+    {
+      "label": "projectile",
+      "record": {
+        "config": {
+          "tick_hz": 30,
+          "max_ticks": 3600,
+          "bounds": {
+            "x": 50000,
+            "y": 50000
+          },
+          "seats": 2
+        },
+        "rules": {
+          "max_speed": 200,
+          "weapon_range": 30000,
+          "hit_radius": 1500,
+          "weapon_mode": "projectile",
+          "projectile_speed": 2000,
+          "aim_mode": "octant",
+          "damage": 100,
+          "fire_cooldown": 6,
+          "mag_size": 30,
+          "perception_range": 40000,
+          "fov_octant_spread": 4,
+          "start_health": 100,
+          "spawn_radius": 2000,
+          "spawn_jitter": 0,
+          "action_deadline_micros": 50000
+        },
+        "replay": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "seed": 72623859790382856,
+          "seats": [
+            {
+              "seat": 0,
+              "team": 0,
+              "controller": "0x00"
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "controller": "0x01"
+            }
+          ],
+          "blockers": [],
+          "ticks": [
+            {
+              "tick": 0,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 1000,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": false,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "tick": 1,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 0,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": true,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "tick": 2,
+              "actions": []
+            }
+          ]
+        },
+        "result": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "final_tick": 3,
+          "outcomes": [
+            {
+              "seat": 0,
+              "team": 0,
+              "placement": 1,
+              "score": 100,
+              "alive_at_end": true
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "placement": 2,
+              "score": 0,
+              "alive_at_end": false
+            }
+          ],
+          "replay_hash": "51ad327d4ca65717d9c0d6e1023291bcdacd34c355eee373d3344f8f1a1639e3"
+        }
+      }
+    }
+  ]
+}
