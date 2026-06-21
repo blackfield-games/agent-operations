@@ -581,6 +581,14 @@ pub struct ReplayRecord {
     /// this field existed deserializes to the no-occluder behavior it ran under.
     #[serde(default)]
     pub blockers: Vec<Blocker>,
+    /// Configured pickup spawn points the match ran under, in declared order. A
+    /// match determinant of combat (a collected health/ammo pickup changes who
+    /// survives), so it is committed by [`digest`](ReplayRecord::digest) — a
+    /// tampered item layout yields a different hash, the same as `blockers`.
+    /// `serde(default)` so a record written before this field existed deserializes
+    /// to the no-pickup behavior it ran under.
+    #[serde(default)]
+    pub pickups: Vec<PickupSpawn>,
     pub ticks: Vec<TickRecord>,
 }
 
@@ -594,11 +602,15 @@ impl ReplayRecord {
     /// [`MatchResult::replay_hash`].
     pub fn digest(&self) -> [u8; 32] {
         let mut h = Keccak256::new();
-        // v2 folds in the static `blockers` set. The bump is honest about the
-        // encoding change: blockers occlude vision only, so they do not alter the
-        // re-run outcome and could not be bound by re-execution alone — committing
-        // them here is what pins a match's perception geometry to its hash.
-        h.update(b"blackfield/arena/replay/v2");
+        // v2 folded in the static `blockers` set; v3 folds in the static `pickups`
+        // set. The bump is honest about each encoding change. Blockers occlude
+        // vision only, so they cannot be bound by re-execution alone and committing
+        // them here is what pins a match's perception geometry to its hash; pickups
+        // DO alter the re-run outcome (a collected heal changes who survives), but an
+        // UNCOLLECTED pickup does not, so binding the full item layout here keeps the
+        // digest a complete, self-identifying commitment to the match world — the
+        // same role `blockers` plays.
+        h.update(b"blackfield/arena/replay/v3");
         h.update(self.protocol_version.to_be_bytes());
         h.update(self.match_id.as_bytes());
         h.update(self.seed.to_be_bytes());
@@ -615,6 +627,18 @@ impl ReplayRecord {
             h.update(b.min.y.to_be_bytes());
             h.update(b.max.x.to_be_bytes());
             h.update(b.max.y.to_be_bytes());
+        }
+        h.update((self.pickups.len() as u32).to_be_bytes());
+        for p in &self.pickups {
+            // An explicit kind byte (not the enum discriminant) so the wire mapping
+            // is the fixed contract a second implementation reproduces.
+            h.update([match p.kind {
+                PickupKind::Health => 0u8,
+                PickupKind::Ammo => 1u8,
+            }]);
+            h.update(p.position.x.to_be_bytes());
+            h.update(p.position.y.to_be_bytes());
+            h.update(p.amount.to_be_bytes());
         }
         h.update((self.ticks.len() as u32).to_be_bytes());
         for t in &self.ticks {
@@ -1414,11 +1438,11 @@ mod tests {
     #[test]
     fn replay_digest_golden() {
         // A fixed record must hash to a fixed value. Any change to the canonical
-        // encoding (field order, prefixing, domain tag, the v2 blockers section)
-        // flips this — the hard byte-stability pin for on-chain attestation.
+        // encoding (field order, prefixing, domain tag, the v2 blockers / v3 pickups
+        // sections) flips this — the hard byte-stability pin for on-chain attestation.
         assert_eq!(
             hex::encode(sample_replay().digest()),
-            "ccf44bcac02a2e32bebb1c07f012ce89ad931fa525f27859e3b8d5897c0ea177"
+            "7e4f0d7d72e68f5a5883c31dfad94aec3db40a3ad4e1e751215820469f3cbf94"
         );
     }
 
@@ -1452,6 +1476,22 @@ mod tests {
         let with_blocker = r.digest();
         r.blockers[0].max.x += 1;
         assert_ne!(with_blocker, r.digest(), "a blocker's geometry must bind");
+        // An added pickup -> different commitment: the item layout is bound (v3), the
+        // same role blockers play — an uncollected pickup is invisible to re-execution.
+        let mut r = sample_replay();
+        r.pickups.push(PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: 5, y: 6 }, amount: 25 });
+        let with_pickup = r.digest();
+        assert_ne!(base, with_pickup, "a pickup must bind");
+        // Its kind, position, and amount each bind.
+        let mut r2 = r.clone();
+        r2.pickups[0].kind = PickupKind::Ammo;
+        assert_ne!(with_pickup, r2.digest(), "a pickup's kind must bind");
+        let mut r2 = r.clone();
+        r2.pickups[0].position.x += 1;
+        assert_ne!(with_pickup, r2.digest(), "a pickup's position must bind");
+        let mut r2 = r.clone();
+        r2.pickups[0].amount += 1;
+        assert_ne!(with_pickup, r2.digest(), "a pickup's amount must bind");
     }
 
     #[test]
@@ -1583,6 +1623,7 @@ mod tests {
                 SeatInfo { seat: 1, team: 2, controller: "0xbbbb".into() },
             ],
             blockers: Vec::new(),
+            pickups: Vec::new(),
             ticks: vec![
                 TickRecord {
                     tick: 0,

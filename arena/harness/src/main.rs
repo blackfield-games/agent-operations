@@ -368,6 +368,7 @@ mod tests {
             seed: 0,
             seats,
             blockers: Vec::new(),
+            pickups: Vec::new(),
             ticks: Vec::new(),
         }
     }

@@ -29,7 +29,9 @@
         "start_health": 100,
         "spawn_radius": 20000,
         "spawn_jitter": 2000,
-        "action_deadline_micros": 50000
+        "action_deadline_micros": 50000,
+        "pickup_radius": 1000,
+        "pickup_respawn_cooldown": 300
       },
       "roster": [
         {
@@ -127,7 +129,9 @@
         "start_health": 100,
         "spawn_radius": 20000,
         "spawn_jitter": 2000,
-        "action_deadline_micros": 50000
+        "action_deadline_micros": 50000,
+        "pickup_radius": 1000,
+        "pickup_respawn_cooldown": 300
       },
       "roster": [
         {
@@ -352,7 +356,9 @@
           "start_health": 100,
           "spawn_radius": 2000,
           "spawn_jitter": 0,
-          "action_deadline_micros": 50000
+          "action_deadline_micros": 50000,
+          "pickup_radius": 1000,
+          "pickup_respawn_cooldown": 300
         },
         "replay": {
           "protocol_version": 1,
@@ -371,6 +377,7 @@
             }
           ],
           "blockers": [],
+          "pickups": [],
           "ticks": [
             {
               "tick": 0,
@@ -436,7 +443,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "678f002b2784ecf524c8d71498e968f023ea1a44b1efaf8b30508dc0bcd66a17"
+          "replay_hash": "3e5d3814fb28c716e4cac9730ab1eade8fb516f8733dc960cd4d69368d74ad03"
         }
       }
     },
@@ -467,7 +474,9 @@
           "start_health": 100,
           "spawn_radius": 2000,
           "spawn_jitter": 0,
-          "action_deadline_micros": 50000
+          "action_deadline_micros": 50000,
+          "pickup_radius": 1000,
+          "pickup_respawn_cooldown": 300
         },
         "replay": {
           "protocol_version": 1,
@@ -486,6 +495,7 @@
             }
           ],
           "blockers": [],
+          "pickups": [],
           "ticks": [
             {
               "tick": 0,
@@ -551,7 +561,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "678f002b2784ecf524c8d71498e968f023ea1a44b1efaf8b30508dc0bcd66a17"
+          "replay_hash": "3e5d3814fb28c716e4cac9730ab1eade8fb516f8733dc960cd4d69368d74ad03"
         }
       }
     },
@@ -582,7 +592,9 @@
           "start_health": 100,
           "spawn_radius": 2000,
           "spawn_jitter": 0,
-          "action_deadline_micros": 50000
+          "action_deadline_micros": 50000,
+          "pickup_radius": 1000,
+          "pickup_respawn_cooldown": 300
         },
         "replay": {
           "protocol_version": 1,
@@ -601,6 +613,7 @@
             }
           ],
           "blockers": [],
+          "pickups": [],
           "ticks": [
             {
               "tick": 0,
@@ -670,7 +683,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "51ad327d4ca65717d9c0d6e1023291bcdacd34c355eee373d3344f8f1a1639e3"
+          "replay_hash": "d57cdd097ff57553d9fa32c1c0e703f20136843cb5f4dd9bd43565c9daff9e65"
         }
       }
     }

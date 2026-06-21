@@ -17,8 +17,9 @@
 
 use arena_proto::{
     check_version, Action, ActionError, ActionIntent, Bam, Blocker, MatchConfig, MatchPhase,
-    MatchResult, Observation, ReplayRecord, SeatAction, SeatId, SeatOutcome, TeamId, TickRecord,
-    Vec2, VersionMismatch, MOVE_INTENT_SCALE, POSITION_SCALE, PROTOCOL_VERSION,
+    MatchResult, Observation, PickupKind, PickupSpawn, ReplayRecord, SeatAction, SeatId,
+    SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch, MOVE_INTENT_SCALE, POSITION_SCALE,
+    PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -255,6 +256,27 @@ const MAX_PROJECTILE_LIFETIME: u16 = 600;
 /// hand-crafted record's) extreme speed degrades to a fast-but-finite shot, not a panic.
 const MAX_PROJECTILE_SPEED: i32 = 1 << 20;
 
+/// Entity-id base for pickups, above BOTH the pawn id space (≤ 255) and the
+/// projectile id space (from [`PROJECTILE_ID_BASE`] = 2^16, monotonic but bounded
+/// by the match length, never approaching 2^24). A pickup's id is its config index
+/// off this base, stable across its whole collect/respawn life, so the canonical
+/// ascending-id visible set lists pawns, then projectiles, then pickups, and the
+/// three id spaces never collide.
+const PICKUP_ID_BASE: u32 = 1 << 24;
+
+/// Default heal/ammo collection radius when a match leaves [`Rules::pickup_radius`]
+/// at the serde default — 1 m, a tight contact disc a pawn must actually reach.
+fn default_pickup_radius() -> i32 {
+    POSITION_SCALE
+}
+
+/// Default dormant duration after collection when a match leaves
+/// [`Rules::pickup_respawn_cooldown`] at the serde default — 300 ticks (~10 s at
+/// 30 Hz), long enough that a contested pickup is a real tempo decision.
+fn default_pickup_respawn_cooldown() -> u16 {
+    300
+}
+
 /// The combat tuning a match runs under — distinct from `arena_proto::MatchConfig`
 /// (which is the read-only rules summary sent to agents). These are the
 /// server-authoritative constants the sim clamps and resolves against; an agent
@@ -318,6 +340,16 @@ pub struct Rules {
     /// Microseconds a seat has to answer an observation before the tick is
     /// forfeited on its behalf — carried on every [`Observation`].
     pub action_deadline_micros: u32,
+    /// Contact radius for collecting a world pickup, in position units: an alive
+    /// pawn collects a pickup whose centre is within this distance. `serde(default)`
+    /// (1 m) so a record written before pickups existed deserializes unchanged.
+    #[serde(default = "default_pickup_radius")]
+    pub pickup_radius: i32,
+    /// Ticks a collected pickup stays dormant before it respawns at its spawn point.
+    /// Deterministic per-tick countdown (no wall-clock). `serde(default)` (300) for
+    /// back-compat. A pickup match with no pickups never consults it.
+    #[serde(default = "default_pickup_respawn_cooldown")]
+    pub pickup_respawn_cooldown: u16,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -345,6 +377,8 @@ impl Default for Rules {
             spawn_radius: 20 * POSITION_SCALE,
             spawn_jitter: 2 * POSITION_SCALE,
             action_deadline_micros: 50_000,
+            pickup_radius: default_pickup_radius(),
+            pickup_respawn_cooldown: default_pickup_respawn_cooldown(),
         }
     }
 }
@@ -449,6 +483,28 @@ struct Projectile {
     age: u16,
 }
 
+/// One pickup's live match state — derived entirely from a [`PickupSpawn`] config
+/// entry plus the tick count, so it is never recorded; replay rebuilds it from the
+/// config and re-runs the same collect/respawn timeline bit-for-bit. The agent
+/// never sees this struct: a perceivable ACTIVE pickup reaches it as a
+/// parity-bounded [`VisibleEntity`] carrying only its `id` and `position` — never
+/// its `kind`, `amount`, or `dormant` timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pickup {
+    /// Stable per-match id (config index off [`PICKUP_ID_BASE`]) — the wire
+    /// `entity_id`, unchanged across its whole collect/respawn life.
+    id: u32,
+    kind: PickupKind,
+    /// Spawn position; a pickup never moves, and respawns here.
+    pos: Vec2,
+    /// Effect magnitude (heal or ammo), clamped to the pawn's ceiling at collection.
+    amount: u16,
+    /// Collectible now? `false` while dormant after a collection.
+    active: bool,
+    /// Ticks remaining dormant; `0` while active. Counts down to a respawn.
+    respawn_in: u16,
+}
+
 /// The arena match: roster, authoritative pawn state, and the lifecycle phase.
 /// A match advances one fixed tick at a time and never moves backward.
 pub struct Match {
@@ -468,6 +524,14 @@ pub struct Match {
     projectiles: Vec<Projectile>,
     /// Monotonic projectile id source; a spawn takes this value, then increments.
     next_projectile_id: u32,
+    /// The configured pickup spawn points, in declared order — the immutable input
+    /// recorded into the [`ReplayRecord`]. Empty means no world items (byte-identical
+    /// to every pre-pickup match).
+    pickup_config: Vec<PickupSpawn>,
+    /// Live pickup state, one per `pickup_config` entry in the same order (so ids and
+    /// the digest stay stable). Derived — never recorded; rebuilt from the config on
+    /// replay.
+    pickups: Vec<Pickup>,
     tick: u64,
     phase: MatchPhase,
     seed: u64,
@@ -491,6 +555,10 @@ impl Match {
     /// no occlusion). They are not validated here — a record-driven re-run gates
     /// well-formed geometry in [`MatchRecord::verify`] before construction.
     ///
+    /// A match built this way has NO world pickups; use
+    /// [`new_with_pickups`](Match::new_with_pickups) to configure them. This keeps
+    /// every existing (no-pickup) call site and replay byte-identical.
+    ///
     /// [`Live`]: MatchPhase::Live
     /// [`Lobby`]: MatchPhase::Lobby
     /// [`Starting`]: MatchPhase::Starting
@@ -502,6 +570,36 @@ impl Match {
         blockers: Vec<Blocker>,
         seed: u64,
     ) -> Self {
+        Match::new_with_pickups(match_id, config, rules, seats, blockers, Vec::new(), seed)
+    }
+
+    /// Like [`new`](Match::new), plus the configured world `pickups`. Each spawn
+    /// becomes a live, active pickup with a stable id ([`PICKUP_ID_BASE`] + its
+    /// config index); the live collect/dormant/respawn state evolves purely from the
+    /// tick stream, so it is derived (never recorded) and replay rebuilds it from
+    /// this same config. The `pickups` are not validated here — a record-driven
+    /// re-run gates them in [`MatchRecord::verify`] before construction.
+    pub fn new_with_pickups(
+        match_id: Uuid,
+        config: arena_proto::MatchConfig,
+        rules: Rules,
+        seats: Vec<arena_proto::SeatInfo>,
+        blockers: Vec<Blocker>,
+        pickups: Vec<PickupSpawn>,
+        seed: u64,
+    ) -> Self {
+        let live_pickups = pickups
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Pickup {
+                id: PICKUP_ID_BASE + i as u32,
+                kind: p.kind,
+                pos: p.position,
+                amount: p.amount,
+                active: true,
+                respawn_in: 0,
+            })
+            .collect();
         let n = seats.len();
         let mut rng = SplitMix64::new(seed);
         let pawns = seats
@@ -543,6 +641,8 @@ impl Match {
             pawns,
             projectiles: Vec::new(),
             next_projectile_id: PROJECTILE_ID_BASE,
+            pickup_config: pickups,
+            pickups: live_pickups,
             tick: 0,
             phase: MatchPhase::Live,
             seed,
@@ -642,6 +742,27 @@ impl Match {
                     position: proj.pos,
                     z: 0,
                     facing: proj.facing,
+                    in_line_of_sight: true,
+                });
+            }
+        }
+        // Perceivable ACTIVE pickups, under the IDENTICAL range + cone + LOS bound. A
+        // dormant (collected, not-yet-respawned) pickup is NOT emitted, so its absence
+        // tracks its real state; a perceived pickup carries only its id and position
+        // (neutral team, no facing) and NEVER its kind, amount, or respawn timer.
+        for pk in &self.pickups {
+            if pk.active
+                && within(me.pos, pk.pos, self.rules.perception_range)
+                && in_fov(me.facing, me.pos, pk.pos, self.rules.fov_octant_spread)
+                && has_line_of_sight(&self.blockers, me.pos, pk.pos)
+            {
+                visible.push(arena_proto::VisibleEntity {
+                    entity_id: pk.id,
+                    kind: arena_proto::EntityKind::Pickup,
+                    team: 0,
+                    position: pk.pos,
+                    z: 0,
+                    facing: 0,
                     in_line_of_sight: true,
                 });
             }
@@ -821,6 +942,11 @@ impl Match {
             self.pawns[i].pos = Vec2 { x: nx, y: ny };
             self.pawns[i].facing = intent.aim;
         }
+
+        // Respawn due pickups, then collect at this tick's post-move positions —
+        // before fire, so a pawn that walks onto an ammo/health pickup fights with
+        // it this tick. A no-op when no pickups are configured (byte-identical).
+        self.process_pickups();
 
         // Reload + fire, in seat order. Sequential resolution: a pawn downed
         // earlier this tick cannot return fire, so a mutual-kill exchange is
@@ -1023,6 +1149,56 @@ impl Match {
         self.projectiles = survivors;
     }
 
+    /// Tick the world pickups: respawn any whose dormant timer has elapsed, then let
+    /// each alive pawn (in seat order) collect every active pickup its body reaches.
+    /// A no-op when no pickups are configured, so a pickup-free match is byte-identical.
+    ///
+    /// Collection is ATOMIC and SEAT-ORDERED: a pickup is consumed (deactivated +
+    /// its respawn timer armed) the instant a pawn collects it, BEFORE the next pawn
+    /// is checked, so two pawns reaching one pickup the same tick resolve to exactly
+    /// one collector — the lower seat — with no double-grant. The effect is CLAMPED
+    /// to the pawn's own ceiling (heal to `max_health`, ammo to `mag_size`) with a
+    /// `saturating_add`, so collecting at the cap is a no-op that never overflows.
+    fn process_pickups(&mut self) {
+        if self.pickups.is_empty() {
+            return;
+        }
+        let cooldown = self.rules.pickup_respawn_cooldown;
+        let radius = self.rules.pickup_radius;
+        // Respawn first, so a pickup whose cooldown elapses is collectible this tick.
+        for pk in &mut self.pickups {
+            if !pk.active {
+                pk.respawn_in = pk.respawn_in.saturating_sub(1);
+                if pk.respawn_in == 0 {
+                    pk.active = true;
+                }
+            }
+        }
+        for i in 0..self.pawns.len() {
+            if !self.pawns[i].alive {
+                continue;
+            }
+            let pos = self.pawns[i].pos;
+            for pk in &mut self.pickups {
+                if !pk.active || !within(pos, pk.pos, radius) {
+                    continue;
+                }
+                match pk.kind {
+                    PickupKind::Health => {
+                        let max = self.pawns[i].max_health;
+                        self.pawns[i].health = self.pawns[i].health.saturating_add(pk.amount).min(max);
+                    }
+                    PickupKind::Ammo => {
+                        let max = self.rules.mag_size;
+                        self.pawns[i].ammo = self.pawns[i].ammo.saturating_add(pk.amount).min(max);
+                    }
+                }
+                pk.active = false;
+                pk.respawn_in = cooldown;
+            }
+        }
+    }
+
     /// End the match when at most one team still has an alive pawn (a winner, or
     /// everyone down) or the tick cap is reached, freezing the [`MatchResult`].
     /// This makes a single-team roster end on its first tick — a co-op/PvE mode
@@ -1087,6 +1263,7 @@ impl Match {
             seed: self.seed,
             seats: self.seats.clone(),
             blockers: self.blockers.clone(),
+            pickups: self.pickup_config.clone(),
             ticks: self.ticks.clone(),
         }
     }
@@ -1126,6 +1303,7 @@ impl Match {
             seed: self.seed,
             seats: self.seats,
             blockers: self.blockers,
+            pickups: self.pickup_config,
             ticks: self.ticks,
         }
     }
@@ -1191,6 +1369,10 @@ pub enum ReplayError {
     /// Every blocker is hashed into the digest, so an oversized list is a CPU-DoS;
     /// rejected here, before the re-run. A generous backstop, far above any real map.
     TooManyBlockers { blockers: usize, max: usize },
+    /// The record carries more pickups than the verifier will process. Per-tick
+    /// collection is O(seats · pickups) and every pickup is hashed into the digest, so
+    /// an oversized list is a CPU-DoS; rejected before the re-run. A generous backstop.
+    TooManyPickups { pickups: usize, max: usize },
     /// The record carries more recorded ticks than the verifier will process.
     /// `verify` re-executes the whole match, so an attacker-controlled record with
     /// a huge tick stream is a CPU-DoS; it is rejected here, before the structural
@@ -1236,6 +1418,9 @@ impl std::fmt::Display for ReplayError {
             }
             ReplayError::TooManyBlockers { blockers, max } => {
                 write!(f, "invalid replay: {blockers} blockers exceeds the verifier budget of {max}")
+            }
+            ReplayError::TooManyPickups { pickups, max } => {
+                write!(f, "invalid replay: {pickups} pickups exceeds the verifier budget of {max}")
             }
             ReplayError::TooManyTicks { ticks, max } => {
                 write!(f, "invalid replay: {ticks} recorded ticks exceeds the verifier budget of {max}")
@@ -1286,6 +1471,12 @@ pub const MAX_REPLAY_SEATS: usize = 64;
 /// record with a huge blocker list is a CPU-DoS; it is rejected before the re-run.
 /// Far above any real arena's occluder count — a DoS backstop, not a map limit.
 pub const MAX_REPLAY_BLOCKERS: usize = 1024;
+
+/// Verifier cost backstop: the most pickups [`MatchRecord::verify`] will process.
+/// Per-tick collection is O(seats · pickups) and every pickup is hashed into the
+/// digest, so an oversized list is a CPU-DoS; it is rejected before the re-run. Far
+/// above any real arena's item count — a DoS backstop, not a gameplay limit.
+pub const MAX_REPLAY_PICKUPS: usize = 256;
 
 impl MatchRecord {
     /// Re-derive the match from this record ALONE and confirm it is a faithful,
@@ -1339,6 +1530,12 @@ impl MatchRecord {
             return Err(ReplayError::TooManyBlockers {
                 blockers: self.replay.blockers.len(),
                 max: MAX_REPLAY_BLOCKERS,
+            });
+        }
+        if self.replay.pickups.len() > MAX_REPLAY_PICKUPS {
+            return Err(ReplayError::TooManyPickups {
+                pickups: self.replay.pickups.len(),
+                max: MAX_REPLAY_PICKUPS,
             });
         }
 
@@ -1398,12 +1595,13 @@ impl MatchRecord {
             }
         }
 
-        let fresh = Match::new(
+        let fresh = Match::new_with_pickups(
             self.replay.match_id,
             self.config,
             self.rules,
             self.replay.seats.clone(),
             self.replay.blockers.clone(),
+            self.replay.pickups.clone(),
             self.replay.seed,
         );
         let rerun = replay_match(fresh, &self.replay);
@@ -3790,6 +3988,7 @@ mod tests {
             seed,
             seats: two_seats(),
             blockers: Vec::new(),
+            pickups: Vec::new(),
             ticks: vec![TickRecord {
                 tick: 0,
                 actions: vec![SeatAction { seat: 0, intent: intent(Vec2 { x: 1_000_000, y: 0 }, EAST, false) }],
