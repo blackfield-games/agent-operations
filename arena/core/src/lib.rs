@@ -1842,4 +1842,78 @@ mod tests {
             assert!(e.to_string().starts_with("invalid replay:"), "{e:?}");
         }
     }
+
+    fn result_with(outcomes: Vec<SeatOutcome>) -> MatchResult {
+        MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: MID.parse().unwrap(),
+            final_tick: 10,
+            outcomes,
+            replay_hash: "00".repeat(32),
+        }
+    }
+
+    #[test]
+    fn settlement_picks_the_unique_first_place_seat() {
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 7, alive_at_end: true },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 3, alive_at_end: false },
+        ]);
+        assert_eq!(settlement(&r), Settlement::Win { seat: 0 });
+    }
+
+    #[test]
+    fn settlement_is_a_draw_when_first_place_is_tied() {
+        // Both alive at the cap with equal score share placement 1 — a draw, not
+        // an arbitrary win for the lower seat. A classifier that took the FIRST
+        // placement-1 seat would wrongly settle seat 0.
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 5, alive_at_end: true },
+            SeatOutcome { seat: 1, team: 1, placement: 1, score: 5, alive_at_end: true },
+        ]);
+        assert_eq!(settlement(&r), Settlement::Draw);
+    }
+
+    #[test]
+    fn settlement_ranks_an_all_down_match_by_placement_not_alive() {
+        // Both seats died, but one out-scored the other, so placement ranks it
+        // first — a decisive winner. A classifier keyed on `alive_at_end` would
+        // call this a draw (nobody alive). Note the winner is the HIGHER seat id,
+        // so this also rejects any "first seat wins" shortcut.
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 2, score: 1, alive_at_end: false },
+            SeatOutcome { seat: 1, team: 1, placement: 1, score: 4, alive_at_end: false },
+        ]);
+        assert_eq!(settlement(&r), Settlement::Win { seat: 1 });
+    }
+
+    #[test]
+    fn settlement_is_a_draw_when_all_down_with_equal_score() {
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 2, alive_at_end: false },
+            SeatOutcome { seat: 1, team: 1, placement: 1, score: 2, alive_at_end: false },
+        ]);
+        assert_eq!(settlement(&r), Settlement::Draw);
+    }
+
+    #[test]
+    fn settlement_of_a_real_played_match_matches_its_outcomes() {
+        // End-to-end: a genuinely simulated match's result classifies the same way
+        // its canonical outcomes rank, so the classifier tracks the sim, not a
+        // hand-built fixture.
+        let mut m = new_match(7);
+        let mut guard = 0;
+        while m.phase() == MatchPhase::Live {
+            m.step(&BTreeMap::new());
+            guard += 1;
+            assert!(guard <= 4000, "match should terminate at the tick cap");
+        }
+        let result = m.result().expect("ended").clone();
+        let firsts: Vec<SeatId> =
+            result.outcomes.iter().filter(|o| o.placement == 1).map(|o| o.seat).collect();
+        match settlement(&result) {
+            Settlement::Win { seat } => assert_eq!(firsts, vec![seat]),
+            Settlement::Draw => assert!(firsts.len() != 1),
+        }
+    }
 }
