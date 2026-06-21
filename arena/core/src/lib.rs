@@ -1572,7 +1572,7 @@ pub enum ReplayError {
     /// hashes (for a re-run-free consumer) exactly as its rules say.
     RulesCommitMismatch,
     /// The record's stored `replay.config` does not match its `config` — the same
-    /// self-contradiction as [`RulesCommitMismatch`], for the arena configuration. The
+    /// self-contradiction as [`RulesCommitMismatch`](ReplayError::RulesCommitMismatch), for the arena configuration. The
     /// re-run is built from `config` (not `replay.config`), so a doctored `replay.config`
     /// re-runs clean yet makes the stored `replay` hash differently for a re-run-free
     /// consumer; rejected so every accepted record hashes exactly as its config says.
@@ -2196,8 +2196,9 @@ pub struct ProjectileCase {
 /// `(config, rules, seed, roster, blockers, action stream)` through its own core
 /// — exactly what [`MatchRecord::verify`] does, now as a cross-implementer
 /// contract. The three weapon/aim modes prove the determinant binding: the digest
-/// commits the INPUTS (so the octant and fine matches share a digest under the
-/// same action stream), while the rules bind the OUTCOMES (so the projectile
+/// commits the INPUTS, the rules, AND the config determinants (v5), so the octant
+/// and fine matches — identical action streams differing only in `aim_mode` — hash
+/// apart on the rules alone, while the rules also bind the OUTCOMES (the projectile
 /// match diverges and a flipped `weapon_mode` fails re-execution).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchCase {
@@ -2552,13 +2553,15 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// wall, a projectile absorbed by a wall, and a target in front of a wall still
 /// hit), the octant-vs-fine sub-octant hit boundary, a swept fast projectile that
 /// must not tunnel, and four full-match records proving the digest commits the
-/// inputs AND the rules (v4) — the octant and fine cases run the identical action
-/// stream yet hash differently because their aim_mode differs — while the rules
-/// also bind the outcomes a re-run reproduces.
+/// inputs, the rules, AND the config determinants (v5) — the octant and fine cases
+/// run the identical action stream yet hash differently because their aim_mode
+/// differs — while the rules also bind the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v2`: blockers became physical cover (movement,
-/// hitscan, and projectiles now respect them), a deliberate convention every twin
-/// must follow.
+/// Set domain is `parity-vectors/v3`: the digest now binds the combat `rules` (v4)
+/// and the `config` determinants — arena bounds + tick cap (v5) — so a twin must
+/// fold both into its match digest or its hashes diverge; the v2 blockers-as-
+/// physical-cover convention (movement, hitscan, and projectiles respect them) still
+/// holds. These are deliberate conventions every twin must follow.
 ///
 /// The generator is pure integer, ordered, and float/map-free, so the set is
 /// byte-stable on every platform and the same on every run. It realizes the

@@ -147,7 +147,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(front.damage > 0 && !front.blockers.is_empty(), "cover behind the target shields nothing");
 
     // Full matches: every committed record re-runs to its own committed result
-    // (self-consistency); the v4 digest commits the inputs AND the rules. The octant
+    // (self-consistency); the v5 digest commits the inputs, the rules, AND the config. The octant
     // and fine matches run the IDENTICAL action stream and differ ONLY in aim_mode, so
     // the tuning difference alone now separates their hashes — where before the rules
     // binding they shared one. Tampering any determinant must break verification.
