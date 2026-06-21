@@ -1202,6 +1202,29 @@ impl Match {
         Ok(action.intent.clamped())
     }
 
+    /// Apply a clamped, blocker-respecting displacement from `from`: scale `move_dir`
+    /// (in [`MOVE_INTENT_SCALE`] units) by `magnitude` position units, clamp the
+    /// destination to the arena bounds, and refuse the whole step — holding at `from`
+    /// — if its swept path crosses a blocker. The shared movement-safety primitive for
+    /// both the per-tick walk (`magnitude == max_speed`) and the dash burst
+    /// (`magnitude == DASH_DISTANCE`), so a dash can no more tunnel a wall or leave the
+    /// arena than a walk can: both go through this one clamp + [`path_hits_blocker`].
+    fn slide(&self, from: Vec2, move_dir: Vec2, magnitude: i32) -> Vec2 {
+        let dx = move_dir.x as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
+        let dy = move_dir.y as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
+        let bx = self.config.bounds.x as i64;
+        let by = self.config.bounds.y as i64;
+        let to = Vec2 {
+            x: (from.x as i64 + dx).clamp(-bx, bx) as i32,
+            y: (from.y as i64 + dy).clamp(-by, by) as i32,
+        };
+        if path_hits_blocker(&self.blockers, from, to) {
+            from
+        } else {
+            to
+        }
+    }
+
     /// Advance the match exactly one tick from the given intents. A seat absent
     /// from `intents` (or already down) forfeits the tick — it holds position and
     /// does not fire — so a slow or hung seat never stalls the match (the
@@ -1244,26 +1267,15 @@ impl Match {
                 self.pawns[i].vel = Vec2::ZERO;
                 continue;
             };
-            let max = self.rules.max_speed as i64;
-            let dx = intent.move_dir.x as i64 * max / MOVE_INTENT_SCALE as i64;
-            let dy = intent.move_dir.y as i64 * max / MOVE_INTENT_SCALE as i64;
-            let bx = self.config.bounds.x as i64;
-            let by = self.config.bounds.y as i64;
-            let from = self.pawns[i].pos;
-            let nx = (from.x as i64 + dx).clamp(-bx, bx) as i32;
-            let ny = (from.y as i64 + dy).clamp(-by, by) as i32;
             // A blocker is physical cover: a step whose swept path crosses one is
             // refused outright (the pawn holds position this tick, vel zero) rather
             // than walking through it. Stopping at the START of the blocked step —
             // not snapping to the wall surface — keeps the rule a single integer
             // segment test the UE5 twin reproduces exactly, no rounding to a contact
-            // point. A no-blocker match never reaches this branch (empty set), so it
+            // point. A no-blocker match never reaches the refusal (empty set), so it
             // is byte-identical. Surface-snap and wall-sliding are deferred follow-ups.
-            let to = if path_hits_blocker(&self.blockers, from, Vec2 { x: nx, y: ny }) {
-                from
-            } else {
-                Vec2 { x: nx, y: ny }
-            };
+            let from = self.pawns[i].pos;
+            let to = self.slide(from, intent.move_dir, self.rules.max_speed);
             self.pawns[i].vel = Vec2 { x: to.x - from.x, y: to.y - from.y };
             self.pawns[i].pos = to;
             self.pawns[i].facing = intent.aim;
