@@ -1526,6 +1526,12 @@ pub enum ReplayError {
     /// The outcomes reproduce, but the committed `replay_hash` does not match the
     /// digest of the re-run — a tampered or stale commitment.
     HashMismatch { expected: String, recomputed: String },
+    /// The record's stored `replay.rules_commit` does not encode its `rules` — a
+    /// self-contradictory record whose rules fingerprint lies about the tuning it
+    /// claims. The re-run reconstructs the commit from `rules`, so this is the one
+    /// inconsistency re-execution alone would miss; rejected so every accepted record
+    /// hashes (for a re-run-free consumer) exactly as its rules say.
+    RulesCommitMismatch,
 }
 
 impl std::fmt::Display for ReplayError {
@@ -1571,6 +1577,9 @@ impl std::fmt::Display for ReplayError {
             }
             ReplayError::HashMismatch { expected, recomputed } => {
                 write!(f, "invalid replay: replay hash mismatch (recorded {expected}, recomputed {recomputed})")
+            }
+            ReplayError::RulesCommitMismatch => {
+                write!(f, "invalid replay: stored rules commitment does not match the record's rules")
             }
         }
     }
@@ -1745,6 +1754,18 @@ impl MatchRecord {
                 expected: self.result.replay_hash.clone(),
                 recomputed: reproduced.replay_hash.clone(),
             });
+        }
+        // The re-run above commits the rules it ran under (`self.rules`); also pin that
+        // the STORED `self.replay.rules_commit` is consistent with them. It is the one
+        // `replay` field the re-run RECONSTRUCTS (from `self.rules`) rather than feeds
+        // back in — every other field is fed into the fresh match, so tampering it
+        // diverges the re-run — so a doctored `rules_commit` (with honest rules and
+        // result) would re-run clean here yet make `self.replay` hash differently for a
+        // hash-only consumer. Reject that self-contradiction so the stored fingerprint
+        // always truthfully encodes the record's rules. (Unlike the digest as a whole,
+        // this is exact: post-terminal tick padding is tolerated, a lying commit is not.)
+        if self.replay.rules_commit != self.rules.canonical_encoding() {
+            return Err(ReplayError::RulesCommitMismatch);
         }
         Ok(reproduced.clone())
     }
@@ -4257,6 +4278,20 @@ mod tests {
             Err(ReplayError::HashMismatch { .. }) => {}
             other => panic!("an outcome-neutral rules tamper must fail as HashMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_tampered_stored_rules_commit_is_rejected() {
+        // rules_commit is the one replay field verify RECONSTRUCTS from self.rules
+        // rather than feeds into the re-run, so a record whose STORED rules_commit is
+        // doctored (self.rules + result left honest) re-runs to the same outcomes AND
+        // the same reconstructed hash — yet a hash-only consumer digesting the stored
+        // replay gets a different hash. verify must reject it too, so the two never
+        // disagree on the same record.
+        let mut rec = play(1).to_record().unwrap();
+        assert!(!rec.replay.rules_commit.is_empty(), "the record carries a rules commitment");
+        rec.replay.rules_commit[0] ^= 0xff;
+        assert_eq!(rec.verify(), Err(ReplayError::RulesCommitMismatch));
     }
 
     #[test]
