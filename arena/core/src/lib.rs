@@ -5823,4 +5823,26 @@ mod tests {
         flipped.rules.weapon_mode = WeaponMode::Melee;
         assert!(flipped.verify().is_err(), "a hitscan record reverified as melee must not verify");
     }
+
+    #[test]
+    fn melee_respects_friendly_fire() {
+        // An ally in range + arc is spared with friendly_fire off, and struck (but never
+        // scored) with it on — the same rule resolve_fire applies.
+        let ally_swing = |ff: bool| {
+            let rules = Rules { weapon_mode: WeaponMode::Melee, friendly_fire: ff, spawn_jitter: 0, ..Default::default() };
+            let roster = vec![
+                SeatInfo { seat: 0, team: 0, controller: "0x00".into() },
+                SeatInfo { seat: 1, team: 0, controller: "0x01".into() }, // same team
+            ];
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, roster, Vec::new(), 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[0].facing = EAST;
+            m.pawns[1].pos = Vec2 { x: POSITION_SCALE, y: 0 };
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+            (m.pawns[1].health, m.pawns[0].score)
+        };
+        let dmg = Rules { weapon_mode: WeaponMode::Melee, ..Default::default() }.melee_damage;
+        assert_eq!(ally_swing(false), (100, 0), "with friendly_fire off, an ally is not struck");
+        assert_eq!(ally_swing(true), (100 - dmg, 0), "with friendly_fire on, an ally is struck but the hit never scores");
+    }
 }
