@@ -62,6 +62,60 @@ fn octant_unit(bam: Bam) -> (i32, i32) {
     OCTANTS[octant_index(bam)]
 }
 
+/// Fixed-point scale of the [`FINE_LUT`] unit vectors (Q15). Larger than
+/// [`OCTANT_SCALE`] so the 64-way table's rounded entries sit tighter to the unit
+/// circle than the octant diagonals do — the squared-perpendicular hit test divides
+/// `dot` by this exact scale, the same shape the octant path divides by [`OCTANT_SCALE`].
+const FINE_SCALE: i32 = 32768;
+/// Directions in the finer-aim table — 64, one every 5.625° (8× the octant's 45°).
+const FINE_DIRS: usize = 64;
+/// Quarter-circle span of [`FINE_QSIN`]: it holds sine for `0..=90°`, and the other
+/// three quadrants fall out by reflection.
+const FINE_QUARTER: usize = FINE_DIRS / 4;
+/// First-quadrant sine, `round(FINE_SCALE · sin(k · 90° / FINE_QUARTER))` for
+/// `k = 0..=FINE_QUARTER`. Authored once and pinned exactly against an f64 reference
+/// (`fine_lut_matches_an_exact_trig_reference`); `[0]`/`[FINE_QUARTER]` are the exact
+/// axis endpoints `0` and `FINE_SCALE`.
+const FINE_QSIN: [i32; FINE_QUARTER + 1] = [
+    0, 3212, 6393, 9512, 12540, 15447, 18205, 20788, 23170, 25330, 27246, 28899, 30274,
+    31357, 32138, 32610, 32768,
+];
+
+/// Build the full 64-way unit-vector table from [`FINE_QSIN`] at compile time, so a
+/// fire is a branchless `O(1)` lookup with no per-shot trig. Each direction's
+/// `(cos, sin)` is the quarter table reflected into its quadrant — `q0=(b,a)`,
+/// `q1=(−a,b)`, `q2=(−b,−a)`, `q3=(a,−b)` with `a=QSIN[r]`, `b=QSIN[Q−r]` — so the four
+/// quadrants are exact mirror images: the table is symmetric by construction, not by
+/// rounding luck (the property a finer-aim approximation must not break).
+const fn build_fine_lut() -> [(i32, i32); FINE_DIRS] {
+    let mut lut = [(0i32, 0i32); FINE_DIRS];
+    let mut i = 0;
+    while i < FINE_DIRS {
+        let r = i % FINE_QUARTER;
+        let a = FINE_QSIN[r];
+        let b = FINE_QSIN[FINE_QUARTER - r];
+        lut[i] = match i / FINE_QUARTER {
+            0 => (b, a),
+            1 => (-a, b),
+            2 => (-b, -a),
+            _ => (a, -b),
+        };
+        i += 1;
+    }
+    lut
+}
+
+/// The 64-way Q15 unit-vector table, indexed by the finer-aim beam direction.
+const FINE_LUT: [(i32, i32); FINE_DIRS] = build_fine_lut();
+
+/// The Q15 unit vector for a facing, resolved to the nearest of 64 directions — the
+/// [`AimMode::Fine`] beam. Adding half a step (`512` BAM, the table's spacing is
+/// `1024`) rounds to nearest rather than truncating, the same half-step bias
+/// [`octant_index`] uses.
+fn fine_unit(bam: Bam) -> (i32, i32) {
+    FINE_LUT[(((bam as u32 + 512) >> 10) & 63) as usize]
+}
+
 /// The octant (an [`OCTANTS`] index) a bearing vector points into — the integer
 /// argmax of the dot product against the eight octant unit vectors, so a direction
 /// is classified into the same partition [`octant_index`] snaps a [`Bam`] into,
@@ -810,12 +864,23 @@ impl Match {
 
     /// Resolve one beam-hitscan shot from `shooter`: damage the nearest enemy
     /// whose body lies within the beam (in range, in front, within the lateral
-    /// `hit_radius`). All integer: the beam direction is the exact octant unit
-    /// vector, the in-front test is a dot-product sign, and the lateral offset is
-    /// a squared perpendicular distance — no trig anywhere.
+    /// `hit_radius`). All integer: the beam direction is the aim-mode unit vector
+    /// (the 8-way [`octant_unit`] or the finer [`fine_unit`]), the in-front test is
+    /// a dot-product sign, and the lateral offset is a squared perpendicular
+    /// distance — no trig anywhere. The unit vector's scale divides `dot` back to a
+    /// real along-beam distance, so each mode carries its own scale.
     fn resolve_fire(&mut self, shooter: usize) {
         let s = self.pawns[shooter];
-        let (fx, fy) = octant_unit(s.facing);
+        let (fx, fy, scale) = match self.rules.aim_mode {
+            AimMode::Octant => {
+                let (x, y) = octant_unit(s.facing);
+                (x, y, OCTANT_SCALE)
+            }
+            AimMode::Fine => {
+                let (x, y) = fine_unit(s.facing);
+                (x, y, FINE_SCALE)
+            }
+        };
         // i128 throughout: positions are i32 and bounded by config.bounds, so a
         // squared planar distance can exceed i64 at extreme (operator-set) arena
         // sizes. Widening keeps the hit test panic-free and exact regardless of
@@ -837,7 +902,7 @@ impl Match {
             if dot <= 0 {
                 continue;
             }
-            let proj = dot / OCTANT_SCALE as i128;
+            let proj = dot / scale as i128;
             let perp2 = dist2 - proj * proj;
             if perp2 > radius2 {
                 continue;
