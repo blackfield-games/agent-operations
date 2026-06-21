@@ -10814,6 +10814,31 @@ mod tests {
         assert!(r.is_err(), "zero retention_secs must be rejected at construction");
     }
 
+    /// The reaper's per-tick helper reads `state.retention_secs`, prunes aged
+    /// terminal jobs under the store lock (released between batches), and returns
+    /// the count — the wiring seam between the reaper and `prune_terminal_jobs`.
+    #[tokio::test]
+    async fn reaper_retention_sweep_prunes_through_appstate() {
+        let state = test_state_empty().await; // DEFAULT_RETENTION_SECS horizon
+        let now = now_secs();
+        let job = job_with_deadline(60);
+        {
+            let store = state.store.lock().await;
+            store.enqueue(&job).unwrap();
+            store.take_next(|_| true).unwrap();
+            assert!(store.requeue(&job, 1).unwrap()); // → failed
+            store
+                .set_created_at(&job.id, now - state.retention_secs - 1)
+                .unwrap(); // aged past the default horizon
+        }
+        assert_eq!(prune_terminal_history(&state).await, 1);
+        assert_eq!(
+            state.store.lock().await.job_status(&job.id).unwrap(),
+            None,
+            "the reaper helper deleted the aged terminal job"
+        );
+    }
+
     // ---- FIFO dispatch fairness (oldest-queued-first) ----
 
     /// Dispatch is oldest-first: two jobs enqueued in sequence are handed out in
