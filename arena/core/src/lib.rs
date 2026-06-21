@@ -4658,4 +4658,133 @@ mod tests {
             "a default match never surfaces a pickup"
         );
     }
+
+    /// A 3-seat match for the friendly-fire tests: seats 0 and 1 are ALLIES
+    /// (team 0); seat 2 is a lone enemy (team 1) parked far to the WEST so the match
+    /// stays Live (≥2 teams) without ever entering seat 0's eastward line of fire.
+    /// Seat 0 sits at the origin facing EAST, with ally seat 1 four metres dead
+    /// ahead. Positions are set by hand for an exact, replay-free assertion.
+    fn ally_match(friendly_fire: bool, weapon_mode: WeaponMode) -> Match {
+        let rules = Rules {
+            friendly_fire,
+            weapon_mode,
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xaa".into() },
+            SeatInfo { seat: 1, team: 0, controller: "0xbb".into() },
+            SeatInfo { seat: 2, team: 1, controller: "0xcc".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 4 * POSITION_SCALE, y: 0 };
+        m.pawns[2].pos = Vec2 { x: -40 * POSITION_SCALE, y: 0 };
+        m
+    }
+
+    #[test]
+    fn friendly_fire_off_a_beam_spares_an_ally() {
+        // FM1: the default (off) hardcodes the pre-flag rule — a hitscan beam never
+        // touches a same-team pawn, so the ally is unharmed and the shooter unscored.
+        let mut m = ally_match(false, WeaponMode::Hitscan);
+        let full = m.pawns[1].health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.pawns[1].health, full, "an ally takes no beam damage with FF off");
+        assert_eq!(m.pawns[0].score, 0, "no hit, no score");
+    }
+
+    #[test]
+    fn friendly_fire_off_a_projectile_spares_an_ally() {
+        // FM1: same default on the projectile path — the shot flies through the ally.
+        let mut m = ally_match(false, WeaponMode::Projectile);
+        let full = m.pawns[1].health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        for _ in 0..5 {
+            step_with(&mut m, &[]);
+        }
+        assert_eq!(m.pawns[1].health, full, "an ally takes no projectile damage with FF off");
+        assert_eq!(m.pawns[0].score, 0, "no hit, no score");
+    }
+
+    #[test]
+    fn friendly_fire_on_a_beam_damages_an_ally_without_scoring() {
+        // FM2 + FM3: with the flag on, a beam hits the nearest body even if it is an
+        // ally — but a team hit deals damage WITHOUT crediting the shooter, and the
+        // shooter is never in its own beam.
+        let mut m = ally_match(true, WeaponMode::Hitscan);
+        let full = m.pawns[1].health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.pawns[1].health, full - Rules::default().damage, "the ally takes the hit");
+        assert_eq!(m.pawns[0].score, 0, "a friendly hit is never rewarded");
+        assert_eq!(m.pawns[0].health, m.pawns[0].max_health, "the shooter never hits itself");
+    }
+
+    #[test]
+    fn friendly_fire_on_a_projectile_damages_an_ally_without_scoring() {
+        // FM2 + FM3: the projectile path honors the flag identically — and the
+        // shooter-self skip (t.seat == proj.shooter) keeps the shot's own firer safe
+        // as it launches from the shooter's position.
+        let mut m = ally_match(true, WeaponMode::Projectile);
+        let full = m.pawns[1].health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        for _ in 0..5 {
+            step_with(&mut m, &[]);
+        }
+        assert_eq!(m.pawns[1].health, full - Rules::default().damage, "the ally takes the shot");
+        assert_eq!(m.pawns[0].score, 0, "a friendly hit is never rewarded");
+        assert_eq!(m.pawns[0].health, m.pawns[0].max_health, "the shot never hits its own firer");
+    }
+
+    #[test]
+    fn friendly_fire_on_stays_deterministic_and_verifies() {
+        // FM3: friendly fire is a pure conditional skip over the existing integer,
+        // seat-ordered combat — a same-seed FF-on match is byte-identical across runs
+        // and re-runs from its record to the same result. Seed-derived spawns (NOT
+        // hand-set, so the record's re-run reproduces them) put seat 0 a short hop
+        // west of its ally; firing along its spawn facing lands a real friendly hit.
+        let play = || {
+            let cfg = MatchConfig { max_ticks: 30, ..config(3) };
+            let rules = Rules {
+                friendly_fire: true,
+                spawn_radius: 2 * POSITION_SCALE,
+                spawn_jitter: 0,
+                ..Default::default()
+            };
+            let seats = vec![
+                SeatInfo { seat: 0, team: 0, controller: "0xaa".into() },
+                SeatInfo { seat: 1, team: 0, controller: "0xbb".into() },
+                SeatInfo { seat: 2, team: 1, controller: "0xcc".into() },
+            ];
+            let mut m = Match::new(MID.parse().unwrap(), cfg, rules, seats, Vec::new(), 9);
+            let aim = m.observe(0).own.facing; // toward the arena centre, where the ally sits
+            while m.phase() == MatchPhase::Live {
+                step_with(&mut m, &[(0, intent(Vec2::ZERO, aim, true))]);
+            }
+            m
+        };
+        let a = play();
+        let b = play();
+        assert_eq!(a.phase(), MatchPhase::Ended);
+        let ally_down = a.observe(1).own.health < Rules::default().start_health;
+        assert!(ally_down, "the scenario must actually exercise a friendly hit");
+        let ra = a.to_record().unwrap();
+        assert!(ra.verify().is_ok(), "an FF-on match re-runs to its committed result");
+        let rb = b.to_record().unwrap();
+        assert_eq!(ra.replay.digest(), rb.replay.digest(), "two FF-on runs diverged");
+        assert_eq!(serde_json::to_string(&ra).unwrap(), serde_json::to_string(&rb).unwrap());
+    }
+
+    #[test]
+    fn friendly_fire_does_not_alter_perception() {
+        // FM4: friendly_fire is a damage rule, not a perception rule — observe() reads
+        // it nowhere, so flipping it leaves every seat's observation byte-identical.
+        let off = ally_match(false, WeaponMode::Hitscan);
+        let on = ally_match(true, WeaponMode::Hitscan);
+        for seat in 0..3u8 {
+            assert_eq!(off.observe(seat), on.observe(seat), "the flag must not touch perception");
+        }
+    }
 }
