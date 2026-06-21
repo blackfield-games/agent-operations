@@ -599,8 +599,10 @@ pub struct ReplayRecord {
     /// [`digest`](ReplayRecord::digest) folds it so the hash COMMITS the tuning,
     /// closing the gap where a record presented with swapped rules shared a hash with
     /// the match it never ran (previously caught only by `verify`'s outcome re-run).
-    /// `serde(default)` (empty) so a record written before this field deserializes to
-    /// the pre-binding behavior it ran under.
+    /// `serde(default)` (empty) is for STRUCTURAL back-compat only — a pre-v4 record
+    /// missing the field still parses; it does not re-verify against its stored hash,
+    /// the same hard cutover every digest-tag bump makes (an empty commit is not "the
+    /// rules it ran under", unlike the empty blockers/pickups defaults above).
     #[serde(default)]
     pub rules_commit: Vec<u8>,
     pub ticks: Vec<TickRecord>,
