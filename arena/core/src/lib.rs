@@ -2199,6 +2199,26 @@ mod tests {
         run_match(close_match(seed), &mut policies)
     }
 
+    /// Like [`play`] but with static vision blockers riding into the record. The
+    /// blockers go off the y=0 combat line ([`off_line_blocker`]) so the quick,
+    /// decisive match is byte-identical in OUTCOME — they exercise the
+    /// record/digest binding, not the result.
+    fn play_with_blockers(seed: u64, blockers: Vec<Blocker>) -> Match {
+        let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), blockers, seed);
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        run_match(m, &mut policies)
+    }
+
+    /// A well-formed blocker off the y=0 combat line: present in the record and the
+    /// digest, but not on the combatants' sightline, so the match still ends fast.
+    fn off_line_blocker() -> Blocker {
+        Blocker {
+            min: Vec2 { x: 30 * POSITION_SCALE, y: 30 * POSITION_SCALE },
+            max: Vec2 { x: 31 * POSITION_SCALE, y: 31 * POSITION_SCALE },
+        }
+    }
+
     #[test]
     fn full_a2a_match_is_decisive() {
         let m = play(1);
@@ -2420,6 +2440,86 @@ mod tests {
         let mut r = good.clone();
         r.rules.spawn_radius = -1;
         assert_eq!(r.verify(), Err(ReplayError::MalformedSetup), "negative spawn radius");
+    }
+
+    #[test]
+    fn a_tampered_blocker_breaks_the_committed_hash() {
+        // FM1: blockers are vision-only, so a tampered blocker re-runs to the SAME
+        // outcomes — the only thing that catches it is the digest. Move one corner
+        // and the recomputed hash diverges: the record cannot be re-settled under a
+        // blocker set it was not committed with.
+        let mut rec = play_with_blockers(1, vec![off_line_blocker()]).to_record().unwrap();
+        assert!(!rec.replay.blockers.is_empty(), "the blocker rode into the record");
+        rec.replay.blockers[0].max.x += 1;
+        assert!(
+            matches!(rec.verify(), Err(ReplayError::HashMismatch { .. })),
+            "a tampered blocker must break the commitment even though outcomes are unchanged"
+        );
+    }
+
+    #[test]
+    fn a_blocker_record_is_byte_identical_across_runs_and_re_verifies() {
+        // Determinism: two independent runs with the same seed AND blockers produce
+        // identical digests and serde, and the record round-trips and re-verifies.
+        let a = play_with_blockers(7, vec![off_line_blocker()]).into_replay();
+        let b = play_with_blockers(7, vec![off_line_blocker()]).into_replay();
+        assert_eq!(a.digest(), b.digest(), "blocker records must hash identically across runs");
+        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+
+        let rec = play_with_blockers(7, vec![off_line_blocker()]).to_record().unwrap();
+        assert!(rec.verify().is_ok(), "a well-formed blocker record verifies");
+        let json = serde_json::to_string(&rec).unwrap();
+        let parsed: MatchRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, rec, "blocker record round-trips through JSON");
+        assert!(parsed.verify().is_ok(), "and re-verifies unchanged");
+    }
+
+    #[test]
+    fn verify_rejects_an_inverted_blocker() {
+        // FM3: an inverted AABB (min greater than max) is geometry the sim never
+        // produces; rejected as MalformedBlocker BEFORE the re-run, naming its index.
+        let mut r = play_with_blockers(1, vec![off_line_blocker()]).to_record().unwrap();
+        r.replay.blockers[0] = Blocker { min: Vec2 { x: 10, y: 0 }, max: Vec2 { x: 0, y: 0 } };
+        assert_eq!(r.verify(), Err(ReplayError::MalformedBlocker { index: 0 }), "inverted on x");
+
+        let mut r = play_with_blockers(1, vec![off_line_blocker()]).to_record().unwrap();
+        r.replay.blockers[0] = Blocker { min: Vec2 { x: 0, y: 10 }, max: Vec2 { x: 0, y: 0 } };
+        assert_eq!(r.verify(), Err(ReplayError::MalformedBlocker { index: 0 }), "inverted on y");
+    }
+
+    #[test]
+    fn verify_rejects_an_over_budget_blocker_list() {
+        // A crafted record with more blockers than the budget is rejected BEFORE the
+        // re-run (every blocker is hashed into the digest, an O(n) CPU-DoS).
+        let mut r = play_with_blockers(1, vec![off_line_blocker()]).to_record().unwrap();
+        let filler = r.replay.blockers[0];
+        r.replay.blockers.resize(MAX_REPLAY_BLOCKERS + 1, filler);
+        assert_eq!(
+            r.verify(),
+            Err(ReplayError::TooManyBlockers { blockers: MAX_REPLAY_BLOCKERS + 1, max: MAX_REPLAY_BLOCKERS }),
+        );
+
+        // Boundary: exactly at the cap is NOT a budget rejection (the guard is `>`,
+        // not `>=`) — it fails later as a HashMismatch (the digest changed), never
+        // TooManyBlockers.
+        let mut at = play_with_blockers(1, vec![off_line_blocker()]).to_record().unwrap();
+        let filler = at.replay.blockers[0];
+        at.replay.blockers.resize(MAX_REPLAY_BLOCKERS, filler);
+        assert!(!matches!(at.verify(), Err(ReplayError::TooManyBlockers { .. })));
+    }
+
+    #[test]
+    fn segment_vs_aabb_does_not_overflow_at_coordinate_extremes() {
+        // The cross products are i128 because an i32 endpoint difference (~4.3e9)
+        // times an i32 corner difference can exceed i64 (~1.8e19 worst case). Drive
+        // the widest products; the call completing without panic — and returning the
+        // correct result — is the assertion.
+        let from = Vec2 { x: i32::MIN, y: i32::MIN };
+        let to = Vec2 { x: i32::MAX, y: i32::MAX };
+        let full_height = Blocker { min: Vec2 { x: -1, y: i32::MIN }, max: Vec2 { x: 1, y: i32::MAX } };
+        assert!(segment_intersects_aabb(from, to, &full_height), "the extreme diagonal crosses a full-height slab");
+        let off = Blocker { min: Vec2 { x: i32::MIN, y: i32::MAX - 1 }, max: Vec2 { x: i32::MIN + 1, y: i32::MAX } };
+        assert!(!segment_intersects_aabb(from, to, &off), "the diagonal misses a far extreme corner box");
     }
 
     #[test]
