@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use arena_core::{Match, MatchRecord, ReplayError, Rules};
+use arena_core::{arena_map, Match, MatchRecord, ReplayError, Rules};
 use arena_proto::{
     verify_join_signature, ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode,
     MatchPhase, MatchResult, SeatId, SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
@@ -223,6 +223,13 @@ pub struct MatchParams {
     pub tick_hz: u16,
     pub max_ticks: u64,
     pub bounds: Vec2,
+    /// The builtin arena key whose static geometry — vision blockers + world
+    /// pickups — every formed match plays under, resolved through
+    /// [`arena_map`](arena_core::arena_map). The default `""` is the empty arena
+    /// (no occlusion, no items), so an unconfigured matchmaker forms matches
+    /// byte-identical to the pre-map-loading behaviour; an unknown key degrades to
+    /// that same empty arena rather than failing a formation.
+    pub arena: &'static str,
 }
 
 impl Default for MatchParams {
@@ -232,6 +239,7 @@ impl Default for MatchParams {
             tick_hz: 30,
             max_ticks: 3600,
             bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+            arena: "",
         }
     }
 }
@@ -378,7 +386,19 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             bounds: self.params.bounds,
             seats: seats.len() as u8,
         };
-        Match::new(match_id, config, Rules::default(), seats, Vec::new(), seed_for_match(match_id))
+        // Load the configured arena's static geometry (vision blockers + world
+        // pickups) at formation; the empty/default key is byte-identical to the
+        // pre-map-loading path, and an unknown key degrades to the empty arena.
+        let map = arena_map(self.params.arena);
+        Match::new_with_pickups(
+            match_id,
+            config,
+            Rules::default(),
+            seats,
+            map.blockers,
+            map.pickups,
+            seed_for_match(match_id),
+        )
     }
 
     /// How many participants are waiting in `mode`'s queue — for observability and
