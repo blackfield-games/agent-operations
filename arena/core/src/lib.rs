@@ -4472,6 +4472,128 @@ mod tests {
         );
     }
 
+    /// A two-seat match with the dash enabled at `dash_cooldown`, no spawn jitter, in
+    /// the given `bounds` with the given `blockers` — so seat 0 starts at exactly
+    /// (-spawn_radius, 0) and seat 1 at (+spawn_radius, 0), and a dash arc is computed
+    /// against known geometry.
+    fn dash_match(dash_cooldown: u16, bounds: Vec2, blockers: Vec<Blocker>, seed: u64) -> Match {
+        let rules = Rules { dash_cooldown, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let cfg = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds, seats: 2 };
+        Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), blockers, seed)
+    }
+
+    fn dash_intent(move_dir: Vec2) -> ActionIntent {
+        ActionIntent { move_dir, aim: EAST, buttons: ActionButtons { fire: false, jump: false, ability: true, reload: false } }
+    }
+
+    #[test]
+    fn a_dash_clamps_to_bounds_and_stops_at_a_wall() {
+        // FM1: the dash burst must respect the SAME movement safety as a walk — it
+        // clamps to the arena bounds and is refused by a blocker (both go through
+        // slide), so it can neither leave the arena nor tunnel a wall (the god-move the
+        // movement clamp exists to stop). DASH_DISTANCE 3000 dwarfs the 200-unit walk,
+        // so an unclamped/untunneled dash would be unmistakable.
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+
+        // (a) Wall: seat 0 at (-2000,0) walks +200 to (-1800,0); the dash from there to
+        // (1200,0) crosses a wall at x∈[-1000,-800], so the burst is refused and the
+        // pawn holds at its post-walk position — it does NOT punch through.
+        let wall = Blocker { min: Vec2 { x: -1000, y: -2000 }, max: Vec2 { x: -800, y: 2000 } };
+        let mut m = dash_match(10, Vec2 { x: 50_000, y: 50_000 }, vec![wall], 1);
+        assert_eq!(m.pawns[0].pos, Vec2 { x: -2000, y: 0 }, "seat 0 spawns at -spawn_radius");
+        step_with(&mut m, &[(0, dash_intent(east))]);
+        assert_eq!(m.pawns[0].pos, Vec2 { x: -1800, y: 0 }, "the dash is refused by the wall — only the walk applied, no tunnel");
+
+        // (b) Bounds: in a ±2500 arena seat 1 starts at (2000,0), walks to (2200,0),
+        // then the dash toward +x clamps to the boundary instead of escaping to 5200.
+        let mut edge = dash_match(10, Vec2 { x: 2500, y: 2500 }, Vec::new(), 1);
+        assert_eq!(edge.pawns[1].pos, Vec2 { x: 2000, y: 0 }, "seat 1 spawns at +spawn_radius");
+        step_with(&mut edge, &[(1, dash_intent(east))]);
+        assert_eq!(edge.pawns[1].pos, Vec2 { x: 2500, y: 0 }, "the dash clamps to the arena bound, never past it");
+    }
+
+    #[test]
+    fn a_dash_is_refused_during_cooldown_and_disabled_at_zero() {
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+
+        // FM2a (cooldown gate): dash_cooldown 10. The opening dash bursts seat 0 from
+        // (-2000,0) to (1200,0) [walk +200, dash +3000]; the very next tick's dash is
+        // still on cooldown, so the pawn only walks (+200) — it does not burst again
+        // (a second burst would land at 4400).
+        let mut m = dash_match(10, Vec2 { x: 50_000, y: 50_000 }, Vec::new(), 1);
+        step_with(&mut m, &[(0, dash_intent(east))]);
+        assert_eq!(m.pawns[0].pos, Vec2 { x: 1200, y: 0 }, "the first dash bursts walk+DASH_DISTANCE");
+        assert_eq!(m.pawns[0].dash_cooldown, 10, "the dash set its cooldown");
+        step_with(&mut m, &[(0, dash_intent(east))]);
+        assert_eq!(m.pawns[0].pos, Vec2 { x: 1400, y: 0 }, "the in-cooldown dash is refused — only the +200 walk applied");
+
+        // FM2b (default-off byte-identity): with dash_cooldown 0 a held ability press
+        // changes nothing — two matches differing ONLY in the ability bit reach
+        // byte-identical state (close_match leaves dash_cooldown at its 0 default).
+        let play = |ability: bool| {
+            let mut m = close_match(1);
+            let press = ActionIntent { move_dir: east, aim: EAST, buttons: ActionButtons { fire: true, jump: false, ability, reload: false } };
+            for _ in 0..24 {
+                if m.phase() != MatchPhase::Live {
+                    break;
+                }
+                step_with(&mut m, &[(0, press), (1, press)]);
+            }
+            m.pawns.iter().map(|p| (p.seat, p.pos, p.health, p.score, p.alive)).collect::<Vec<_>>()
+        };
+        assert_eq!(play(true), play(false), "with dash_cooldown 0 the ability button changes nothing — byte-identical");
+    }
+
+    #[test]
+    fn a_dash_reproduces_byte_for_byte_and_surfaces_only_own_cooldown() {
+        // FM3: the dash displacement is pure integer and reproduces across runs; the
+        // OWN dash cooldown is surfaced on SelfState, counting down to 0 exactly on the
+        // tick the next dash is honored (the same start-of-tick off-by-one the fire
+        // cooldown carries). An enemy's perception of the dasher carries NO dash
+        // readiness — pinned structurally proto-side (VisibleEntity/BroadcastEntity
+        // have no such field; widening either fails the wire-shape tests).
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+        let run = || {
+            let mut m = dash_match(3, Vec2 { x: 50_000, y: 50_000 }, Vec::new(), 1);
+            let mut trace = Vec::new();
+            for _ in 0..5 {
+                let ready = m.observe(0).own.dash_cooldown;
+                step_with(&mut m, &[(0, dash_intent(east))]);
+                trace.push((ready, m.pawns[0].pos));
+            }
+            trace
+        };
+        let a = run();
+        assert_eq!(a, run(), "the dash arc + cooldown readout reproduce byte-for-byte across runs");
+
+        // dash_cooldown reads 0 (ready) exactly when a dash fires: the opening tick,
+        // then again after the 3-tick cooldown elapses. Each 0 readout coincides with a
+        // walk+burst (+3200), the in-cooldown ticks with a walk-only step (+200).
+        let readouts: Vec<u16> = a.iter().map(|(r, _)| *r).collect();
+        assert_eq!(readouts, vec![0, 2, 1, 0, 2], "dash_cooldown counts 0 (ready) → 2 → 1 → 0 (ready) → 2");
+        let xs: Vec<i32> = a.iter().map(|(_, p)| p.x).collect();
+        assert_eq!(xs, vec![1200, 1400, 1600, 4800, 5000], "the two ready ticks burst +3200, the cooldown ticks walk +200");
+    }
+
+    #[test]
+    fn a_zero_direction_dash_is_a_noop_and_keeps_the_dash_ready() {
+        // FM4: an ability press with no movement direction has a DEFINED behavior — a
+        // no-op that does NOT consume the cooldown (there is no direction to dash, so
+        // the dash stays ready) rather than dashing a garbage vector or wasting the
+        // cooldown. A directionful press the next tick still dashes, proving the
+        // directionless press cost nothing.
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+        let mut m = dash_match(10, Vec2 { x: 50_000, y: 50_000 }, Vec::new(), 1);
+
+        step_with(&mut m, &[(0, dash_intent(Vec2::ZERO))]);
+        assert_eq!(m.pawns[0].pos, Vec2 { x: -2000, y: 0 }, "a zero-direction dash moves nothing");
+        assert_eq!(m.pawns[0].dash_cooldown, 0, "a zero-direction dash does NOT consume the cooldown — the dash stays ready");
+
+        step_with(&mut m, &[(0, dash_intent(east))]);
+        assert_eq!(m.pawns[0].pos, Vec2 { x: 1200, y: 0 }, "the still-ready dash fires on a directionful press");
+        assert_eq!(m.pawns[0].dash_cooldown, 10, "now the dash consumed its cooldown");
+    }
+
     #[test]
     fn ingest_accepts_well_formed_and_clamps_overlong_move() {
         let m = new_match(1);
