@@ -1639,6 +1639,157 @@ pub fn settlement(result: &MatchResult) -> Settlement {
     }
 }
 
+// ===========================================================================
+// Cross-implementation parity vectors — the UE5-twin conformance set.
+//
+// Every parity audit elsewhere in this crate checks the reference core against
+// ITSELF (it recomputes the same predicate and confirms `observe`/combat agree
+// with it), so it pins self-consistency but NOT a contract a *second*
+// implementation must meet. The types below model a small, canonical, versioned
+// set of `inputs -> exact integer outputs` vectors generated FROM this reference
+// core: the spec the UE5 dedicated-server twin (operator-gated, does not exist
+// yet) must reproduce bit-for-bit. Every field is integer, every container an
+// ordered `Vec`, so the set serializes byte-stably with no float, map, or
+// platform-formatting leak. See [`parity_vectors`] for the generator and the
+// honest scope of what a passing self-check does and does not prove.
+// ===========================================================================
+
+/// One seat's pinned spawn state, read through the public `observe(seat).own` —
+/// the integer facets the deterministic spawn formula derives from the seed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnVector {
+    pub seat: SeatId,
+    pub team: TeamId,
+    pub position: Vec2,
+    pub facing: Bam,
+    pub health: u16,
+    pub ammo: u16,
+}
+
+/// A pinned spawn case: a fixed `(seed, config, rules, roster)` and the exact
+/// per-seat spawn state it must reproduce. Discriminating because it carries a
+/// multi-seat roster (exercising the spawn-line spread divisor), non-zero jitter
+/// (the PRNG draw order), and seats on both sides of centre (the facing rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnCase {
+    pub label: String,
+    pub seed: u64,
+    pub config: MatchConfig,
+    pub rules: Rules,
+    pub roster: Vec<arena_proto::SeatInfo>,
+    pub spawns: Vec<SpawnVector>,
+}
+
+/// Whether — and by which filter, in the sim's range → cone → line-of-sight
+/// order — a candidate entity is excluded from an observer's parity-bounded
+/// visible set. The FIRST failing filter is the verdict, exactly as
+/// [`Match::observe`] applies them, so a divergent twin pinpoints the convention
+/// it broke rather than only seeing a different visible set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerceptionVerdict {
+    Visible,
+    OutOfRange,
+    OutOfCone,
+    Occluded,
+}
+
+/// One candidate enemy in a [`PerceptionCase`]: its ground-truth state and the
+/// verdict the observer reaches for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerceptionCandidate {
+    pub seat: SeatId,
+    pub team: TeamId,
+    pub position: Vec2,
+    pub alive: bool,
+    pub verdict: PerceptionVerdict,
+}
+
+/// A pinned perception case: an observer at a fixed pose under a fixed range +
+/// FOV cone + blocker set, the candidates around it, and the exact visible set it
+/// must produce. The load-bearing edges — an enemy past range, one outside the
+/// cone seam, one behind a wall — are the conventions a UE5 twin must match, not
+/// a happy-path everyone-in-view tautology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerceptionCase {
+    pub label: String,
+    pub observer_position: Vec2,
+    pub observer_facing: Bam,
+    pub perception_range: i32,
+    pub fov_octant_spread: u8,
+    pub blockers: Vec<Blocker>,
+    pub candidates: Vec<PerceptionCandidate>,
+    /// The observer's resulting visible entity ids, ascending — the conformance
+    /// target. Equals exactly the candidates whose verdict is `Visible`.
+    pub visible: Vec<u32>,
+}
+
+/// A pinned hitscan case: a shot fired from an explicit pose at an explicit
+/// target under a given [`AimMode`], and the damage it deals (`0` == a clean
+/// miss). The sub-octant boundary — a fine-aim direction that snaps to an octant
+/// axis — is where the two aim modes diverge, the convention an octant-only twin
+/// breaks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HitCase {
+    pub label: String,
+    pub shooter_position: Vec2,
+    pub shooter_facing: Bam,
+    pub target_position: Vec2,
+    pub weapon_range: i32,
+    pub hit_radius: i32,
+    pub aim_mode: AimMode,
+    pub damage: u16,
+}
+
+/// A pinned projectile case: a shot launched from an explicit pose toward a
+/// target, swept one tick at a time. `ticks_to_hit` is the flight age at which
+/// the swept segment first reached the target (`None` == it never did) — swept
+/// collision is what stops a fast shot tunnelling through a body between ticks, so
+/// a twin doing per-tick point collision fails the fast case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectileCase {
+    pub label: String,
+    pub shooter_position: Vec2,
+    pub shooter_facing: Bam,
+    pub target_position: Vec2,
+    pub projectile_speed: i32,
+    pub weapon_range: i32,
+    pub hit_radius: i32,
+    pub ticks_to_hit: Option<u16>,
+    pub damage: u16,
+    pub target_downed: bool,
+}
+
+/// A pinned full-match case: a complete, self-contained [`MatchRecord`] whose
+/// `result` (outcomes + `replay_hash`) a twin must reproduce by re-running the
+/// `(config, rules, seed, roster, blockers, action stream)` through its own core
+/// — exactly what [`MatchRecord::verify`] does, now as a cross-implementer
+/// contract. The three weapon/aim modes prove the determinant binding: the digest
+/// commits the INPUTS (so the octant and fine matches share a digest under the
+/// same action stream), while the rules bind the OUTCOMES (so the projectile
+/// match diverges and a flipped `weapon_mode` fails re-execution).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchCase {
+    pub label: String,
+    pub record: MatchRecord,
+}
+
+/// The canonical cross-implementation parity-vector set — the conformance spec
+/// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
+/// and the bytes are the contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParityVectors {
+    /// Domain tag versioning the set's MEANING; a bump signals a deliberate
+    /// convention change the twin must follow.
+    pub domain: String,
+    pub protocol_version: u32,
+    pub spawns: Vec<SpawnCase>,
+    pub perception: Vec<PerceptionCase>,
+    pub hits: Vec<HitCase>,
+    pub projectiles: Vec<ProjectileCase>,
+    pub matches: Vec<MatchCase>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
