@@ -5686,4 +5686,141 @@ mod tests {
             assert!(!e.to_string().is_empty(), "every ArenaMapError renders a message");
         }
     }
+
+    /// A 2-seat match in melee mode, no jitter, seats placed by the caller.
+    fn melee_match(seats: u8) -> Match {
+        let rules = Rules { weapon_mode: WeaponMode::Melee, spawn_jitter: 0, ..Default::default() };
+        let roster: Vec<SeatInfo> = (0..seats)
+            .map(|s| SeatInfo { seat: s, team: s as u16, controller: format!("0x{s:02x}") })
+            .collect();
+        Match::new(MID.parse().unwrap(), config(seats), rules, roster, Vec::new(), 1)
+    }
+
+    #[test]
+    fn melee_strikes_an_enemy_in_range_and_arc() {
+        // A swing damages an enemy within melee_range and the frontal arc, by
+        // melee_damage (not the ranged `damage`), and the shooter scores it.
+        let mut m = melee_match(2);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: POSITION_SCALE, y: 0 }; // 1 m dead ahead, inside the 2 m reach
+        let hp = m.pawns[1].health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.pawns[1].health, hp - m.rules.melee_damage, "the in-range, in-arc enemy takes melee_damage");
+        assert_eq!(m.pawns[0].score, m.rules.melee_damage as i32, "the shooter scores the melee hit");
+    }
+
+    #[test]
+    fn melee_misses_out_of_range_and_behind_the_arc() {
+        // Out of reach OR outside the frontal arc → no hit (the close-quarters arc is
+        // not a 360 ring and not infinite reach).
+        let mut far = melee_match(2);
+        far.pawns[0].pos = Vec2::ZERO;
+        far.pawns[0].facing = EAST;
+        far.pawns[1].pos = Vec2 { x: 3 * POSITION_SCALE, y: 0 }; // 3 m > 2 m reach
+        let hp = far.pawns[1].health;
+        step_with(&mut far, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(far.pawns[1].health, hp, "an enemy beyond melee_range is not struck");
+
+        let mut behind = melee_match(2);
+        behind.pawns[0].pos = Vec2::ZERO;
+        behind.pawns[0].facing = EAST;
+        behind.pawns[1].pos = Vec2 { x: -POSITION_SCALE, y: 0 }; // in reach but directly behind
+        let hp = behind.pawns[1].health;
+        step_with(&mut behind, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(behind.pawns[1].health, hp, "an enemy behind the facing arc is not struck");
+    }
+
+    #[test]
+    fn melee_cleaves_every_enemy_in_the_arc_deterministically() {
+        // Unlike the nearest-only beam, one swing strikes EVERY enemy in range + arc;
+        // seat-ordered + atomic so the same-tick multi-hit is reproducible.
+        let strike = || {
+            let mut m = melee_match(3);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[0].facing = EAST;
+            m.pawns[1].pos = Vec2 { x: POSITION_SCALE, y: 100 }; // both ~1 m ahead, in arc
+            m.pawns[2].pos = Vec2 { x: POSITION_SCALE, y: -100 };
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+            (m.pawns[1].health, m.pawns[2].health, m.pawns[0].score)
+        };
+        let dmg = Rules { weapon_mode: WeaponMode::Melee, ..Default::default() }.melee_damage;
+        let (h1, h2, score) = strike();
+        assert_eq!(h1, 100 - dmg, "the first enemy in the arc is cleaved");
+        assert_eq!(h2, 100 - dmg, "the second enemy in the arc is cleaved by the same swing");
+        assert_eq!(score, 2 * dmg as i32, "the shooter scores both cleaved enemies");
+        assert_eq!(strike(), (h1, h2, score), "the cleave is deterministic across identical runs");
+    }
+
+    #[test]
+    fn melee_needs_no_ammo() {
+        // Melee is the always-available fallback: an empty magazine still swings, and
+        // ammo is neither required nor decremented (no underflow).
+        let mut m = melee_match(2);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[0].ammo = 0;
+        m.pawns[1].pos = Vec2 { x: POSITION_SCALE, y: 0 };
+        let hp = m.pawns[1].health;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        assert_eq!(m.pawns[1].health, hp - m.rules.melee_damage, "a melee swing lands with an empty magazine");
+        assert_eq!(m.pawns[0].ammo, 0, "melee consumes no ammo (and does not underflow)");
+    }
+
+    #[test]
+    fn melee_cooldown_gates_repeat_swings() {
+        // The first swing connects and arms melee_cooldown; an immediate second swing
+        // is refused until the cooldown elapses.
+        let mut m = melee_match(2);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: POSITION_SCALE, y: 0 };
+        m.pawns[1].health = m.rules.melee_damage + 10; // survives exactly one swing
+        let fire = (0u8, intent(Vec2::ZERO, EAST, true));
+        step_with(&mut m, &[fire]);
+        assert_eq!(m.pawns[1].health, 10, "the first swing lands");
+        step_with(&mut m, &[fire]);
+        assert_eq!(m.pawns[1].health, 10, "a second swing within melee_cooldown is refused");
+    }
+
+    #[test]
+    fn a_hitscan_match_outcome_ignores_the_melee_fields() {
+        // The melee fields are read ONLY in melee mode: a Hitscan match's OUTCOME is
+        // identical whatever they are set to (only the replay_hash, which binds them,
+        // differs — the hard cutover, pinned by the regenerated parity golden).
+        let baseline_match = play(1);
+        let baseline = baseline_match.result().unwrap();
+        let rules = Rules {
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            melee_range: 99 * POSITION_SCALE,
+            melee_damage: u16::MAX,
+            melee_cooldown: 1,
+            ..Default::default()
+        };
+        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        let melee_match = run_match(m, &mut policies);
+        let melee_fields = melee_match.result().unwrap();
+        assert_eq!(baseline.outcomes, melee_fields.outcomes, "extreme melee fields do not change a Hitscan outcome");
+        assert_eq!(baseline.final_tick, melee_fields.final_tick, "nor the final tick");
+    }
+
+    #[test]
+    fn a_melee_match_self_verifies_and_a_flipped_mode_does_not() {
+        // A melee match seals into a self-verifying record; flipping a HITSCAN record's
+        // weapon_mode to Melee fails verify (the tuning is digest-bound — the binds-rules
+        // guard catches the stored rules_commit no longer matching the rules).
+        let rules = Rules { weapon_mode: WeaponMode::Melee, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        let played = run_match(m, &mut policies);
+        assert_eq!(played.phase(), MatchPhase::Ended, "a melee Seeker duel reaches a terminal state");
+        let melee_record = played.to_record().unwrap();
+        assert!(melee_record.verify().is_ok(), "a melee match re-runs to its own committed result");
+
+        let mut flipped = play(1).to_record().unwrap();
+        flipped.rules.weapon_mode = WeaponMode::Melee;
+        assert!(flipped.verify().is_err(), "a hitscan record reverified as melee must not verify");
+    }
 }
