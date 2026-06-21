@@ -4631,6 +4631,142 @@ mod tests {
         assert_eq!(m.pawns[0].dash_cooldown, 10, "now the dash consumed its cooldown");
     }
 
+    /// Build a 2-seat match with `wall_slide` set, no jitter, seat 0 at the origin and
+    /// seat 1 parked far away (idle, keeping the match Live) — so a slide is computed
+    /// from (0,0) against known wall geometry.
+    fn slide_match(wall_slide: bool, blockers: Vec<Blocker>) -> Match {
+        let rules = Rules { wall_slide, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), blockers, 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 };
+        m
+    }
+
+    #[test]
+    fn wall_slide_slides_along_a_grazed_wall_and_a_corner_still_stops() {
+        // FM1: with wall_slide on, a diagonal step whose full path is refused retries the
+        // axis-separated components, so a pawn grazing a wall SLIDES along the unblocked
+        // axis instead of dead-stopping — but it must not tunnel (the slid end stays on
+        // the near side of the wall), and an inside corner (both axes refused) holds.
+        let ne = Vec2 { x: 600, y: 800 }; // mag 1000 -> dx=120, dy=160 at max_speed 200
+        // A tall vertical wall east of the origin: it refuses the eastward component but
+        // never the pure-north one.
+        let east_wall = Blocker { min: Vec2 { x: 100, y: -5000 }, max: Vec2 { x: 300, y: 5000 } };
+
+        // Off: the diagonal into the wall dead-stops at the origin (the historical rule).
+        let mut off = slide_match(false, vec![east_wall]);
+        step_with(&mut off, &[(0, intent(ne, EAST, false))]);
+        assert_eq!(off.pawns[0].pos, Vec2::ZERO, "wall_slide off: a grazing diagonal dead-stops");
+
+        // On: the eastward component is refused but the northward one is clear, so the
+        // pawn slides straight north (x stays 0 — well short of the wall's near edge 100).
+        let mut on = slide_match(true, vec![east_wall]);
+        step_with(&mut on, &[(0, intent(ne, EAST, false))]);
+        assert_eq!(on.pawns[0].pos, Vec2 { x: 0, y: 160 }, "wall_slide on: the pawn slides along the wall");
+        assert!(on.pawns[0].pos.x < east_wall.min.x, "the slid pawn never crosses the wall's near edge (no tunnel)");
+
+        // Inside corner: a wall to the east AND one to the north refuse BOTH axis-
+        // separated retries, so even with wall_slide on the pawn holds at the origin.
+        let north_wall = Blocker { min: Vec2 { x: -5000, y: 100 }, max: Vec2 { x: 5000, y: 300 } };
+        let mut corner = slide_match(true, vec![east_wall, north_wall]);
+        step_with(&mut corner, &[(0, intent(ne, EAST, false))]);
+        assert_eq!(corner.pawns[0].pos, Vec2::ZERO, "an inside corner (both axes refused) still full-stops");
+    }
+
+    #[test]
+    fn wall_slide_only_changes_a_blocked_step() {
+        // FM2 (default-off byte-identity): wall_slide changes movement ONLY when a step
+        // is refused — an unobstructed move is identical on and off, and with it OFF a
+        // blocked move dead-stops exactly as before. So the default (off) is byte-
+        // identical to the pre-slide rule, and the flag is the sole load-bearing
+        // difference on a block (the parity golden regenerated with zero outcome drift).
+        let ne = Vec2 { x: 600, y: 800 };
+        let east_wall = Blocker { min: Vec2 { x: 100, y: -5000 }, max: Vec2 { x: 300, y: 5000 } };
+
+        // Unobstructed: no wall, so the full diagonal applies — identical on and off.
+        let mut clear_off = slide_match(false, Vec::new());
+        let mut clear_on = slide_match(true, Vec::new());
+        step_with(&mut clear_off, &[(0, intent(ne, EAST, false))]);
+        step_with(&mut clear_on, &[(0, intent(ne, EAST, false))]);
+        assert_eq!(clear_off.pawns[0].pos, Vec2 { x: 120, y: 160 }, "an unobstructed diagonal advances fully");
+        assert_eq!(clear_on.pawns[0].pos, clear_off.pawns[0].pos, "wall_slide does not touch an unobstructed step");
+
+        // Obstructed: off dead-stops (the historical rule), on slides — the flag is the
+        // only difference, and off reproduces the pre-slide behavior exactly.
+        let mut blocked_off = slide_match(false, vec![east_wall]);
+        let mut blocked_on = slide_match(true, vec![east_wall]);
+        step_with(&mut blocked_off, &[(0, intent(ne, EAST, false))]);
+        step_with(&mut blocked_on, &[(0, intent(ne, EAST, false))]);
+        assert_eq!(blocked_off.pawns[0].pos, Vec2::ZERO, "wall_slide off: a blocked step dead-stops as before");
+        assert_ne!(
+            blocked_on.pawns[0].pos, blocked_off.pawns[0].pos,
+            "wall_slide on is the sole load-bearing difference on a block"
+        );
+    }
+
+    #[test]
+    fn wall_slide_resolves_x_before_y_and_reproduces() {
+        // FM3 (axis-order determinism + reproducibility): when BOTH axis-separated
+        // retries are clear, the fixed X-first convention decides — the pawn slides on X,
+        // not Y. A small blocker squarely on the diagonal refuses the full step while
+        // neither axis-aligned path touches it, so the resolution order is the only thing
+        // that picks the outcome. The result is pure-integer and reproduces exactly.
+        let ne = Vec2 { x: 600, y: 800 }; // dx=120, dy=160
+        // (60,80) is the midpoint of the (0,0)->(120,160) diagonal; this box straddles it
+        // but lies clear of both the y=0 (X-only) and x=0 (Y-only) paths.
+        let nub = Blocker { min: Vec2 { x: 50, y: 70 }, max: Vec2 { x: 70, y: 90 } };
+
+        let mut a = slide_match(true, vec![nub]);
+        step_with(&mut a, &[(0, intent(ne, EAST, false))]);
+        assert_eq!(a.pawns[0].pos, Vec2 { x: 120, y: 0 }, "both retries clear -> X-first wins (slides on X, not Y)");
+
+        // Reproducible: a second identical run lands byte-for-byte on the same slid point.
+        let mut b = slide_match(true, vec![nub]);
+        step_with(&mut b, &[(0, intent(ne, EAST, false))]);
+        assert_eq!(b.pawns[0].pos, a.pawns[0].pos, "the slid position reproduces exactly");
+    }
+
+    #[test]
+    fn wall_slide_dash_slides_and_a_slide_clamps_to_bounds() {
+        // FM4 (shared-helper + bounds): slide() is used by BOTH the walk and the dash, so
+        // wall_slide changes the dash too — a dash grazing a wall slides instead of being
+        // refused outright; and the slid destination still clamps to the arena bounds.
+        let ne = Vec2 { x: 600, y: 800 }; // walk dx,dy = 120,160 / dash burst = 1800,2400
+        // A tall vertical wall east of the post-walk position: the walk (to x=120) clears
+        // it, the dash burst (to x~1920) is refused on X, the north component is clear.
+        let east_wall = Blocker { min: Vec2 { x: 300, y: -10_000 }, max: Vec2 { x: 500, y: 10_000 } };
+        let dash = |wall_slide: bool| {
+            let rules = Rules { wall_slide, dash_cooldown: 5, spawn_jitter: 0, ..Default::default() };
+            let cfg = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 };
+            let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), vec![east_wall], 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 };
+            m
+        };
+
+        // Off: the walk applies (to (120,160)), then the dash burst is refused by the
+        // wall -> the pawn holds at the post-walk position.
+        let mut off = dash(false);
+        step_with(&mut off, &[(0, dash_intent(ne))]);
+        assert_eq!(off.pawns[0].pos, Vec2 { x: 120, y: 160 }, "wall_slide off: the blocked dash burst is refused, only the walk applies");
+
+        // On: the dash burst's eastward component is refused but the northward one is
+        // clear, so the burst slides north from the post-walk position.
+        let mut on = dash(true);
+        step_with(&mut on, &[(0, dash_intent(ne))]);
+        assert_eq!(on.pawns[0].pos, Vec2 { x: 120, y: 2560 }, "wall_slide on: the dash inherits the slide and bursts north");
+        assert!(on.pawns[0].pos.x < east_wall.min.x, "the slid dash never crosses the wall's near edge");
+
+        // Bounds: a wall_slide move toward the arena edge still clamps in-bounds (no wall).
+        let cfg = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 2500, y: 2500 }, seats: 2 };
+        let rules = Rules { wall_slide: true, spawn_jitter: 0, ..Default::default() };
+        let mut edge = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), Vec::new(), 1);
+        edge.pawns[0].pos = Vec2 { x: 2400, y: 0 };
+        edge.pawns[1].pos = Vec2 { x: -2400, y: 0 };
+        step_with(&mut edge, &[(0, intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false))]);
+        assert_eq!(edge.pawns[0].pos, Vec2 { x: 2500, y: 0 }, "a wall_slide move still clamps to the arena bound");
+    }
+
     #[test]
     fn ingest_accepts_well_formed_and_clamps_overlong_move() {
         let m = new_match(1);
