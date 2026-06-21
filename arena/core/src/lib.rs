@@ -593,6 +593,84 @@ impl ArenaMap {
     pub fn empty() -> Self {
         Self::default()
     }
+
+    /// Parse + validate a data-driven arena map from its JSON form.
+    ///
+    /// The parser is string-in — the harness/match edge reads files — so arena-core
+    /// stays filesystem-free and deterministic (the UE5 twin and any no-fs context
+    /// can reuse it). After a successful parse it enforces the SAME structural bounds
+    /// [`MatchRecord::verify`] requires — at most [`MAX_REPLAY_BLOCKERS`] blockers and
+    /// [`MAX_REPLAY_PICKUPS`] pickups — so any map that loads is guaranteed to pass
+    /// verify (the loader can never accept geometry a downstream record would reject),
+    /// plus two well-formedness checks the sim relies on: no degenerate (`min > max`)
+    /// blocker AABB (the line-of-sight test and the movement clamp both assume
+    /// `min <= max`; a zero-area `min == max` point is allowed) and no zero-amount
+    /// (no-op) pickup.
+    pub fn from_json(json: &str) -> Result<ArenaMap, ArenaMapError> {
+        let map: ArenaMap =
+            serde_json::from_str(json).map_err(|e| ArenaMapError::Parse(e.to_string()))?;
+        if map.blockers.len() > MAX_REPLAY_BLOCKERS {
+            return Err(ArenaMapError::TooManyBlockers {
+                count: map.blockers.len(),
+                max: MAX_REPLAY_BLOCKERS,
+            });
+        }
+        if map.pickups.len() > MAX_REPLAY_PICKUPS {
+            return Err(ArenaMapError::TooManyPickups { count: map.pickups.len(), max: MAX_REPLAY_PICKUPS });
+        }
+        for (index, b) in map.blockers.iter().enumerate() {
+            if b.min.x > b.max.x || b.min.y > b.max.y {
+                return Err(ArenaMapError::DegenerateBlocker { index });
+            }
+        }
+        for (index, p) in map.pickups.iter().enumerate() {
+            if p.amount == 0 {
+                return Err(ArenaMapError::EmptyPickup { index });
+            }
+        }
+        Ok(map)
+    }
+}
+
+/// Why [`ArenaMap::from_json`] rejected a map. Validation runs after a successful
+/// parse, so [`Parse`](ArenaMapError::Parse) covers malformed JSON (a syntax error,
+/// a wrong field type, or — via `deny_unknown_fields` — an unrecognised key), while
+/// the structural variants reject a well-formed-JSON map the sim could not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArenaMapError {
+    /// The bytes are not a valid [`ArenaMap`] JSON document.
+    Parse(String),
+    /// More `blockers` than [`MAX_REPLAY_BLOCKERS`] — the cap [`MatchRecord::verify`]
+    /// enforces, applied here so a loadable map always passes verify.
+    TooManyBlockers { count: usize, max: usize },
+    /// More `pickups` than [`MAX_REPLAY_PICKUPS`] (same rationale as
+    /// [`TooManyBlockers`](ArenaMapError::TooManyBlockers)).
+    TooManyPickups { count: usize, max: usize },
+    /// The blocker at `index` is an inverted AABB (`min > max` on an axis), which the
+    /// line-of-sight test and the movement clamp both assume cannot happen.
+    DegenerateBlocker { index: usize },
+    /// The pickup at `index` grants nothing (`amount == 0`) — a no-op item.
+    EmptyPickup { index: usize },
+}
+
+impl std::fmt::Display for ArenaMapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArenaMapError::Parse(msg) => write!(f, "malformed arena map JSON: {msg}"),
+            ArenaMapError::TooManyBlockers { count, max } => {
+                write!(f, "arena map has {count} blockers, over the {max} cap")
+            }
+            ArenaMapError::TooManyPickups { count, max } => {
+                write!(f, "arena map has {count} pickups, over the {max} cap")
+            }
+            ArenaMapError::DegenerateBlocker { index } => {
+                write!(f, "arena map blocker {index} is degenerate (min > max)")
+            }
+            ArenaMapError::EmptyPickup { index } => {
+                write!(f, "arena map pickup {index} grants nothing (amount == 0)")
+            }
+        }
+    }
 }
 
 /// Resolve a builtin arena key to its [`ArenaMap`]. The empty/default key (`""`)
@@ -5371,5 +5449,101 @@ mod tests {
         assert_eq!(record.replay.blockers, map.blockers, "the arena's blockers rode into the record");
         assert_eq!(record.replay.pickups, map.pickups, "the arena's pickups rode into the record");
         assert!(record.verify().is_ok(), "a reference-arena match re-runs to its committed result");
+    }
+
+    #[test]
+    fn arena_map_json_round_trips() {
+        // Serialize -> from_json reproduces the map exactly: the data-driven format
+        // is the map's own serde form, so an authored map and a loaded one agree.
+        let map = ArenaMap {
+            blockers: vec![Blocker { min: Vec2 { x: -3000, y: -3000 }, max: Vec2 { x: 3000, y: 3000 } }],
+            pickups: vec![health_pickup(-20000, 0, 50), ammo_pickup(20000, 0, 30)],
+        };
+        let json = serde_json::to_string(&map).unwrap();
+        assert_eq!(ArenaMap::from_json(&json).unwrap(), map, "the map round-trips through JSON");
+    }
+
+    #[test]
+    fn from_json_loads_a_partial_or_empty_map() {
+        // Each field is serde(default): a blockers-only, pickups-only, or fully empty
+        // map all load (the absent array is empty) — authoring one half is valid.
+        assert_eq!(ArenaMap::from_json("{}").unwrap(), ArenaMap::empty(), "an empty object is the empty arena");
+        let blockers_only = ArenaMap::from_json(r#"{"blockers":[{"min":{"x":-1,"y":-1},"max":{"x":1,"y":1}}]}"#).unwrap();
+        assert_eq!(blockers_only.blockers.len(), 1);
+        assert!(blockers_only.pickups.is_empty(), "an omitted pickups array defaults to empty");
+        let pickups_only = ArenaMap::from_json(r#"{"pickups":[{"kind":"health","position":{"x":0,"y":0},"amount":10}]}"#).unwrap();
+        assert!(pickups_only.blockers.is_empty(), "an omitted blockers array defaults to empty");
+        assert_eq!(pickups_only.pickups.len(), 1);
+    }
+
+    #[test]
+    fn from_json_rejects_an_unknown_field_and_malformed_json() {
+        // deny_unknown_fields: a typo'd key (`blocker` for `blockers`) fails loudly
+        // instead of silently parsing to an empty arena (which would ship broken).
+        assert!(matches!(ArenaMap::from_json(r#"{"blocker":[]}"#), Err(ArenaMapError::Parse(_))), "an unknown field is rejected");
+        assert!(matches!(ArenaMap::from_json("{ not json"), Err(ArenaMapError::Parse(_))), "syntactically invalid JSON is rejected");
+        assert!(matches!(ArenaMap::from_json(r#"{"blockers":42}"#), Err(ArenaMapError::Parse(_))), "a wrong field type is rejected");
+    }
+
+    #[test]
+    fn from_json_rejects_a_degenerate_blocker_but_allows_a_zero_area_point() {
+        // An inverted AABB (min > max on an axis) breaks the SAT LOS test + the
+        // movement clamp; reject it. A zero-AREA blocker (min == max) is a harmless
+        // point and is allowed.
+        for bad in [
+            ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 10, y: 0 }, max: Vec2 { x: 0, y: 0 } }], pickups: vec![] },
+            ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 0, y: 10 }, max: Vec2 { x: 0, y: 0 } }], pickups: vec![] },
+        ] {
+            let json = serde_json::to_string(&bad).unwrap();
+            assert_eq!(ArenaMap::from_json(&json), Err(ArenaMapError::DegenerateBlocker { index: 0 }), "an inverted AABB is rejected");
+        }
+        let point = ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 5, y: 5 }, max: Vec2 { x: 5, y: 5 } }], pickups: vec![] };
+        let json = serde_json::to_string(&point).unwrap();
+        assert!(ArenaMap::from_json(&json).is_ok(), "a zero-area point blocker (min == max) is allowed");
+    }
+
+    #[test]
+    fn from_json_rejects_a_zero_amount_pickup() {
+        // A pickup that grants nothing (amount == 0) is a no-op item — malformed
+        // authoring, rejected with its index.
+        let bad = ArenaMap { blockers: vec![], pickups: vec![health_pickup(0, 0, 50), ammo_pickup(0, 0, 0)] };
+        let json = serde_json::to_string(&bad).unwrap();
+        assert_eq!(ArenaMap::from_json(&json), Err(ArenaMapError::EmptyPickup { index: 1 }), "a zero-amount pickup is rejected at its index");
+    }
+
+    #[test]
+    fn from_json_enforces_the_verify_caps_so_a_loadable_map_always_verifies() {
+        // The loader caps at exactly the bounds MatchRecord::verify enforces, so a map
+        // the loader accepts can never be rejected downstream. At the cap: ok; over: rejected.
+        let blocker = Blocker { min: Vec2 { x: 0, y: 0 }, max: Vec2 { x: 1, y: 1 } };
+        let at_cap = ArenaMap { blockers: vec![blocker; MAX_REPLAY_BLOCKERS], pickups: vec![] };
+        assert!(ArenaMap::from_json(&serde_json::to_string(&at_cap).unwrap()).is_ok(), "exactly MAX_REPLAY_BLOCKERS loads");
+        let over = ArenaMap { blockers: vec![blocker; MAX_REPLAY_BLOCKERS + 1], pickups: vec![] };
+        assert_eq!(
+            ArenaMap::from_json(&serde_json::to_string(&over).unwrap()),
+            Err(ArenaMapError::TooManyBlockers { count: MAX_REPLAY_BLOCKERS + 1, max: MAX_REPLAY_BLOCKERS }),
+            "one blocker over the verify cap is rejected"
+        );
+        let pk = health_pickup(0, 0, 1);
+        let pk_over = ArenaMap { blockers: vec![], pickups: vec![pk; MAX_REPLAY_PICKUPS + 1] };
+        assert_eq!(
+            ArenaMap::from_json(&serde_json::to_string(&pk_over).unwrap()),
+            Err(ArenaMapError::TooManyPickups { count: MAX_REPLAY_PICKUPS + 1, max: MAX_REPLAY_PICKUPS }),
+            "one pickup over the verify cap is rejected"
+        );
+    }
+
+    #[test]
+    fn arena_map_error_display_covers_every_variant() {
+        let cases = [
+            ArenaMapError::Parse("boom".into()),
+            ArenaMapError::TooManyBlockers { count: 2000, max: MAX_REPLAY_BLOCKERS },
+            ArenaMapError::TooManyPickups { count: 500, max: MAX_REPLAY_PICKUPS },
+            ArenaMapError::DegenerateBlocker { index: 3 },
+            ArenaMapError::EmptyPickup { index: 4 },
+        ];
+        for e in cases {
+            assert!(!e.to_string().is_empty(), "every ArenaMapError renders a message");
+        }
     }
 }
