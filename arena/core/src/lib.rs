@@ -116,6 +116,38 @@ impl SplitMix64 {
     }
 }
 
+/// How a match's weapon resolves a fire — the match-level weapon model, a
+/// server-authoritative [`Rules`] field (never sent to agents, the same posture as
+/// every other combat constant; agents learn the weapon's behavior empirically).
+///
+/// [`Hitscan`](WeaponMode::Hitscan) is the default and resolves a shot instantly
+/// along the beam ([`resolve_fire`](Match::resolve_fire)); a match left at the
+/// default is byte-identical to every pre-projectile match and replay.
+/// [`Projectile`](WeaponMode::Projectile) instead spawns a traveling shot that
+/// advances per tick and can be dodged. The mode is a determinant of the outcome,
+/// so it rides in the [`Rules`] a [`MatchRecord`] commits — a record re-run under a
+/// different mode reproduces a different result and is rejected by
+/// [`verify`](MatchRecord::verify), exactly as a tampered `damage` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeaponMode {
+    /// Instant beam hitscan — the shot lands the tick it is fired.
+    #[default]
+    Hitscan,
+    /// A traveling projectile — the shot spawns and flies, hitting only when its
+    /// swept path crosses an enemy body on a later (or the same point-blank) tick.
+    Projectile,
+}
+
+/// The default projectile travel speed ([`Rules::projectile_speed`]): 2 m/tick,
+/// faster than the default `max_speed` so a shot outruns a strafing pawn yet is
+/// slow enough to dodge over its flight. The `serde(default)` for the field, so a
+/// `Rules` serialized before projectiles existed deserializes to this — harmless,
+/// since the same record also defaults `weapon_mode` to `Hitscan`, which ignores it.
+fn default_projectile_speed() -> i32 {
+    2 * POSITION_SCALE
+}
+
 /// The combat tuning a match runs under — distinct from `arena_proto::MatchConfig`
 /// (which is the read-only rules summary sent to agents). These are the
 /// server-authoritative constants the sim clamps and resolves against; an agent
@@ -132,8 +164,22 @@ pub struct Rules {
     /// Beam-hitscan reach, in position units.
     pub weapon_range: i32,
     /// Lateral half-width of the hitscan beam, in position units — the aim
-    /// tolerance that lets the coarse 8-way facing still land a shot.
+    /// tolerance that lets the coarse 8-way facing still land a shot. In
+    /// [`WeaponMode::Projectile`] it doubles as the pawn body half-width a
+    /// projectile's swept path must reach to hit.
     pub hit_radius: i32,
+    /// How a fire resolves: instant [`WeaponMode::Hitscan`] (the default,
+    /// byte-identical to every pre-projectile match) or a traveling
+    /// [`WeaponMode::Projectile`]. `serde(default)` resolves to `Hitscan` so a
+    /// record written before this field replays under the model it actually ran.
+    #[serde(default)]
+    pub weapon_mode: WeaponMode,
+    /// Projectile travel speed in position units per tick (only consulted in
+    /// [`WeaponMode::Projectile`]). Snapped to the firing octant and clamped to a
+    /// sane non-negative bound at spawn, so it never produces an over-fast shot that
+    /// could overflow the swept-collision integer math.
+    #[serde(default = "default_projectile_speed")]
+    pub projectile_speed: i32,
     /// Damage one landed shot deals.
     pub damage: u16,
     /// Ticks between shots; a pawn may fire only when its cooldown is `0`.
@@ -174,6 +220,8 @@ impl Default for Rules {
             max_speed: 200,             // 0.2 m/tick → ~6 m/s at 30 Hz
             weapon_range: 30 * POSITION_SCALE,
             hit_radius: 1500,           // 1.5 m beam radius
+            weapon_mode: WeaponMode::Hitscan,
+            projectile_speed: default_projectile_speed(),
             damage: 25,                 // four shots to down a full-health pawn
             fire_cooldown: 6,           // five shots/sec at 30 Hz
             mag_size: 30,
@@ -1330,6 +1378,29 @@ mod tests {
         let m = new_match(1);
         assert_eq!(m.phase(), MatchPhase::Live);
         assert_eq!(m.tick(), 0);
+    }
+
+    #[test]
+    fn rules_default_to_hitscan_and_old_records_deserialize_to_it() {
+        // The default weapon model is Hitscan, so every pre-projectile match is
+        // byte-identical, and a Rules serialized before the projectile fields existed
+        // deserializes to Hitscan + the default speed (not Projectile, not speed 0) —
+        // the back-compat contract that lets old records replay under the model they
+        // actually ran.
+        assert_eq!(WeaponMode::default(), WeaponMode::Hitscan);
+        assert_eq!(Rules::default().weapon_mode, WeaponMode::Hitscan);
+
+        let mut v = serde_json::to_value(Rules::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("weapon_mode");
+        obj.remove("projectile_speed");
+        let old: Rules = serde_json::from_value(v).unwrap();
+        assert_eq!(old.weapon_mode, WeaponMode::Hitscan, "absent weapon_mode defaults to Hitscan");
+        assert_eq!(old.projectile_speed, default_projectile_speed(), "absent speed defaults, not zero");
+
+        // The wire spelling is the snake_case tag both Gateway implementers share.
+        assert_eq!(serde_json::to_value(WeaponMode::Projectile).unwrap(), serde_json::json!("projectile"));
+        assert_eq!(serde_json::to_value(WeaponMode::Hitscan).unwrap(), serde_json::json!("hitscan"));
     }
 
     #[test]
