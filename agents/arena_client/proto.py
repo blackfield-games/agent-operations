@@ -12,8 +12,14 @@ the wire — so the same match hashes identically on every platform. Integer fie
 mirror the Rust integer WIDTH (`u8`/`u16`/`u32`/`u64`/`i32`) and `match_id` is
 UUID-shaped, so an out-of-domain value an agent might emit fails here with a clean
 parity error rather than panicking the Rust server on deserialize. `extra=forbid`
-makes an unexpected field a decode error rather than a silent drop: within a
-`PROTOCOL_VERSION` the shape is fixed, and a new field means a version bump.
+makes an unexpected field a decode error rather than a silent drop, so any drift
+between the two implementers fails loud. `PROTOCOL_VERSION` is exact-matched at the
+handshake and bound into the replay/join settlement digests, so a change to what
+those digests commit — the seed, the per-tick action stream, the handshake — bumps
+it. The parity-bounded observation is *not* a settlement determinant (no digest
+hashes it), so while the wire is pre-release its own-state shape is completed in
+lockstep across both sides rather than minting a version that would invalidate
+every prior settlement commitment for a HUD-only field.
 """
 
 from __future__ import annotations
@@ -117,6 +123,11 @@ class SelfState(_Wire):
     health: U16
     max_health: U16
     ammo: U16
+    # Ticks until this pawn may fire again as the next action sees it: 0 means a
+    # fire submitted for this observation's tick is honored (subject to ammo). The
+    # server already subtracts the start-of-tick decrement, so the fire-ready
+    # predicate is simply `cooldown == 0`. Own state only — never on VisibleEntity.
+    cooldown: U16
     alive: bool
 
 
