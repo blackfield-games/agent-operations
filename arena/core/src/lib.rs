@@ -2123,10 +2123,12 @@ pub struct PerceptionCase {
 }
 
 /// A pinned hitscan case: a shot fired from an explicit pose at an explicit
-/// target under a given [`AimMode`], and the damage it deals (`0` == a clean
-/// miss). The sub-octant boundary — a fine-aim direction that snaps to an octant
-/// axis — is where the two aim modes diverge, the convention an octant-only twin
-/// breaks.
+/// target under a given [`AimMode`] and occluder set, and the damage it deals
+/// (`0` == a clean miss). The sub-octant boundary — a fine-aim direction that
+/// snaps to an octant axis — is where the two aim modes diverge; a non-empty
+/// `blockers` set is physical cover, so a beam to a target behind a wall is
+/// blocked. A twin that snaps the fine beam to the octant, or that shoots through
+/// a wall, fails the matching case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HitCase {
     pub label: String,
@@ -2135,6 +2137,9 @@ pub struct HitCase {
     pub target_position: Vec2,
     pub weapon_range: i32,
     pub hit_radius: i32,
+    /// Vision blockers between (or around) the shooter and target — physical
+    /// cover. Empty for the pure-aim cases; a wall on the sightline forces a miss.
+    pub blockers: Vec<Blocker>,
     pub aim_mode: AimMode,
     pub damage: u16,
 }
@@ -2143,7 +2148,10 @@ pub struct HitCase {
 /// target, swept one tick at a time. `ticks_to_hit` is the flight age at which
 /// the swept segment first reached the target (`None` == it never did) — swept
 /// collision is what stops a fast shot tunnelling through a body between ticks, so
-/// a twin doing per-tick point collision fails the fast case.
+/// a twin doing per-tick point collision fails the fast case. A non-empty
+/// `blockers` set is physical cover: a wall on the flight path absorbs the shot
+/// (it never reaches a target behind the wall), which a twin that flies a
+/// projectile through walls fails.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectileCase {
     pub label: String,
@@ -2153,6 +2161,9 @@ pub struct ProjectileCase {
     pub projectile_speed: i32,
     pub weapon_range: i32,
     pub hit_radius: i32,
+    /// Vision blockers on (or off) the flight path — physical cover. Empty for the
+    /// pure-sweep cases; a wall on the path absorbs the shot before the target.
+    pub blockers: Vec<Blocker>,
     pub ticks_to_hit: Option<u16>,
     pub damage: u16,
     pub target_downed: bool,
@@ -2172,6 +2183,30 @@ pub struct MatchCase {
     pub record: MatchRecord,
 }
 
+/// A pinned movement case: one [`Match::step`] move from an explicit pose under an
+/// explicit speed, bounds, and occluder set, and the exact post-step position it
+/// produces. Physical cover is the convention it pins: a step whose swept path
+/// crosses a blocker is REFUSED (the pawn holds, `end == start`), a step alongside
+/// or away from a wall is allowed, a fast step is stopped by a thin wall it would
+/// tunnel, and a pawn starting inside a wall can still leave it. A twin that walks
+/// through walls, that point-tests movement (and so tunnels), or that traps a
+/// wall-spawned pawn fails the matching case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveCase {
+    pub label: String,
+    pub start: Vec2,
+    /// The move intent (`MOVE_INTENT_SCALE` units, server-clamped to `max_speed`).
+    pub move_dir: Vec2,
+    pub max_speed: i32,
+    pub bounds: Vec2,
+    pub blockers: Vec<Blocker>,
+    /// Seat 0's position after exactly one `step` with this intent.
+    pub end: Vec2,
+    /// `true` when the step produced no displacement — for these non-zero intents
+    /// away from the bounds, a blocker refusal.
+    pub blocked: bool,
+}
+
 /// The canonical cross-implementation parity-vector set — the conformance spec
 /// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
 /// and the bytes are the contract.
@@ -2183,13 +2218,16 @@ pub struct ParityVectors {
     pub protocol_version: u32,
     pub spawns: Vec<SpawnCase>,
     pub perception: Vec<PerceptionCase>,
+    pub moves: Vec<MoveCase>,
     pub hits: Vec<HitCase>,
     pub projectiles: Vec<ProjectileCase>,
     pub matches: Vec<MatchCase>,
 }
 
-/// Domain tag for the parity-vector set — see [`ParityVectors::domain`].
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v1";
+/// Domain tag for the parity-vector set — see [`ParityVectors::domain`]. Bumped to
+/// v2 when blockers became physical cover (movement/hitscan/projectile now respect
+/// them): a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v2";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -2323,6 +2361,7 @@ fn perception_case(
 
 /// Build a hitscan case: place shooter (seat 0) and target (seat 1), fire once,
 /// and record the damage dealt.
+#[allow(clippy::too_many_arguments)]
 fn hit_case(
     label: &str,
     shooter: Vec2,
@@ -2330,11 +2369,12 @@ fn hit_case(
     target: Vec2,
     weapon_range: i32,
     hit_radius: i32,
+    blockers: Vec<Blocker>,
     aim_mode: AimMode,
 ) -> HitCase {
     let rules = Rules { weapon_range, hit_radius, aim_mode, spawn_jitter: 0, ..Default::default() };
     let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
-    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, blockers.clone(), 1);
     m.pawns[0].pos = shooter;
     m.pawns[0].facing = facing;
     m.pawns[1].pos = target;
@@ -2347,6 +2387,7 @@ fn hit_case(
         target_position: target,
         weapon_range,
         hit_radius,
+        blockers,
         aim_mode,
         damage: before - m.pawns[1].health,
     }
@@ -2355,6 +2396,7 @@ fn hit_case(
 /// Build a projectile case: launch one shot and sweep it tick by tick until it
 /// hits, expires, or reaches the lifetime backstop, recording when (if ever) the
 /// swept path first reached the target.
+#[allow(clippy::too_many_arguments)]
 fn projectile_case(
     label: &str,
     shooter: Vec2,
@@ -2363,6 +2405,7 @@ fn projectile_case(
     projectile_speed: i32,
     weapon_range: i32,
     hit_radius: i32,
+    blockers: Vec<Blocker>,
 ) -> ProjectileCase {
     let rules = Rules {
         weapon_mode: WeaponMode::Projectile,
@@ -2373,7 +2416,7 @@ fn projectile_case(
         ..Default::default()
     };
     let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
-    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, blockers.clone(), 1);
     m.pawns[0].pos = shooter;
     m.pawns[0].facing = facing;
     m.pawns[1].pos = target;
@@ -2398,10 +2441,36 @@ fn projectile_case(
         projectile_speed,
         weapon_range,
         hit_radius,
+        blockers,
         ticks_to_hit,
         damage: start_health - m.pawns[1].health,
         target_downed: !m.pawns[1].alive,
     }
+}
+
+/// Build a movement case: place seat 0 at `start` in a 2-seat (stays-Live) match
+/// under the given speed/bounds/blockers, `step` once with the move intent, and
+/// record the resulting position. Pins the physical-cover movement convention.
+fn move_case(
+    label: &str,
+    start: Vec2,
+    move_dir: Vec2,
+    max_speed: i32,
+    bounds: Vec2,
+    blockers: Vec<Blocker>,
+) -> MoveCase {
+    let rules = Rules { max_speed, spawn_jitter: 0, ..Default::default() };
+    let config = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds, seats: 2 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), config, rules, roster, blockers.clone(), 1);
+    m.pawns[0].pos = start;
+    // Seat 1 idles far off so the match stays Live and seat 0 alone moves.
+    m.pawns[1].pos = Vec2 { x: bounds.x, y: bounds.y };
+    let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    intents.insert(0, parity_intent(move_dir, EAST, false));
+    m.step(&intents);
+    let end = m.pawns[0].pos;
+    MoveCase { label: label.to_string(), start, move_dir, max_speed, bounds, blockers, end, blocked: end == start }
 }
 
 /// Build a full-match case under a fixed, tiny scripted action stream: seat 0
@@ -2454,11 +2523,18 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// implements the arena Gateway — must reproduce bit-for-bit. The cases are chosen
 /// to be load-bearing, not happy-path: spawn determinism (PRNG + spread + jitter
 /// order + facing rule), the perception range/cone/line-of-sight exclusion edges,
-/// the octant-vs-fine sub-octant hit boundary, a swept fast projectile that must
-/// not tunnel, and four full-match records proving the digest commits the inputs
-/// AND the rules (v4) — the octant and fine cases run the identical action stream
-/// yet hash differently because their aim_mode differs — while the rules also bind
-/// the outcomes a re-run reproduces.
+/// physical cover (movement refused into a wall, a fast step that must not tunnel a
+/// thin wall, a wall-spawned pawn that can still leave, a hitscan beam blocked by a
+/// wall, a projectile absorbed by a wall, and a target in front of a wall still
+/// hit), the octant-vs-fine sub-octant hit boundary, a swept fast projectile that
+/// must not tunnel, and four full-match records proving the digest commits the
+/// inputs AND the rules (v4) — the octant and fine cases run the identical action
+/// stream yet hash differently because their aim_mode differs — while the rules
+/// also bind the outcomes a re-run reproduces.
+///
+/// Set domain is `parity-vectors/v2`: blockers became physical cover (movement,
+/// hitscan, and projectiles now respect them), a deliberate convention every twin
+/// must follow.
 ///
 /// The generator is pure integer, ordered, and float/map-free, so the set is
 /// byte-stable on every platform and the same on every run. It realizes the
@@ -2477,6 +2553,9 @@ pub fn parity_vectors() -> ParityVectors {
     let (range, radius) = (default.weapon_range, default.hit_radius);
     let jittered = Rules { spawn_radius: 20 * POSITION_SCALE, spawn_jitter: 2 * POSITION_SCALE, ..Default::default() };
     let wall = Blocker { min: Vec2 { x: 8_000, y: 800 }, max: Vec2 { x: 12_000, y: 2_200 } };
+    // A wall astride the +X axis between origin and 10 m, the physical-cover
+    // occluder the movement/hitscan/projectile cases fire against.
+    let east_wall = Blocker { min: Vec2 { x: 4_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 } };
 
     ParityVectors {
         domain: PARITY_VECTORS_DOMAIN.to_string(),
@@ -2505,20 +2584,42 @@ pub fn parity_vectors() -> ParityVectors {
                 (4, 4, Vec2 { x: 20_000, y: 3_000 }),  // in range + cone, behind the wall -> occluded
             ],
         )],
+        moves: vec![
+            // A 5 m/tick step due east straight into a wall is refused: the pawn holds.
+            move_case("into_wall_blocked", Vec2::ZERO, Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, 5 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![east_wall]),
+            // The same speed NORTH, with the wall off to the east, is unobstructed.
+            move_case("alongside_wall_allowed", Vec2::ZERO, Vec2 { x: 0, y: MOVE_INTENT_SCALE }, 5 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![east_wall]),
+            // A 20 m/tick step over a ZERO-width wall is still stopped — a point test
+            // at the destination (past the wall) would tunnel; the swept test catches it.
+            move_case("fast_step_no_tunnel", Vec2::ZERO, Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, 20 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![Blocker { min: Vec2 { x: 5_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 } }]),
+            // Spawned INSIDE a wall, a pawn can still step out (start-containment
+            // exemption) — the seed-spawn-in-cover safety valve, no trap.
+            move_case("spawn_in_wall_escapes", Vec2::ZERO, Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, 5 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![Blocker { min: Vec2 { x: -2_000, y: -2_000 }, max: Vec2 { x: 2_000, y: 2_000 } }]),
+        ],
         hits: vec![
-            hit_case("dead_on_octant", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, AimMode::Octant),
-            hit_case("dead_on_fine", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, AimMode::Fine),
+            hit_case("dead_on_octant", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, vec![], AimMode::Octant),
+            hit_case("dead_on_fine", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, vec![], AimMode::Fine),
             // 11.25 degrees: a fine direction that snaps to the East octant. The
             // octant beam misses the off-axis target; the finer beam lands it.
-            hit_case("sub_octant_octant_misses", Vec2::ZERO, 2048, Vec2 { x: 19_617, y: 3_902 }, range, radius, AimMode::Octant),
-            hit_case("sub_octant_fine_hits", Vec2::ZERO, 2048, Vec2 { x: 19_617, y: 3_902 }, range, radius, AimMode::Fine),
+            hit_case("sub_octant_octant_misses", Vec2::ZERO, 2048, Vec2 { x: 19_617, y: 3_902 }, range, radius, vec![], AimMode::Octant),
+            hit_case("sub_octant_fine_hits", Vec2::ZERO, 2048, Vec2 { x: 19_617, y: 3_902 }, range, radius, vec![], AimMode::Fine),
+            // Same dead-on shot, now with a wall on the sightline: physical cover, so
+            // the beam is blocked and the target takes nothing (vs dead_on_octant).
+            hit_case("blocked_by_wall", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, vec![east_wall], AimMode::Octant),
         ],
         projectiles: vec![
             // 20 m/tick overshoots a 5 m target in one step: the endpoints both miss,
             // the swept segment hits.
-            projectile_case("fast_sweep_no_tunnel", Vec2::ZERO, EAST, Vec2 { x: 5 * POSITION_SCALE, y: 0 }, 20 * POSITION_SCALE, range, radius),
+            projectile_case("fast_sweep_no_tunnel", Vec2::ZERO, EAST, Vec2 { x: 5 * POSITION_SCALE, y: 0 }, 20 * POSITION_SCALE, range, radius, vec![]),
             // Off the firing line: the sweep never reaches it, so the shot expires clean.
-            projectile_case("off_line_clean_miss", Vec2::ZERO, EAST, Vec2 { x: 0, y: 5 * POSITION_SCALE }, 2 * POSITION_SCALE, range, radius),
+            projectile_case("off_line_clean_miss", Vec2::ZERO, EAST, Vec2 { x: 0, y: 5 * POSITION_SCALE }, 2 * POSITION_SCALE, range, radius, vec![]),
+            // A wall on the flight path absorbs the shot before it reaches the target
+            // behind it: never hits, no damage.
+            projectile_case("blocked_by_wall", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, 2 * POSITION_SCALE, range, radius, vec![east_wall]),
+            // A target IN FRONT of a wall is still hit on the same swept step that also
+            // reaches the wall — the shot resolves the body first, so cover behind the
+            // target gives it nothing (a wall-first twin would wrongly absorb the shot).
+            projectile_case("pawn_in_front_of_wall_is_hit", Vec2::ZERO, EAST, Vec2 { x: 3 * POSITION_SCALE, y: 0 }, 5 * POSITION_SCALE, range, radius, vec![Blocker { min: Vec2 { x: 3_200, y: -2_000 }, max: Vec2 { x: 4_000, y: 2_000 } }]),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

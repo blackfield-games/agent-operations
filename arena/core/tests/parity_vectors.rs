@@ -62,7 +62,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v1");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v2");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -94,12 +94,35 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         .collect();
     assert_eq!(p.visible, expected, "the visible set must be exactly the Visible-verdict candidates");
 
+    // Physical cover — movement: a step into a wall is refused (the pawn holds), one
+    // alongside it is free, a fast step cannot tunnel a thin wall, and a pawn spawned
+    // inside a wall can still leave it. A twin that walks through walls, point-tests
+    // movement (and so tunnels), or traps a wall-spawned pawn fails one of these.
+    let mv = |label: &str| v.moves.iter().find(|c| c.label == label).unwrap();
+    let into = mv("into_wall_blocked");
+    assert!(into.blocked && into.end == into.start, "a step into a wall is refused");
+    let along = mv("alongside_wall_allowed");
+    assert!(!along.blocked && along.end != along.start, "a step alongside the wall is free");
+    let fast = mv("fast_step_no_tunnel");
+    assert!(fast.blocked && fast.end == fast.start, "a fast step is stopped by a thin wall");
+    // The unblocked destination is PAST the wall, so an endpoint/point test tunnels —
+    // the swept test is load-bearing here.
+    let tunnel_dest = Vec2 { x: fast.start.x + fast.max_speed, y: fast.start.y };
+    assert!(tunnel_dest.x > fast.blockers[0].max.x, "the would-be destination overshoots the wall");
+    let escapes = mv("spawn_in_wall_escapes");
+    assert!(!escapes.blocked && escapes.end != escapes.start, "a pawn spawned in a wall can step out");
+
     // Hit boundary: the sub-octant target is MISSED under octant aim and LANDED under
     // fine aim — a twin that snaps the fine beam to the octant fails one of these.
     let dmg = |label: &str| v.hits.iter().find(|h| h.label == label).unwrap().damage;
     assert_eq!(dmg("sub_octant_octant_misses"), 0, "the octant beam misses the sub-octant target");
     assert!(dmg("sub_octant_fine_hits") > 0, "the finer beam lands the shot the octant missed");
     assert!(dmg("dead_on_octant") > 0 && dmg("dead_on_fine") > 0, "a dead-on shot hits in either mode");
+    // Physical cover — hitscan: the SAME dead-on shot is blocked by a wall on the
+    // sightline (the wall is load-bearing — without it dead_on_octant lands).
+    let blocked_hit = v.hits.iter().find(|h| h.label == "blocked_by_wall").unwrap();
+    assert_eq!(blocked_hit.damage, 0, "a wall on the sightline blocks the beam");
+    assert!(!blocked_hit.blockers.is_empty(), "the blocked hit carries its occluder");
 
     // Projectile sweep: a 20 m/tick shot hits a 5 m target on its first swept step
     // though BOTH endpoints miss — a per-tick point check tunnels and reports no hit,
@@ -112,6 +135,16 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(!within(after, sweep.target_position, sweep.hit_radius), "the post-step point alone misses");
     let miss = v.projectiles.iter().find(|c| c.label == "off_line_clean_miss").unwrap();
     assert_eq!(miss.ticks_to_hit, None, "an off-line shot never reaches the target");
+    // Physical cover — projectile: a wall on the path absorbs the shot (the target
+    // behind it is never hit), and a target IN FRONT of a wall is still hit on the
+    // same swept step — a wall-first twin would wrongly absorb that shot.
+    let proj_blocked = v.projectiles.iter().find(|c| c.label == "blocked_by_wall").unwrap();
+    assert_eq!(proj_blocked.ticks_to_hit, None, "a wall absorbs the projectile before the target");
+    assert_eq!(proj_blocked.damage, 0);
+    assert!(!proj_blocked.blockers.is_empty(), "the blocked projectile carries its occluder");
+    let front = v.projectiles.iter().find(|c| c.label == "pawn_in_front_of_wall_is_hit").unwrap();
+    assert_eq!(front.ticks_to_hit, Some(1), "a target in front of a wall is hit on the first swept step");
+    assert!(front.damage > 0 && !front.blockers.is_empty(), "cover behind the target shields nothing");
 
     // Full matches: every committed record re-runs to its own committed result
     // (self-consistency); the v4 digest commits the inputs AND the rules. The octant

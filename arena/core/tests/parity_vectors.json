@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v1",
+  "domain": "blackfield/arena/parity-vectors/v2",
   "protocol_version": 1,
   "spawns": [
     {
@@ -226,6 +226,140 @@
       ]
     }
   ],
+  "moves": [
+    {
+      "label": "into_wall_blocked",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 5000,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 4000,
+            "y": -2000
+          },
+          "max": {
+            "x": 5000,
+            "y": 2000
+          }
+        }
+      ],
+      "end": {
+        "x": 0,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "alongside_wall_allowed",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 0,
+        "y": 1000
+      },
+      "max_speed": 5000,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 4000,
+            "y": -2000
+          },
+          "max": {
+            "x": 5000,
+            "y": 2000
+          }
+        }
+      ],
+      "end": {
+        "x": 0,
+        "y": 5000
+      },
+      "blocked": false
+    },
+    {
+      "label": "fast_step_no_tunnel",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 20000,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 5000,
+            "y": -2000
+          },
+          "max": {
+            "x": 5000,
+            "y": 2000
+          }
+        }
+      ],
+      "end": {
+        "x": 0,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "spawn_in_wall_escapes",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 5000,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": -2000,
+            "y": -2000
+          },
+          "max": {
+            "x": 2000,
+            "y": 2000
+          }
+        }
+      ],
+      "end": {
+        "x": 5000,
+        "y": 0
+      },
+      "blocked": false
+    }
+  ],
   "hits": [
     {
       "label": "dead_on_octant",
@@ -240,6 +374,7 @@
       },
       "weapon_range": 30000,
       "hit_radius": 1500,
+      "blockers": [],
       "aim_mode": "octant",
       "damage": 25
     },
@@ -256,6 +391,7 @@
       },
       "weapon_range": 30000,
       "hit_radius": 1500,
+      "blockers": [],
       "aim_mode": "fine",
       "damage": 25
     },
@@ -272,6 +408,7 @@
       },
       "weapon_range": 30000,
       "hit_radius": 1500,
+      "blockers": [],
       "aim_mode": "octant",
       "damage": 0
     },
@@ -288,8 +425,37 @@
       },
       "weapon_range": 30000,
       "hit_radius": 1500,
+      "blockers": [],
       "aim_mode": "fine",
       "damage": 25
+    },
+    {
+      "label": "blocked_by_wall",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 10000,
+        "y": 0
+      },
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "blockers": [
+        {
+          "min": {
+            "x": 4000,
+            "y": -2000
+          },
+          "max": {
+            "x": 5000,
+            "y": 2000
+          }
+        }
+      ],
+      "aim_mode": "octant",
+      "damage": 0
     }
   ],
   "projectiles": [
@@ -307,6 +473,7 @@
       "projectile_speed": 20000,
       "weapon_range": 30000,
       "hit_radius": 1500,
+      "blockers": [],
       "ticks_to_hit": 1,
       "damage": 25,
       "target_downed": false
@@ -325,8 +492,69 @@
       "projectile_speed": 2000,
       "weapon_range": 30000,
       "hit_radius": 1500,
+      "blockers": [],
       "ticks_to_hit": null,
       "damage": 0,
+      "target_downed": false
+    },
+    {
+      "label": "blocked_by_wall",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 10000,
+        "y": 0
+      },
+      "projectile_speed": 2000,
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "blockers": [
+        {
+          "min": {
+            "x": 4000,
+            "y": -2000
+          },
+          "max": {
+            "x": 5000,
+            "y": 2000
+          }
+        }
+      ],
+      "ticks_to_hit": null,
+      "damage": 0,
+      "target_downed": false
+    },
+    {
+      "label": "pawn_in_front_of_wall_is_hit",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 3000,
+        "y": 0
+      },
+      "projectile_speed": 5000,
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "blockers": [
+        {
+          "min": {
+            "x": 3200,
+            "y": -2000
+          },
+          "max": {
+            "x": 4000,
+            "y": 2000
+          }
+        }
+      ],
+      "ticks_to_hit": 1,
+      "damage": 25,
       "target_downed": false
     }
   ],
