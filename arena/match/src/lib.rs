@@ -11,13 +11,16 @@
 //!
 //! Two properties are structural, not left to a caller's goodwill:
 //!
-//! - **Ranked seats are authenticated.** A ranked agent seat must present an
-//!   identity token the [`IdentityVerifier`] accepts *before* it is queued, so an
+//! - **Ranked seats are authenticated.** A ranked agent seat must present a
+//!   signature the [`IdentityVerifier`] accepts *before* it is queued, so an
 //!   unauthenticated or duplicate agent can never reach a settle-able ranked
-//!   match. The production verifier recovers the secp256k1 signer from the
-//!   arena-01 `join_digest` and checks on-chain registration; until that contracts
-//!   task lands, [`StubIdentityVerifier`] enforces the same accept/reject boundary
-//!   against a configured allowlist — the gate is real, not a TODO.
+//!   match. [`SignatureVerifier`] is the real gate: it recovers the secp256k1
+//!   signer from the arena-01 `join_digest` over *this connection's* challenge
+//!   nonce and admits a ranked seat only when the recovered address equals the
+//!   claimed `agent_id` — key possession, not assertion. (Whether that address is
+//!   a *registered* on-chain agent is a separate eligibility check that composes on
+//!   top, a later contracts task; [`StubIdentityVerifier`] stands in for that
+//!   allowlist in tests.)
 //! - **Formation is atomic.** Per-mode queues live behind one lock, so a join that
 //!   completes a match pulls its whole roster under that lock — no concurrent join
 //!   can double-seat a participant or start a match a seat short.
@@ -28,25 +31,48 @@ use std::sync::{Arc, Mutex, Weak};
 
 use arena_core::{Match, MatchRecord, ReplayError, Rules};
 use arena_proto::{
-    ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode, MatchPhase, MatchResult, SeatId,
-    SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
+    verify_join_signature, ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode,
+    MatchPhase, MatchResult, SeatId, SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
+    PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
-/// Verifies that a ranked seat controls the on-chain identity it claims.
+/// Verifies that a ranked seat controls the identity it claims, over the
+/// connection's server-issued challenge.
 ///
-/// The `token` is the arena-01 `AgentMsg::Join.signature_hex`. The production
-/// implementation recovers the secp256k1 signer from the
-/// [`join_digest`](arena_proto::join_digest) and checks that the recovered
-/// address is a registered agent (the on-chain identity registry is a later
-/// contracts task); [`StubIdentityVerifier`] stands in for it now and enforces
-/// the *same* accept/reject boundary, so the matchmaker's ranked gate is exercised
-/// end to end rather than deferred.
+/// `signature_hex` is the arena-01 `AgentMsg::Join.signature_hex`; `nonce` is the
+/// challenge the Gateway minted for *this* connection (never a client-supplied
+/// value). [`SignatureVerifier`] is the real implementation — it recovers the
+/// secp256k1 signer from the [`join_digest`](arena_proto::join_digest) and accepts
+/// only when the recovered address equals `agent_id`. [`StubIdentityVerifier`]
+/// stands in for the on-chain *registration* check (a later contracts task) in the
+/// matchmaker's policy tests, enforcing the same accept/reject boundary against an
+/// allowlist so the ranked gate is exercised without crypto.
 pub trait IdentityVerifier {
-    /// `true` iff `token` proves control of `agent_id`. An empty, missing, or
-    /// wrong token must return `false` — admitting an unproven identity to a
+    /// `true` iff `signature_hex` proves control of `agent_id` over `nonce`. An
+    /// empty, missing, or wrong signature — or one over a different nonce, version,
+    /// or identity — must return `false`; admitting an unproven identity to a
     /// ranked seat is the exact failure this trait exists to prevent.
-    fn verify(&self, agent_id: &str, token: &str) -> bool;
+    fn verify(&self, agent_id: &str, nonce: &[u8], signature_hex: &str) -> bool;
+}
+
+/// The production [`IdentityVerifier`]: recover the join-digest signer and admit a
+/// ranked seat only when the recovered address equals the claimed `agent_id`.
+///
+/// Delegates to [`verify_join_signature`] over the build's [`PROTOCOL_VERSION`] and
+/// the connection's challenge `nonce`, so a ranked seat forms only for a connection
+/// that holds the key behind the address it claims — the arena counterpart of the
+/// render mesh's earner `Hello` recovery. A forged, wrong-key, cross-version, or
+/// replayed-nonce signature recovers a different (or no) address and is rejected.
+/// This proves key possession; on-chain registration eligibility is a separate
+/// check that wraps this one.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SignatureVerifier;
+
+impl IdentityVerifier for SignatureVerifier {
+    fn verify(&self, agent_id: &str, nonce: &[u8], signature_hex: &str) -> bool {
+        verify_join_signature(PROTOCOL_VERSION, agent_id, nonce, signature_hex).is_ok()
+    }
 }
 
 /// A stand-in [`IdentityVerifier`] that authorizes a fixed `agent_id -> token`
@@ -73,7 +99,11 @@ impl StubIdentityVerifier {
 }
 
 impl IdentityVerifier for StubIdentityVerifier {
-    fn verify(&self, agent_id: &str, token: &str) -> bool {
+    // Ignores `nonce`: the stub stands in for the on-chain *registration* lookup
+    // (allowlist membership), not the signature recovery — the challenge binding is
+    // [`SignatureVerifier`]'s job. Policy tests use the stub to exercise admission
+    // without crypto.
+    fn verify(&self, agent_id: &str, _nonce: &[u8], token: &str) -> bool {
         // Reject an empty token outright (the unranked/casual sentinel) so it can
         // never satisfy a ranked seat by coincidentally matching an empty allowlist
         // entry; otherwise require an exact match against the registered token.
@@ -276,8 +306,20 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// [`JoinOutcome::Formed`] to the join that completes a match (whose roster is
     /// removed from the queue atomically), [`JoinOutcome::Queued`] otherwise, or a
     /// [`JoinError`] if the request is inadmissible — rejected before it is queued.
-    pub fn join(&self, mode: MatchMode, req: JoinRequest) -> Result<JoinOutcome, JoinError> {
-        self.admit(mode, &req)?;
+    ///
+    /// `nonce` is the challenge the Gateway issued for *this* connection; it is
+    /// taken as a parameter from server connection state, never from the
+    /// client-supplied `req`, so a ranked signature is always checked against the
+    /// freshly-issued challenge and a captured Join can't be replayed on another
+    /// connection. It is consulted only for a ranked agent claim; human and casual
+    /// seats ignore it.
+    pub fn join(
+        &self,
+        mode: MatchMode,
+        nonce: &[u8],
+        req: JoinRequest,
+    ) -> Result<JoinOutcome, JoinError> {
+        self.admit(mode, nonce, &req)?;
         let seated = Seated { agent_id: req.agent_id, kind: req.kind };
         let roster = {
             let mut q = self.queues.lock().expect("matchmaker mutex poisoned");
@@ -294,7 +336,7 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// Kind + identity admission, run *before* the queue lock so a rejected join
     /// never enters a queue — verifying at formation instead would let an
     /// unauthenticated agent sit in the ranked queue until it was selected.
-    fn admit(&self, mode: MatchMode, req: &JoinRequest) -> Result<(), JoinError> {
+    fn admit(&self, mode: MatchMode, nonce: &[u8], req: &JoinRequest) -> Result<(), JoinError> {
         match (mode, req.kind) {
             (MatchMode::Human, ControllerKind::Agent) | (MatchMode::Agent, ControllerKind::Human) => {
                 return Err(JoinError::WrongKindForMode { mode, kind: req.kind });
@@ -303,7 +345,7 @@ impl<V: IdentityVerifier> Matchmaker<V> {
         }
         if req.kind == ControllerKind::Agent {
             match req.presented_token() {
-                Some(token) if self.verifier.verify(&req.agent_id, token) => {}
+                Some(token) if self.verifier.verify(&req.agent_id, nonce, token) => {}
                 Some(_) => return Err(JoinError::Unauthenticated { agent_id: req.agent_id.clone() }),
                 // Agent mode is ranked: every agent seat must authenticate. Mixed
                 // admits a token-less agent as a casual cross-play seat.
@@ -590,17 +632,19 @@ mod tests {
         let mut v = StubIdentityVerifier::new();
         v.authorize("0xagent", "goodsig");
 
-        assert!(v.verify("0xagent", "goodsig"), "the authorized identity + token is accepted");
-        assert!(!v.verify("0xagent", "badsig"), "a wrong token is rejected");
-        assert!(!v.verify("0xagent", ""), "an empty token is rejected");
-        assert!(!v.verify("0xunknown", "goodsig"), "an unregistered agent is rejected");
-        assert!(!v.verify("0xunknown", ""), "an unknown agent with no token is rejected");
+        // The stub ignores the nonce (it stands in for the registration lookup), so
+        // these pass an empty challenge; SignatureVerifier's tests exercise the nonce.
+        assert!(v.verify("0xagent", b"", "goodsig"), "the authorized identity + token is accepted");
+        assert!(!v.verify("0xagent", b"", "badsig"), "a wrong token is rejected");
+        assert!(!v.verify("0xagent", b"", ""), "an empty token is rejected");
+        assert!(!v.verify("0xunknown", b"", "goodsig"), "an unregistered agent is rejected");
+        assert!(!v.verify("0xunknown", b"", ""), "an unknown agent with no token is rejected");
 
         // An empty token never authenticates even if an agent is (wrongly)
         // allowlisted with one — the empty-token guard rejects, not just an
         // allowlist miss, so an empty signature can never satisfy a ranked seat.
         v.authorize("0xempty", "");
-        assert!(!v.verify("0xempty", ""), "an empty token is rejected even when allowlisted empty");
+        assert!(!v.verify("0xempty", b"", ""), "an empty token is rejected even when allowlisted empty");
     }
 
     #[test]
@@ -608,7 +652,7 @@ mod tests {
         // A fresh verifier is closed by default — no identity is ranked-admissible
         // until explicitly authorized, so a forgotten allowlist fails safe.
         let v = StubIdentityVerifier::new();
-        assert!(!v.verify("0xagent", "anything"));
+        assert!(!v.verify("0xagent", b"", "anything"));
     }
 
     #[test]
@@ -673,9 +717,9 @@ mod tests {
     #[test]
     fn human_mode_forms_an_all_human_match() {
         let mm = open_mm();
-        assert!(mm.join(MatchMode::Human, JoinRequest::human("alice")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Human, b"",JoinRequest::human("alice")).unwrap().is_queued());
         let m = mm
-            .join(MatchMode::Human, JoinRequest::human("bob"))
+            .join(MatchMode::Human, b"",JoinRequest::human("bob"))
             .unwrap()
             .into_formed()
             .expect("the second human completes the 2-seat match");
@@ -688,7 +732,7 @@ mod tests {
     fn human_mode_rejects_an_agent_seat() {
         // FM1: a Human ranked match must never admit an agent seat.
         let mm = open_mm();
-        let r = mm.join(MatchMode::Human, JoinRequest::casual_agent("0xbot"));
+        let r = mm.join(MatchMode::Human, b"",JoinRequest::casual_agent("0xbot"));
         assert!(matches!(
             r,
             Err(JoinError::WrongKindForMode { mode: MatchMode::Human, kind: ControllerKind::Agent })
@@ -699,7 +743,7 @@ mod tests {
     #[test]
     fn agent_mode_rejects_a_human_seat() {
         let mm = open_mm();
-        let r = mm.join(MatchMode::Agent, JoinRequest::human("alice"));
+        let r = mm.join(MatchMode::Agent, b"",JoinRequest::human("alice"));
         assert!(matches!(
             r,
             Err(JoinError::WrongKindForMode { mode: MatchMode::Agent, kind: ControllerKind::Human })
@@ -709,9 +753,9 @@ mod tests {
     #[test]
     fn agent_mode_forms_from_authorized_agents() {
         let mm = ranked_mm(&[("0xa", "siga"), ("0xb", "sigb")]);
-        assert!(mm.join(MatchMode::Agent, JoinRequest::ranked_agent("0xa", "siga")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xa", "siga")).unwrap().is_queued());
         let m = mm
-            .join(MatchMode::Agent, JoinRequest::ranked_agent("0xb", "sigb"))
+            .join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xb", "sigb"))
             .unwrap()
             .into_formed()
             .expect("two authorized agents form a ranked match");
@@ -723,13 +767,13 @@ mod tests {
     fn mixed_needs_both_kinds_to_form() {
         // FM1: a Mixed match must not start all-one-kind. Humans alone never form…
         let humans = open_mm();
-        assert!(humans.join(MatchMode::Mixed, JoinRequest::human("h1")).unwrap().is_queued());
-        assert!(humans.join(MatchMode::Mixed, JoinRequest::human("h2")).unwrap().is_queued());
+        assert!(humans.join(MatchMode::Mixed, b"",JoinRequest::human("h1")).unwrap().is_queued());
+        assert!(humans.join(MatchMode::Mixed, b"",JoinRequest::human("h2")).unwrap().is_queued());
         assert_eq!(humans.waiting(MatchMode::Mixed), 2, "no Mixed match from humans alone");
         // …and casual agents alone never form.
         let agents = open_mm();
-        assert!(agents.join(MatchMode::Mixed, JoinRequest::casual_agent("a1")).unwrap().is_queued());
-        assert!(agents.join(MatchMode::Mixed, JoinRequest::casual_agent("a2")).unwrap().is_queued());
+        assert!(agents.join(MatchMode::Mixed, b"",JoinRequest::casual_agent("a1")).unwrap().is_queued());
+        assert!(agents.join(MatchMode::Mixed, b"",JoinRequest::casual_agent("a2")).unwrap().is_queued());
         assert_eq!(agents.waiting(MatchMode::Mixed), 2, "no Mixed match from agents alone");
     }
 
@@ -738,10 +782,10 @@ mod tests {
         // Selection takes one-of-each first, so even a queue stacked with humans
         // forms a Mixed match around the single agent — never an all-human one.
         let mm = open_mm();
-        assert!(mm.join(MatchMode::Mixed, JoinRequest::human("h1")).unwrap().is_queued());
-        assert!(mm.join(MatchMode::Mixed, JoinRequest::human("h2")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::human("h1")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::human("h2")).unwrap().is_queued());
         let m = mm
-            .join(MatchMode::Mixed, JoinRequest::casual_agent("a1"))
+            .join(MatchMode::Mixed, b"",JoinRequest::casual_agent("a1"))
             .unwrap()
             .into_formed()
             .expect("the agent completes a Mixed match");
@@ -769,8 +813,8 @@ mod tests {
     #[test]
     fn a_formed_match_starts_on_the_real_core() {
         let mm = open_mm();
-        mm.join(MatchMode::Human, JoinRequest::human("p0")).unwrap();
-        let m = mm.join(MatchMode::Human, JoinRequest::human("p1")).unwrap().into_formed().unwrap();
+        mm.join(MatchMode::Human, b"",JoinRequest::human("p0")).unwrap();
+        let m = mm.join(MatchMode::Human, b"",JoinRequest::human("p1")).unwrap().into_formed().unwrap();
         // A real arena-02 match: Live at tick 0, two seats on distinct teams (a
         // free-for-all, so it does not end instantly), reproducible from its id.
         assert_eq!(m.phase(), MatchPhase::Live);
@@ -810,7 +854,7 @@ mod tests {
                 let mm = Arc::clone(&mm);
                 let formed = Arc::clone(&formed);
                 thread::spawn(move || {
-                    let outcome = mm.join(MatchMode::Human, JoinRequest::human(format!("p{i}"))).unwrap();
+                    let outcome = mm.join(MatchMode::Human, b"",JoinRequest::human(format!("p{i}"))).unwrap();
                     if let Some(m) = outcome.into_formed() {
                         let roster = m.seats().iter().map(|s| s.controller.clone()).collect::<Vec<_>>();
                         formed.lock().unwrap().push(roster);
@@ -843,15 +887,15 @@ mod tests {
             _ => panic!("expected Unauthenticated for {who}"),
         };
         // No token — every Agent-mode seat is ranked.
-        rejected(mm.join(MatchMode::Agent, JoinRequest::casual_agent("0xa")), "0xa");
+        rejected(mm.join(MatchMode::Agent, b"",JoinRequest::casual_agent("0xa")), "0xa");
         // A wrong token for a known agent.
-        rejected(mm.join(MatchMode::Agent, JoinRequest::ranked_agent("0xa", "badsig")), "0xa");
+        rejected(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xa", "badsig")), "0xa");
         // A valid-looking token for an unregistered agent.
-        rejected(mm.join(MatchMode::Agent, JoinRequest::ranked_agent("0xb", "goodsig")), "0xb");
+        rejected(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xb", "goodsig")), "0xb");
         assert_eq!(mm.waiting(MatchMode::Agent), 0, "no unauthenticated agent entered the ranked queue");
 
         // The authorized identity is admitted.
-        assert!(mm.join(MatchMode::Agent, JoinRequest::ranked_agent("0xa", "goodsig")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Agent, b"",JoinRequest::ranked_agent("0xa", "goodsig")).unwrap().is_queued());
         assert_eq!(mm.waiting(MatchMode::Agent), 1);
     }
 
@@ -861,10 +905,10 @@ mod tests {
         // token is a ranked claim — a forged one is rejected, so a bad ranked claim
         // cannot slip in disguised as casual play.
         let mm = ranked_mm(&[("0xgood", "goodsig")]);
-        assert!(mm.join(MatchMode::Mixed, JoinRequest::casual_agent("0xcasual")).unwrap().is_queued());
-        let forged = mm.join(MatchMode::Mixed, JoinRequest::ranked_agent("0xevil", "forged"));
+        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::casual_agent("0xcasual")).unwrap().is_queued());
+        let forged = mm.join(MatchMode::Mixed, b"",JoinRequest::ranked_agent("0xevil", "forged"));
         assert!(matches!(forged, Err(JoinError::Unauthenticated { .. })));
-        assert!(mm.join(MatchMode::Mixed, JoinRequest::ranked_agent("0xgood", "goodsig")).unwrap().is_queued());
+        assert!(mm.join(MatchMode::Mixed, b"",JoinRequest::ranked_agent("0xgood", "goodsig")).unwrap().is_queued());
         // Two agents, no human → no match formed; the forged join never queued.
         assert_eq!(mm.waiting(MatchMode::Mixed), 2);
     }
@@ -877,9 +921,9 @@ mod tests {
         // claim against an empty signature.
         let empty = || JoinRequest { agent_id: "0xbot".into(), kind: ControllerKind::Agent, token: Some(String::new()) };
         let mm = open_mm();
-        assert!(mm.join(MatchMode::Mixed, empty()).unwrap().is_queued(), "an empty token is a casual Mixed seat");
+        assert!(mm.join(MatchMode::Mixed, b"",empty()).unwrap().is_queued(), "an empty token is a casual Mixed seat");
         assert!(
-            matches!(mm.join(MatchMode::Agent, empty()), Err(JoinError::Unauthenticated { .. })),
+            matches!(mm.join(MatchMode::Agent, b"",empty()), Err(JoinError::Unauthenticated { .. })),
             "an empty token is not a ranked claim, so Agent mode rejects it"
         );
     }
