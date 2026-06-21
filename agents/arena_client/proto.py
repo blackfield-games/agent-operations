@@ -122,6 +122,9 @@ class SelfState(_Wire):
     velocity: Vec2
     health: U16
     max_health: U16
+    # Remaining damage-absorbing shield, drained before health on a hit. Own state
+    # only — like ammo/cooldown, never on VisibleEntity (an enemy's armor is x-ray).
+    shield: U16
     ammo: U16
     # Ticks until this pawn may fire again as the next action sees it: 0 means a
     # fire submitted for this observation's tick is honored (subject to ammo). The

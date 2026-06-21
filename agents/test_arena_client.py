@@ -61,7 +61,7 @@ def test_observation_wire_shape_matches_rust():
             "position": {"x": 0, "y": 0}, "z": 0,
             "facing": 16384,
             "velocity": {"x": 0, "y": 0},
-            "health": 100, "max_health": 100, "ammo": 30, "cooldown": 5, "alive": True,
+            "health": 100, "max_health": 100, "shield": 40, "ammo": 30, "cooldown": 5, "alive": True,
         },
         "visible": [{
             "entity_id": 7, "kind": "player", "team": 2,
@@ -79,7 +79,7 @@ def test_self_state_carries_cooldown_but_visible_entity_does_not():
     # Rust/Python drift fails loud instead of silently defaulting.
     own = {
         "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
-        "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100,
+        "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
         "ammo": 30, "cooldown": 3, "alive": True,
     }
     assert proto.SelfState.model_validate(own).cooldown == 3
@@ -94,6 +94,27 @@ def test_self_state_carries_cooldown_but_visible_entity_does_not():
             "entity_id": 1, "kind": "player", "team": 2,
             "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
             "in_line_of_sight": True, "cooldown": 3,
+        })
+
+
+def test_self_state_carries_shield_but_visible_entity_does_not():
+    # FM2 parity bound: shield is private-HUD armor state. SelfState REQUIRES it (the
+    # Rust wire always carries it, so a drift fails loud instead of silently
+    # defaulting), and VisibleEntity must REJECT it (extra=forbid mirrors the Rust
+    # wire-pin exclusion), so an enemy's remaining mitigation is never an x-ray.
+    own = {
+        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+        "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 40,
+        "ammo": 30, "cooldown": 0, "alive": True,
+    }
+    assert proto.SelfState.model_validate(own).shield == 40
+    with pytest.raises(pydantic.ValidationError):
+        proto.SelfState.model_validate({k: v for k, v in own.items() if k != "shield"})
+    with pytest.raises(pydantic.ValidationError):
+        proto.VisibleEntity.model_validate({
+            "entity_id": 1, "kind": "player", "team": 2,
+            "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+            "in_line_of_sight": True, "shield": 40,
         })
 
 
@@ -158,7 +179,7 @@ def test_out_of_domain_fields_are_rejected():
     with pytest.raises(pydantic.ValidationError):
         proto.SelfState.model_validate({  # seat is u8
             "seat": -1, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
-            "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "ammo": 30, "cooldown": 0, "alive": True,
+            "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "alive": True,
         })
     with pytest.raises(pydantic.ValidationError):
         proto.Welcome.model_validate(  # match_id must be a UUID
@@ -185,7 +206,7 @@ def test_gateway_envelopes_decode():
         "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 1,
         "phase": "live", "deadline_micros": 50_000,
         "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
-                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "ammo": 30, "cooldown": 0, "alive": True},
+                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "alive": True},
         "visible": [],
     }).model_dump(mode="json")}
     assert isinstance(decode_gateway(obs_frame), Observation)
@@ -298,7 +319,7 @@ def _observe_frame(tick: int = 0, seat: int = 0, alive: bool = True, deadline: i
         "type": "observe", "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH,
         "seat": seat, "tick": tick, "phase": "live", "deadline_micros": deadline,
         "own": {"seat": seat, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
-                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "ammo": 30, "cooldown": 0, "alive": alive},
+                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "alive": alive},
         "visible": [],
     }
 
@@ -448,7 +469,7 @@ def _make_obs(x, y, ammo=30, alive=True, team=0, facing=0, visible=()):
         "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 0,
         "phase": "live", "deadline_micros": 50_000,
         "own": {"seat": 0, "team": team, "position": {"x": x, "y": y}, "z": 0, "facing": facing,
-                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "ammo": ammo, "cooldown": 0, "alive": alive},
+                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": ammo, "cooldown": 0, "alive": alive},
         "visible": [{"entity_id": eid, "kind": "player", "team": t, "position": {"x": ex, "y": ey},
                      "z": 0, "facing": 0, "in_line_of_sight": True} for (eid, t, ex, ey) in visible],
     })
