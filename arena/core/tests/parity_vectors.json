@@ -38,7 +38,8 @@
         "melee_cooldown": 15,
         "max_shield": 0,
         "gravity": 0,
-        "dash_cooldown": 0
+        "dash_cooldown": 0,
+        "wall_slide": false
       },
       "roster": [
         {
@@ -145,7 +146,8 @@
         "melee_cooldown": 15,
         "max_shield": 0,
         "gravity": 0,
-        "dash_cooldown": 0
+        "dash_cooldown": 0,
+        "wall_slide": false
       },
       "roster": [
         {
@@ -607,7 +609,8 @@
           "melee_cooldown": 15,
           "max_shield": 0,
           "gravity": 0,
-          "dash_cooldown": 0
+          "dash_cooldown": 0,
+          "wall_slide": false
         },
         "replay": {
           "protocol_version": 1,
@@ -693,6 +696,7 @@
             0,
             0,
             0,
+            0,
             0
           ],
           "config": {
@@ -769,7 +773,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "bc6c68b3d68f3e166172b427571cf2f633f067c53e6a4af9725df247d4b46281"
+          "replay_hash": "18ad1a800b6f5c79db0c81e9ca25308e65d4c1995dae2b64da4d0698699e1200"
         }
       }
     },
@@ -809,7 +813,8 @@
           "melee_cooldown": 15,
           "max_shield": 0,
           "gravity": 0,
-          "dash_cooldown": 0
+          "dash_cooldown": 0,
+          "wall_slide": false
         },
         "replay": {
           "protocol_version": 1,
@@ -888,6 +893,7 @@
             50,
             0,
             15,
+            0,
             0,
             0,
             0,
@@ -971,7 +977,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "ab5d26aea03840c5f1629daefe4dea5b2176d6011eb385d3c0f99cbae049860a"
+          "replay_hash": "7ba04da5aa7c212f301589aecf922325c668c0025242ed8bcafbf15706f6a740"
         }
       }
     },
@@ -1011,7 +1017,8 @@
           "melee_cooldown": 15,
           "max_shield": 0,
           "gravity": 0,
-          "dash_cooldown": 0
+          "dash_cooldown": 0,
+          "wall_slide": false
         },
         "replay": {
           "protocol_version": 1,
@@ -1090,6 +1097,7 @@
             50,
             0,
             15,
+            0,
             0,
             0,
             0,
@@ -1177,7 +1185,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "1610ada681fabc7ec340a029303a2491034e069377af4bedf6b133b5d25d3bda"
+          "replay_hash": "d7155f8fbf995a30b22ad7a0be95e47ae6751f8d6fa5c9872c27f00175531192"
         }
       }
     },
@@ -1217,7 +1225,8 @@
           "melee_cooldown": 15,
           "max_shield": 0,
           "gravity": 0,
-          "dash_cooldown": 0
+          "dash_cooldown": 0,
+          "wall_slide": false
         },
         "replay": {
           "protocol_version": 1,
@@ -1312,6 +1321,7 @@
             0,
             0,
             0,
+            0,
             0
           ],
           "config": {
@@ -1388,7 +1398,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "4bb272563d6edc777292913d092957d6bd0e5d9fc51dd40274d68fbc768cde16"
+          "replay_hash": "61bf62036d761e8ef87c18fea20aec15e0445c1ae140ef76becaced974e23b86"
         }
       }
     }

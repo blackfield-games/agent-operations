@@ -453,6 +453,17 @@ pub struct Rules {
     /// constant; this cooldown is the only dash tuning the digest binds.
     #[serde(default)]
     pub dash_cooldown: u16,
+    /// When `true`, a move whose full swept path is refused by a blocker retries the
+    /// axis-separated components (X-only, then Y-only) through the same
+    /// [`path_hits_blocker`] test + bounds clamp, so a pawn grazing a wall SLIDES along
+    /// the unblocked axis instead of dead-stopping at the step origin; an inside corner
+    /// (both axes refused) still holds. `serde(default)` (`false`) keeps the historical
+    /// stop-at-origin — byte-identical to every pre-slide record. Reused by the walk AND
+    /// the dash (both go through [`slide`](Match::slide)), so enabling it changes both.
+    /// No surface-snap (no contact-point rounding), so the rule stays the same integer
+    /// segment test the UE5 twin reproduces exactly.
+    #[serde(default)]
+    pub wall_slide: bool,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -489,6 +500,7 @@ impl Default for Rules {
             max_shield: 0, // shield disabled by default — earned only when configured
             gravity: 0,    // vertical physics off by default — jump inert, z stays 0
             dash_cooldown: 0, // dash disabled by default — ability press inert
+            wall_slide: false, // a grazing step stops at its origin (no slide) by default
         }
     }
 }
@@ -541,6 +553,7 @@ impl Rules {
         b.extend_from_slice(&self.max_shield.to_be_bytes());
         b.extend_from_slice(&self.gravity.to_be_bytes());
         b.extend_from_slice(&self.dash_cooldown.to_be_bytes());
+        b.push(self.wall_slide as u8);
         b
     }
 }
@@ -5282,9 +5295,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 10×i32 + 1×u32 + 9×u16 + 4×u8 = 66 bytes. A new sim field added to the
+        // 10×i32 + 1×u32 + 9×u16 + 5×u8 = 67 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 66, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 67, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -5311,8 +5324,9 @@ mod tests {
             ("max_shield", Rules { max_shield: base.max_shield + 1, ..base }),
             ("gravity", Rules { gravity: base.gravity + 1, ..base }),
             ("dash_cooldown", Rules { dash_cooldown: base.dash_cooldown + 1, ..base }),
+            ("wall_slide", Rules { wall_slide: !base.wall_slide, ..base }),
         ];
-        assert_eq!(cases.len(), 24, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 25, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
