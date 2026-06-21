@@ -756,6 +756,16 @@ pub enum ReplayError {
     /// `i32::MIN`), so the record is rejected before any simulation rather than
     /// crashing the verifier.
     MalformedSetup,
+    /// The record carries more recorded ticks than the verifier will process.
+    /// `verify` re-executes the whole match, so an attacker-controlled record with
+    /// a huge tick stream is a CPU-DoS; it is rejected here, before the structural
+    /// scan and the re-run. The bound is a generous backstop, far above any real
+    /// match — not a gameplay limit.
+    TooManyTicks { ticks: usize, max: usize },
+    /// The roster is larger than the verifier will process. Combat is O(seats²) per
+    /// re-run tick, so an oversized roster is a CPU-DoS; it is rejected before the
+    /// roster scan and the re-run. A generous backstop, far above any real match.
+    TooManySeats { seats: usize, max: usize },
     /// A recorded action names a seat that is not in the roster.
     UnknownSeat { tick: u64, seat: SeatId },
     /// A tick's actions are not in canonical ascending-unique seat order.
@@ -786,6 +796,12 @@ impl std::fmt::Display for ReplayError {
             ReplayError::MalformedSetup => {
                 write!(f, "invalid replay: config or rules out of the well-formed range")
             }
+            ReplayError::TooManyTicks { ticks, max } => {
+                write!(f, "invalid replay: {ticks} recorded ticks exceeds the verifier budget of {max}")
+            }
+            ReplayError::TooManySeats { seats, max } => {
+                write!(f, "invalid replay: roster of {seats} seats exceeds the verifier budget of {max}")
+            }
             ReplayError::UnknownSeat { tick, seat } => {
                 write!(f, "invalid replay: tick {tick} names seat {seat} not in the roster")
             }
@@ -809,6 +825,19 @@ impl std::fmt::Display for ReplayError {
 }
 
 impl std::error::Error for ReplayError {}
+
+/// Verifier cost backstop: the most recorded ticks [`MatchRecord::verify`] will
+/// process before rejecting a record as oversized. `verify` re-executes the whole
+/// match (and the structural scan touches every tick), so this bounds verifier CPU
+/// against an attacker-controlled record. ~27 min of real play at 60 ticks/s —
+/// far above any real match (default `max_ticks` is 3600); a DoS backstop, not a
+/// gameplay limit.
+pub const MAX_REPLAY_TICKS: usize = 100_000;
+
+/// Verifier cost backstop: the largest roster [`MatchRecord::verify`] will process.
+/// Per-tick combat is O(seats²), so this bounds the re-run cost. Far above any real
+/// match (settlement is 1v1; arenas seat a handful) — a DoS backstop, not a limit.
+pub const MAX_REPLAY_SEATS: usize = 64;
 
 impl MatchRecord {
     /// Re-derive the match from this record ALONE and confirm it is a faithful,
@@ -834,6 +863,28 @@ impl MatchRecord {
             return Err(ReplayError::MatchIdMismatch {
                 replay: self.replay.match_id,
                 result: self.result.match_id,
+            });
+        }
+
+        // Cost budget. `config`, `seats`, and `ticks` come from a deserialized,
+        // attacker-controlled record, and `verify` re-executes the whole match
+        // (`replay_match` steps once per recorded tick, each tick O(seats²) combat)
+        // after an O(ticks) structural scan and an O(seats) roster scan. Reject an
+        // oversized record HERE — before the roster scan below, the tick loop, and
+        // `Match::new` — so a crafted stream cannot turn the verifier (or
+        // `replay_frames`, which calls `verify` first) into a CPU-DoS. Two absolute
+        // caps bound total cost to O(MAX_REPLAY_TICKS · MAX_REPLAY_SEATS²)
+        // regardless of `config`; they are generous backstops, not gameplay limits.
+        if self.replay.seats.len() > MAX_REPLAY_SEATS {
+            return Err(ReplayError::TooManySeats {
+                seats: self.replay.seats.len(),
+                max: MAX_REPLAY_SEATS,
+            });
+        }
+        if self.replay.ticks.len() > MAX_REPLAY_TICKS {
+            return Err(ReplayError::TooManyTicks {
+                ticks: self.replay.ticks.len(),
+                max: MAX_REPLAY_TICKS,
             });
         }
 
