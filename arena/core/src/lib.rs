@@ -4266,6 +4266,130 @@ mod tests {
         assert!(within(me, foe, r), "visibility flipped on exactly when within perception");
     }
 
+    /// A two-seat match with vertical physics enabled at `gravity`. Seeds are
+    /// irrelevant to the z arc (z always starts at 0 and the arc is driven by the
+    /// JUMP_VELOCITY/gravity constants, not the spawn draw), but threaded so a test can
+    /// prove that seed-independence.
+    fn jump_match(gravity: i32, seed: u64) -> Match {
+        Match::new(MID.parse().unwrap(), config(2), Rules { gravity, ..Default::default() }, two_seats(), Vec::new(), seed)
+    }
+
+    fn jump_press() -> ActionIntent {
+        ActionIntent {
+            move_dir: Vec2::ZERO,
+            aim: EAST,
+            buttons: ActionButtons { fire: false, jump: true, ability: false, reload: false },
+        }
+    }
+
+    #[test]
+    fn jump_arc_is_integer_reproducible_and_lands_exactly() {
+        // FM1: the vertical arc is pure integer physics — a recorded jump reproduces
+        // byte-for-byte across runs and lands EXACTLY at z==0. gravity 500 does not
+        // divide JUMP_VELOCITY 1200, so the descent crosses zero BETWEEN ticks and the
+        // land-clamp snaps it to exactly 0 (no drift, no negative-z tunnel).
+        let arc = |seed: u64| {
+            let mut m = jump_match(500, seed);
+            // Jump on the opening tick, then ride the arc with no further input.
+            step_with(&mut m, &[(0, jump_press())]);
+            let mut zs = vec![m.pawns[0].z];
+            while m.pawns[0].z > 0 {
+                step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+                zs.push(m.pawns[0].z);
+            }
+            zs
+        };
+        let expected = vec![1200, 1900, 2100, 1800, 1000, 0];
+        assert_eq!(arc(1), expected, "the integer arc rises to the apex and lands exactly at 0");
+        assert_eq!(arc(7), expected, "a different seed runs the IDENTICAL arc — z is seed-independent and reproducible");
+        assert!(expected.iter().all(|&z| z >= 0), "z never tunnels below the ground");
+        assert_eq!(*expected.last().unwrap(), 0, "the pawn lands exactly on the ground, no fractional drift");
+    }
+
+    #[test]
+    fn gravity_zero_keeps_z_inert_and_the_match_2d() {
+        // FM2: gravity 0 (the default) DISABLES vertical physics — a spammed jump never
+        // lifts a pawn and the match plays exactly as the pre-jump 2D one. Two default
+        // matches with identical fire+move scripts differing ONLY in whether jump is
+        // held must reach byte-identical sim state, and every z must stay 0.
+        let play = |jump: bool| {
+            let mut m = close_match(1);
+            let press = ActionIntent {
+                move_dir: Vec2 { x: MOVE_INTENT_SCALE, y: 0 },
+                aim: EAST,
+                buttons: ActionButtons { fire: true, jump, ability: false, reload: false },
+            };
+            for _ in 0..24 {
+                if m.phase() != MatchPhase::Live {
+                    break;
+                }
+                step_with(&mut m, &[(0, press), (1, press)]);
+            }
+            (
+                m.phase(),
+                m.pawns.iter().map(|p| (p.seat, p.pos, p.z, p.health, p.score, p.alive)).collect::<Vec<_>>(),
+            )
+        };
+        let with_jump = play(true);
+        let without_jump = play(false);
+        assert_eq!(with_jump, without_jump, "with gravity 0 the jump button changes nothing — the match is 2D");
+        assert!(with_jump.1.iter().all(|s| s.2 == 0), "every pawn's z stays 0 while vertical physics are disabled");
+    }
+
+    #[test]
+    fn an_airborne_pawn_is_hit_and_perceived_exactly_as_on_the_ground() {
+        // FM3: this slice keeps z OUT of hit resolution AND perception — combat stays
+        // planar. Lift the target to a high z (as if mid-jump) and the SAME shot lands
+        // the SAME damage and the SAME perception verdict as at z==0; z is REPORTED on
+        // the wire, never used to gate.
+        let mut ground = close_match(1);
+        let ground_visible: Vec<u32> = ground.observe(0).visible.iter().map(|e| e.entity_id).collect();
+        step_with(&mut ground, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        let ground_dmg = Rules::default().start_health - ground.pawns[1].health;
+        assert!(ground_dmg > 0, "the baseline shot lands on the grounded target");
+
+        // Identical scenario, target lifted to z=5000 before the shot (gravity 0 holds it).
+        let mut air = close_match(1);
+        air.pawns[1].z = 5000;
+        let air_visible: Vec<u32> = air.observe(0).visible.iter().map(|e| e.entity_id).collect();
+        let reported_z = air.observe(0).visible.iter().find(|e| e.entity_id == 1).map(|e| e.z);
+        step_with(&mut air, &[(0, intent(Vec2::ZERO, EAST, true))]);
+        let air_dmg = Rules::default().start_health - air.pawns[1].health;
+
+        assert_eq!(air_visible, ground_visible, "perception is unchanged by z — the airborne enemy is still seen");
+        assert_eq!(reported_z, Some(5000), "z is reported on the visible entity (reported, not used to gate)");
+        assert_eq!(air_dmg, ground_dmg, "the hit lands the same damage regardless of the target's z");
+    }
+
+    #[test]
+    fn a_held_jump_never_double_jumps_and_relaunches_only_after_landing() {
+        // FM4: a jump requires the grounded state (z==0 && z_vel==0). Holding jump every
+        // tick must NOT relaunch mid-air (no double/infinite jump) — the pawn rides the
+        // single arc to an exact landing — and then jumps AGAIN the first grounded tick.
+        let mut m = jump_match(500, 1);
+        let mut zs = Vec::new();
+        for _ in 0..7 {
+            step_with(&mut m, &[(0, jump_press())]);
+            zs.push(m.pawns[0].z);
+        }
+        assert_eq!(
+            zs,
+            vec![1200, 1900, 2100, 1800, 1000, 0, 1200],
+            "held jump rides the arc to z==0 (no mid-air relaunch), then re-jumps the tick after landing"
+        );
+
+        // The airborne portion is byte-identical to a SINGLE jump: every held press
+        // during flight was ignored by the grounded gate, contributing nothing.
+        let mut single = jump_match(500, 1);
+        step_with(&mut single, &[(0, jump_press())]);
+        let mut single_zs = vec![single.pawns[0].z];
+        while single.pawns[0].z > 0 {
+            step_with(&mut single, &[(0, intent(Vec2::ZERO, EAST, false))]);
+            single_zs.push(single.pawns[0].z);
+        }
+        assert_eq!(single_zs.as_slice(), &zs[..6], "a held jump's flight equals a single jump's — mid-air presses are inert");
+    }
+
     #[test]
     fn ingest_accepts_well_formed_and_clamps_overlong_move() {
         let m = new_match(1);
