@@ -321,6 +321,14 @@ pub struct Rules {
     pub fire_cooldown: u16,
     /// Rounds a full magazine holds; `reload` refills to this.
     pub mag_size: u16,
+    /// Whether a shot can damage an allied pawn. `false` (the default) hardcodes the
+    /// pre-friendly-fire rule — a shot never touches a same-team pawn — so a record
+    /// written before this field replays byte-identically. When `true`, a hit lands on
+    /// the nearest body regardless of team (the shooter itself is still always
+    /// excluded); the team hit deals the same capped damage but credits the shooter no
+    /// score (a friendly hit is never rewarded). `serde(default)` resolves to `false`.
+    #[serde(default)]
+    pub friendly_fire: bool,
     /// How far a seat can perceive another entity, in position units.
     pub perception_range: i32,
     /// Forward field-of-view half-width as an octant spread (`0..=4`): an enemy in
@@ -371,6 +379,7 @@ impl Default for Rules {
             damage: 25,                 // four shots to down a full-health pawn
             fire_cooldown: 6,           // five shots/sec at 30 Hz
             mag_size: 30,
+            friendly_fire: false,
             perception_range: 40 * POSITION_SCALE,
             fov_octant_spread: full_circle_fov(),
             start_health: 100,
