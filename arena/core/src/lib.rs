@@ -1325,9 +1325,19 @@ mod tests {
     /// Returns the count of alive enemies correctly EXCLUDED for being out of
     /// perception — a nonzero total proves the range filter was load-bearing, so
     /// the audit can't pass vacuously in an everyone-always-in-range scenario.
-    fn assert_parity_bound(m: &Match) -> usize {
+    /// Live enemies the bound excluded, split by reason. Disjoint: an out-of-range
+    /// enemy counts as `out_of_range`; one in range but outside the FOV cone counts
+    /// as `out_of_cone`. A non-zero count is how a test proves the corresponding
+    /// filter is load-bearing rather than vacuous.
+    struct ParityCounts {
+        out_of_range: usize,
+        out_of_cone: usize,
+    }
+
+    fn assert_parity_bound(m: &Match) -> ParityCounts {
         let perception = m.rules.perception_range;
-        let mut excluded_out_of_range = 0;
+        let spread = m.rules.fov_octant_spread;
+        let mut counts = ParityCounts { out_of_range: 0, out_of_cone: 0 };
         for truth in &m.pawns {
             let seat = truth.seat;
             let obs = m.observe(seat);
@@ -1347,7 +1357,8 @@ mod tests {
             // The bound, both directions, against ground truth.
             for other in &m.pawns {
                 let in_range = within(truth.pos, other.pos, perception);
-                let perceivable = other.seat != seat && other.alive && in_range;
+                let in_cone = in_fov(truth.facing, truth.pos, other.pos, spread);
+                let perceivable = other.seat != seat && other.alive && in_range && in_cone;
                 let entry = obs.visible.iter().find(|e| e.entity_id == other.seat as u32);
                 assert_eq!(
                     entry.is_some(),
@@ -1360,12 +1371,16 @@ mod tests {
                     assert_eq!(e.team, other.team, "perceived team must be the real one");
                     assert_eq!(e.kind, arena_proto::EntityKind::Player);
                 }
-                if other.seat != seat && other.alive && !in_range {
-                    excluded_out_of_range += 1;
+                if other.seat != seat && other.alive {
+                    if !in_range {
+                        counts.out_of_range += 1;
+                    } else if !in_cone {
+                        counts.out_of_cone += 1;
+                    }
                 }
             }
         }
-        excluded_out_of_range
+        counts
     }
 
     #[test]
@@ -1395,7 +1410,7 @@ mod tests {
         let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
         let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker), Box::new(Seeker)];
 
-        let mut excluded = assert_parity_bound(&m);
+        let mut excluded = assert_parity_bound(&m).out_of_range;
         let mut ticks = 0u64;
         while m.phase() == MatchPhase::Live {
             let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
@@ -1408,12 +1423,58 @@ mod tests {
                 }
             }
             m.step(&intents);
-            excluded += assert_parity_bound(&m);
+            excluded += assert_parity_bound(&m).out_of_range;
             ticks += 1;
         }
         assert!(ticks > 1, "the match ran multiple ticks");
         assert!(m.pawns.iter().any(|p| !p.alive), "the match exercised a death transition");
         assert!(excluded > 0, "the range filter was never load-bearing — the bound check was vacuous");
+    }
+
+    #[test]
+    fn parity_bound_holds_under_a_tight_fov_cone_through_a_full_match() {
+        // The arena-06 per-tick audit, now with the FOV cone load-bearing. A tight
+        // spread-1 cone over a real 3-seat match with a GENEROUS perception range
+        // (so range never excludes — the cone is the only filter under test): the
+        // bound must hold for every seat every tick (an in-range enemy outside the
+        // cone is NOT perceived), and the cone must actually exclude in-range
+        // enemies (`out_of_cone > 0`) or the audit is vacuous.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "a".into() },
+            SeatInfo { seat: 1, team: 1, controller: "b".into() },
+            SeatInfo { seat: 2, team: 2, controller: "c".into() },
+        ];
+        let rules = Rules {
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            perception_range: 100 * POSITION_SCALE,
+            fov_octant_spread: 1,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, 1);
+        let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker), Box::new(Seeker)];
+
+        let counts = assert_parity_bound(&m);
+        assert_eq!(counts.out_of_range, 0, "perception range is generous — only the cone excludes");
+        let mut cone_excluded = counts.out_of_cone;
+        let mut ticks = 0u64;
+        while m.phase() == MatchPhase::Live {
+            let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+            for (i, &seat) in seat_ids.iter().enumerate() {
+                let obs = m.observe(seat);
+                if let Some(a) = policies[i].act(&obs) {
+                    if let Ok(intent) = m.ingest(seat, &a) {
+                        intents.insert(seat, intent);
+                    }
+                }
+            }
+            m.step(&intents);
+            cone_excluded += assert_parity_bound(&m).out_of_cone;
+            ticks += 1;
+        }
+        assert!(ticks > 1, "the match ran multiple ticks");
+        assert!(cone_excluded > 0, "the FOV cone never excluded an in-range enemy — the bound check was vacuous");
     }
 
     #[test]
