@@ -1159,6 +1159,13 @@ impl Match {
             if perp2 > radius2 {
                 continue;
             }
+            // A blocker is physical cover: an enemy in the beam but behind a wall
+            // takes no hit — the SAME sightline test perception uses, so a shooter
+            // can damage exactly what it could see. Checked last (only for a target
+            // already in the beam) so the O(blockers) scan runs only when it matters.
+            if !has_line_of_sight(&self.blockers, s.pos, t.pos) {
+                continue;
+            }
             if best.is_none_or(|(_, d)| dist2 < d) {
                 best = Some((j, dist2));
             }
