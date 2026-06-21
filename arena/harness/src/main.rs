@@ -118,6 +118,11 @@ enum SettleError {
     /// settlement that already landed. The caller treats it as benign (the terminal
     /// state already holds) instead of double-applying reputation or escrow.
     AlreadyResolved,
+    /// The match is not a 1v1 ranked pair. `MatchSettlement` settles exactly two
+    /// agents (`agentA` vs `agentB`); a result with any other seat count has no
+    /// on-chain `settle`/`settleDraw` form, so the driver refuses to emit an
+    /// unsettleable resolution rather than commit one the contract can't accept.
+    NotRankedPair,
 }
 
 /// The off-chain → on-chain settlement boundary for a finished match. Mirrors the
@@ -198,6 +203,12 @@ fn settle_match(
     result: &MatchResult,
     replay: &ReplayRecord,
 ) -> Result<Settlement, SettleError> {
+    // MatchSettlement is strictly 1v1; a non-pair match (FFA, a single seat, an
+    // empty result) has no on-chain settle form, so refuse it here rather than emit
+    // a Win/Draw the contract structurally cannot accept.
+    if result.outcomes.len() != 2 {
+        return Err(SettleError::NotRankedPair);
+    }
     let digest = replay.digest();
     let outcome = settlement(result);
     match outcome {
@@ -424,6 +435,23 @@ mod tests {
             "a cancelled match can never be settled",
         );
         assert_eq!(settler.resolution(id()), Some(Resolution::Cancelled), "still cancelled");
+    }
+
+    #[test]
+    fn a_non_pair_match_is_not_settleable() {
+        // MatchSettlement settles exactly two agents, so a 3-seat FFA (and likewise
+        // a single/empty result) is refused rather than emitted as an unsettleable
+        // Win/Draw — and nothing is recorded.
+        let replay = replay_for(roster(3));
+        let result =
+            result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 3, true), outcome(2, 3, 1, false)]);
+        let settler = MockSettler::default();
+
+        assert!(matches!(
+            settle_match(&settler, &result, &replay),
+            Err(SettleError::NotRankedPair)
+        ));
+        assert_eq!(settler.resolution(id()), None, "a non-pair match records nothing");
     }
 
     #[test]
