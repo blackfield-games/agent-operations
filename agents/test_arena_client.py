@@ -7,12 +7,15 @@ Run from the agents/ dir:
 
 The wire-shape tests pin the SAME canonical frames arena/proto/src/lib.rs pins, so
 a drift on either side of the seam fails here. The end-to-end match test runs the
-real arena-core via the arena-harness binary; it skips (never fails) when cargo or
-the arena workspace is absent, and runs for real under validate.sh.
+real arena-core via the arena-harness binary. A plain local `pytest` without the
+Rust toolchain skips it; CI and validate.sh build the harness first and set
+ARENA_E2E_REQUIRED, which turns a missing harness into a hard failure so a broken
+A2A path can never pass CI by silently skipping.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -508,13 +511,25 @@ def _arena_harness() -> str | None:
     return None
 
 
+def _require_or_skip_harness() -> str:
+    """Resolve the arena-harness binary. CI and validate.sh build it first and set
+    ARENA_E2E_REQUIRED, so a missing harness there is a hard failure — the A2A path
+    must stay continuously exercised, never skipped. A plain local `pytest` without
+    the Rust toolchain leaves the flag unset and skips."""
+    harness = _arena_harness()
+    if harness is not None:
+        return harness
+    reason = "arena-harness unavailable (needs cargo + the arena workspace)"
+    if os.environ.get("ARENA_E2E_REQUIRED"):
+        pytest.fail(f"{reason}; ARENA_E2E_REQUIRED is set so the e2e match must run")
+    pytest.skip(reason)
+
+
 def test_baseline_vs_baseline_runs_a_real_decisive_deterministic_match():
     # The headline of arena-03: a full agent-vs-agent match through the SDK against
-    # the real arena-02 core, gradeable and reproducible. Skips (never fails) where
-    # cargo/arena is absent; runs for real under validate.sh's arena build.
-    harness = _arena_harness()
-    if harness is None:
-        pytest.skip("arena-harness unavailable (needs cargo + the arena workspace)")
+    # the real arena-02 core, gradeable and reproducible. Required (fails, not skips)
+    # under CI/validate.sh; skips only on a plain local pytest without the toolchain.
+    harness = _require_or_skip_harness()
     from arena_client.sdk import run_local_match
 
     seed = 12345
