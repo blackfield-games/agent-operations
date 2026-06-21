@@ -392,6 +392,51 @@ impl Default for Rules {
     }
 }
 
+impl Rules {
+    /// The canonical, ordered, integer-only encoding of every sim-affecting field —
+    /// the bytes the replay digest folds so the committed `replay_hash` binds the
+    /// combat tuning, not just the seed/roster/world/actions. Without this a record
+    /// presented with swapped `Rules` (a weaker weapon, friendly fire flipped, a
+    /// wider FOV) shares a hash with the match it never ran, caught only by
+    /// re-execution; folding this into the digest makes the tuning part of the
+    /// commitment a hash-only consumer can check.
+    ///
+    /// Fields are appended in declaration order, big-endian, fixed-width — so the
+    /// concatenation is unambiguous without internal length prefixes and the same
+    /// `Rules` yields the same bytes on every platform (no float, no map). Each enum
+    /// is an EXPLICIT byte (not its `as` discriminant), so the wire mapping is the
+    /// fixed contract a second implementation reproduces — the same discipline the
+    /// pickup-kind byte and [`join_digest`](arena_proto::join_digest) follow.
+    pub fn canonical_encoding(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&self.max_speed.to_be_bytes());
+        b.extend_from_slice(&self.weapon_range.to_be_bytes());
+        b.extend_from_slice(&self.hit_radius.to_be_bytes());
+        b.push(match self.weapon_mode {
+            WeaponMode::Hitscan => 0,
+            WeaponMode::Projectile => 1,
+        });
+        b.extend_from_slice(&self.projectile_speed.to_be_bytes());
+        b.push(match self.aim_mode {
+            AimMode::Octant => 0,
+            AimMode::Fine => 1,
+        });
+        b.extend_from_slice(&self.damage.to_be_bytes());
+        b.extend_from_slice(&self.fire_cooldown.to_be_bytes());
+        b.extend_from_slice(&self.mag_size.to_be_bytes());
+        b.push(self.friendly_fire as u8);
+        b.extend_from_slice(&self.perception_range.to_be_bytes());
+        b.push(self.fov_octant_spread);
+        b.extend_from_slice(&self.start_health.to_be_bytes());
+        b.extend_from_slice(&self.spawn_radius.to_be_bytes());
+        b.extend_from_slice(&self.spawn_jitter.to_be_bytes());
+        b.extend_from_slice(&self.action_deadline_micros.to_be_bytes());
+        b.extend_from_slice(&self.pickup_radius.to_be_bytes());
+        b.extend_from_slice(&self.pickup_respawn_cooldown.to_be_bytes());
+        b
+    }
+}
+
 /// Why the server refused an [`Action`] envelope at the Gateway boundary. A
 /// refused action is not applied; the seat forfeits the tick exactly as if no
 /// action had arrived, so a malformed or spoofed action can never advance state.
@@ -4189,6 +4234,44 @@ mod tests {
         let mut rec = play(1).to_record().unwrap();
         rec.rules.damage = rec.rules.damage.saturating_mul(4);
         assert!(rec.verify().is_err(), "altered rules must not reproduce the record");
+    }
+
+    #[test]
+    fn rules_canonical_encoding_binds_every_field() {
+        // Mirror of arena_proto::join_digest_binds_every_field: every sim-affecting
+        // Rules field must land in the encoding, or a tampered value for an omitted
+        // field slips through the digest unchanged — the exact gap this binding
+        // closes. Flip EACH field and assert the bytes move.
+        let base = Rules::default();
+        assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
+        // 8×i32 + 1×u32 + 5×u16 + 4×u8 = 50 bytes. A new sim field added to the
+        // encoding moves this pin, forcing the field-flip set below to grow with it.
+        assert_eq!(base.canonical_encoding().len(), 50, "the encoding width pins the covered field set");
+
+        let cases: Vec<(&str, Rules)> = vec![
+            ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
+            ("weapon_range", Rules { weapon_range: base.weapon_range + 1, ..base }),
+            ("hit_radius", Rules { hit_radius: base.hit_radius + 1, ..base }),
+            ("weapon_mode", Rules { weapon_mode: WeaponMode::Projectile, ..base }),
+            ("projectile_speed", Rules { projectile_speed: base.projectile_speed + 1, ..base }),
+            ("aim_mode", Rules { aim_mode: AimMode::Fine, ..base }),
+            ("damage", Rules { damage: base.damage + 1, ..base }),
+            ("fire_cooldown", Rules { fire_cooldown: base.fire_cooldown + 1, ..base }),
+            ("mag_size", Rules { mag_size: base.mag_size + 1, ..base }),
+            ("friendly_fire", Rules { friendly_fire: !base.friendly_fire, ..base }),
+            ("perception_range", Rules { perception_range: base.perception_range + 1, ..base }),
+            ("fov_octant_spread", Rules { fov_octant_spread: base.fov_octant_spread - 1, ..base }),
+            ("start_health", Rules { start_health: base.start_health + 1, ..base }),
+            ("spawn_radius", Rules { spawn_radius: base.spawn_radius + 1, ..base }),
+            ("spawn_jitter", Rules { spawn_jitter: base.spawn_jitter + 1, ..base }),
+            ("action_deadline_micros", Rules { action_deadline_micros: base.action_deadline_micros + 1, ..base }),
+            ("pickup_radius", Rules { pickup_radius: base.pickup_radius + 1, ..base }),
+            ("pickup_respawn_cooldown", Rules { pickup_respawn_cooldown: base.pickup_respawn_cooldown + 1, ..base }),
+        ];
+        assert_eq!(cases.len(), 18, "every Rules field needs a flip case");
+        for (field, mutated) in &cases {
+            assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
+        }
     }
 
     #[test]
