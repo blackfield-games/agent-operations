@@ -1478,6 +1478,77 @@ mod tests {
     }
 
     #[test]
+    fn in_fov_cone_geometry_is_exact_and_seam_correct() {
+        // FM1/FM2/FM3: pin in_fov's exact integer geometry, facing EAST (octant 0).
+        let o = Vec2::ZERO;
+        let east = Vec2 { x: 10, y: 0 }; // octant 0 — dead ahead
+        let west = Vec2 { x: -10, y: 0 }; // octant 4 — directly behind (distance 4)
+        let ne = Vec2 { x: 10, y: 10 }; // octant 1 — one off E
+        let se = Vec2 { x: 10, y: -10 }; // octant 7 — one off E ACROSS the 0/7 seam
+
+        // Dead ahead is in the cone at every spread, including the narrowest.
+        for spread in 0..=4 {
+            assert!(in_fov(EAST, o, east, spread), "dead-ahead must be in any cone (spread {spread})");
+        }
+        // Directly behind is excluded by every cone tighter than the full circle,
+        // and admitted only by the full circle — FM1, no omniscience regression.
+        for spread in 0..4 {
+            assert!(!in_fov(EAST, o, west, spread), "the rear must be outside a non-full cone (spread {spread})");
+        }
+        assert!(in_fov(EAST, o, west, 4), "the full circle (spread 4) admits the rear");
+        // Symmetry + the 0/7 seam (FM2): NE (octant 1) and SE (octant 7) are BOTH one
+        // octant off EAST — SE only because the distance wraps. A non-circular
+        // distance would read SE as 7 away and wrongly drop it at spread 1.
+        assert!(!in_fov(EAST, o, ne, 0) && !in_fov(EAST, o, se, 0), "spread 0 is the facing octant alone");
+        assert!(in_fov(EAST, o, ne, 1), "NE is one octant off — inside a spread-1 cone");
+        assert!(in_fov(EAST, o, se, 1), "SE is one octant off across the 0/7 seam — inside a spread-1 cone");
+        // A co-located target (zero bearing) is always in view.
+        assert!(in_fov(EAST, o, o, 0), "a co-located entity is always in view");
+    }
+
+    #[test]
+    fn observe_applies_the_fov_cone_and_does_not_leak_the_excluded_position() {
+        // Integration: an enemy in range but directly behind is perceived under the
+        // default full circle and EXCLUDED under a tight cone — and its position
+        // never leaks through the observation.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "obs".into() },
+            SeatInfo { seat: 1, team: 1, controller: "behind".into() },
+        ];
+        let rear = Vec2 { x: -10 * POSITION_SCALE, y: 0 };
+        let make = |spread: u8| {
+            let rules = Rules {
+                perception_range: 100 * POSITION_SCALE,
+                fov_octant_spread: spread,
+                spawn_jitter: 0,
+                ..Default::default()
+            };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, seats.clone(), 1);
+            for p in &mut m.pawns {
+                match p.seat {
+                    0 => {
+                        p.pos = Vec2::ZERO;
+                        p.facing = EAST;
+                    }
+                    1 => p.pos = rear,
+                    _ => {}
+                }
+            }
+            m
+        };
+        // Default full circle: the rear enemy is perceived.
+        let full = make(4);
+        let seen: Vec<u32> = full.observe(0).visible.iter().map(|e| e.entity_id).collect();
+        assert_eq!(seen, vec![1], "the full circle perceives the rear enemy");
+        // Tight cone (facing octant only): excluded, and its position is absent.
+        let coned = make(0);
+        let obs = coned.observe(0);
+        assert!(obs.visible.is_empty(), "the rear enemy is outside the facing-octant cone");
+        assert!(obs.visible.iter().all(|e| e.position != rear), "an out-of-cone enemy's position must not leak");
+        assert_parity_bound(&coned);
+    }
+
+    #[test]
     fn an_enemy_just_past_perception_is_absent_everywhere() {
         // Adversarial: an enemy exactly AT the perception edge is perceived
         // (`within` is inclusive); one a single unit BEYOND it is absent, and its
