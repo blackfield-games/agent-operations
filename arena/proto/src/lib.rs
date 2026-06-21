@@ -519,10 +519,17 @@ pub struct TickRecord {
 /// overflow `i32` — keeping the integer geometry panic-free at any (operator-set)
 /// arena coordinate.
 ///
-/// First cut: a blocker occludes VISION only — it is NOT physical, so movement and
-/// hitscan pass through it. It is a server-authoritative match determinant: a
-/// match's blocker set decides what each seat can perceive, so it is bound into
-/// the [`ReplayRecord`] and committed by [`digest`](ReplayRecord::digest).
+/// A blocker is PHYSICAL cover: it occludes vision (an enemy behind it is not
+/// perceived), stops movement (a step whose swept path would cross it is refused),
+/// and stops fire (a hitscan beam or projectile is blocked by it) — so cover gives
+/// protection, not just an information advantage. It is a server-authoritative
+/// match determinant: a match's blocker set decides what each seat can perceive,
+/// where it can move, and what it can hit, so it is bound into the [`ReplayRecord`]
+/// and committed by [`digest`](ReplayRecord::digest). The geometry was already
+/// folded into the digest when blockers occluded vision (v2); making it physical
+/// changes the OUTCOMES a re-run reproduces, not the committed encoding — a
+/// no-blocker match stays byte-identical. Movement stops at the start of a blocked
+/// step (no surface-snap) and there is no wall-sliding yet; both are follow-ups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blocker {
     /// The low corner: the minimum on each axis. `min.x <= max.x && min.y <= max.y`.
@@ -620,14 +627,17 @@ impl ReplayRecord {
         let mut h = Keccak256::new();
         // v2 folded in the static `blockers` set; v3 folds in the static `pickups`
         // set; v4 folds in the `rules_commit` (the combat tuning). The bump is honest
-        // about each encoding change. Blockers occlude vision only, so they cannot be
-        // bound by re-execution alone and committing them here is what pins a match's
+        // about each encoding change. Blockers are physical cover now (they stop
+        // movement and fire, which a re-run DOES reproduce), but their VISION effect
+        // still cannot be bound by re-execution alone — outcomes never reveal what a
+        // seat perceived — so committing the geometry here is what pins a match's
         // perception geometry to its hash; pickups DO alter the re-run outcome (a
         // collected heal changes who survives), but an UNCOLLECTED pickup does not;
         // and the rules drive every outcome yet rode only on the parent record, so a
         // hash-only consumer could not tell a record's tuning from a swapped one.
         // Folding all three keeps the digest a complete, self-identifying commitment
-        // to the match world AND the rules it ran under.
+        // to the match world AND the rules it ran under. Physicality adds no new
+        // encoding bytes (the geometry is already here), so it is not a tag bump.
         h.update(b"blackfield/arena/replay/v4");
         h.update(self.protocol_version.to_be_bytes());
         h.update(self.match_id.as_bytes());
