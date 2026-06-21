@@ -514,6 +514,64 @@ struct Pickup {
     respawn_in: u16,
 }
 
+/// A named arena's static geometry — the vision [`Blocker`]s and world
+/// [`PickupSpawn`]s a match plays under. The match core already consumes both
+/// (blockers gate perception in [`observe`](Match::observe); pickups drive the
+/// collect/respawn loop) and binds them into the replay digest, but every
+/// formation path passed empty vecs, so occlusion and items were unreachable in a
+/// live match. An `ArenaMap` is the per-arena source the matchmaker loads at
+/// formation through [`Match::new_with_pickups`].
+///
+/// Geometry only: combat tuning ([`Rules`]) stays a separate match input, so an
+/// arena's layout and its rules vary independently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArenaMap {
+    /// Static vision occluders (see [`Blocker`]). Empty = no occlusion.
+    pub blockers: Vec<Blocker>,
+    /// Collectible world-item spawns (see [`PickupSpawn`]). Empty = no items.
+    pub pickups: Vec<PickupSpawn>,
+}
+
+impl ArenaMap {
+    /// The empty arena — no occluders, no items: the geometry every match formed
+    /// without a named arena plays under, byte-identical to the pre-map-loading
+    /// behaviour.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// Resolve a builtin arena key to its [`ArenaMap`]. The empty/default key (`""`)
+/// and any UNKNOWN key both resolve to [`ArenaMap::empty`] — an unrecognised arena
+/// degrades safe to no geometry, never panicking or guessing — so the default
+/// formation path stays byte-identical and a misconfigured key can't brick a
+/// match.
+///
+/// `"reference"` is a small symmetric NON-production arena that exercises the
+/// loading path end-to-end; real arena layouts are authored content (operator
+/// level-design), not hardcoded here.
+pub fn arena_map(key: &str) -> ArenaMap {
+    match key {
+        "reference" => reference_arena(),
+        _ => ArenaMap::empty(),
+    }
+}
+
+/// A minimal, symmetric reference arena: one central square vision occluder and
+/// two health pickups mirrored east/west, so neither seat of a 2-seat
+/// free-for-all opens with a sightline or item edge. Integer position units. A
+/// path-exercising demo, deliberately NOT a tuned production map.
+fn reference_arena() -> ArenaMap {
+    let m = POSITION_SCALE;
+    ArenaMap {
+        blockers: vec![Blocker { min: Vec2 { x: -3 * m, y: -3 * m }, max: Vec2 { x: 3 * m, y: 3 * m } }],
+        pickups: vec![
+            PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: -20 * m, y: 0 }, amount: 50 },
+            PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: 20 * m, y: 0 }, amount: 50 },
+        ],
+    }
+}
+
 /// The arena match: roster, authoritative pawn state, and the lifecycle phase.
 /// A match advances one fixed tick at a time and never moves backward.
 pub struct Match {
