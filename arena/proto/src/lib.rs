@@ -491,9 +491,34 @@ pub struct TickRecord {
     pub actions: Vec<SeatAction>,
 }
 
-/// The full deterministic record of a match — the PRNG seed, the roster, and the
-/// ordered per-tick accepted-action stream — sufficient to re-run the match
-/// bit-for-bit and reproduce its [`MatchResult`].
+/// A static axis-aligned vision-blocking volume on the ground plane — the
+/// integer footprint of an occluder (a wall, a pillar) the line-of-sight test
+/// reasons against. Stored as its two opposite corners in position units (see
+/// [`POSITION_SCALE`]): `min` is the low corner and `max` the high corner on each
+/// axis, so the well-formed invariant is `min.x <= max.x && min.y <= max.y`. An
+/// inverted box is rejected before any simulation; a zero-extent box on one axis
+/// is a legitimate thin wall.
+///
+/// Corners are stored directly (not as centre ± half-extent) so the segment-vs-box
+/// test consumes them with zero arithmetic — no `centre + half` step that could
+/// overflow `i32` — keeping the integer geometry panic-free at any (operator-set)
+/// arena coordinate.
+///
+/// First cut: a blocker occludes VISION only — it is NOT physical, so movement and
+/// hitscan pass through it. It is a server-authoritative match determinant: a
+/// match's blocker set decides what each seat can perceive, so it is bound into
+/// the [`ReplayRecord`] and committed by [`digest`](ReplayRecord::digest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blocker {
+    /// The low corner: the minimum on each axis. `min.x <= max.x && min.y <= max.y`.
+    pub min: Vec2,
+    /// The high corner: the maximum on each axis.
+    pub max: Vec2,
+}
+
+/// The full deterministic record of a match — the PRNG seed, the roster, the
+/// static vision blockers, and the ordered per-tick accepted-action stream —
+/// sufficient to re-run the match bit-for-bit and reproduce its [`MatchResult`].
 ///
 /// For the record to be a stable commitment the producer MUST build it in
 /// canonical order: `seats` and each tick's `actions` ascending by seat, `ticks`
