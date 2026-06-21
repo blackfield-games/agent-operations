@@ -2494,6 +2494,47 @@ mod tests {
     }
 
     #[test]
+    fn the_live_projectile_cap_bounds_a_fire_spammer() {
+        // FM4 (DoS): a fire-every-tick agent cannot grow the live set — hence per-tick
+        // O(live · seats) work — without bound. With fire_cooldown 0 and a deep
+        // magazine both seats spawn a shot every tick, and the (motionless, so
+        // persisting) live set climbs to MAX_LIVE_PROJECTILES and never past it: at the
+        // cap a fire spends ammo but spawns nothing.
+        let rules = Rules {
+            weapon_mode: WeaponMode::Projectile,
+            fire_cooldown: 0,
+            mag_size: u16::MAX,
+            projectile_speed: 0, // shots sit and persist, so the set actually fills
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        let aim0 = m.observe(0).own.facing;
+        let aim1 = m.observe(1).own.facing;
+        let mut reached_cap = false;
+        let mut held = 0;
+        let mut ticks = 0u64;
+        while m.phase() == MatchPhase::Live && ticks < 2 * MAX_LIVE_PROJECTILES as u64 {
+            step_with(
+                &mut m,
+                &[(0, intent(Vec2::ZERO, aim0, true)), (1, intent(Vec2::ZERO, aim1, true))],
+            );
+            assert!(m.projectiles.len() <= MAX_LIVE_PROJECTILES, "the live set exceeded the cap");
+            if m.projectiles.len() == MAX_LIVE_PROJECTILES {
+                reached_cap = true;
+                held += 1;
+                if held > 20 {
+                    break; // the cap has held for a stretch — enough
+                }
+            }
+            ticks += 1;
+        }
+        assert!(reached_cap, "the cap was never reached — the bound check was vacuous");
+        assert_eq!(m.phase(), MatchPhase::Live, "the cap bounds spawns, it does not end the match");
+    }
+
+    #[test]
     fn a_pawn_spawned_inside_a_blocker_is_neither_blind_nor_invisible() {
         // FM4: the seed-driven spawn can land a pawn inside a vision blocker. The
         // endpoint exemption makes that safe with no setup rejection: the occupant
