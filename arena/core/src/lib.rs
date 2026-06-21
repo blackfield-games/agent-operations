@@ -1443,19 +1443,21 @@ mod tests {
     /// Returns the count of alive enemies correctly EXCLUDED for being out of
     /// perception — a nonzero total proves the range filter was load-bearing, so
     /// the audit can't pass vacuously in an everyone-always-in-range scenario.
-    /// Live enemies the bound excluded, split by reason. Disjoint: an out-of-range
-    /// enemy counts as `out_of_range`; one in range but outside the FOV cone counts
-    /// as `out_of_cone`. A non-zero count is how a test proves the corresponding
-    /// filter is load-bearing rather than vacuous.
+    /// Live enemies the bound excluded, split by reason. Disjoint, in filter order:
+    /// an out-of-range enemy counts as `out_of_range`; one in range but outside the
+    /// FOV cone as `out_of_cone`; one in range and in cone but occluded by a vision
+    /// blocker as `out_of_los`. A non-zero count is how a test proves the
+    /// corresponding filter is load-bearing rather than vacuous.
     struct ParityCounts {
         out_of_range: usize,
         out_of_cone: usize,
+        out_of_los: usize,
     }
 
     fn assert_parity_bound(m: &Match) -> ParityCounts {
         let perception = m.rules.perception_range;
         let spread = m.rules.fov_octant_spread;
-        let mut counts = ParityCounts { out_of_range: 0, out_of_cone: 0 };
+        let mut counts = ParityCounts { out_of_range: 0, out_of_cone: 0, out_of_los: 0 };
         for truth in &m.pawns {
             let seat = truth.seat;
             let obs = m.observe(seat);
@@ -1476,7 +1478,10 @@ mod tests {
             for other in &m.pawns {
                 let in_range = within(truth.pos, other.pos, perception);
                 let in_cone = in_fov(truth.facing, truth.pos, other.pos, spread);
-                let perceivable = other.seat != seat && other.alive && in_range && in_cone;
+                // Independently recompute LOS from the raw blockers (not via the
+                // observed entry) so the audit is ground truth, not a tautology.
+                let in_los = has_line_of_sight(&m.blockers, truth.pos, other.pos);
+                let perceivable = other.seat != seat && other.alive && in_range && in_cone && in_los;
                 let entry = obs.visible.iter().find(|e| e.entity_id == other.seat as u32);
                 assert_eq!(
                     entry.is_some(),
@@ -1494,6 +1499,8 @@ mod tests {
                         counts.out_of_range += 1;
                     } else if !in_cone {
                         counts.out_of_cone += 1;
+                    } else if !in_los {
+                        counts.out_of_los += 1;
                     }
                 }
             }
@@ -1732,6 +1739,160 @@ mod tests {
         assert!(obs.visible.is_empty(), "the rear enemy is outside the facing-octant cone");
         assert!(obs.visible.iter().all(|e| e.position != rear), "an out-of-cone enemy's position must not leak");
         assert_parity_bound(&coned);
+    }
+
+    #[test]
+    fn observe_occludes_an_enemy_behind_a_blocker_and_does_not_leak_it() {
+        // Integration: an in-range, in-cone enemy directly behind a wall is excluded
+        // from the visible set and its position never leaks; remove the wall and the
+        // same enemy is perceived — so the blocker, not range or cone, is what hid it.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "obs".into() },
+            SeatInfo { seat: 1, team: 1, controller: "behind".into() },
+        ];
+        let foe = Vec2 { x: 20 * POSITION_SCALE, y: 0 };
+        let wall = Blocker {
+            min: Vec2 { x: 9 * POSITION_SCALE, y: -2 * POSITION_SCALE },
+            max: Vec2 { x: 11 * POSITION_SCALE, y: 2 * POSITION_SCALE },
+        };
+        let make = |blockers: Vec<Blocker>| {
+            let rules = Rules { perception_range: 100 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, seats.clone(), blockers, 1);
+            for p in &mut m.pawns {
+                match p.seat {
+                    0 => {
+                        p.pos = Vec2::ZERO;
+                        p.facing = EAST;
+                    }
+                    1 => p.pos = foe,
+                    _ => {}
+                }
+            }
+            m
+        };
+        let walled = make(vec![wall]);
+        let obs = walled.observe(0);
+        assert!(obs.visible.is_empty(), "the enemy behind the wall is occluded");
+        assert!(obs.visible.iter().all(|e| e.position != foe), "an occluded enemy's position must not leak");
+        assert_parity_bound(&walled);
+
+        let clear = make(Vec::new());
+        let seen: Vec<u32> = clear.observe(0).visible.iter().map(|e| e.entity_id).collect();
+        assert_eq!(seen, vec![1], "with no wall the same enemy is perceived — the blocker was load-bearing");
+    }
+
+    #[test]
+    fn line_of_sight_is_recomputed_as_the_observer_clears_cover() {
+        // FM (perception is per-tick): a stationary enemy starts hidden behind a
+        // wall; the observer strafes until its sightline clears the wall, and the
+        // enemy appears ONLY once line of sight opens — never through the wall.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "mover".into() },
+            SeatInfo { seat: 1, team: 1, controller: "still".into() },
+        ];
+        let wall = Blocker {
+            min: Vec2 { x: 9 * POSITION_SCALE, y: -2 * POSITION_SCALE },
+            max: Vec2 { x: 11 * POSITION_SCALE, y: 2 * POSITION_SCALE },
+        };
+        let rules = Rules {
+            perception_range: 100 * POSITION_SCALE,
+            spawn_jitter: 0,
+            max_speed: POSITION_SCALE,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, seats, vec![wall], 1);
+        for p in &mut m.pawns {
+            match p.seat {
+                0 => p.pos = Vec2::ZERO,
+                1 => p.pos = Vec2 { x: 20 * POSITION_SCALE, y: 0 },
+                _ => {}
+            }
+        }
+        assert!(m.observe(0).visible.is_empty(), "the enemy starts hidden behind the wall");
+
+        let north = intent(Vec2 { x: 0, y: MOVE_INTENT_SCALE }, EAST, false);
+        let mut seen = false;
+        while m.phase() == MatchPhase::Live && !seen && m.tick() < 100 {
+            step_with(&mut m, &[(0, north)]);
+            // Whenever the enemy is visible, the sightline must genuinely be clear —
+            // never perceived through the wall.
+            let me = m.pawns.iter().find(|p| p.seat == 0).unwrap().pos;
+            let foe = m.pawns.iter().find(|p| p.seat == 1).unwrap().pos;
+            seen = !m.observe(0).visible.is_empty();
+            assert_eq!(seen, has_line_of_sight(&m.blockers, me, foe), "visibility tracks line of sight exactly");
+        }
+        assert!(seen, "the enemy appeared once the observer strafed past the wall");
+    }
+
+    #[test]
+    fn parity_bound_holds_under_occlusion_through_a_full_match() {
+        // The arena-06 per-tick audit with line of sight load-bearing. A wall around
+        // the centre seat occludes the two flank seats from each other (full circle
+        // FOV + generous range, so only LOS excludes); the bound must hold for every
+        // seat every tick, and the occlusion must actually fire (`out_of_los > 0`).
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "a".into() },
+            SeatInfo { seat: 1, team: 1, controller: "b".into() },
+            SeatInfo { seat: 2, team: 2, controller: "c".into() },
+        ];
+        let wall = Blocker {
+            min: Vec2 { x: -500, y: -3 * POSITION_SCALE },
+            max: Vec2 { x: 500, y: 3 * POSITION_SCALE },
+        };
+        let rules = Rules {
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            perception_range: 100 * POSITION_SCALE,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, seats, vec![wall], 1);
+        let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker), Box::new(Seeker)];
+
+        let counts = assert_parity_bound(&m);
+        assert_eq!(counts.out_of_range, 0, "range is generous — it never excludes");
+        let mut los_excluded = counts.out_of_los;
+        let mut ticks = 0u64;
+        while m.phase() == MatchPhase::Live {
+            let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+            for (i, &seat) in seat_ids.iter().enumerate() {
+                let obs = m.observe(seat);
+                if let Some(a) = policies[i].act(&obs) {
+                    if let Ok(intent) = m.ingest(seat, &a) {
+                        intents.insert(seat, intent);
+                    }
+                }
+            }
+            m.step(&intents);
+            los_excluded += assert_parity_bound(&m).out_of_los;
+            ticks += 1;
+        }
+        assert!(ticks > 1, "the match ran multiple ticks");
+        assert!(los_excluded > 0, "the wall never occluded anyone — the LOS bound check was vacuous");
+    }
+
+    #[test]
+    fn a_pawn_spawned_inside_a_blocker_is_neither_blind_nor_invisible() {
+        // FM4: the seed-driven spawn can land a pawn inside a vision blocker. The
+        // endpoint exemption makes that safe with no setup rejection: the occupant
+        // still perceives the enemy (not self-blinded) and is still perceived by it
+        // (not hidden), while any OTHER blocker would still occlude.
+        let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        // close_match spawns seat 0 at x = -2 m; wrap that spawn in a blocker.
+        let around_spawn0 = Blocker {
+            min: Vec2 { x: -3 * POSITION_SCALE, y: -POSITION_SCALE },
+            max: Vec2 { x: -POSITION_SCALE, y: POSITION_SCALE },
+        };
+        let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![around_spawn0], 1);
+        let spawn0 = m.pawns.iter().find(|p| p.seat == 0).unwrap().pos;
+        assert!(blocker_contains(&around_spawn0, spawn0), "seat 0 really spawned inside the blocker");
+        // Not blind: the enclosed seat still perceives the enemy (in default range).
+        let seen0: Vec<u32> = m.observe(0).visible.iter().map(|e| e.entity_id).collect();
+        assert_eq!(seen0, vec![1], "a pawn in a blocker is not self-blinded");
+        // Not invisible: the enemy still perceives the enclosed seat.
+        let seen1: Vec<u32> = m.observe(1).visible.iter().map(|e| e.entity_id).collect();
+        assert_eq!(seen1, vec![0], "a pawn in a blocker is not hidden by it");
+        assert_parity_bound(&m);
     }
 
     #[test]
