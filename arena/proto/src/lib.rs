@@ -188,7 +188,11 @@ pub enum EntityKind {
     /// neither the shooter's nor the target's identity. A pure-hitscan match never
     /// produces one.
     Projectile,
-    /// A world pickup (reserved; not yet produced by the reference core).
+    /// A collectible world item (a health or ammo pickup). Produced by a match
+    /// configured with [`PickupSpawn`]s as a parity-bounded [`VisibleEntity`]: it
+    /// carries only its perceivable facets (id, position) and is reported as the
+    /// neutral team, so its effect sub-kind, amount, and respawn timer never leak. A
+    /// dormant (collected, not-yet-respawned) pickup produces none.
     Pickup,
 }
 
