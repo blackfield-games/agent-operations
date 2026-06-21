@@ -4420,4 +4420,201 @@ mod tests {
             Settlement::Draw => assert!(firsts.len() != 1),
         }
     }
+
+    fn health_pickup(x: i32, y: i32, amount: u16) -> PickupSpawn {
+        PickupSpawn { kind: PickupKind::Health, position: Vec2 { x, y }, amount }
+    }
+
+    fn ammo_pickup(x: i32, y: i32, amount: u16) -> PickupSpawn {
+        PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x, y }, amount }
+    }
+
+    /// A 2-seat match with a configured pickup set, tight collection radius, seats
+    /// not jittered so the geometry is exact.
+    fn pickup_match(pickups: Vec<PickupSpawn>, rules: Rules) -> Match {
+        Match::new_with_pickups(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), pickups, 1)
+    }
+
+    fn pickup_rules() -> Rules {
+        Rules { spawn_jitter: 0, pickup_radius: 1000, pickup_respawn_cooldown: 3, ..Default::default() }
+    }
+
+    #[test]
+    fn a_health_pickup_heals_a_wounded_pawn_then_goes_dormant() {
+        let mut m = pickup_match(vec![health_pickup(0, 0, 40)], pickup_rules());
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].health = 50;
+        m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 }; // far, no combat
+        // The active pickup is perceivable to the pawn standing on it.
+        assert!(
+            m.observe(0).visible.iter().any(|e| e.kind == arena_proto::EntityKind::Pickup),
+            "an active pickup is perceivable"
+        );
+        step_with(&mut m, &[]);
+        assert_eq!(m.pawns[0].health, 90, "the heal is applied (50 + 40)");
+        assert!(
+            !m.observe(0).visible.iter().any(|e| e.kind == arena_proto::EntityKind::Pickup),
+            "a collected pickup is dormant and not perceivable"
+        );
+    }
+
+    #[test]
+    fn an_ammo_pickup_refills_and_respawns_after_its_cooldown() {
+        let rules = Rules { perception_range: 50 * POSITION_SCALE, ..pickup_rules() };
+        let mut m = pickup_match(vec![ammo_pickup(0, 0, 8)], rules);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[0].ammo = 0; // emptied, so the refill is observable
+        m.pawns[1].pos = Vec2 { x: -45 * POSITION_SCALE, y: 0 };
+        step_with(&mut m, &[]);
+        assert_eq!(m.pawns[0].ammo, 8, "the ammo pickup refilled an empty magazine");
+        // Step off the pad so the respawned pickup is not instantly re-collected.
+        m.pawns[0].pos = Vec2 { x: 20 * POSITION_SCALE, y: 0 };
+        assert!(!m.observe(0).visible.iter().any(|e| e.kind == arena_proto::EntityKind::Pickup), "dormant");
+        for _ in 0..3 {
+            step_with(&mut m, &[]);
+        }
+        assert!(
+            m.observe(0).visible.iter().any(|e| e.kind == arena_proto::EntityKind::Pickup),
+            "the pickup respawned after its cooldown and is perceivable again"
+        );
+    }
+
+    #[test]
+    fn simultaneous_contact_resolves_to_exactly_one_collector_by_seat() {
+        // FM3: two pawns reaching one pickup the same tick — only the lower seat
+        // collects (it is consumed before the next pawn is checked); no double-grant.
+        let mut m = pickup_match(vec![health_pickup(0, 0, 30)], pickup_rules());
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].health = 50;
+        m.pawns[1].pos = Vec2::ZERO;
+        m.pawns[1].health = 50;
+        step_with(&mut m, &[]);
+        assert_eq!(m.pawns[0].health, 80, "the lower seat collects the contested pickup");
+        assert_eq!(m.pawns[1].health, 50, "the higher seat gets nothing — already consumed");
+    }
+
+    #[test]
+    fn collecting_at_the_cap_is_a_no_op_without_overflow() {
+        // FM3: a heal at full health clamps to the cap with no overflow — even with an
+        // absurd amount that a plain add would wrap (overflow-checks are on in release).
+        let mut m = pickup_match(vec![health_pickup(0, 0, u16::MAX)], pickup_rules());
+        m.pawns[0].pos = Vec2::ZERO; // full health
+        m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 };
+        let max = m.pawns[0].max_health;
+        step_with(&mut m, &[]);
+        assert_eq!(m.pawns[0].health, max, "a heal at the cap stays at the cap, no overflow");
+    }
+
+    #[test]
+    fn pickup_perception_obeys_the_same_parity_bound_as_a_pawn() {
+        // FM2: an active pickup is perceivable ONLY within range + cone + LOS, carries
+        // no hidden state, and an out-of-bound one never leaks its position.
+        let near = ammo_pickup(5000, 0, 5); // dead ahead, in range
+        let behind = health_pickup(-5000, 0, 5); // in range but behind the facing
+        let far = health_pickup(0, 100 * POSITION_SCALE, 5); // out of perception range
+        let rules = Rules {
+            perception_range: 30 * POSITION_SCALE,
+            fov_octant_spread: 1,
+            ..pickup_rules()
+        };
+        let mut m = pickup_match(vec![near, behind, far], rules);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 49 * POSITION_SCALE, y: 0 };
+        let obs = m.observe(0);
+        let seen: Vec<&arena_proto::VisibleEntity> =
+            obs.visible.iter().filter(|e| e.kind == arena_proto::EntityKind::Pickup).collect();
+        assert_eq!(seen.len(), 1, "only the in-range, in-cone, clear-LOS pickup is perceivable");
+        let p = seen[0];
+        assert_eq!(p.entity_id, PICKUP_ID_BASE, "the near pickup, by its stable id");
+        assert_eq!(p.position, Vec2 { x: 5000, y: 0 }, "its real position");
+        assert_eq!(p.team, 0, "a pickup is reported neutral");
+        assert_eq!(p.facing, 0, "a pickup carries no facing");
+        // Neither the behind nor the far pickup's position leaks anywhere.
+        assert!(
+            obs.visible.iter().all(|e| e.position != Vec2 { x: -5000, y: 0 } && e.position != Vec2 { x: 0, y: 100 * POSITION_SCALE }),
+            "an out-of-cone or out-of-range pickup's position must not leak"
+        );
+    }
+
+    /// Run a 2-seat Seeker-vs-Seeker match (close, in range at spawn) with a pickup
+    /// set, to a terminal record.
+    fn play_with_pickups(seed: u64, pickups: Vec<PickupSpawn>) -> Match {
+        let rules = Rules { spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let m = Match::new_with_pickups(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), pickups, seed);
+        let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+        run_match(m, &mut policies)
+    }
+
+    #[test]
+    fn a_pickup_match_replays_byte_for_byte_and_across_runs() {
+        // FM1: the pickup collect/respawn timeline is a pure function of the seed,
+        // rules, and recorded actions — a pickup match re-runs from its record ALONE
+        // to the same result + digest, and two same-seed runs are byte-identical.
+        let pickups = vec![health_pickup(-2000, 0, 30), ammo_pickup(0, 0, 10)];
+        let played = play_with_pickups(1, pickups.clone());
+        assert_eq!(played.phase(), MatchPhase::Ended);
+        let record = played.to_record().unwrap();
+        assert!(!record.replay.pickups.is_empty(), "the configured pickups rode into the record");
+        assert!(record.verify().is_ok(), "a pickup match re-runs to its own committed result");
+
+        let a = play_with_pickups(7, pickups.clone()).into_replay();
+        let b = play_with_pickups(7, pickups).into_replay();
+        assert_eq!(a.digest(), b.digest(), "two same-seed pickup runs diverged");
+        assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
+    }
+
+    #[test]
+    fn the_recorded_pickup_layout_binds_the_committed_hash() {
+        // FM1: the item layout is committed (v3), so moving or dropping a pickup —
+        // even one no pawn collected — breaks the committed hash, like a blocker.
+        let record = play_with_pickups(1, vec![health_pickup(-2000, 0, 30), ammo_pickup(10 * POSITION_SCALE, 0, 5)])
+            .to_record()
+            .unwrap();
+        assert!(record.verify().is_ok());
+        let mut moved = record.clone();
+        moved.replay.pickups[1].position.x += 1;
+        assert!(moved.verify().is_err(), "a moved pickup must break the committed hash");
+        let mut dropped = record.clone();
+        dropped.replay.pickups.pop();
+        assert!(dropped.verify().is_err(), "dropping a pickup must break the committed hash");
+    }
+
+    #[test]
+    fn verify_rejects_an_over_budget_pickup_list() {
+        // FM4: the verifier bounds the pickup count (per-tick collection is
+        // O(seats·pickups)); the budget itself is processed, one past it is rejected.
+        let record = play_with_pickups(1, vec![health_pickup(-2000, 0, 10)]).to_record().unwrap();
+        let filler = ammo_pickup(0, 0, 1);
+        let mut over = record.clone();
+        over.replay.pickups.resize(MAX_REPLAY_PICKUPS + 1, filler);
+        assert_eq!(
+            over.verify(),
+            Err(ReplayError::TooManyPickups { pickups: MAX_REPLAY_PICKUPS + 1, max: MAX_REPLAY_PICKUPS }),
+            "one past the budget is rejected before the re-run"
+        );
+        let mut at = record.clone();
+        at.replay.pickups.resize(MAX_REPLAY_PICKUPS, filler);
+        assert!(
+            !matches!(at.verify(), Err(ReplayError::TooManyPickups { .. })),
+            "the budget itself is processed, not size-rejected — the bound is non-vacuous"
+        );
+    }
+
+    #[test]
+    fn the_default_no_pickup_match_is_unchanged() {
+        // FM5: Match::new delegates to new_with_pickups with none, so a no-pickup match
+        // is identical and no pickup ever appears in any observation.
+        let a = Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), Vec::new(), 1).into_replay();
+        let b = Match::new_with_pickups(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), Vec::new(), Vec::new(), 1)
+            .into_replay();
+        assert_eq!(a.digest(), b.digest(), "new == new_with_pickups(empty)");
+        assert!(a.pickups.is_empty(), "a default match records no pickups");
+        let played = play(1);
+        assert!(
+            played.observe(0).visible.iter().all(|e| e.kind != arena_proto::EntityKind::Pickup),
+            "a default match never surfaces a pickup"
+        );
+    }
 }
