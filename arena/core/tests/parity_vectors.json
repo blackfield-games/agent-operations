@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v2",
+  "domain": "blackfield/arena/parity-vectors/v3",
   "protocol_version": 1,
   "spawns": [
     {
@@ -661,6 +661,15 @@
             1,
             44
           ],
+          "config": {
+            "tick_hz": 30,
+            "max_ticks": 3600,
+            "bounds": {
+              "x": 50000,
+              "y": 50000
+            },
+            "seats": 2
+          },
           "ticks": [
             {
               "tick": 0,
@@ -726,7 +735,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "2335971e1825fbaf4b5854e22345272abce0753e774bf77f657c3650863f9e51"
+          "replay_hash": "5dc022801558356ccb5509e5060c6e611913d66473204190f6428fe7ec5a31fa"
         }
       }
     },
@@ -832,6 +841,15 @@
             1,
             44
           ],
+          "config": {
+            "tick_hz": 30,
+            "max_ticks": 3600,
+            "bounds": {
+              "x": 50000,
+              "y": 50000
+            },
+            "seats": 2
+          },
           "ticks": [
             {
               "tick": 0,
@@ -897,7 +915,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "dc4153fe25e9319b5fd735ecb54ceec89f0faa4b6faeef55f25910f6546cb3f8"
+          "replay_hash": "12fa8624a33cac2d6653c5dda65ec584a261218810267d3dfb2decf0831dabcd"
         }
       }
     },
@@ -1003,6 +1021,15 @@
             1,
             44
           ],
+          "config": {
+            "tick_hz": 30,
+            "max_ticks": 3600,
+            "bounds": {
+              "x": 50000,
+              "y": 50000
+            },
+            "seats": 2
+          },
           "ticks": [
             {
               "tick": 0,
@@ -1072,7 +1099,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "492672658bab603de28fad8201c0791611bc4f9da891dad42784eed16e4629f8"
+          "replay_hash": "7e9918aeb3850cd327af6ad93c396fb45784506ea86e065f25f321c31573dd5f"
         }
       }
     },
@@ -1187,6 +1214,15 @@
             1,
             44
           ],
+          "config": {
+            "tick_hz": 30,
+            "max_ticks": 3600,
+            "bounds": {
+              "x": 50000,
+              "y": 50000
+            },
+            "seats": 2
+          },
           "ticks": [
             {
               "tick": 0,
@@ -1252,7 +1288,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "bf6d74d728b27a6f438f5809b49835f6efbb0d50f595f0b41de57a2776bd8abd"
+          "replay_hash": "6dd5e095f6da2e98ec6e815681de38ae3463477cd1aad6ed11f6f72e1a2992a9"
         }
       }
     }

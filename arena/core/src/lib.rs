@@ -1423,6 +1423,7 @@ impl Match {
             blockers: self.blockers.clone(),
             pickups: self.pickup_config.clone(),
             rules_commit: self.rules.canonical_encoding(),
+            config: self.config,
             ticks: self.ticks.clone(),
         }
     }
@@ -1461,6 +1462,7 @@ impl Match {
             match_id: self.match_id,
             seed: self.seed,
             rules_commit: self.rules.canonical_encoding(),
+            config: self.config,
             seats: self.seats,
             blockers: self.blockers,
             pickups: self.pickup_config,
@@ -1471,11 +1473,13 @@ impl Match {
 
 /// A complete, self-determining record of one finished match.
 ///
-/// A bare [`ReplayRecord`] carries the seed, roster, world, action stream, and a
-/// COMMITMENT to the [`Rules`] (its `rules_commit`, which the digest folds) — but
-/// not the [`MatchConfig`] (arena bounds, tick cap) nor the typed [`Rules`] the sim
-/// re-execution consumes, so a `ReplayRecord` alone cannot be RE-RUN: its hash
-/// commits the tuning, but reproducing the match still needs the rules themselves.
+/// A bare [`ReplayRecord`] carries the seed, roster, world, action stream, the
+/// [`MatchConfig`] (arena bounds, tick cap — whose determinants the digest folds),
+/// and a COMMITMENT to the [`Rules`] (its `rules_commit`, which the digest folds) —
+/// but not the typed [`Rules`] the sim re-execution consumes, so a `ReplayRecord`
+/// alone cannot be RE-RUN: its hash commits the config and the tuning, but
+/// reproducing the match still needs the rules themselves (a fingerprint, unlike the
+/// config it carries, cannot be re-executed).
 /// A `MatchRecord` closes that gap by bundling the full determinant set (the
 /// `config`, the `rules`, the `replay` inputs, and the terminal `result` they
 /// produced), so [`verify`](MatchRecord::verify) re-runs it from the record
@@ -2226,8 +2230,10 @@ pub struct ParityVectors {
 
 /// Domain tag for the parity-vector set — see [`ParityVectors::domain`]. Bumped to
 /// v2 when blockers became physical cover (movement/hitscan/projectile now respect
-/// them): a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v2";
+/// them); bumped to v3 when the replay digest began committing the `MatchConfig`
+/// determinants (arena bounds + tick cap), moving every committed match hash — a
+/// deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v3";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4446,6 +4452,7 @@ mod tests {
             blockers: Vec::new(),
             pickups: Vec::new(),
             rules_commit: Rules::default().canonical_encoding(),
+            config: config(2),
             ticks: vec![TickRecord {
                 tick: 0,
                 actions: vec![SeatAction { seat: 0, intent: intent(Vec2 { x: 1_000_000, y: 0 }, EAST, false) }],

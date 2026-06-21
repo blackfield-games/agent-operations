@@ -615,6 +615,18 @@ pub struct ReplayRecord {
     /// rules it ran under", unlike the empty blockers/pickups defaults above).
     #[serde(default)]
     pub rules_commit: Vec<u8>,
+    /// The [`MatchConfig`] the match ran under — arena bounds and tick cap. Its
+    /// DETERMINANT fields are committed by [`digest`](ReplayRecord::digest): `bounds`
+    /// clamps movement and `max_ticks` ends the match, so a tampered bound or cap
+    /// yields a different hash (previously caught only by `verify`'s re-run). `tick_hz`
+    /// (a wall-clock display mapping the sim never reads) and `seats` (already
+    /// committed via the roster above) are carried but deliberately NOT folded into
+    /// the hash — committing them would over-commit a non-determinant or double-commit.
+    /// `serde(default)` (the all-zero config) is STRUCTURAL back-compat only — a pre-v5
+    /// record missing the field still parses but does not re-verify against its stored
+    /// hash, the same hard cutover every digest-tag bump makes.
+    #[serde(default)]
+    pub config: MatchConfig,
     pub ticks: Vec<TickRecord>,
 }
 
@@ -629,19 +641,21 @@ impl ReplayRecord {
     pub fn digest(&self) -> [u8; 32] {
         let mut h = Keccak256::new();
         // v2 folded in the static `blockers` set; v3 folds in the static `pickups`
-        // set; v4 folds in the `rules_commit` (the combat tuning). The bump is honest
-        // about each encoding change. Blockers are physical cover now (they stop
-        // movement and fire, which a re-run DOES reproduce), but their VISION effect
-        // still cannot be bound by re-execution alone — outcomes never reveal what a
-        // seat perceived — so committing the geometry here is what pins a match's
+        // set; v4 folds in the `rules_commit` (the combat tuning); v5 folds in the
+        // `config` DETERMINANTS (arena bounds + tick cap). The bump is honest about
+        // each encoding change. Blockers are physical cover now (they stop movement
+        // and fire, which a re-run DOES reproduce), but their VISION effect still
+        // cannot be bound by re-execution alone — outcomes never reveal what a seat
+        // perceived — so committing the geometry here is what pins a match's
         // perception geometry to its hash; pickups DO alter the re-run outcome (a
         // collected heal changes who survives), but an UNCOLLECTED pickup does not;
-        // and the rules drive every outcome yet rode only on the parent record, so a
-        // hash-only consumer could not tell a record's tuning from a swapped one.
-        // Folding all three keeps the digest a complete, self-identifying commitment
-        // to the match world AND the rules it ran under. Physicality adds no new
-        // encoding bytes (the geometry is already here), so it is not a tag bump.
-        h.update(b"blackfield/arena/replay/v4");
+        // the rules drive every outcome yet rode only on the parent record, so a
+        // hash-only consumer could not tell a record's tuning from a swapped one; and
+        // the config bounds clamp movement / max_ticks ends the match — both drive the
+        // outcome yet, like the rules, rode only on the parent `MatchRecord.config`.
+        // Folding them all keeps the digest a complete, self-identifying commitment to
+        // the match world, the rules, AND the arena it ran under.
+        h.update(b"blackfield/arena/replay/v5");
         h.update(self.protocol_version.to_be_bytes());
         h.update(self.match_id.as_bytes());
         h.update(self.seed.to_be_bytes());
@@ -673,6 +687,11 @@ impl ReplayRecord {
         }
         h.update((self.rules_commit.len() as u32).to_be_bytes());
         h.update(&self.rules_commit);
+        // Config determinants only: bounds (movement clamp) + max_ticks (match end).
+        // tick_hz and config.seats are intentionally excluded — see the field doc.
+        h.update(self.config.bounds.x.to_be_bytes());
+        h.update(self.config.bounds.y.to_be_bytes());
+        h.update(self.config.max_ticks.to_be_bytes());
         h.update((self.ticks.len() as u32).to_be_bytes());
         for t in &self.ticks {
             h.update(t.tick.to_be_bytes());
@@ -1477,11 +1496,11 @@ mod tests {
     fn replay_digest_golden() {
         // A fixed record must hash to a fixed value. Any change to the canonical
         // encoding (field order, prefixing, domain tag, the v2 blockers / v3 pickups /
-        // v4 rules_commit sections) flips this — the hard byte-stability pin for
-        // on-chain attestation.
+        // v4 rules_commit / v5 config-determinant sections) flips this — the hard
+        // byte-stability pin for on-chain attestation.
         assert_eq!(
             hex::encode(sample_replay().digest()),
-            "66864c0152285acc0db36aea5aa87b221d5d2db44d18ad73010c6817b4702733"
+            "d8629dc300a459192a2d6c7ca72a4763c8f70416283ec4e5f29d084185ccb4c0"
         );
     }
 
@@ -1542,6 +1561,26 @@ mod tests {
         let mut r3 = sample_replay();
         r3.rules_commit[0] ^= 1;
         assert_ne!(base, r3.digest(), "a rules-commit byte must bind");
+        // The config DETERMINANTS bind (v5): arena bounds clamp movement and max_ticks
+        // ends the match, so each must change the hash.
+        let mut r = sample_replay();
+        r.config.bounds.x += 1;
+        assert_ne!(base, r.digest(), "the arena bound (x) must bind");
+        let mut r = sample_replay();
+        r.config.bounds.y += 1;
+        assert_ne!(base, r.digest(), "the arena bound (y) must bind");
+        let mut r = sample_replay();
+        r.config.max_ticks += 1;
+        assert_ne!(base, r.digest(), "the tick cap must bind");
+        // ...while the NON-determinants are deliberately NOT folded: tick_hz is a
+        // wall-clock display mapping the sim never reads, and config.seats is already
+        // committed via the roster — folding either would over-commit / double-commit.
+        let mut r = sample_replay();
+        r.config.tick_hz += 1;
+        assert_eq!(base, r.digest(), "tick_hz is a display mapping, not a digest determinant");
+        let mut r = sample_replay();
+        r.config.seats += 1;
+        assert_eq!(base, r.digest(), "config.seats is redundant with the bound roster, not folded again");
     }
 
     #[test]
@@ -1675,6 +1714,7 @@ mod tests {
             blockers: Vec::new(),
             pickups: Vec::new(),
             rules_commit: vec![1, 2, 3, 4],
+            config: MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 },
             ticks: vec![
                 TickRecord {
                     tick: 0,

@@ -370,6 +370,7 @@ mod tests {
             blockers: Vec::new(),
             pickups: Vec::new(),
             rules_commit: Vec::new(),
+            config: MatchConfig::default(),
             ticks: Vec::new(),
         }
     }
