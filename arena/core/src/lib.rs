@@ -577,6 +577,12 @@ struct Pawn {
     team: TeamId,
     pos: Vec2,
     z: i32,
+    /// Vertical velocity for the integer jump arc — the per-tick change applied to
+    /// `z`, decremented by [`Rules::gravity`] each tick. `0` on the ground; set to
+    /// [`JUMP_VELOCITY`] by a grounded jump press. Never recorded (derived from the
+    /// action stream like every other live quantity), so replay rebuilds the arc
+    /// bit-for-bit. Always `0` when `gravity == 0` (vertical physics off).
+    z_vel: i32,
     facing: Bam,
     /// The move delta actually applied last tick (post-clamp), reported to the
     /// owning seat as its velocity.
@@ -912,6 +918,7 @@ impl Match {
                     team: s.team,
                     pos,
                     z: 0,
+                    z_vel: 0,
                     facing,
                     vel: Vec2::ZERO,
                     health: rules.start_health,
@@ -1247,6 +1254,42 @@ impl Match {
             self.pawns[i].vel = Vec2 { x: to.x - from.x, y: to.y - from.y };
             self.pawns[i].pos = to;
             self.pawns[i].facing = intent.aim;
+        }
+
+        // Vertical (z-axis) movement: a grounded jump launches at JUMP_VELOCITY and
+        // gravity pulls it back down to z == 0. Integer semi-implicit Euler, gated on
+        // gravity > 0 so a 2D match (the default) never enters here and stays
+        // byte-identical. z is deliberately kept OUT of hit/LOS/perception this slice —
+        // combat stays planar — so gravity changes only the observable z trajectory,
+        // never an outcome; z-coupled combat and fall damage are follow-ups.
+        if self.rules.gravity > 0 {
+            for i in 0..self.pawns.len() {
+                if !self.pawns[i].alive {
+                    continue;
+                }
+                // Launch only from the ground (z == 0 AND not already moving
+                // vertically) so a held jump can't double- or infinite-jump; at the
+                // apex z_vel == 0 but z != 0, so the z == 0 conjunct still refuses a
+                // re-jump until the pawn has landed.
+                let grounded = self.pawns[i].z == 0 && self.pawns[i].z_vel == 0;
+                let seat = self.pawns[i].seat;
+                if grounded && accepted.get(&seat).is_some_and(|a| a.buttons.jump) {
+                    self.pawns[i].z_vel = JUMP_VELOCITY;
+                }
+                // Integrate every pawn — a forfeited or airborne one keeps falling. The
+                // add widens to i64 defensively (z is bounded by the apex
+                // JUMP_VELOCITY² / 2·gravity, well within i32); landing snaps exactly to
+                // z == 0 and zeroes the velocity, so any (JUMP_VELOCITY, gravity) lands
+                // on the ground with no drift and never tunnels to negative z.
+                let nz = self.pawns[i].z as i64 + self.pawns[i].z_vel as i64;
+                if nz <= 0 {
+                    self.pawns[i].z = 0;
+                    self.pawns[i].z_vel = 0;
+                } else {
+                    self.pawns[i].z = nz as i32;
+                    self.pawns[i].z_vel = self.pawns[i].z_vel.saturating_sub(self.rules.gravity);
+                }
+            }
         }
 
         // Respawn due pickups, then collect at this tick's post-move positions —
