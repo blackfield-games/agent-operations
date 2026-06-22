@@ -4801,10 +4801,12 @@ mod tests {
 
     #[test]
     fn an_airborne_pawn_is_hit_and_perceived_exactly_as_on_the_ground() {
-        // FM3: this slice keeps z OUT of hit resolution AND perception — combat stays
-        // planar. Lift the target to a high z (as if mid-jump) and the SAME shot lands
-        // the SAME damage and the SAME perception verdict as at z==0; z is REPORTED on
-        // the wire, never used to gate.
+        // FM2 (default-off): with vertical_hit_tolerance 0 (the default) z is IGNORED in
+        // hit resolution — combat is planar, so the SAME shot lands the SAME damage on a
+        // target lifted to a high z (as if mid-jump) as at z==0. Perception stays planar
+        // at ANY tolerance (this slice couples HIT only, never vision), so the airborne
+        // enemy is still seen and its z is REPORTED on the wire. z-coupling is exercised
+        // by the vertical_hit_tolerance tests below.
         let mut ground = close_match(1);
         let ground_visible: Vec<u32> = ground.observe(0).visible.iter().map(|e| e.entity_id).collect();
         step_with(&mut ground, &[(0, intent(Vec2::ZERO, EAST, true))]);
@@ -4821,7 +4823,138 @@ mod tests {
 
         assert_eq!(air_visible, ground_visible, "perception is unchanged by z — the airborne enemy is still seen");
         assert_eq!(reported_z, Some(5000), "z is reported on the visible entity (reported, not used to gate)");
-        assert_eq!(air_dmg, ground_dmg, "the hit lands the same damage regardless of the target's z");
+        assert_eq!(air_dmg, ground_dmg, "with the tolerance off, the hit lands the same damage regardless of z");
+    }
+
+    /// A controlled 2-seat hit scenario for z-coupling: shooter (seat 0) at the origin
+    /// facing east, target (seat 1) dead-on at 10 m at elevation `target_z`, under
+    /// `mode`/`tolerance`. Returns the damage the one shot deals (0 == cleared). Uses the
+    /// in-crate privilege to place pawns and z exactly, the same as the parity helpers.
+    fn vertical_hit_damage(mode: WeaponMode, tolerance: i32, target_z: i32) -> u16 {
+        let rules = Rules {
+            weapon_mode: mode,
+            vertical_hit_tolerance: tolerance,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
+        m.pawns[1].z = target_z;
+        let before = m.pawns[1].health;
+        match mode {
+            WeaponMode::Hitscan => m.resolve_fire(0),
+            WeaponMode::Melee => {
+                m.pawns[1].pos = Vec2 { x: m.rules.melee_range, y: 0 }; // inside the swing
+                m.resolve_melee(0);
+            }
+            WeaponMode::Projectile => {
+                m.spawn_projectile(0);
+                let mut age = 0;
+                while !m.projectiles.is_empty() && age < MAX_PROJECTILE_LIFETIME {
+                    m.advance_projectiles();
+                    age += 1;
+                }
+            }
+        }
+        before - m.pawns[1].health
+    }
+
+    #[test]
+    fn vertical_tolerance_gates_a_hitscan_shot_at_the_inclusive_boundary() {
+        // The core mechanic: a shot lands only within |Δz| <= tolerance. With tolerance
+        // off (0) an elevated target is hit (planar); with it on, a target above the
+        // tolerance clears the shot, one at exactly the tolerance is still hit (the
+        // boundary is INCLUSIVE), and one a single unit higher is missed.
+        let dmg = Rules::default().damage;
+        assert_eq!(vertical_hit_damage(WeaponMode::Hitscan, 0, 9999), dmg, "tolerance off: z ignored, elevated target hit");
+        assert_eq!(vertical_hit_damage(WeaponMode::Hitscan, 1000, 800), dmg, "within tolerance: hit");
+        assert_eq!(vertical_hit_damage(WeaponMode::Hitscan, 1000, 1000), dmg, "exactly at the tolerance: hit (inclusive)");
+        assert_eq!(vertical_hit_damage(WeaponMode::Hitscan, 1000, 1001), 0, "one unit over the tolerance: cleared");
+        assert_eq!(vertical_hit_damage(WeaponMode::Hitscan, 1000, 5000), 0, "far above the tolerance: cleared");
+        // Symmetric below the shooter: |Δz| uses the absolute difference, so a target
+        // dug in BELOW the shooter clears the shot the same way one above does.
+        assert_eq!(vertical_hit_damage(WeaponMode::Hitscan, 1000, -5000), 0, "far below the tolerance: cleared too");
+    }
+
+    #[test]
+    fn vertical_tolerance_gates_melee_and_projectiles_too() {
+        // Every weapon mode shares the one vertical rule: an elevated target beyond the
+        // tolerance escapes a melee swing and a projectile alike, while the tolerance-off
+        // (0) default lands both regardless of z — so enabling z-combat is consistent
+        // across modes and disabling it is byte-identical for all of them.
+        let melee = Rules::default().melee_damage;
+        assert_eq!(vertical_hit_damage(WeaponMode::Melee, 0, 5000), melee, "melee tolerance off: elevated target cleaved");
+        assert_eq!(vertical_hit_damage(WeaponMode::Melee, 1000, 5000), 0, "melee on: a mid-air enemy escapes the swing");
+        assert_eq!(vertical_hit_damage(WeaponMode::Melee, 1000, 0), melee, "melee on, same elevation: still cleaved");
+
+        let proj = Rules::default().damage;
+        assert_eq!(vertical_hit_damage(WeaponMode::Projectile, 0, 5000), proj, "projectile tolerance off: elevated target hit");
+        assert_eq!(vertical_hit_damage(WeaponMode::Projectile, 1000, 5000), 0, "projectile on: the level shot flies under a high target");
+        assert_eq!(vertical_hit_damage(WeaponMode::Projectile, 1000, 0), proj, "projectile on, same elevation: hits");
+    }
+
+    #[test]
+    fn vertical_hit_math_saturates_at_extreme_z_and_is_deterministic() {
+        // FM3 (overflow / non-determinism): the |Δz| compare widens to i64, so even the
+        // widest possible separation (i32::MAX above, i32::MIN below) resolves without a
+        // panic, and the resolver is a pure function of its inputs (two identical setups
+        // deal identical damage). Extreme separation clears the shot; a maxed tolerance
+        // re-lands a same-elevation target.
+        assert_eq!(vertical_hit_damage(WeaponMode::Hitscan, i32::MAX, i32::MAX), Rules::default().damage, "max tolerance, same z: hit, no overflow");
+        // |i32::MAX - i32::MIN| ~= 2^32 > any i32 tolerance, so the shot is cleared (the
+        // i64 widening is what keeps this from panicking on subtract/abs).
+        let rules = Rules { vertical_hit_tolerance: i32::MAX, spawn_jitter: 0, ..Default::default() };
+        let shoot_extreme = || {
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[0].facing = EAST;
+            m.pawns[0].z = i32::MAX;
+            m.pawns[1].pos = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
+            m.pawns[1].z = i32::MIN;
+            let before = m.pawns[1].health;
+            m.resolve_fire(0);
+            before - m.pawns[1].health
+        };
+        assert_eq!(shoot_extreme(), 0, "the widest z separation clears the shot without panicking");
+        assert_eq!(shoot_extreme(), shoot_extreme(), "the z-coupled resolver is deterministic");
+    }
+
+    #[test]
+    fn z_coupled_match_is_deterministic_and_jumping_reduces_damage() {
+        // FM3 (determinism) + the payoff: in a gravity match a pawn that jumps above the
+        // tolerance takes strictly LESS fire than the same pawn planar (tolerance 0),
+        // and two identical z-coupled runs evolve to the IDENTICAL sim state. seat 0
+        // fires east every tick (lands on cooldown); seat 1 holds jump and rides the arc.
+        let script = |tolerance: i32| {
+            let rules = Rules {
+                gravity: 500,
+                vertical_hit_tolerance: tolerance,
+                damage: 50, // a landed cadence downs seat 1 in two shots — so dodging shows
+                spawn_radius: 2 * POSITION_SCALE,
+                spawn_jitter: 0,
+                ..Default::default()
+            };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            for _ in 0..16 {
+                if m.phase() != MatchPhase::Live {
+                    break;
+                }
+                step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true)), (1, jump_press())]);
+            }
+            m.pawns.iter().map(|p| (p.seat, p.pos, p.z, p.health, p.alive)).collect::<Vec<_>>()
+        };
+        let coupled = script(500); // JUMP_VELOCITY 1200 keeps seat 1 above 500 for most of the arc
+        assert_eq!(coupled, script(500), "two identical z-coupled runs evolve to the identical sim state");
+        let planar = script(0);
+        let target_hp = |st: &[(SeatId, Vec2, i32, u16, bool)]| st.iter().find(|s| s.0 == 1).unwrap().3;
+        assert!(
+            target_hp(&coupled) > target_hp(&planar),
+            "jumping above the tolerance dodged fire the planar run landed (coupled hp {} > planar hp {})",
+            target_hp(&coupled),
+            target_hp(&planar),
+        );
     }
 
     #[test]
