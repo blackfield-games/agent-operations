@@ -480,6 +480,30 @@ struct RedriveResponse {
     rearmed: bool,
 }
 
+/// One dead-lettered ComputeMeter debit in the operator listing (`GET
+/// /debits/dead-lettered`). `job_id` is the UUID an operator passes to `POST
+/// /debits/{id}/redrive`; `amount_wei` is the owed charge as the persisted decimal
+/// string (a 1e18-scale value, never coerced to a number); `dead_lettered_at` is the
+/// epoch-second stamp it was quarantined.
+#[derive(Debug, Serialize)]
+struct DeadLetteredDebit {
+    job_id: Uuid,
+    buyer: String,
+    amount_wei: String,
+    dead_lettered_at: i64,
+}
+
+/// Response for `GET /debits/dead-lettered`: the dead-lettered debits (oldest-first,
+/// capped at [`MAX_DEAD_LETTERED_LIST`]) plus the full `total` so a truncated list is
+/// never mistaken for the whole set. `truncated` is `true` when `total` exceeds the
+/// returned page — the operator's signal that more stuck charges exist beyond the cap.
+#[derive(Debug, Serialize)]
+struct DeadLetteredListing {
+    debits: Vec<DeadLetteredDebit>,
+    total: usize,
+    truncated: bool,
+}
+
 /// Aggregate mesh stats. Backs the wedge requirement
 /// "Mesh GPUs joined count exposed at /stats".
 #[derive(Debug, Serialize)]
@@ -1810,6 +1834,7 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/jobs/{id}/status", get(job_status))
         // Operator recovery: re-arm a dead-lettered debit (body-less; the same
         // bearer-token gate as POST /jobs, enforced inside the handler).
+        .route("/debits/dead-lettered", get(dead_lettered_debits))
         .route("/debits/{id}/redrive", post(redrive_debit))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -2138,6 +2163,58 @@ async fn redrive_debit(
     }
 }
 
+/// `GET /debits/dead-lettered` — operator enumeration of quarantined ComputeMeter
+/// debits, so a stuck charge can be located and re-driven by id (`POST
+/// /debits/{id}/redrive`) after the buyer tops up. Returns each dead-lettered,
+/// not-yet-settled debit (oldest-first, capped at [`MAX_DEAD_LETTERED_LIST`]) plus
+/// the full `total` and a `truncated` flag, so a capped page is never mistaken for
+/// the whole set.
+///
+/// The listing exposes buyer addresses + owed amounts (a privileged operational
+/// view), so it carries the SAME bearer-token gate as `POST /jobs` and `POST
+/// /debits/{id}/redrive`: a missing/malformed/wrong/blank token is `401` before any
+/// store work; open when no token is configured (the dev posture). A listed row is
+/// always genuinely re-armable — the store filters to `dead_lettered_at IS NOT NULL
+/// AND tx_hash IS NULL`, so a still-pending (drainable) or already-settled (paid)
+/// debit never appears.
+async fn dead_lettered_debits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<DeadLetteredListing>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!("rejected: GET /debits/dead-lettered missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    let rows = match store.list_dead_lettered_debits(MAX_DEAD_LETTERED_LIST) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(?e, "dead_lettered_debits: list query failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let total = match store.dead_lettered_debit_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "dead_lettered_debits: count query failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let debits = rows
+        .into_iter()
+        .map(|(job_id, buyer, amount_wei, dead_lettered_at)| DeadLetteredDebit {
+            job_id,
+            buyer,
+            amount_wei,
+            dead_lettered_at,
+        })
+        .collect::<Vec<_>>();
+    let truncated = total > debits.len();
+    Ok(Json(DeadLetteredListing { debits, total, truncated }))
+}
+
 async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, StatusCode> {
     let now = now_secs();
     let ttl = state.earner_ttl_secs;
@@ -2456,6 +2533,13 @@ async fn job_detail(
 
 /// Upper bound on rows returned by `GET /jobs`, to keep the payload bounded.
 const RECENT_JOBS_LIMIT: usize = 100;
+
+/// Upper bound on rows returned by `GET /debits/dead-lettered`, so a pathological
+/// dead-letter backlog can't return an unbounded body. Generous headroom: a
+/// dead-lettered debit means a real stuck charge, so even hundreds is already an
+/// alarm condition; beyond this cap the response's `truncated`/`total` fields tell
+/// the operator more exist. The dead-letter depth is also on `/stats`.
+const MAX_DEAD_LETTERED_LIST: usize = 1000;
 
 /// `GET /jobs` — most-recent jobs (capped at `RECENT_JOBS_LIMIT`) as a JSON
 /// array of `{ id, kind, status }`, newest first. An optional `?status=` query
