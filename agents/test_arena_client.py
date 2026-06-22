@@ -31,6 +31,7 @@ from arena_client.proto import (
     Action,
     ActionButtons,
     ActionIntent,
+    Blocker,
     Challenge,
     MatchResult,
     Observation,
@@ -363,6 +364,57 @@ def test_connect_completes_handshake():
     assert c.seat == 2 and c.match_id == FIXED_MATCH and c.nonce == "abcd"
     assert c.config is not None and c.config.seats == 2
     assert len(t.sent) == 1 and t.sent[0]["type"] == "join" and t.sent[0]["signature_hex"] == ""
+
+
+def test_start_carries_static_cover_blockers_and_defaults_empty():
+    # Decode side: a Start with the static cover layout decodes into typed Blockers
+    # an agent can path around; a Start WITHOUT the field (an older server, or a
+    # no-occluder match) decodes to an empty list — the back-compat default.
+    with_blockers = decode_gateway({
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+        "blockers": [{"min": {"x": -1000, "y": -2000}, "max": {"x": 1000, "y": 2000}}],
+    })
+    assert isinstance(with_blockers, Start)
+    assert with_blockers.blockers == [Blocker(min=Vec2(x=-1000, y=-2000), max=Vec2(x=1000, y=2000))]
+
+    without = decode_gateway(_start_frame())  # no "blockers" key
+    assert isinstance(without, Start) and without.blockers == []
+
+
+def test_connect_exposes_the_static_blockers():
+    # The client surfaces the cover layout learned at Start (the twin of c.config),
+    # so a policy can read c.blockers to path around physical cover.
+    from arena_client.sdk import ArenaClient
+    start = {
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+        "blockers": [{"min": {"x": 0, "y": 0}, "max": {"x": 500, "y": 500}}],
+    }
+    c = ArenaClient(MockTransport([_challenge_frame(), _welcome_frame(), start]), agent_id="a").connect()
+    assert c.blockers == [Blocker(min=Vec2(x=0, y=0), max=Vec2(x=500, y=500))]
+
+    # A match with no occluders (the default Start) exposes an empty layout.
+    c2 = ArenaClient(
+        MockTransport([_challenge_frame(), _welcome_frame(), _start_frame()]), agent_id="a"
+    ).connect()
+    assert c2.blockers == []
+
+
+def test_static_geometry_never_rides_the_parity_bounded_observation():
+    # FM1 (parity): the static map is surfaced ONCE at Start, never on the per-tick
+    # Observation — the security boundary. A blockers field on an Observation is
+    # rejected (extra=forbid), so no static-geometry channel can be added to the
+    # parity-bounded snapshot by drift on either side.
+    with pytest.raises(pydantic.ValidationError):
+        Observation.model_validate({
+            "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 1,
+            "phase": "live", "deadline_micros": 50_000,
+            "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+                    "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
+                    "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": True},
+            "visible": [], "blockers": [],
+        })
 
 
 def test_connect_refuses_version_skew():
