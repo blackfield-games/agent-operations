@@ -2900,6 +2900,30 @@ pub fn rating_delta(rating_a: i32, rating_b: i32, outcome: MatchOutcome, k: i32)
     RatingDelta { a, b: -a }
 }
 
+/// The zero-sum rating delta for a settled 1v1 ranked match, deriving the outcome
+/// from the match's own [`settlement`].
+///
+/// `rating_a`/`rating_b` are the pre-match ratings of the FIRST and SECOND seat in
+/// the result's canonical ascending-seat `outcomes`, so the caller pairs ratings to
+/// seats the way the record orders them. Returns `None` for anything but a two-seat
+/// result — ranked settlement is head-to-head, and a non-1v1 result has no A-vs-B
+/// reputation to apply here. The decisive seat from `settlement` selects `WinA` vs
+/// `WinB`; a tie is a `Draw`.
+pub fn ranked_delta(result: &MatchResult, rating_a: i32, rating_b: i32, k: i32) -> Option<RatingDelta> {
+    let [a, b] = result.outcomes.as_slice() else {
+        return None;
+    };
+    let outcome = match settlement(result) {
+        Settlement::Win { seat } if seat == a.seat => MatchOutcome::WinA,
+        Settlement::Win { seat } if seat == b.seat => MatchOutcome::WinB,
+        // The winner is always one of the two seats for a well-formed result; bail
+        // rather than misattribute if a malformed result ever says otherwise.
+        Settlement::Win { .. } => return None,
+        Settlement::Draw => MatchOutcome::Draw,
+    };
+    Some(rating_delta(rating_a, rating_b, outcome, k))
+}
+
 // ===========================================================================
 // Cross-implementation parity vectors — the UE5-twin conformance set.
 //
@@ -3856,6 +3880,51 @@ mod tests {
         }
         assert_eq!(rating_delta(1200, 1800, MatchOutcome::WinA, 0), RatingDelta { a: 0, b: 0 });
         assert_eq!(rating_delta(1200, 1800, MatchOutcome::WinA, -50), RatingDelta { a: 0, b: 0 });
+    }
+
+    #[test]
+    fn ranked_delta_reads_the_outcome_from_settlement() {
+        // A 1v1 result: seat 0 first vs seat 1 first vs a shared first place maps to
+        // WinA/WinB/Draw via settlement(), and the bridge equals the primitive for it.
+        let result = |p0: u16, p1: u16| MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: MID.parse().unwrap(),
+            final_tick: 10,
+            outcomes: vec![
+                SeatOutcome { seat: 0, team: 0, placement: p0, score: 0, alive_at_end: p0 == 1 },
+                SeatOutcome { seat: 1, team: 1, placement: p1, score: 0, alive_at_end: p1 == 1 },
+            ],
+            replay_hash: "00".into(),
+        };
+        let (ra, rb, k) = (1600, 1400, 32);
+        assert_eq!(
+            ranked_delta(&result(1, 2), ra, rb, k),
+            Some(rating_delta(ra, rb, MatchOutcome::WinA, k)),
+            "seat 0 first -> WinA"
+        );
+        assert_eq!(
+            ranked_delta(&result(2, 1), ra, rb, k),
+            Some(rating_delta(ra, rb, MatchOutcome::WinB, k)),
+            "seat 1 first -> WinB"
+        );
+        assert_eq!(
+            ranked_delta(&result(1, 1), ra, rb, k),
+            Some(rating_delta(ra, rb, MatchOutcome::Draw, k)),
+            "a shared first placement -> Draw"
+        );
+    }
+
+    #[test]
+    fn ranked_delta_requires_a_head_to_head_result() {
+        // Ranked settlement is 1v1: a non-two-seat result yields no A-vs-B delta.
+        let solo = MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: MID.parse().unwrap(),
+            final_tick: 1,
+            outcomes: vec![SeatOutcome { seat: 0, team: 0, placement: 1, score: 0, alive_at_end: true }],
+            replay_hash: "00".into(),
+        };
+        assert_eq!(ranked_delta(&solo, 1500, 1500, 32), None);
     }
 
     #[test]
