@@ -35,10 +35,14 @@ def _brief() -> WorldBrief:
     return WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
 
 
-# Metrics each role is contracted to emit (mirrors the real terrain/optimization
-# stubs); other specialists emit none. _full_set applies these so a fully-formed
-# world satisfies the validator's per-role metrics schema.
-_ROLE_METRICS = {"terrain": {"triangles": 262144.0}, "optimization": {"over_budget": 0.0}}
+# Metrics each role is contracted to emit (mirrors the real terrain/biome/
+# optimization stubs); other specialists emit none. _full_set applies these so a
+# fully-formed world satisfies the validator's per-role metrics schema.
+_ROLE_METRICS = {
+    "terrain": {"triangles": 262144.0},
+    "biome": {"triangles": 100000.0},
+    "optimization": {"over_budget": 0.0},
+}
 
 
 def _layer(
@@ -271,10 +275,10 @@ async def test_run_accepts_int_valued_metrics(tmp_path):
 
 
 def test_metrics_no_schema_role_imposes_no_requirement(tmp_path):
-    # FM4: a role with no ROLE_METRICS entry (biome) and no metrics must return no
+    # FM4: a role with no ROLE_METRICS entry (director) and no metrics must return no
     # issues and must not KeyError.
-    biome = _layer(tmp_path, "biome", metrics={})
-    assert validator._metrics_issues(biome) == []
+    director = _layer(tmp_path, "director", metrics={})
+    assert validator._metrics_issues(director) == []
 
 
 def test_is_finite_number_accepts_int_and_float_rejects_nonfinite_and_nonnumeric():
