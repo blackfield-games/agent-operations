@@ -114,6 +114,10 @@ class ArenaClient:
         # The arena's static cover layout, learned at Start — empty until connect()
         # and on a match with no occluders. A policy reads it to path around cover.
         self.blockers: list[Blocker] = []
+        # The static pickup spawn points (position-only — kind/amount stays empirical),
+        # learned at Start. Empty until connect() and on a match with no pickups. A
+        # policy reads it to path toward where items spawn.
+        self.pickup_points: list[Vec2] = []
         self.nonce: str | None = None
         self.result: MatchResult | None = None
         self.done = False
@@ -143,6 +147,7 @@ class ArenaClient:
             raise ProtocolError(f"expected start, got {type(start).__name__}")
         self.config = start.config
         self.blockers = start.blockers
+        self.pickup_points = start.pickup_points
         self.connected = True
         return self
 
