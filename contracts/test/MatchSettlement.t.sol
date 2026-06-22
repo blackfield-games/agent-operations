@@ -1263,6 +1263,43 @@ contract MatchSettlementTest is Test {
         settlement.settleField(MATCH, one, oneD, HASH);
     }
 
+    /// @dev FM2 bound: a roster over MAX_FIELD reverts FieldTooLarge — the hard gas bound on
+    ///      the O(n²) scan + n external writes, so a single settle can never approach the
+    ///      block limit even from a buggy/compromised attester. MAX_FIELD itself settles.
+    function test_settleField_revertsOverMaxField() public {
+        _enableVariable(RATING_CAP);
+        uint256 max = settlement.MAX_FIELD();
+
+        // MAX_FIELD + 1 seats: reverts before touching the registry (all-zero deltas, so only
+        // the size bound can trip). Agents need not be registered — the bound is checked first.
+        uint256 over = max + 1;
+        address[] memory big = new address[](over);
+        int256[] memory bigD = new int256[](over);
+        for (uint256 i = 0; i < over; i++) {
+            big[i] = address(uint160(0x1000 + i));
+        }
+        vm.expectRevert(MatchSettlement.FieldTooLarge.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, big, bigD, HASH);
+
+        // Exactly MAX_FIELD registered seats with a zero-sum vector settles (the bound is
+        // inclusive): seat 0 takes +RATING_CAP, seat 1 −RATING_CAP, the rest 0.
+        address[] memory full = new address[](max);
+        int256[] memory fullD = new int256[](max);
+        for (uint256 i = 0; i < max; i++) {
+            address a = address(uint160(0x2000 + i));
+            full[i] = a;
+            _registerAgent(a, bytes32(uint256(0x5000 + i)));
+        }
+        fullD[0] = int256(RATING_CAP);
+        fullD[1] = -int256(RATING_CAP);
+        vm.prank(attester);
+        settlement.settleField(MATCH, full, fullD, HASH);
+        assertEq(registry.reputationOf(full[0]), int256(RATING_CAP), "MAX_FIELD settles inclusively");
+        assertEq(registry.reputationOf(full[1]), -int256(RATING_CAP));
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Settled);
+    }
+
     /// @dev FM2: a duplicated agent reverts DuplicateAgent (it would double-write that agent's
     ///      reputation and break the field's zero-sum intent) — caught before any write even
     ///      though the vector sums to zero.

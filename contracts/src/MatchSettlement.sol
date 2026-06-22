@@ -125,6 +125,15 @@ contract MatchSettlement is Ownable2Step {
     ///         and its negation can never overflow.
     uint256 public maxRatingDelta;
 
+    /// @notice Hard upper bound on a `settleField` roster — caps the function's O(n²)
+    ///         distinctness scan and its `n` external reputation writes so a single
+    ///         settle can never approach the block gas limit, even from a buggy or
+    ///         compromised attester. 64 is far above any plausible PvP arena field (a
+    ///         real match is a handful of seats), so it never rejects a legitimate
+    ///         result; it exists purely to make the gas envelope a contract guarantee
+    ///         rather than a trust assumption.
+    uint256 public constant MAX_FIELD = 64;
+
     /// @notice Lower/upper bounds and the construction default for `settleWindow`. The
     ///         floor is generous (a match plays in seconds and an attester settles in
     ///         one tx, so an hour is ~60× headroom) so a still-in-progress match can
@@ -195,6 +204,7 @@ contract MatchSettlement is Ownable2Step {
     error NegativeWinnerDelta();
     error RatingDeltaTooLarge();
     error FieldTooSmall();
+    error FieldTooLarge();
     error LengthMismatch();
     error DuplicateAgent(address agent);
     error NonZeroSum(int256 sum);
@@ -423,7 +433,8 @@ contract MatchSettlement is Ownable2Step {
     ///
     ///         Reverts unless: the variable path is enabled (`maxRatingDelta > 0`, else
     ///         `VariableSettleDisabled` — off by default, byte-identical to fixed-only);
-    ///         the field has `>= 2` seats (`FieldTooSmall`, which also rejects empty/one);
+    ///         the field has `>= 2` seats (`FieldTooSmall`, which also rejects empty/one)
+    ///         and `<= MAX_FIELD` (`FieldTooLarge`, the gas-bound on the O(n²) scan);
     ///         `agents` and `deltas` are equal-length (`LengthMismatch`); every agent is
     ///         registered (`AgentNotRegistered`) and DISTINCT (`DuplicateAgent` — a repeat
     ///         would double-write that agent and break the field's zero-sum intent); each
@@ -443,6 +454,7 @@ contract MatchSettlement is Ownable2Step {
         if (maxRatingDelta == 0) revert VariableSettleDisabled();
         uint256 n = agents.length;
         if (n < 2) revert FieldTooSmall();
+        if (n > MAX_FIELD) revert FieldTooLarge();
         if (deltas.length != n) revert LengthMismatch();
         if (replayHash == bytes32(0)) revert ZeroReplayHash();
 
@@ -451,10 +463,10 @@ contract MatchSettlement is Ownable2Step {
 
         // Validate the entire vector first (CEI: no effects, no reputation write until the
         // whole field is proven well-formed). `cap` is a safe cast — `setMaxRatingDelta`
-        // bounds `maxRatingDelta <= int256.max`. Distinctness is an O(n^2) scan; a match
-        // field is a handful of seats and the attester pays the gas, so the quadratic is
-        // immaterial and avoids imposing an address ordering that would fight the seat
-        // order the deltas are paired in. `sum` accumulates in checked arithmetic, so a
+        // bounds `maxRatingDelta <= int256.max`. Distinctness is an O(n^2) scan, hard-
+        // bounded by `MAX_FIELD` (so worst-case ~MAX_FIELD^2 comparisons, immaterial gas)
+        // and chosen over a sort to avoid imposing an address ordering that would fight
+        // the seat order the deltas are paired in. `sum` accumulates in checked arithmetic, so a
         // pathological cap×n overflow reverts rather than wrapping past the zero-sum check.
         int256 cap = int256(maxRatingDelta);
         int256 sum = 0;
