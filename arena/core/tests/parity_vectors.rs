@@ -8,8 +8,8 @@
 //! prove any second implementation agrees — there is no UE5 consumer yet.
 
 use arena_core::{
-    expected_score_bp, parity_vectors, AimMode, MatchOutcome, ParityVectors, PerceptionVerdict,
-    WeaponMode, RATING_DIFF_CAP, RATING_SCALE,
+    expected_score_bp, parity_vectors, rating_delta, AimMode, MatchOutcome, ParityVectors,
+    PerceptionVerdict, WeaponMode, RATING_DIFF_CAP, RATING_SCALE,
 };
 use arena_proto::Vec2;
 
@@ -65,7 +65,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v7");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v8");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -313,6 +313,61 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let cap = rd("beyond_cap_favoured_win");
     assert_eq!(cap.delta.a, 0, "a gap past the cap saturates the win to nothing");
     assert_eq!(cap.expected_a_bp, expected_score_bp(RATING_DIFF_CAP), "the expected score is clamped at the cap");
+
+    // Multi-seat ranked rating (v8): an FFA / 3+ field settled as a sum of pairwise
+    // games. Every field is zero-sum with each per-seat delta mapped to its OWN seat in
+    // canonical order; the n=2 field reduces to the 1v1 curve bit-for-bit; equal ratings
+    // make placement alone drive a symmetric spread; a tie for a place is a draw (the
+    // favourite moves DOWN toward the underdog, not a mutual win); and a gap past the cap
+    // saturates. A twin that normalizes by field size, mis-maps a seat, mishandles the
+    // tie, or drops the cap fails one of these.
+    let fd = |label: &str| v.field_deltas.iter().find(|c| c.label == label).unwrap();
+    for c in &v.field_deltas {
+        assert_eq!(
+            c.deltas.iter().map(|d| d.delta as i64).sum::<i64>(),
+            0,
+            "field {} mints or burns reputation — not zero-sum",
+            c.label
+        );
+        assert_eq!(c.deltas.len(), c.seats.len(), "field {} delta count must match the seat count", c.label);
+        for (d, s) in c.deltas.iter().zip(&c.seats) {
+            assert_eq!(d.seat, s.seat, "field {} delta is misaligned from its seat (a swap credits the wrong agent)", c.label);
+        }
+    }
+    // n=2 reduction: routed through the multi-seat path, a two-seat field equals the 1v1
+    // ranked curve bit-for-bit — seat 0 placed first (WinA), the delta mapping matching
+    // the agentA/agentB convention.
+    let two = fd("two_seat_matches_ranked_delta");
+    let one_v_one = rating_delta(two.seats[0].rating, two.seats[1].rating, MatchOutcome::WinA, two.k);
+    assert_eq!(two.deltas[0].delta, one_v_one.a, "the two-seat field's seat 0 must equal the 1v1 delta.a");
+    assert_eq!(two.deltas[1].delta, one_v_one.b, "the two-seat field's seat 1 must equal the 1v1 delta.b");
+    // Equal ratings: placement alone drives a fixed symmetric spread that sums to 0 and
+    // mirrors to its own negation (seat i and seat n-1-i are exact opposites). A field-size
+    // normalization or a placement-mapping bug breaks the exact values.
+    let spread: Vec<i32> = fd("all_equal_field").deltas.iter().map(|d| d.delta).collect();
+    assert_eq!(spread, vec![48, 24, 0, -24, -48], "equal ratings give a placement-only symmetric spread");
+    let mirrored: Vec<i32> = spread.iter().rev().map(|d| -d).collect();
+    assert_eq!(spread, mirrored, "the equal-rating spread is symmetric about the median seat");
+    // A skill spread with a clean 1/2/3 finish: the first-place seat gains and the last
+    // loses. The winner need NOT hold the max swing — a prohibitive favourite gains little
+    // for placing first — so this pins direction, not magnitude order.
+    let skill = fd("three_way_skill_spread");
+    assert!(skill.deltas[0].delta > 0, "the first-place seat gains");
+    assert!(skill.deltas[2].delta < 0, "the last-place seat loses");
+    // A tie for 2nd between the favoured seat 1 and the underdog seat 2: their pairwise
+    // game is a DRAW, so the favourite ends BELOW the underdog (a mutual-win twin would
+    // invert this) while the clean winner/last still bound the field.
+    let tie = fd("four_way_with_tie");
+    assert_eq!(tie.seats[1].placement, tie.seats[2].placement, "seats 1 and 2 share the placement");
+    assert!(tie.deltas[1].delta < tie.deltas[2].delta, "the favourite that only tied the underdog ends below it");
+    assert!(tie.deltas[0].delta > 0 && tie.deltas[3].delta < 0, "the winner gains and the last-place loses");
+    // Saturation: the 3000-rated seat 0 is upset into 2nd, its expected score clamped at
+    // the cap, so it sheds ~a full K while both expected wins over the 200-rated seat 2
+    // round to nothing — the ±cap is load-bearing in the multi-seat path too.
+    let sat = fd("saturated_gap_upset");
+    assert!(sat.deltas[0].delta < 0, "the upset favourite loses despite its rating");
+    assert!(sat.deltas[0].delta.abs() >= sat.k - 2, "the capped upset sheds nearly a full K");
+    assert_eq!(sat.deltas[2].delta, 0, "the expected wins over the weakest, past the cap, move nothing");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it

@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v7",
+  "domain": "blackfield/arena/parity-vectors/v8",
   "protocol_version": 1,
   "spawns": [
     {
@@ -1008,6 +1008,201 @@
         "a": 0,
         "b": 0
       }
+    }
+  ],
+  "field_deltas": [
+    {
+      "label": "two_seat_matches_ranked_delta",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 1,
+          "rating": 1700
+        },
+        {
+          "seat": 1,
+          "placement": 2,
+          "rating": 1400
+        }
+      ],
+      "k": 32,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": 4
+        },
+        {
+          "seat": 1,
+          "delta": -4
+        }
+      ]
+    },
+    {
+      "label": "three_way_skill_spread",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 1,
+          "rating": 1800
+        },
+        {
+          "seat": 1,
+          "placement": 2,
+          "rating": 1500
+        },
+        {
+          "seat": 2,
+          "placement": 3,
+          "rating": 1400
+        }
+      ],
+      "k": 32,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": 6
+        },
+        {
+          "seat": 1,
+          "delta": 7
+        },
+        {
+          "seat": 2,
+          "delta": -13
+        }
+      ]
+    },
+    {
+      "label": "four_way_with_tie",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 1,
+          "rating": 1500
+        },
+        {
+          "seat": 1,
+          "placement": 2,
+          "rating": 1700
+        },
+        {
+          "seat": 2,
+          "placement": 2,
+          "rating": 1300
+        },
+        {
+          "seat": 3,
+          "placement": 4,
+          "rating": 1500
+        }
+      ],
+      "k": 32,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": 47
+        },
+        {
+          "seat": 1,
+          "delta": -30
+        },
+        {
+          "seat": 2,
+          "delta": 30
+        },
+        {
+          "seat": 3,
+          "delta": -47
+        }
+      ]
+    },
+    {
+      "label": "all_equal_field",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 1,
+          "rating": 1500
+        },
+        {
+          "seat": 1,
+          "placement": 2,
+          "rating": 1500
+        },
+        {
+          "seat": 2,
+          "placement": 3,
+          "rating": 1500
+        },
+        {
+          "seat": 3,
+          "placement": 4,
+          "rating": 1500
+        },
+        {
+          "seat": 4,
+          "placement": 5,
+          "rating": 1500
+        }
+      ],
+      "k": 24,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": 48
+        },
+        {
+          "seat": 1,
+          "delta": 24
+        },
+        {
+          "seat": 2,
+          "delta": 0
+        },
+        {
+          "seat": 3,
+          "delta": -24
+        },
+        {
+          "seat": 4,
+          "delta": -48
+        }
+      ]
+    },
+    {
+      "label": "saturated_gap_upset",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 2,
+          "rating": 3000
+        },
+        {
+          "seat": 1,
+          "placement": 1,
+          "rating": 1500
+        },
+        {
+          "seat": 2,
+          "placement": 3,
+          "rating": 200
+        }
+      ],
+      "k": 32,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": -31
+        },
+        {
+          "seat": 1,
+          "delta": 31
+        },
+        {
+          "seat": 2,
+          "delta": 0
+        }
+      ]
     }
   ],
   "matches": [

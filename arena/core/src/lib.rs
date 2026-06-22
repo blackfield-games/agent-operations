@@ -3254,6 +3254,34 @@ pub struct RatingDeltaCase {
     pub delta: RatingDelta,
 }
 
+/// One seat's input to a [`FieldDeltaCase`]: its canonical `seat`, final `placement`
+/// (1-based, tied seats share a rank), and pre-match `rating`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldSeat {
+    pub seat: SeatId,
+    pub placement: u16,
+    pub rating: i32,
+}
+
+/// A pinned multi-seat ranked-rating case: a placement field with each seat's pre-match
+/// rating and the K-factor, and the exact zero-sum per-seat reputation deltas
+/// [`ranked_field_delta`] must produce. The rule a twin reproduces: read each pair's
+/// outcome from the two seats' relative placement, score it through the integer
+/// [`rating_delta`] curve, and sum per seat — every field summing to exactly `0`. A
+/// twin with a float curve, a field-size normalization, or a non-zero-sum split fails
+/// the matching case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldDeltaCase {
+    pub label: String,
+    /// The placement field, each seat carrying its pre-match rating; canonical
+    /// ascending seat order.
+    pub seats: Vec<FieldSeat>,
+    pub k: i32,
+    /// The zero-sum per-seat deltas ([`ranked_field_delta`]): `deltas[i].seat ==
+    /// seats[i].seat`, and the `delta`s sum to `0`.
+    pub deltas: Vec<SeatDelta>,
+}
+
 /// The canonical cross-implementation parity-vector set — the conformance spec
 /// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
 /// and the bytes are the contract.
@@ -3280,6 +3308,10 @@ pub struct ParityVectors {
     /// ranked-rating cases (domain v7): the zero-sum Elo reputation delta a settled
     /// A2A match applies — a settlement-layer rule, NOT a replay-digest input.
     pub rating_deltas: Vec<RatingDeltaCase>,
+    /// multi-seat ranked-rating cases (domain v8): the zero-sum per-seat reputation
+    /// delta a settled FFA / 3+ ranked match applies — the multi-player generalization
+    /// of `rating_deltas`, also a settlement-layer rule.
+    pub field_deltas: Vec<FieldDeltaCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3296,9 +3328,12 @@ pub struct ParityVectors {
 /// the twin of the v5 sight rule) and a new `movement_over_cover` category pins it — a
 /// pure-logic change, so no replay-digest tag move this time; bumped to v7 for the
 /// ranked-rating delta (a new `rating_deltas` category pinning the zero-sum Elo
-/// reputation curve) — a settlement-layer rule, so again no replay-digest tag move.
-/// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v7";
+/// reputation curve) — a settlement-layer rule, so again no replay-digest tag move;
+/// bumped to v8 for the multi-seat ranked-rating delta (a new `field_deltas` category
+/// pinning the zero-sum per-seat reputation a settled FFA / 3+ match applies, the
+/// multi-player generalization of v7) — also settlement-layer, so no replay-digest tag
+/// move. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v8";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -3633,6 +3668,39 @@ fn rating_delta_case(label: &str, rating_a: i32, rating_b: i32, outcome: MatchOu
     }
 }
 
+/// Build a multi-seat ranked-rating case from a `(seat, placement, rating)` field:
+/// synthesize the canonical placement result, run [`ranked_field_delta`], and record
+/// the field and the exact zero-sum per-seat deltas a twin must reproduce. The
+/// synthesized [`SeatOutcome`] carries only what the delta reads (seat + placement);
+/// the per-seat `score`/`alive_at_end`/`team` do not enter the computation.
+fn field_delta_case(label: &str, field: &[(SeatId, u16, i32)], k: i32) -> FieldDeltaCase {
+    let outcomes = field
+        .iter()
+        .map(|&(seat, placement, _)| SeatOutcome {
+            seat,
+            team: seat as TeamId,
+            placement,
+            score: 0,
+            alive_at_end: placement == 1,
+        })
+        .collect();
+    let ratings: Vec<i32> = field.iter().map(|&(_, _, rating)| rating).collect();
+    let result = MatchResult {
+        protocol_version: PROTOCOL_VERSION,
+        match_id: parity_match_id(),
+        final_tick: 0,
+        outcomes,
+        replay_hash: "00".into(),
+    };
+    let deltas = ranked_field_delta(&result, &ratings, k).expect("a >=2-seat field aligned with its ratings");
+    FieldDeltaCase {
+        label: label.to_string(),
+        seats: field.iter().map(|&(seat, placement, rating)| FieldSeat { seat, placement, rating }).collect(),
+        k,
+        deltas,
+    }
+}
+
 /// Build a full-match case under a fixed, tiny scripted action stream: seat 0
 /// steps east on the opening tick, fires due east on the next, then everyone
 /// idles. A hitscan match ends on the kill; a projectile match runs on until the
@@ -3695,19 +3763,23 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// path or projectile clears a low wall, the physical twin of the sight rule), the
 /// zero-sum ranked-rating delta (the favourite gains less for a win, the underdog
 /// more for the mirror upset, a draw moves the favourite down, every case zero-sum),
-/// and four full-match records proving the digest commits the inputs, the rules, AND
+/// the multi-seat ranked-rating delta (an FFA / 3+ field settled as a sum of pairwise
+/// games — the n=2 reduction agreeing with the 1v1, a placement tie scored a draw, the
+/// ±cap honoured, every field zero-sum), and four full-match records proving the digest
+/// commits the inputs, the rules, AND
 /// the config determinants — the octant and fine cases run the identical action
 /// stream yet hash differently because their aim_mode differs — while the rules also
 /// bind the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v7`: the digest binds the combat `rules` and the
+/// Set domain is `parity-vectors/v8`: the digest binds the combat `rules` and the
 /// `config` determinants (arena bounds + tick cap); v4 added the z-coupled-combat rule
 /// ([`Rules::vertical_hit_tolerance`] widened the rules encoding and the `vertical_hits`
 /// cases pin it); v5 adds blocker `height` — the digest folds it at replay tag v6
 /// (moving every committed match hash) and the `vision_over_cover` cases pin the
 /// see-over-low-cover rule; v6 adds the `movement_over_cover` cases (the same height
 /// bounds physical traversal); v7 adds the `rating_deltas` cases (the settlement-layer
-/// zero-sum Elo reputation curve) — v6 and v7 are pure-logic, so neither moves the
+/// zero-sum Elo reputation curve); v8 adds the `field_deltas` cases (the multi-seat
+/// generalization of that curve) — v6, v7, and v8 are pure-logic, so none moves the
 /// replay-digest tag. A twin must fold the wider encodings into its match digest and
 /// reproduce every rule or it diverges; the v2 blockers-as-physical-cover convention
 /// still holds. These are deliberate conventions every twin must follow.
@@ -3860,6 +3932,31 @@ pub fn parity_vectors() -> ParityVectors {
             // A gap past the cap saturates the expected score, so a heavy favourite's
             // win rounds to nothing (anti-farming) — the clamp made load-bearing.
             rating_delta_case("beyond_cap_favoured_win", 3000, 1000, MatchOutcome::WinA, 32),
+        ],
+        field_deltas: vec![
+            // A two-seat field routed through the multi-seat path: one pairwise game IS
+            // the 1v1, so it must agree bit-for-bit with ranked_delta (the n=2 reduction).
+            field_delta_case("two_seat_matches_ranked_delta", &[(0, 1, 1700), (1, 2, 1400)], 32),
+            // A 3-way FFA with distinct rating gaps and a clean 1/2/3 finish: the basic
+            // multi-seat fold and the seat->delta mapping over an asymmetric field.
+            field_delta_case("three_way_skill_spread", &[(0, 1, 1800), (1, 2, 1500), (2, 3, 1400)], 32),
+            // A tie for 2nd between a favourite (seat 1) and an underdog (seat 2): the
+            // tied pair scores a Draw — the favourite moves DOWN toward the underdog, not
+            // a mutual win — so the equal-placement branch is load-bearing.
+            field_delta_case("four_way_with_tie", &[(0, 1, 1500), (1, 2, 1700), (2, 2, 1300), (3, 4, 1500)], 32),
+            // All seats at DEFAULT_RATING with a strict 1..5 finish: placement ALONE drives
+            // the deltas, which come out symmetric (+48, +24, 0, -24, -48) — a larger field
+            // and an exact-value pin a placement-mapping bug would break.
+            field_delta_case(
+                "all_equal_field",
+                &[(0, 1, 1500), (1, 2, 1500), (2, 3, 1500), (3, 4, 1500), (4, 5, 1500)],
+                24,
+            ),
+            // An upset inside a field with gaps PAST the ±800 cap: the 3000-rated seat 0
+            // places 2nd behind the 1500 seat 1, and its expected score saturates — so the
+            // upset costs it ~a full K while both expected wins over the 200 seat 2 round to
+            // nothing. Pins the cap in the multi-seat path.
+            field_delta_case("saturated_gap_upset", &[(0, 2, 3000), (1, 1, 1500), (2, 3, 200)], 32),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
