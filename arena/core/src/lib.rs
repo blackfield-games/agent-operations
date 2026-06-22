@@ -1019,6 +1019,15 @@ impl Match {
         &self.blockers
     }
 
+    /// The static pickup spawn config this match runs under, in declared order — the
+    /// source the harness projects to the position-only `GatewayMsg::Start.pickup_points`
+    /// it sends agents (the spawn POSITIONS are map layout a human knows; the kind/amount
+    /// stays the server-side determinant it is here). The read-only companion to
+    /// [`blockers`](Self::blockers).
+    pub fn pickup_spawns(&self) -> &[PickupSpawn] {
+        &self.pickup_config
+    }
+
     /// The roster, in seat order.
     pub fn seats(&self) -> &[arena_proto::SeatInfo] {
         &self.seats

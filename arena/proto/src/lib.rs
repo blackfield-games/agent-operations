@@ -818,6 +818,21 @@ pub enum GatewayMsg {
         /// deserializes to the no-geometry behavior, byte-identical to today.
         #[serde(default)]
         blockers: Vec<Blocker>,
+        /// The static pickup spawn POINTS the match runs under — where world items
+        /// spawn, the same map layout a human studying the arena knows. Surfaced
+        /// position-only BY CONSTRUCTION: a bare [`Vec2`] list that cannot carry the
+        /// pickup kind/amount, because the effect stays empirical (an agent learns a
+        /// pickup's effect by collecting it — the [`PickupKind`] posture). The harness
+        /// projects it from the match's [`PickupSpawn`] config
+        /// ([`Match::pickup_spawns`](../../arena_core/struct.Match.html#method.pickup_spawns)),
+        /// dropping `kind`/`amount`. Like `blockers` it rides `Start` (never the
+        /// per-tick [`Observation`], whose parity boundary stays untouched — the live
+        /// collectible/dormant state is the dynamic channel) and is never hashed, so
+        /// this field changes no `replay_hash`. `serde(default)` (empty) so a `Start`
+        /// without it — an older server, or a match with no pickups — deserializes to
+        /// the no-item behavior, byte-identical to today.
+        #[serde(default)]
+        pickup_points: Vec<Vec2>,
     },
     /// A per-tick parity-bounded observation; the agent answers with
     /// [`AgentMsg::Act`] before its `deadline_micros` elapses.
@@ -1693,11 +1708,13 @@ mod tests {
         let reject = serde_json::json!({ "type": "reject", "reason": "version mismatch" });
         assert_round::<GatewayMsg>(&reject, "GatewayMsg::Reject");
 
-        // Start — struct variant carrying the config and the static cover layout.
+        // Start — struct variant carrying the config, the static cover layout, and
+        // the position-only static pickup points.
         let start = serde_json::json!({
             "type": "start", "match_id": FIXED_MATCH,
             "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 },
-            "blockers": [ { "min": { "x": -1000, "y": -2000 }, "max": { "x": 1000, "y": 2000 } } ]
+            "blockers": [ { "min": { "x": -1000, "y": -2000 }, "max": { "x": 1000, "y": 2000 } } ],
+            "pickup_points": [ { "x": 1500, "y": 0 }, { "x": -1500, "y": 0 } ]
         });
         assert_round::<GatewayMsg>(&start, "GatewayMsg::Start");
 

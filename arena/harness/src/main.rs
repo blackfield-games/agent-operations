@@ -306,6 +306,7 @@ fn main() {
                 match_id: m.match_id(),
                 config: m.config(),
                 blockers: m.blockers().to_vec(),
+                pickup_points: m.pickup_spawns().iter().map(|p| p.position).collect(),
             },
         );
         out.flush().expect("flush welcome+start");
