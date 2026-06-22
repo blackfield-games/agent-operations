@@ -1479,6 +1479,211 @@ mod tests {
         assert_eq!(mm.unsettled_ranked(), 0);
     }
 
+    // -- multi-seat (FFA / 3+ / team) ranked settlement -------------------------
+
+    /// A multi-seat [`MatchResult`] for `match_id`: each `(seat, placement)` becomes a
+    /// [`SeatOutcome`] (placement 1 = best, ties share a rank). FFA, so `team == seat`.
+    /// Outcomes keep the given order (callers pass canonical ascending seat).
+    fn field_result(match_id: Uuid, placements: &[(SeatId, u16)]) -> MatchResult {
+        MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id,
+            final_tick: 10,
+            outcomes: placements
+                .iter()
+                .map(|&(seat, placement)| SeatOutcome {
+                    seat,
+                    team: seat as TeamId,
+                    placement,
+                    score: 0,
+                    alive_at_end: placement == 1,
+                })
+                .collect(),
+            replay_hash: String::new(),
+        }
+    }
+
+    /// Form an N-seat FFA ranked match whose seats carry DISTINCT pre-match ratings.
+    /// The ratings are restored via a snapshot (a fresh join would seed them all equal),
+    /// then the agents join to form the match with those ratings intact — `join` seeds
+    /// only an ABSENT agent, so the restored ladder survives. Returns the matchmaker and
+    /// the formed match.
+    fn ranked_field_seeded(seats: &[(&str, i32)]) -> (Matchmaker<StubIdentityVerifier>, Match) {
+        let mut v = StubIdentityVerifier::new();
+        for &(id, _) in seats {
+            v.authorize(id, "t");
+        }
+        let snapshot = LadderSnapshot {
+            version: LADDER_SNAPSHOT_VERSION,
+            ratings: seats.iter().map(|&(id, r)| (id.to_string(), r)).collect(),
+        };
+        let params = MatchParams {
+            seats_per_match: seats.len() as u8,
+            ranked_rating_tolerance: i32::MAX,
+            ..MatchParams::default()
+        };
+        let mm = Matchmaker::from_snapshot(v, params, snapshot).expect("a current-version snapshot restores");
+        let mut formed = None;
+        for &(id, _) in seats {
+            if let Some(m) = mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent(id, "t")).unwrap().into_formed() {
+                formed = Some(m);
+            }
+        }
+        (mm, formed.expect("the full roster forms an N-seat ranked match"))
+    }
+
+    /// A seat -> agent map read from a formed match, indexed by seat id (the selector's
+    /// internal seating order is opaque, so the test reads it back rather than assuming).
+    fn agents_by_seat(m: &Match) -> Vec<String> {
+        let mut roster = m.seats().to_vec();
+        roster.sort_by_key(|s| s.seat);
+        roster.iter().map(|s| s.controller.clone()).collect()
+    }
+
+    #[test]
+    fn a_multiseat_result_settles_each_seat_against_the_field_zero_sum() {
+        // FM1 (seat->rating mapping) + FM2 (zero-sum): a 3-seat FFA ranked match settles
+        // every seat by EXACTLY core ranked_field_delta over the seats' LIVE ratings,
+        // sourced in canonical seat order. Distinct ratings + an UPSET placement (the
+        // 1200 underdog wins, the 1800 favourite comes last) make every seat's delta
+        // distinct and sign-dependent on its own (rating, placement) pair, so a
+        // seat->agent swap would settle the wrong reputation; the field stays zero-sum.
+        let (mm, m) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1800), ("0xc", 1200)]);
+        assert_eq!(mm.unsettled_ranked(), 1, "the formed 3-seat ranked match is registered");
+        let agent_at = agents_by_seat(&m);
+        let rating_at: Vec<i32> = agent_at.iter().map(|a| mm.rating(a).unwrap()).collect();
+
+        // seat 0 second, seat 1 (favourite) last, seat 2 (underdog) first.
+        let result = field_result(m.match_id(), &[(0, 2), (1, 3), (2, 1)]);
+        let k = 32;
+        let expected = ranked_field_delta(&result, &rating_at, k).expect("a 3-seat field aligned to its ratings");
+
+        let applied = mm.apply_ranked_field_result(&result, k).expect("a registered multi-seat match settles");
+        assert_eq!(applied, expected, "the matchmaker feeds the core the seats' ratings in canonical order");
+
+        for (i, agent) in agent_at.iter().enumerate() {
+            assert_eq!(
+                mm.rating(agent),
+                Some(rating_at[i] + expected[i].delta),
+                "seat {i}'s agent moved by exactly its own field delta — a swap would fail here"
+            );
+        }
+        assert_eq!(expected.iter().map(|d| i64::from(d.delta)).sum::<i64>(), 0, "the field is zero-sum");
+        let before: i64 = rating_at.iter().map(|&r| i64::from(r)).sum();
+        let after: i64 = agent_at.iter().map(|a| i64::from(mm.rating(a).unwrap())).sum();
+        assert_eq!(before, after, "total ladder reputation is conserved across the settle");
+        assert_eq!(mm.unsettled_ranked(), 0, "settling consumes the registration");
+    }
+
+    #[test]
+    fn a_multiseat_result_settles_at_most_once() {
+        // FM3 (no double-apply): the registration is consumed on the first settle, so a
+        // replayed multi-seat result is a clean no-op and every rating holds.
+        let (mm, m) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1500), ("0xc", 1500)]);
+        let result = field_result(m.match_id(), &[(0, 1), (1, 2), (2, 3)]);
+        assert!(mm.apply_ranked_field_result(&result, 32).is_some(), "the first settle applies");
+        let after: Vec<_> = ["0xa", "0xb", "0xc"].iter().map(|a| mm.rating(a)).collect();
+        assert!(mm.apply_ranked_field_result(&result, 32).is_none(), "a replay of the same match is a no-op");
+        let again: Vec<_> = ["0xa", "0xb", "0xc"].iter().map(|a| mm.rating(a)).collect();
+        assert_eq!(after, again, "the replay left every rating unchanged");
+        assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
+    #[test]
+    fn a_malformed_multiseat_result_is_a_noop_that_leaves_the_match_registered() {
+        // FM2 (no partial apply / validate-then-commit): a result that does not cover the
+        // full roster — wrong seat count, an out-of-roster seat, or a duplicated seat
+        // (which would double-apply and break zero-sum) — settles NOTHING and LEAVES the
+        // match registered, so a later well-formed result can still settle it.
+        let (mm, m) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1600), ("0xc", 1400)]);
+        let mid = m.match_id();
+        let book = || ["0xa", "0xb", "0xc"].iter().map(|a| mm.rating(a)).collect::<Vec<_>>();
+        let before = book();
+
+        assert!(mm.apply_ranked_field_result(&field_result(mid, &[(0, 1), (1, 2)]), 32).is_none(), "too few outcomes is a partial field");
+        assert!(mm.apply_ranked_field_result(&field_result(mid, &[(0, 1), (1, 2), (3, 3)]), 32).is_none(), "a seat outside the roster bails");
+        assert!(mm.apply_ranked_field_result(&field_result(mid, &[(0, 1), (0, 2), (2, 3)]), 32).is_none(), "a duplicated seat bails");
+
+        assert_eq!(book(), before, "no malformed result moved the ladder");
+        assert_eq!(mm.unsettled_ranked(), 1, "the match is still registered after every malformed report");
+        assert!(mm.apply_ranked_field_result(&field_result(mid, &[(0, 1), (1, 2), (2, 3)]), 32).is_some(), "a well-formed result still settles it");
+        assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
+    #[test]
+    fn a_2seat_result_settles_identically_through_both_paths() {
+        // FM4 (no 1v1 regression): a 2-seat ranked result routed through the multi-seat
+        // field path settles the ladder IDENTICALLY to the existing 1v1 ranked_delta
+        // route (ranked_field_delta agrees with ranked_delta at n=2). Two matchmakers
+        // seeded the same, the same decisive result, settled by each path — the ladders
+        // must match and the field's two seat-deltas equal the RatingDelta's a/b.
+        let (mm_legacy, m_legacy) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1600)]);
+        let (mm_field, m_field) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1600)]);
+        let k = 32;
+
+        let legacy = mm_legacy
+            .apply_ranked_result(&decisive_result(m_legacy.match_id(), 0), k)
+            .expect("the 1v1 route settles");
+        let deltas = mm_field
+            .apply_ranked_field_result(&decisive_result(m_field.match_id(), 0), k)
+            .expect("the field route settles");
+
+        assert_eq!(deltas.len(), 2, "a 2-seat field has two seat deltas");
+        assert_eq!(deltas[0].delta, legacy.a, "seat 0's field delta equals ranked_delta.a");
+        assert_eq!(deltas[1].delta, legacy.b, "seat 1's field delta equals ranked_delta.b");
+        assert!(mm_field.rating("0xa").unwrap() > 1500, "the underdog winner actually moved (not a double no-op)");
+        assert_eq!(
+            (mm_legacy.rating("0xa"), mm_legacy.rating("0xb")),
+            (mm_field.rating("0xa"), mm_field.rating("0xb")),
+            "both routes leave byte-identical ladders"
+        );
+    }
+
+    /// A ranked FFA matchmaker over `seats` seats with a custom `max_pending_ranked`
+    /// cap (open tolerance), for the multi-seat eviction test.
+    fn ranked_field_mm_cap(authorized: &[&str], seats: u8, cap: usize) -> Matchmaker<StubIdentityVerifier> {
+        let mut v = StubIdentityVerifier::new();
+        for id in authorized {
+            v.authorize(*id, "t");
+        }
+        Matchmaker::new(
+            v,
+            MatchParams { seats_per_match: seats, ranked_rating_tolerance: i32::MAX, max_pending_ranked: cap, ..MatchParams::default() },
+        )
+    }
+
+    /// Form one N-seat ranked match from `ids` on a shared `mm` (the roster leaves the
+    /// queue on forming, so the next call forms a fresh `match_id`).
+    fn form_ranked_field(mm: &Matchmaker<StubIdentityVerifier>, ids: &[&str]) -> Match {
+        let mut formed = None;
+        for id in ids {
+            if let Some(m) = mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent(*id, "t")).unwrap().into_formed() {
+                formed = Some(m);
+            }
+        }
+        formed.expect("the full roster forms an N-seat ranked match")
+    }
+
+    #[test]
+    fn multiseat_registrations_are_bounded_by_the_same_cap_evicting_the_oldest() {
+        // FM3 (eviction): a multi-seat registration is bounded by the SAME
+        // max_pending_ranked + oldest-eviction the 1v1 path uses. With cap 2 and 3-seat
+        // matches, the third formation evicts the first; the evicted oldest is a clean
+        // no-op, the two survivors still settle.
+        let mm = ranked_field_mm_cap(&["0xa", "0xb", "0xc"], 3, 2);
+        let first = form_ranked_field(&mm, &["0xa", "0xb", "0xc"]); // oldest (seq 0)
+        let second = form_ranked_field(&mm, &["0xa", "0xb", "0xc"]);
+        let third = form_ranked_field(&mm, &["0xa", "0xb", "0xc"]); // this formation evicts `first`
+        assert_eq!(mm.unsettled_ranked(), 2, "the registry never exceeds the cap");
+        assert_eq!(mm.ranked_evictions(), 1, "one multi-seat registration was evicted");
+
+        let full = |id: Uuid| field_result(id, &[(0, 1), (1, 2), (2, 3)]);
+        assert!(mm.apply_ranked_field_result(&full(first.match_id()), 32).is_none(), "the evicted oldest is a clean no-op");
+        assert!(mm.apply_ranked_field_result(&full(third.match_id()), 32).is_some(), "a surviving recent match still settles");
+        assert!(mm.apply_ranked_field_result(&full(second.match_id()), 32).is_some(), "the other survivor settles too");
+        assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
     // -- ladder snapshot persistence --------------------------------------------
 
     /// Just the `StubIdentityVerifier` (not a whole matchmaker), for `from_snapshot`,
