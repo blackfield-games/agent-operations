@@ -3159,6 +3159,26 @@ pub struct MovementOverCoverCase {
     pub blocked: bool,
 }
 
+/// A pinned ranked-rating case: two pre-match ratings, the [`MatchOutcome`], and the
+/// K-factor, with the exact integer expected score and the zero-sum per-seat
+/// reputation [`RatingDelta`] the curve must produce. The rule a twin must reproduce
+/// bit-for-bit: the integer Elo [`expected_score_bp`] from the rating gap, then
+/// `K·(S − E)/RATING_SCALE` truncated toward zero, with `delta.b == -delta.a`. A twin
+/// with a float curve, a different rounding, or a non-zero-sum split fails the
+/// matching case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatingDeltaCase {
+    pub label: String,
+    pub rating_a: i32,
+    pub rating_b: i32,
+    pub outcome: MatchOutcome,
+    pub k: i32,
+    /// A's expected score in basis points ([`expected_score_bp`]).
+    pub expected_a_bp: i32,
+    /// The zero-sum reputation delta ([`rating_delta`]); `delta.b == -delta.a`.
+    pub delta: RatingDelta,
+}
+
 /// The canonical cross-implementation parity-vector set — the conformance spec
 /// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
 /// and the bytes are the contract.
@@ -3182,6 +3202,9 @@ pub struct ParityVectors {
     /// high-enough level path — the physical twin of `vision_over_cover` (movement and a
     /// level projectile share the collision predicate).
     pub movement_over_cover: Vec<MovementOverCoverCase>,
+    /// ranked-rating cases (domain v7): the zero-sum Elo reputation delta a settled
+    /// A2A match applies — a settlement-layer rule, NOT a replay-digest input.
+    pub rating_deltas: Vec<RatingDeltaCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3196,9 +3219,11 @@ pub struct ParityVectors {
 /// occlusion so a pawn high enough sees over low cover); bumped to v6 when that height
 /// also bounds physical TRAVERSAL (movement + a level projectile pass over low cover,
 /// the twin of the v5 sight rule) and a new `movement_over_cover` category pins it — a
-/// pure-logic change, so no replay-digest tag move this time. Each is a deliberate
-/// convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v6";
+/// pure-logic change, so no replay-digest tag move this time; bumped to v7 for the
+/// ranked-rating delta (a new `rating_deltas` category pinning the zero-sum Elo
+/// reputation curve) — a settlement-layer rule, so again no replay-digest tag move.
+/// Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v7";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -3518,6 +3543,21 @@ fn movement_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z
     }
 }
 
+/// Build a ranked-rating case: record the expected score and the zero-sum delta the
+/// curve produces for the given ratings, outcome, and K — the inputs and the exact
+/// integer outputs a twin must reproduce.
+fn rating_delta_case(label: &str, rating_a: i32, rating_b: i32, outcome: MatchOutcome, k: i32) -> RatingDeltaCase {
+    RatingDeltaCase {
+        label: label.to_string(),
+        rating_a,
+        rating_b,
+        outcome,
+        k,
+        expected_a_bp: expected_score_bp(rating_a - rating_b),
+        delta: rating_delta(rating_a, rating_b, outcome, k),
+    }
+}
+
 /// Build a full-match case under a fixed, tiny scripted action stream: seat 0
 /// steps east on the opening tick, fires due east on the next, then everyone
 /// idles. A hitscan match ends on the kill; a projectile match runs on until the
@@ -3576,19 +3616,26 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// above [`Rules::vertical_hit_tolerance`] clears a hitscan/melee/projectile shot,
 /// the boundary inclusive, the tolerance-off default ignoring elevation), the
 /// z-aware-occlusion rule (a height-bounded [`Blocker`] is cleared by a high-enough
-/// sightline, an infinitely-tall one never is), and four full-match records proving
-/// the digest commits the inputs, the rules, AND the config determinants — the octant
-/// and fine cases run the identical action stream yet hash differently because their
-/// aim_mode differs — while the rules also bind the outcomes a re-run reproduces.
+/// sightline, an infinitely-tall one never is), the z-aware-traversal rule (a level
+/// path or projectile clears a low wall, the physical twin of the sight rule), the
+/// zero-sum ranked-rating delta (the favourite gains less for a win, the underdog
+/// more for the mirror upset, a draw moves the favourite down, every case zero-sum),
+/// and four full-match records proving the digest commits the inputs, the rules, AND
+/// the config determinants — the octant and fine cases run the identical action
+/// stream yet hash differently because their aim_mode differs — while the rules also
+/// bind the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v5`: the digest binds the combat `rules` and the
+/// Set domain is `parity-vectors/v7`: the digest binds the combat `rules` and the
 /// `config` determinants (arena bounds + tick cap); v4 added the z-coupled-combat rule
 /// ([`Rules::vertical_hit_tolerance`] widened the rules encoding and the `vertical_hits`
 /// cases pin it); v5 adds blocker `height` — the digest folds it at replay tag v6
 /// (moving every committed match hash) and the `vision_over_cover` cases pin the
-/// see-over-low-cover rule — so a twin must fold the wider encodings into its match
-/// digest and reproduce both rules or it diverges; the v2 blockers-as-physical-cover
-/// convention still holds. These are deliberate conventions every twin must follow.
+/// see-over-low-cover rule; v6 adds the `movement_over_cover` cases (the same height
+/// bounds physical traversal); v7 adds the `rating_deltas` cases (the settlement-layer
+/// zero-sum Elo reputation curve) — v6 and v7 are pure-logic, so neither moves the
+/// replay-digest tag. A twin must fold the wider encodings into its match digest and
+/// reproduce every rule or it diverges; the v2 blockers-as-physical-cover convention
+/// still holds. These are deliberate conventions every twin must follow.
 ///
 /// The generator is pure integer, ordered, and float/map-free, so the set is
 /// byte-stable on every platform and the same on every run. It realizes the
@@ -3725,6 +3772,20 @@ pub fn parity_vectors() -> ParityVectors {
                 movement_over_cover_case("end_inside_is_blocked", Vec2::ZERO, 0, Vec2 { x: 5_000, y: 0 }, 0, wall),
             ]
         },
+        rating_deltas: vec![
+            // Even match: a win is half of K and a draw moves nobody — the curve's centre.
+            rating_delta_case("even_win", 1500, 1500, MatchOutcome::WinA, 32),
+            rating_delta_case("even_draw", 1500, 1500, MatchOutcome::Draw, 32),
+            // Favoured A (+300): A's win earns little; the mirror upset (B wins the same
+            // pairing) earns much more — the same rating gap, opposite reward.
+            rating_delta_case("favoured_a_wins", 1700, 1400, MatchOutcome::WinA, 32),
+            rating_delta_case("upset_b_wins", 1700, 1400, MatchOutcome::WinB, 32),
+            // A draw when A is favoured moves A DOWN toward B.
+            rating_delta_case("favoured_a_draws", 1700, 1400, MatchOutcome::Draw, 32),
+            // A gap past the cap saturates the expected score, so a heavy favourite's
+            // win rounds to nothing (anti-farming) — the clamp made load-bearing.
+            rating_delta_case("beyond_cap_favoured_win", 3000, 1000, MatchOutcome::WinA, 32),
+        ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

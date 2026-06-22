@@ -7,7 +7,10 @@
 //! conventions cannot drift without an intentional golden update. It does NOT
 //! prove any second implementation agrees — there is no UE5 consumer yet.
 
-use arena_core::{parity_vectors, AimMode, ParityVectors, PerceptionVerdict, WeaponMode};
+use arena_core::{
+    expected_score_bp, parity_vectors, AimMode, MatchOutcome, ParityVectors, PerceptionVerdict,
+    WeaponMode, RATING_DIFF_CAP, RATING_SCALE,
+};
 use arena_proto::Vec2;
 
 const EAST: u16 = 0;
@@ -62,7 +65,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v6");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v7");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -278,6 +281,38 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let mut inconsistent = octant_rec.clone();
     inconsistent.replay.config.bounds.y += 1;
     assert!(inconsistent.verify().is_err(), "a stored config inconsistent with the record must not verify");
+
+    // Ranked rating (v7): the zero-sum Elo reputation delta. Every case is zero-sum;
+    // an even win is half of K; the favourite gains LESS for a win than a coin flip and
+    // the underdog gains MORE for the mirror upset on the SAME rating gap; a draw moves
+    // the favourite down; and a gap past the cap saturates the win to nothing. A twin
+    // with a float curve, a different rounding, or a non-zero-sum split fails one.
+    let rd = |label: &str| v.rating_deltas.iter().find(|c| c.label == label).unwrap();
+    for c in &v.rating_deltas {
+        assert_eq!(c.delta.a + c.delta.b, 0, "rating case {} is not zero-sum", c.label);
+        assert_eq!(c.delta.b, -c.delta.a);
+        assert_eq!(
+            c.expected_a_bp,
+            expected_score_bp(c.rating_a - c.rating_b),
+            "rating case {} expected score must match the curve",
+            c.label
+        );
+    }
+    let even_win = rd("even_win");
+    assert_eq!(even_win.outcome, MatchOutcome::WinA);
+    assert_eq!(even_win.delta.a, even_win.k / 2, "an even win is half of K");
+    assert_eq!(even_win.expected_a_bp, RATING_SCALE / 2, "an even match is a coin flip");
+    assert_eq!(rd("even_draw").delta.a, 0, "an even draw moves nobody");
+    let fav = rd("favoured_a_wins");
+    let ups = rd("upset_b_wins");
+    assert_eq!(ups.outcome, MatchOutcome::WinB);
+    assert!(fav.delta.a < even_win.delta.a, "the favourite gains less for a win than a coin flip");
+    assert!(ups.delta.b > even_win.delta.a, "the underdog gains more than a coin flip for the upset");
+    assert_eq!(fav.expected_a_bp, ups.expected_a_bp, "the favoured win and the mirror upset share one rating gap");
+    assert!(rd("favoured_a_draws").delta.a < 0, "a draw moves the favourite down");
+    let cap = rd("beyond_cap_favoured_win");
+    assert_eq!(cap.delta.a, 0, "a gap past the cap saturates the win to nothing");
+    assert_eq!(cap.expected_a_bp, expected_score_bp(RATING_DIFF_CAP), "the expected score is clamped at the cap");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it

@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v6",
+  "domain": "blackfield/arena/parity-vectors/v7",
   "protocol_version": 1,
   "spawns": [
     {
@@ -934,6 +934,80 @@
         "height": 2000
       },
       "blocked": true
+    }
+  ],
+  "rating_deltas": [
+    {
+      "label": "even_win",
+      "rating_a": 1500,
+      "rating_b": 1500,
+      "outcome": "win_a",
+      "k": 32,
+      "expected_a_bp": 5000,
+      "delta": {
+        "a": 16,
+        "b": -16
+      }
+    },
+    {
+      "label": "even_draw",
+      "rating_a": 1500,
+      "rating_b": 1500,
+      "outcome": "draw",
+      "k": 32,
+      "expected_a_bp": 5000,
+      "delta": {
+        "a": 0,
+        "b": 0
+      }
+    },
+    {
+      "label": "favoured_a_wins",
+      "rating_a": 1700,
+      "rating_b": 1400,
+      "outcome": "win_a",
+      "k": 32,
+      "expected_a_bp": 8484,
+      "delta": {
+        "a": 4,
+        "b": -4
+      }
+    },
+    {
+      "label": "upset_b_wins",
+      "rating_a": 1700,
+      "rating_b": 1400,
+      "outcome": "win_b",
+      "k": 32,
+      "expected_a_bp": 8484,
+      "delta": {
+        "a": -27,
+        "b": 27
+      }
+    },
+    {
+      "label": "favoured_a_draws",
+      "rating_a": 1700,
+      "rating_b": 1400,
+      "outcome": "draw",
+      "k": 32,
+      "expected_a_bp": 8484,
+      "delta": {
+        "a": -11,
+        "b": 11
+      }
+    },
+    {
+      "label": "beyond_cap_favoured_win",
+      "rating_a": 3000,
+      "rating_b": 1000,
+      "outcome": "win_a",
+      "k": 32,
+      "expected_a_bp": 9901,
+      "delta": {
+        "a": 0,
+        "b": 0
+      }
     }
   ],
   "matches": [
