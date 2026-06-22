@@ -799,8 +799,26 @@ pub enum GatewayMsg {
     /// Handshake refused (version mismatch, full match, or unauthenticated
     /// ranked seat). Terminal for this connection.
     Reject { reason: String },
-    /// The match is starting; here are the rules.
-    Start { match_id: MatchId, config: MatchConfig },
+    /// The match is starting; here are the rules and the arena's static cover layout.
+    Start {
+        match_id: MatchId,
+        config: MatchConfig,
+        /// The static vision/cover [`Blocker`]s the match runs under — the same set
+        /// the core occludes and collides against. Surfaced to the agent at match
+        /// start because the arena's static cover layout is map knowledge a human
+        /// player has: an `AgentController` needs it to path around physical cover.
+        /// It rides `Start`, NOT the per-tick [`Observation`] (whose parity-bounded
+        /// security boundary stays untouched — the static map is not dynamic world
+        /// state), and NOT [`MatchConfig`] (which is folded into
+        /// [`ReplayRecord::digest`] and whose blockers already ride
+        /// [`ReplayRecord::blockers`], so duplicating them there would double-commit
+        /// and shift the hash). `Start` is a transport message and is never hashed,
+        /// so this field changes no `replay_hash`. `serde(default)` (empty) so a
+        /// `Start` written before this field — or a match with no occluders —
+        /// deserializes to the no-geometry behavior, byte-identical to today.
+        #[serde(default)]
+        blockers: Vec<Blocker>,
+    },
     /// A per-tick parity-bounded observation; the agent answers with
     /// [`AgentMsg::Act`] before its `deadline_micros` elapses.
     Observe(Observation),
@@ -1675,10 +1693,11 @@ mod tests {
         let reject = serde_json::json!({ "type": "reject", "reason": "version mismatch" });
         assert_round::<GatewayMsg>(&reject, "GatewayMsg::Reject");
 
-        // Start — struct variant carrying the config.
+        // Start — struct variant carrying the config and the static cover layout.
         let start = serde_json::json!({
             "type": "start", "match_id": FIXED_MATCH,
-            "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 }
+            "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 },
+            "blockers": [ { "min": { "x": -1000, "y": -2000 }, "max": { "x": 1000, "y": 2000 } } ]
         });
         assert_round::<GatewayMsg>(&start, "GatewayMsg::Start");
 

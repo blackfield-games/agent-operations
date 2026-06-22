@@ -1012,6 +1012,13 @@ impl Match {
         self.config
     }
 
+    /// The static vision/cover blockers this match runs under, in declared order —
+    /// the same set sent to agents at `GatewayMsg::Start` so an `AgentController` can
+    /// path around physical cover. Read-only; the companion to [`config`](Self::config).
+    pub fn blockers(&self) -> &[Blocker] {
+        &self.blockers
+    }
+
     /// The roster, in seat order.
     pub fn seats(&self) -> &[arena_proto::SeatInfo] {
         &self.seats

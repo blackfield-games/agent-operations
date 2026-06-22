@@ -299,7 +299,15 @@ fn main() {
             seat,
             &GatewayMsg::Welcome { protocol_version: PROTOCOL_VERSION, match_id: m.match_id(), seat },
         );
-        emit(&mut out, seat, &GatewayMsg::Start { match_id: m.match_id(), config: m.config() });
+        emit(
+            &mut out,
+            seat,
+            &GatewayMsg::Start {
+                match_id: m.match_id(),
+                config: m.config(),
+                blockers: m.blockers().to_vec(),
+            },
+        );
         out.flush().expect("flush welcome+start");
     }
 
