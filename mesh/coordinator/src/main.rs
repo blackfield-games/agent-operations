@@ -471,6 +471,15 @@ struct CreateJobResponse {
     id: Uuid,
 }
 
+/// Response for `POST /debits/{id}/redrive`: whether the re-drive re-armed a
+/// dead-lettered debit. `false` is a successful no-op — the row was not
+/// dead-lettered, was already settled, or no such debit exists — so a re-drive is
+/// idempotent and an operator can replay it safely.
+#[derive(Debug, Serialize)]
+struct RedriveResponse {
+    rearmed: bool,
+}
+
 /// Aggregate mesh stats. Backs the wedge requirement
 /// "Mesh GPUs joined count exposed at /stats".
 #[derive(Debug, Serialize)]
@@ -1799,6 +1808,9 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/jobs/next", get(next_job))
         .route("/jobs/{id}/submit", post(submit).layer(body_guard()))
         .route("/jobs/{id}/status", get(job_status))
+        // Operator recovery: re-arm a dead-lettered debit (body-less; the same
+        // bearer-token gate as POST /jobs, enforced inside the handler).
+        .route("/debits/{id}/redrive", post(redrive_debit))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -2078,6 +2090,52 @@ async fn create_job(
     }
     tracing::info!(?id, kind = ?spec.kind, "job enqueued");
     Ok((StatusCode::CREATED, Json(CreateJobResponse { id })))
+}
+
+/// `POST /debits/{id}/redrive` — operator recovery: re-arm the dead-lettered
+/// ComputeMeter debit for job `{id}` so the next drain re-attempts it, used after
+/// the `Permanent` cause is fixed (e.g. an underfunded buyer tops up the credit the
+/// `InsufficientCredit` revert was about). A dead-lettered debit is never
+/// auto-re-claimed, so this is the only path back into the drainable backlog.
+///
+/// A privileged recovery action, so it carries the SAME bearer-token gate as
+/// `POST /jobs` (`--ingest-token` / `COORDINATOR_INGEST_TOKEN`): when a token is
+/// configured, a request without `Authorization: Bearer <token>` is rejected `401`
+/// before any store work — nothing is re-armed for an unauthorized caller. With no
+/// token configured the endpoint is open (the same dev posture as ingestion).
+///
+/// Returns `200` with `{"rearmed": bool}`: `true` when a dead-lettered, unsettled
+/// debit was re-armed; `false` for the idempotent no-op cases (the row was not
+/// dead-lettered, was already settled — re-arming would risk a double-spend, so the
+/// store refuses it — or no such debit exists). A re-armed debit re-enters the
+/// oldest-first drain and, if the buyer is still underfunded, simply re-dead-letters
+/// on the next `Permanent` error — one attempt per re-drive, never an auto-retry.
+async fn redrive_debit(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<RedriveResponse>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!(%id, "rejected: POST /debits/{{id}}/redrive missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    match store.redrive_dead_lettered_debit(&id) {
+        Ok(rearmed) => {
+            if rearmed {
+                tracing::info!(%id, "re-drive: dead-lettered debit re-armed for the next drain");
+            } else {
+                tracing::info!(%id, "re-drive: no dead-lettered, unsettled debit to re-arm (no-op)");
+            }
+            Ok(Json(RedriveResponse { rearmed }))
+        }
+        Err(e) => {
+            tracing::error!(%id, ?e, "re-drive: redrive_dead_lettered_debit failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, StatusCode> {
