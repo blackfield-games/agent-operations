@@ -5048,7 +5048,10 @@ mod tests {
 
         {
             let store = state.store.lock().await;
-            // Already-settled (good): tx_hash set → never re-armed (no resurrecting a paid charge).
+            // Already-settled (good): tx_hash set AND not dead-lettered, so the re-arm's
+            // `dead_lettered_at IS NOT NULL` clause refuses it (no resurrecting a paid
+            // charge). The `tx_hash IS NULL` clause is additional defense-in-depth — no
+            // reachable row is both settled and dead-lettered, so it can't be exercised here.
             assert!(!store.redrive_dead_lettered_debit(&good.id).unwrap(), "a settled debit is not re-armed");
             // Unknown job: nothing to re-arm.
             assert!(!store.redrive_dead_lettered_debit(&Uuid::new_v4()).unwrap(), "an unknown debit is not re-armed");
