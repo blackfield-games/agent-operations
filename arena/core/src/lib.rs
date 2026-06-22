@@ -437,9 +437,11 @@ pub struct Rules {
     /// purely 2D one (the default, and every pre-jump record). A positive value turns
     /// jumping on — a grounded jump launches at the fixed [`JUMP_VELOCITY`] and this
     /// gravity pulls it back to the ground. Higher gravity ⇒ a lower, shorter arc.
-    /// This slice keeps `z` OUT of hit/LOS/perception (combat stays planar), so gravity
-    /// changes only the observable z trajectory, never a combat outcome — z-coupled
-    /// combat and fall damage are deferred follow-ups.
+    /// On its own gravity changes only the observable `z` trajectory, never a combat
+    /// outcome — `z` enters HIT resolution only when
+    /// [`vertical_hit_tolerance`](Rules::vertical_hit_tolerance)` > 0` (otherwise combat
+    /// stays planar, byte-identical to a 2D match). Fall damage remains a deferred
+    /// follow-up (it needs variable fall heights to be a non-degenerate mechanic).
     #[serde(default)]
     pub gravity: i32,
     /// Ticks between dashes — the rate gate for the
@@ -480,6 +482,25 @@ pub struct Rules {
     /// folds into [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
     #[serde(default)]
     pub perception_memory_ticks: u16,
+    /// Max vertical separation, in position units, at which a shot still connects —
+    /// the z-coupling of combat. `serde(default)` (`0`) DISABLES it: combat is planar,
+    /// a target's elevation is ignored, and a match plays byte-identically to every
+    /// pre-z-combat record — the historical behavior where a pawn mid-jump is hit
+    /// exactly as on the ground. A positive value couples `z` into EVERY weapon mode:
+    /// a hitscan beam, a melee swing, and a projectile (which flies LEVEL at its launch
+    /// elevation — the protocol has no vertical aim) each land only when
+    /// `|shooter_z - target_z| <= vertical_hit_tolerance` (inclusive), so a pawn that
+    /// jumps higher than the tolerance clears the planar shot and jumping becomes a real
+    /// evasive tool. Only meaningful with [`gravity`](Rules::gravity)` > 0` (the sole
+    /// source of any non-zero `z`); with gravity off every pawn's `z` stays `0`, the
+    /// bound never triggers, and the match is byte-identical even with a tolerance set.
+    /// Couples HIT resolution only — vision and blocker line-of-sight stay planar (a
+    /// jumping pawn is still SEEN, since a player plainly sees someone jump, and
+    /// occluders are still infinitely tall), so z-aware occlusion and fall damage are
+    /// deferred follow-ups. Folds into
+    /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
+    #[serde(default)]
+    pub vertical_hit_tolerance: i32,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -518,6 +539,7 @@ impl Default for Rules {
             dash_cooldown: 0, // dash disabled by default — ability press inert
             wall_slide: false, // a grazing step stops at its origin (no slide) by default
             perception_memory_ticks: 0, // perception memory off — a lost entity vanishes at once
+            vertical_hit_tolerance: 0, // combat planar by default — z ignored in hit resolution
         }
     }
 }
@@ -572,6 +594,7 @@ impl Rules {
         b.extend_from_slice(&self.dash_cooldown.to_be_bytes());
         b.push(self.wall_slide as u8);
         b.extend_from_slice(&self.perception_memory_ticks.to_be_bytes());
+        b.extend_from_slice(&self.vertical_hit_tolerance.to_be_bytes());
         b
     }
 }
@@ -2818,9 +2841,11 @@ pub struct ParityVectors {
 /// Domain tag for the parity-vector set — see [`ParityVectors::domain`]. Bumped to
 /// v2 when blockers became physical cover (movement/hitscan/projectile now respect
 /// them); bumped to v3 when the replay digest began committing the `MatchConfig`
-/// determinants (arena bounds + tick cap), moving every committed match hash — a
-/// deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v3";
+/// determinants (arena bounds + tick cap); bumped to v4 for z-coupled combat — the
+/// gated [`Rules::vertical_hit_tolerance`] widened `canonical_encoding` (so every
+/// committed match hash moved) and a new `vertical_hits` category pins the rule. Each
+/// is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v4";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5752,9 +5777,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 10×i32 + 1×u32 + 10×u16 + 5×u8 = 69 bytes. A new sim field added to the
+        // 11×i32 + 1×u32 + 10×u16 + 5×u8 = 73 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 69, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 73, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -5783,8 +5808,9 @@ mod tests {
             ("dash_cooldown", Rules { dash_cooldown: base.dash_cooldown + 1, ..base }),
             ("wall_slide", Rules { wall_slide: !base.wall_slide, ..base }),
             ("perception_memory_ticks", Rules { perception_memory_ticks: base.perception_memory_ticks + 1, ..base }),
+            ("vertical_hit_tolerance", Rules { vertical_hit_tolerance: base.vertical_hit_tolerance + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 26, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 27, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }

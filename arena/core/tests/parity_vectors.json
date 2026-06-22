@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v3",
+  "domain": "blackfield/arena/parity-vectors/v4",
   "protocol_version": 1,
   "spawns": [
     {
@@ -40,7 +40,8 @@
         "gravity": 0,
         "dash_cooldown": 0,
         "wall_slide": false,
-        "perception_memory_ticks": 0
+        "perception_memory_ticks": 0,
+        "vertical_hit_tolerance": 0
       },
       "roster": [
         {
@@ -149,7 +150,8 @@
         "gravity": 0,
         "dash_cooldown": 0,
         "wall_slide": false,
-        "perception_memory_ticks": 0
+        "perception_memory_ticks": 0,
+        "vertical_hit_tolerance": 0
       },
       "roster": [
         {
@@ -613,7 +615,8 @@
           "gravity": 0,
           "dash_cooldown": 0,
           "wall_slide": false,
-          "perception_memory_ticks": 0
+          "perception_memory_ticks": 0,
+          "vertical_hit_tolerance": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -702,6 +705,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -778,7 +785,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "922755d016e9f292f0b0b1bc730550f2cea792e9fe116aeba6f3fde1b5f28dcd"
+          "replay_hash": "06e92d78c6d71031d0e17b67968042c5672a9bcaabbab2e21e6e6324e73fc51c"
         }
       }
     },
@@ -820,7 +827,8 @@
           "gravity": 0,
           "dash_cooldown": 0,
           "wall_slide": false,
-          "perception_memory_ticks": 0
+          "perception_memory_ticks": 0,
+          "vertical_hit_tolerance": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -899,6 +907,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -985,7 +997,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "c0bd0afee069c1e8d2fa0347c760712802f89dbef54d5fa12b2482a6ce2d7964"
+          "replay_hash": "2a945b17cd414326025936e8e51a613f85b5f43142f144e9a1c4a856be20ab30"
         }
       }
     },
@@ -1027,7 +1039,8 @@
           "gravity": 0,
           "dash_cooldown": 0,
           "wall_slide": false,
-          "perception_memory_ticks": 0
+          "perception_memory_ticks": 0,
+          "vertical_hit_tolerance": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1106,6 +1119,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -1196,7 +1213,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "2cd81df418768f2a75fc65caa384f32f565e417d62a97f960cad9a63485d01ac"
+          "replay_hash": "356a9f3235eb9481c5feebcb720d63abf596bdc41985e16e6fdd7f12d06a227b"
         }
       }
     },
@@ -1238,7 +1255,8 @@
           "gravity": 0,
           "dash_cooldown": 0,
           "wall_slide": false,
-          "perception_memory_ticks": 0
+          "perception_memory_ticks": 0,
+          "vertical_hit_tolerance": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1336,6 +1354,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -1412,7 +1434,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "519f6b7b23de5167fdcd136d13338c974ed1020a3beb7902754e39fa3525cf07"
+          "replay_hash": "5c599d85abf162048211021f210371ec4e82214fb9e1813c14f4083d3ad5a099"
         }
       }
     }
