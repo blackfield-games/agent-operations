@@ -1120,17 +1120,20 @@ impl Match {
         self.pawns.iter().any(|p| p.seat == seat && p.alive)
     }
 
-    /// Whether an observer at `(eye, facing)` perceives a target at `target` this
-    /// tick: inside `perception_range`, within the forward FOV cone, and with a clear
-    /// line of sight past every [`Blocker`]. The ONE perception test, shared by the
+    /// Whether an observer at `(eye, eye_z, facing)` perceives a target at
+    /// `(target, target_z)` this tick: inside `perception_range`, within the forward
+    /// FOV cone, and with a clear line of sight past every [`Blocker`]. Range and cone
+    /// stay PLANAR (a jumping entity is no harder to spot); only the line-of-sight test
+    /// reads the elevations, so a height-bounded wall stops occluding a target seen
+    /// over its top. The ONE perception test, shared by the
     /// live visible set ([`observe`](Self::observe)) and the perception-memory refresh
     /// ([`refresh_perception_memory`](Self::refresh_perception_memory)) — so a
     /// remembered entity can never be one the observer could not actually see, the
     /// parity bound holding identically across both channels.
-    fn perceives(&self, eye: Vec2, facing: Bam, target: Vec2) -> bool {
+    fn perceives(&self, eye: Vec2, eye_z: i32, facing: Bam, target: Vec2, target_z: i32) -> bool {
         within(eye, target, self.rules.perception_range)
             && in_fov(facing, eye, target, self.rules.fov_octant_spread)
-            && has_line_of_sight(&self.blockers, eye, target)
+            && has_line_of_sight(&self.blockers, eye, eye_z, target, target_z)
     }
 
     /// Refresh every alive seat's perception memory at `tick`: record each entity the
@@ -1144,12 +1147,12 @@ impl Match {
         let window = self.rules.perception_memory_ticks as u64;
         // Snapshot the alive observers first, so the perceive-and-gather below borrows
         // self immutably and never overlaps the mutable seat_memory write that applies it.
-        let observers: Vec<(Vec2, Bam, SeatId)> =
-            self.pawns.iter().filter(|p| p.alive).map(|p| (p.pos, p.facing, p.seat)).collect();
-        for (eye, facing, seat) in observers {
+        let observers: Vec<(Vec2, i32, Bam, SeatId)> =
+            self.pawns.iter().filter(|p| p.alive).map(|p| (p.pos, p.z, p.facing, p.seat)).collect();
+        for (eye, eye_z, facing, seat) in observers {
             let mut seen: Vec<(u32, Remembered)> = Vec::new();
             for p in &self.pawns {
-                if p.seat != seat && p.alive && self.perceives(eye, facing, p.pos) {
+                if p.seat != seat && p.alive && self.perceives(eye, eye_z, facing, p.pos, p.z) {
                     seen.push((p.seat as u32, Remembered {
                         kind: arena_proto::EntityKind::Player,
                         team: p.team, pos: p.pos, z: p.z, facing: p.facing, last_seen: tick,
@@ -1157,7 +1160,7 @@ impl Match {
                 }
             }
             for proj in &self.projectiles {
-                if self.perceives(eye, facing, proj.pos) {
+                if self.perceives(eye, eye_z, facing, proj.pos, proj.z) {
                     seen.push((proj.id, Remembered {
                         kind: arena_proto::EntityKind::Projectile,
                         team: 0, pos: proj.pos, z: 0, facing: proj.facing, last_seen: tick,
@@ -1165,7 +1168,7 @@ impl Match {
                 }
             }
             for pk in &self.pickups {
-                if pk.active && self.perceives(eye, facing, pk.pos) {
+                if pk.active && self.perceives(eye, eye_z, facing, pk.pos, 0) {
                     seen.push((pk.id, Remembered {
                         kind: arena_proto::EntityKind::Pickup,
                         team: 0, pos: pk.pos, z: 0, facing: 0, last_seen: tick,
@@ -1200,7 +1203,7 @@ impl Match {
             .pawns
             .iter()
             .filter(|p| p.seat != seat && p.alive)
-            .filter(|p| self.perceives(me.pos, me.facing, p.pos))
+            .filter(|p| self.perceives(me.pos, me.z, me.facing, p.pos, p.z))
             .map(|p| arena_proto::VisibleEntity {
                 entity_id: p.seat as u32,
                 kind: arena_proto::EntityKind::Player,
@@ -1221,7 +1224,7 @@ impl Match {
         // contract. It is reported as the neutral team and carries no shooter/target,
         // so an observed shot reveals only its position and travel heading.
         for proj in &self.projectiles {
-            if self.perceives(me.pos, me.facing, proj.pos) {
+            if self.perceives(me.pos, me.z, me.facing, proj.pos, proj.z) {
                 visible.push(arena_proto::VisibleEntity {
                     entity_id: proj.id,
                     kind: arena_proto::EntityKind::Projectile,
@@ -1238,7 +1241,7 @@ impl Match {
         // tracks its real state; a perceived pickup carries only its id and position
         // (neutral team, no facing) and NEVER its kind, amount, or respawn timer.
         for pk in &self.pickups {
-            if pk.active && self.perceives(me.pos, me.facing, pk.pos) {
+            if pk.active && self.perceives(me.pos, me.z, me.facing, pk.pos, 0) {
                 visible.push(arena_proto::VisibleEntity {
                     entity_id: pk.id,
                     kind: arena_proto::EntityKind::Pickup,
@@ -1706,7 +1709,7 @@ impl Match {
             // takes no hit — the SAME sightline test perception uses, so a shooter
             // can damage exactly what it could see. Checked last (only for a target
             // already in the beam) so the O(blockers) scan runs only when it matters.
-            if !has_line_of_sight(&self.blockers, s.pos, t.pos) {
+            if !has_line_of_sight(&self.blockers, s.pos, s.z, t.pos, t.z) {
                 continue;
             }
             // z-coupled combat (gated default-off): a target too far above/below the
@@ -1758,7 +1761,7 @@ impl Match {
             if !in_fov(s.facing, s.pos, t.pos, MELEE_ARC_SPREAD) {
                 continue;
             }
-            if !has_line_of_sight(&self.blockers, s.pos, t.pos) {
+            if !has_line_of_sight(&self.blockers, s.pos, s.z, t.pos, t.z) {
                 continue;
             }
             // z-coupled combat (gated default-off): an enemy out of the shooter's
@@ -1858,7 +1861,7 @@ impl Match {
                 // same shooter->target sightline test hitscan and perception use, so
                 // a pawn IN FRONT of a wall (clear sightline from the shot) still
                 // takes the hit while one behind it is spared.
-                if !has_line_of_sight(&self.blockers, from, t.pos) {
+                if !has_line_of_sight(&self.blockers, from, proj.z, t.pos, t.z) {
                     continue;
                 }
                 // z-coupled combat (gated default-off): the shot flies level at its
@@ -2538,29 +2541,85 @@ fn in_fov(facing: Bam, from: Vec2, to: Vec2, spread: u8) -> bool {
     circular_octant_distance(octant_index(facing), bearing_octant(dx, dy)) <= spread as usize
 }
 
-/// `true` if the sightline from `from` to `to` is clear of every vision blocker.
-/// Occlusion only ever REMOVES a perceivable enemy, so it cannot widen perception
-/// beyond the range+cone set — the parity bound holds a fortiori.
-fn has_line_of_sight(blockers: &[Blocker], from: Vec2, to: Vec2) -> bool {
-    !blockers.iter().any(|b| occludes(b, from, to))
+/// `true` if the sightline from `(from, from_z)` to `(to, to_z)` is clear of every
+/// vision blocker. Occlusion only ever REMOVES a perceivable entity, so it cannot
+/// widen perception beyond the range+cone set — the parity bound holds a fortiori.
+/// The elevations matter only for a height-bounded [`Blocker`]: a wall with
+/// `height > 0` no longer occludes a sightline that passes over its top, so a pawn
+/// high enough (mid-jump) sees and shoots over low cover; an infinitely-tall wall
+/// (`height == 0`) ignores `z` and occludes exactly as the planar test always did.
+fn has_line_of_sight(blockers: &[Blocker], from: Vec2, from_z: i32, to: Vec2, to_z: i32) -> bool {
+    !blockers.iter().any(|b| occludes(b, from, from_z, to, to_z))
 }
 
-/// `true` if point `p` lies within the closed AABB `b` (boundary inclusive).
+/// `true` if point `p` lies within the closed AABB footprint of `b` (boundary
+/// inclusive). Planar — the movement-collision exemption ([`path_hits_blocker`]) is
+/// z-agnostic, since walls stop movement at full height regardless of a pawn's `z`.
 fn blocker_contains(b: &Blocker, p: Vec2) -> bool {
     b.min.x <= p.x && p.x <= b.max.x && b.min.y <= p.y && p.y <= b.max.y
 }
 
-/// `true` if blocker `b` occludes the sightline from `from` to `to`: the segment
-/// crosses the blocker's closed AABB AND neither endpoint is inside it. The
-/// endpoint exemption is what makes a pawn standing in (or pressed against) an
-/// occluder neither blind nor invisible — its own enclosing blocker is skipped,
-/// while every other blocker still occludes it. Without it a spawn the seed
-/// happened to place inside a blocker would be permanently self-occluded.
-fn occludes(b: &Blocker, from: Vec2, to: Vec2) -> bool {
-    if blocker_contains(b, from) || blocker_contains(b, to) {
+/// `true` if `(p, pz)` lies within the closed 3D box of `b` — its footprint AND, for
+/// a height-bounded wall, the vertical band `0..=height`. An infinitely-tall wall
+/// (`height == 0`) is contained by the footprint alone (any `z`). This is the
+/// sightline endpoint-exemption test: a pawn standing INSIDE the box is neither blind
+/// nor invisible through its own occluder, but a pawn ABOVE a low wall is not "inside"
+/// it (and is not occluded by it either).
+fn blocker_contains_3d(b: &Blocker, p: Vec2, pz: i32) -> bool {
+    blocker_contains(b, p) && (b.height == 0 || (0 <= pz && pz <= b.height))
+}
+
+/// `true` if blocker `b` occludes the sightline from `(from, from_z)` to `(to, to_z)`:
+/// the 3D segment crosses the blocker's closed box AND neither endpoint is inside it.
+/// The endpoint exemption is what makes a pawn standing in (or pressed against) an
+/// occluder neither blind nor invisible — its own enclosing blocker is skipped, while
+/// every other blocker still occludes it. Without it a spawn the seed happened to
+/// place inside a blocker would be permanently self-occluded.
+fn occludes(b: &Blocker, from: Vec2, from_z: i32, to: Vec2, to_z: i32) -> bool {
+    if blocker_contains_3d(b, from, from_z) || blocker_contains_3d(b, to, to_z) {
         return false;
     }
-    segment_intersects_aabb(from, to, b)
+    segment_intersects_box_3d(from, from_z, to, to_z, b)
+}
+
+/// Integer 3D segment-vs-box intersection by the separating-axis theorem — the
+/// vertical generalization of [`segment_intersects_aabb`]. The box rises from the
+/// ground (`z == 0`) to `b.height`; a sightline that passes OVER the top is no longer
+/// occluded. `height == 0` is an infinitely-tall wall, so the planar test decides and
+/// the elevations are ignored (byte-identical to every pre-height match).
+///
+/// For a segment vs an AABB, six axes suffice: the three box face normals (a
+/// per-axis slab overlap) and the three cross products of the segment direction with
+/// each box axis. No separating axis ⇒ they touch or cross, and boundary contact (a
+/// grazed top edge) counts as a hit — the same conservative, parity-tightening
+/// direction the planar test takes. Everything is doubled (`×2`) so the box centre,
+/// half-extents, segment midpoint, and half-vector stay exact integers, and all
+/// products are `i128`, so an extreme (operator-set) coordinate neither overflows nor
+/// divides — the test is platform-stable like the rest of the sim.
+fn segment_intersects_box_3d(from: Vec2, from_z: i32, to: Vec2, to_z: i32, b: &Blocker) -> bool {
+    if b.height == 0 {
+        return segment_intersects_aabb(from, to, b);
+    }
+    let (ax, ay, az) = (from.x as i128, from.y as i128, from_z as i128);
+    let (bx, by, bz) = (to.x as i128, to.y as i128, to_z as i128);
+    let (lox, loy, loz) = (b.min.x as i128, b.min.y as i128, 0i128);
+    let (hix, hiy, hiz) = (b.max.x as i128, b.max.y as i128, b.height as i128);
+    // Doubled box full-extent, segment full-vector, and (midpoint−centre)×2.
+    let (ex, ey, ez) = (hix - lox, hiy - loy, hiz - loz);
+    let (dx, dy, dz) = (bx - ax, by - ay, bz - az);
+    let (tx, ty, tz) = (ax + bx - (lox + hix), ay + by - (loy + hiy), az + bz - (loz + hiz));
+    // Box face normals (per-axis slab): separated if the gap exceeds both spans.
+    if tx.abs() > ex + dx.abs() || ty.abs() > ey + dy.abs() || tz.abs() > ez + dz.abs() {
+        return false;
+    }
+    // Segment-direction × box-axis cross products.
+    if (ty * dz - tz * dy).abs() > ey * dz.abs() + ez * dy.abs()
+        || (tz * dx - tx * dz).abs() > ez * dx.abs() + ex * dz.abs()
+        || (tx * dy - ty * dx).abs() > ex * dy.abs() + ey * dx.abs()
+    {
+        return false;
+    }
+    true
 }
 
 /// `true` if the swept travel `from → to` runs into a physical blocker — the
@@ -2988,7 +3047,10 @@ fn perception_verdict(
     if !in_fov(facing, observer, candidate, spread) {
         return PerceptionVerdict::OutOfCone;
     }
-    if !has_line_of_sight(blockers, observer, candidate) {
+    // The perception parity cases are planar (grounded observer + full-height walls),
+    // so z is 0 on both ends; the height-bounded over-the-wall rule is pinned by the
+    // dedicated vision-over-cover cases, not here.
+    if !has_line_of_sight(blockers, observer, 0, candidate, 0) {
         return PerceptionVerdict::Occluded;
     }
     PerceptionVerdict::Visible
@@ -3827,7 +3889,7 @@ mod tests {
                 let in_cone = in_fov(truth.facing, truth.pos, other.pos, spread);
                 // Independently recompute LOS from the raw blockers (not via the
                 // observed entry) so the audit is ground truth, not a tautology.
-                let in_los = has_line_of_sight(&m.blockers, truth.pos, other.pos);
+                let in_los = has_line_of_sight(&m.blockers, truth.pos, truth.z, other.pos, other.z);
                 let perceivable = other.seat != seat && other.alive && in_range && in_cone && in_los;
                 let entry = obs.visible.iter().find(|e| e.entity_id == other.seat as u32);
                 assert_eq!(
@@ -3859,7 +3921,7 @@ mod tests {
             for proj in &m.projectiles {
                 let in_range = within(truth.pos, proj.pos, perception);
                 let in_cone = in_fov(truth.facing, truth.pos, proj.pos, spread);
-                let in_los = has_line_of_sight(&m.blockers, truth.pos, proj.pos);
+                let in_los = has_line_of_sight(&m.blockers, truth.pos, truth.z, proj.pos, proj.z);
                 let perceivable = in_range && in_cone && in_los;
                 let entry = obs.visible.iter().find(|e| e.entity_id == proj.id);
                 assert_eq!(
@@ -4051,25 +4113,47 @@ mod tests {
         let outside = Vec2 { x: 20, y: 0 };
         assert!(blocker_contains(&b, inside) && blocker_contains(&b, on_edge));
         // Observer inside the box: not occluded by it (would otherwise be blind).
-        assert!(!occludes(&b, inside, outside), "the enclosing blocker does not blind its occupant");
+        assert!(!occludes(&b, inside, 0, outside, 0), "the enclosing blocker does not blind its occupant");
         // Target on the box boundary: not occluded by the box it touches.
-        assert!(!occludes(&b, outside, on_edge), "a target against a blocker is not hidden by it");
+        assert!(!occludes(&b, outside, 0, on_edge, 0), "a target against a blocker is not hidden by it");
         // A DIFFERENT blocker still occludes the same pair.
         let between = box_of((10, -3), (11, 3));
-        assert!(occludes(&between, outside, inside), "an unrelated blocker still occludes");
+        assert!(occludes(&between, outside, 0, inside, 0), "an unrelated blocker still occludes");
     }
 
     #[test]
     fn has_line_of_sight_is_clear_only_when_no_blocker_occludes() {
         // The set-level predicate: a sightline is clear iff NO blocker occludes it,
-        // and an empty blocker set is always clear (the no-occlusion default).
+        // and an empty blocker set is always clear (the no-occlusion default). Ground
+        // level (z 0) against full-height walls, so the planar behavior is unchanged.
         let from = Vec2::ZERO;
         let to = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
-        assert!(has_line_of_sight(&[], from, to), "no blockers means a clear sightline");
+        assert!(has_line_of_sight(&[], from, 0, to, 0), "no blockers means a clear sightline");
         let off_axis = box_of((5 * POSITION_SCALE, 5 * POSITION_SCALE), (6 * POSITION_SCALE, 6 * POSITION_SCALE));
         let on_axis = box_of((5 * POSITION_SCALE, -POSITION_SCALE), (6 * POSITION_SCALE, POSITION_SCALE));
-        assert!(has_line_of_sight(&[off_axis], from, to), "an off-axis blocker leaves the sightline clear");
-        assert!(!has_line_of_sight(&[off_axis, on_axis], from, to), "any blocker on the sightline occludes");
+        assert!(has_line_of_sight(&[off_axis], from, 0, to, 0), "an off-axis blocker leaves the sightline clear");
+        assert!(!has_line_of_sight(&[off_axis, on_axis], from, 0, to, 0), "any blocker on the sightline occludes");
+    }
+
+    #[test]
+    fn a_height_bounded_wall_is_cleared_by_a_high_enough_sightline() {
+        // A wall on the sightline with a finite height occludes a ground-level look but
+        // NOT one that passes over its top — the see-over-low-cover rule. An
+        // infinitely-tall wall (height 0) occludes regardless of elevation.
+        let from = Vec2::ZERO;
+        let to = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
+        let low = Blocker { min: Vec2 { x: 4 * POSITION_SCALE, y: -POSITION_SCALE }, max: Vec2 { x: 6 * POSITION_SCALE, y: POSITION_SCALE }, height: 2000 };
+        // Both ends on the ground: the 2 m wall blocks the look.
+        assert!(!has_line_of_sight(&[low], from, 0, to, 0), "a ground-level look is blocked by the wall");
+        // Both ends well above the wall top: the sightline passes over, so it is clear.
+        assert!(has_line_of_sight(&[low], from, 5000, to, 5000), "a look from above the wall top clears it");
+        // An infinitely-tall twin of the same wall still occludes the high look.
+        let infinite = Blocker { height: 0, ..low };
+        assert!(!has_line_of_sight(&[infinite], from, 5000, to, 5000), "an infinitely-tall wall occludes at any height");
+        // A look rising from the ground that is still BELOW the top where it crosses
+        // the wall (z 1600 at the near edge) enters the box and is blocked, even though
+        // its far end (z 4000) is above the top.
+        assert!(!has_line_of_sight(&[low], from, 0, to, 4000), "a sightline still below the top at the wall is blocked");
     }
 
     #[test]
@@ -4194,7 +4278,7 @@ mod tests {
             let me = m.pawns.iter().find(|p| p.seat == 0).unwrap().pos;
             let foe = m.pawns.iter().find(|p| p.seat == 1).unwrap().pos;
             seen = !m.observe(0).visible.is_empty();
-            assert_eq!(seen, has_line_of_sight(&m.blockers, me, foe), "visibility tracks line of sight exactly");
+            assert_eq!(seen, has_line_of_sight(&m.blockers, me, 0, foe, 0), "visibility tracks line of sight exactly");
         }
         assert!(seen, "the enemy appeared once the observer strafed past the wall");
     }
