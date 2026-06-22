@@ -160,6 +160,11 @@ contract MatchSettlement is Ownable2Step {
     event MatchDrawn(
         bytes32 indexed matchId, address indexed agentA, address indexed agentB, bytes32 replayHash
     );
+    /// @dev A multi-seat (FFA/3+) ranked result settled to reputation only (no escrow).
+    ///      The per-seat agents and signed deltas are in calldata + the registry writes;
+    ///      only the seat count is evented (the roster is not stored on-chain for a
+    ///      reputation-only field settle).
+    event MatchFieldSettled(bytes32 indexed matchId, bytes32 replayHash, uint256 seats);
     event MatchCancelled(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event MatchExpired(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event AttesterSet(address indexed attester, bool authorized);
@@ -189,6 +194,10 @@ contract MatchSettlement is Ownable2Step {
     error VariableSettleDisabled();
     error NegativeWinnerDelta();
     error RatingDeltaTooLarge();
+    error FieldTooSmall();
+    error LengthMismatch();
+    error DuplicateAgent(address agent);
+    error NonZeroSum(int256 sum);
 
     constructor(address registry_, address owner_, uint256 reputationDelta_) Ownable(owner_) {
         if (registry_ == address(0)) revert ZeroRegistry();
@@ -395,6 +404,79 @@ contract MatchSettlement is Ownable2Step {
         int256 cap = int256(maxRatingDelta);
         if (ratingDeltaA > cap || ratingDeltaA < -cap) revert RatingDeltaTooLarge();
         _applyDraw(matchId, replayHash, ratingDeltaA);
+    }
+
+    /// @notice Settle a multi-seat (FFA / 3+) ranked result to REPUTATION ONLY — the
+    ///         on-chain consumer of arena-core `ranked_field_delta`, the N-seat
+    ///         generalization of `settleRanked`'s single `+d/-d`. `agents[i]` receives
+    ///         `deltas[i]`, the zero-sum per-seat Elo delta the off-chain rating curve
+    ///         computed for the placement field, recorded into `AgentRegistry` in the
+    ///         caller's canonical seat order. Attester-gated.
+    ///
+    ///         This slice carries NO escrow: a field match is settled directly (never
+    ///         `openMatch`'d/`fund`ed), so there is no pot to distribute — the N-seat
+    ///         WAGER (per-seat stake + placement payout) is a separate, larger design.
+    ///         Idempotency reuses the shared `matches` fence: the match must be untouched
+    ///         (`Status.None`) and is flipped to `Settled`, so a field `matchId` can never
+    ///         also be `openMatch`'d as a 1v1 (nor a 1v1 `matchId` field-settled) and a
+    ///         replay reverts `MatchExists` — one settlement record per `matchId`.
+    ///
+    ///         Reverts unless: the variable path is enabled (`maxRatingDelta > 0`, else
+    ///         `VariableSettleDisabled` — off by default, byte-identical to fixed-only);
+    ///         the field has `>= 2` seats (`FieldTooSmall`, which also rejects empty/one);
+    ///         `agents` and `deltas` are equal-length (`LengthMismatch`); every agent is
+    ///         registered (`AgentNotRegistered`) and DISTINCT (`DuplicateAgent` — a repeat
+    ///         would double-write that agent and break the field's zero-sum intent); each
+    ///         `|delta| <= maxRatingDelta` (`RatingDeltaTooLarge` — the same per-match
+    ///         magnitude ceiling on attester power as the 1v1 variable path); and the
+    ///         deltas sum to EXACTLY 0 (`NonZeroSum` — no reputation minted or burned, the
+    ///         N-seat analog of the 1v1 `+d/-d`). Validates the whole vector BEFORE any
+    ///         write (CEI: the `Settled` fence + `replayHash` commit precede the registry
+    ///         interactions), so a malformed field settles nothing and leaves the `matchId`
+    ///         free for a corrected result.
+    function settleField(
+        bytes32 matchId,
+        address[] calldata agents,
+        int256[] calldata deltas,
+        bytes32 replayHash
+    ) external onlyAttester {
+        if (maxRatingDelta == 0) revert VariableSettleDisabled();
+        uint256 n = agents.length;
+        if (n < 2) revert FieldTooSmall();
+        if (deltas.length != n) revert LengthMismatch();
+        if (replayHash == bytes32(0)) revert ZeroReplayHash();
+
+        Match storage m = matches[matchId];
+        if (m.status != Status.None) revert MatchExists();
+
+        // Validate the entire vector first (CEI: no effects, no reputation write until the
+        // whole field is proven well-formed). `cap` is a safe cast — `setMaxRatingDelta`
+        // bounds `maxRatingDelta <= int256.max`. Distinctness is an O(n^2) scan; a match
+        // field is a handful of seats and the attester pays the gas, so the quadratic is
+        // immaterial and avoids imposing an address ordering that would fight the seat
+        // order the deltas are paired in. `sum` accumulates in checked arithmetic, so a
+        // pathological cap×n overflow reverts rather than wrapping past the zero-sum check.
+        int256 cap = int256(maxRatingDelta);
+        int256 sum = 0;
+        for (uint256 i = 0; i < n; i++) {
+            address a = agents[i];
+            if (!registry.isRegistered(a)) revert AgentNotRegistered(a);
+            for (uint256 j = 0; j < i; j++) {
+                if (agents[j] == a) revert DuplicateAgent(a);
+            }
+            int256 d = deltas[i];
+            if (d > cap || d < -cap) revert RatingDeltaTooLarge();
+            sum += d;
+        }
+        if (sum != 0) revert NonZeroSum(sum);
+
+        m.status = Status.Settled;
+        m.replayHash = replayHash;
+
+        for (uint256 i = 0; i < n; i++) {
+            registry.recordMatchResult(agents[i], deltas[i]);
+        }
+        emit MatchFieldSettled(matchId, replayHash, n);
     }
 
     /// @notice Void an open match and refund every funded seat — the recovery path for

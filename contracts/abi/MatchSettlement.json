@@ -425,6 +425,34 @@
         "type": "bytes32"
       },
       {
+        "internalType": "address[]",
+        "name": "agents",
+        "type": "address[]"
+      },
+      {
+        "internalType": "int256[]",
+        "name": "deltas",
+        "type": "int256[]"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "replayHash",
+        "type": "bytes32"
+      }
+    ],
+    "name": "settleField",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
         "internalType": "address",
         "name": "winner",
         "type": "address"
@@ -582,6 +610,31 @@
       }
     ],
     "name": "MatchExpired",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "bytes32",
+        "name": "replayHash",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "seats",
+        "type": "uint256"
+      }
+    ],
+    "name": "MatchFieldSettled",
     "type": "event"
   },
   {
@@ -796,8 +849,29 @@
     "type": "error"
   },
   {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "agent",
+        "type": "address"
+      }
+    ],
+    "name": "DuplicateAgent",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "FieldTooSmall",
+    "type": "error"
+  },
+  {
     "inputs": [],
     "name": "InvalidWinner",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "LengthMismatch",
     "type": "error"
   },
   {
@@ -818,6 +892,17 @@
   {
     "inputs": [],
     "name": "NoWager",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "int256",
+        "name": "sum",
+        "type": "int256"
+      }
+    ],
+    "name": "NonZeroSum",
     "type": "error"
   },
   {
