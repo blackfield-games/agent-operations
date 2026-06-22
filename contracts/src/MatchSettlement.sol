@@ -108,26 +108,36 @@ contract MatchSettlement is Ownable2Step {
     ///         `settleField` records via `_requireFreshId`, so one id is at most one record
     ///         across all opening entrypoints.
     ///
-    ///         This slice is the OPEN / FUND / RECOVER half only: the resolutions are
-    ///         `reclaimField` (before any peer funds), `cancelFieldMatch` (attester void),
-    ///         and `refundFieldExpired` (permissionless past the deadline) — all FULL
-    ///         refunds. The placement-ordered pot distribution (a `Settled` resolution) is
-    ///         the sibling slice; until it lands a funded field is always fully recoverable,
-    ///         so no stake is ever stranded.
+    ///         Resolutions: `reclaimField` (before any peer funds), `cancelFieldMatch`
+    ///         (attester void), and `refundFieldExpired` (permissionless past the deadline)
+    ///         all FULL-refund every funded seat; `settleFieldWager` distributes the funded
+    ///         pot by placement (an attester-supplied split the contract bounds to sum ==
+    ///         pot) AND writes the zero-sum per-seat reputation, atomically behind the same
+    ///         `Status` fence — the field analog of the 1v1 decisive settle. A wager settle
+    ///         requires EVERY seat funded; an underfunded field is recovered, never partly
+    ///         paid, so no stake is ever stranded.
     struct FieldMatch {
-        /// @dev The roster in seat order, set once at open. Iterated on refund (O(n),
-        ///      bounded by `MAX_FIELD`) to pay each funded seat; `fieldSeatPlus1` is the
-        ///      O(1) inverse (agent -> seat) used by `fundField`/`reclaimField`.
+        /// @dev The roster in seat order, set once at open. Iterated on refund/settle (O(n),
+        ///      bounded by `MAX_FIELD`) to pay each seat; `fieldSeatPlus1` is the O(1)
+        ///      inverse (agent -> seat) used by `fundField`/`reclaimField`. The payout/delta
+        ///      vectors of `settleFieldWager` align to this roster by index (canonical seat
+        ///      order), so a payee is always a roster member — never a third party.
         address[] agents;
         /// @dev Uniform per-seat wager in $BLCKFLD (each seat funds exactly this). 0 = a
         ///      no-escrow field; `fundField` then reverts and only cancel/expire void it.
         uint256 stake;
         /// @dev Funded set: bit `i` set iff `agents[i]` has funded. One word covers all
-        ///      `MAX_FIELD` seats; cleared to 0 before refunding (CEI).
+        ///      `MAX_FIELD` seats; cleared to 0 before refunding (CEI). A `settleFieldWager`
+        ///      requires this be the full `(1<<n)-1` mask (every seat funded).
         uint256 fundedBits;
         Status status;
         /// @dev Self-refund instant, frozen at open from `settleWindow` (see `Match.deadline`).
         uint64 deadline;
+        /// @dev The arena `ReplayRecord` digest committed by `settleFieldWager`, the on-chain
+        ///      proof of the field result the payout/reputation settled (0 until settled, and
+        ///      0 forever on a cancelled/expired field). Appended last so the public
+        ///      `fieldMatches` getter's leading fields keep their positions.
+        bytes32 replayHash;
     }
 
     IAgentRegistry public immutable registry;
@@ -234,6 +244,10 @@ contract MatchSettlement is Ownable2Step {
     event FieldMatchReclaimed(bytes32 indexed matchId, address indexed agent, uint256 stake);
     event FieldMatchCancelled(bytes32 indexed matchId, uint256 totalRefunded);
     event FieldMatchExpired(bytes32 indexed matchId, uint256 totalRefunded);
+    /// @dev `pot` is the distributed total (`stake * seats`); `replayHash` the committed
+    ///      field result. The per-seat payout/delta split is in calldata, recoverable from
+    ///      the tx — kept off the log so the event stays a fixed-size settlement marker.
+    event FieldMatchWagerSettled(bytes32 indexed matchId, bytes32 replayHash, uint256 seats, uint256 pot);
     event AttesterSet(address indexed attester, bool authorized);
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
@@ -266,6 +280,7 @@ contract MatchSettlement is Ownable2Step {
     error LengthMismatch();
     error DuplicateAgent(address agent);
     error NonZeroSum(int256 sum);
+    error PayoutMismatch(uint256 paid, uint256 pot);
 
     constructor(address registry_, address owner_, uint256 reputationDelta_) Ownable(owner_) {
         if (registry_ == address(0)) revert ZeroRegistry();
@@ -692,6 +707,103 @@ contract MatchSettlement is Ownable2Step {
     ///         `fieldMatches` omits the dynamic array. Empty for an unknown id.
     function fieldRoster(bytes32 matchId) external view returns (address[] memory) {
         return fieldMatches[matchId].agents;
+    }
+
+    /// @notice Settle a fully-funded N-seat field wager in ONE attester-gated, fenced
+    ///         resolution: distribute the funded pot by placement AND write the zero-sum
+    ///         per-seat reputation — the field analog of the 1v1 decisive `settle`. The
+    ///         `payouts` and `deltas` vectors align 1:1 with the STORED roster
+    ///         (`fieldRoster`) in canonical seat order: seat `i` (`agents[i]`) earns
+    ///         `payouts[i]` of the pot and `deltas[i]` reputation. Because the payee is
+    ///         ALWAYS the stored roster member, a payout can never reach the attester or a
+    ///         third party, and the roster's open-time distinctness guarantees no seat is
+    ///         paid twice.
+    ///
+    ///         The placement CURVE (the share each finishing position earns) is the
+    ///         owner/attester economic choice, supplied off-chain exactly like the rating-K
+    ///         magnitude; the contract ENFORCES conservation, not policy: `sum(payouts)`
+    ///         must equal the funded pot (`stake * seats`) EXACTLY — not `<=`, not `>=` — so
+    ///         no value is minted from the escrow nor stranded in it (`PayoutMismatch`), the
+    ///         wager analog of the sum-zero reputation invariant. A zero payout for a seat
+    ///         (a last-place finisher) is valid as long as the whole vector still sums to
+    ///         the pot.
+    ///
+    ///         Requires EVERY seat funded (`fundedBits == (1<<seats)-1`, else
+    ///         `NotFullyFunded`) — an underfunded field is recovered by
+    ///         `cancelFieldMatch`/`refundFieldExpired`, never partially paid (mirrors the
+    ///         1v1 both-funded precondition); this also excludes a zero-stake field, which
+    ///         can never fund a seat. Reverts too unless the variable path is enabled
+    ///         (`maxRatingDelta > 0`, else `VariableSettleDisabled`), `replayHash` is
+    ///         non-zero (`ZeroReplayHash`), both vectors match the seat count
+    ///         (`LengthMismatch`), each `|delta| <= maxRatingDelta` (`RatingDeltaTooLarge`),
+    ///         and the deltas sum to EXACTLY 0 (`NonZeroSum`).
+    ///
+    ///         CEI + atomicity: the whole pair is validated, then the `Settled` fence +
+    ///         `replayHash` commit happen BEFORE any external call, then the reputation
+    ///         records and pot transfers run — so a reentrant token re-enters a non-`Open`
+    ///         match and reverts, a replay reverts `MatchNotOpen`, and a revert in EITHER
+    ///         the registry write or a token transfer rolls BOTH the reputation and the
+    ///         payout back (never a half-settle). The stored roster is already registered +
+    ///         distinct from open, so no roster re-validation is needed and — since
+    ///         reputation persists across deregistration — `recordMatchResult` cannot revert
+    ///         for a seat that deregistered after open.
+    function settleFieldWager(
+        bytes32 matchId,
+        uint256[] calldata payouts,
+        int256[] calldata deltas,
+        bytes32 replayHash
+    ) external onlyAttester {
+        if (maxRatingDelta == 0) revert VariableSettleDisabled();
+        if (replayHash == bytes32(0)) revert ZeroReplayHash();
+
+        FieldMatch storage fm = fieldMatches[matchId];
+        if (fm.status != Status.Open) revert MatchNotOpen();
+
+        address[] storage roster = fm.agents;
+        uint256 n = roster.length;
+        if (payouts.length != n) revert LengthMismatch();
+        if (deltas.length != n) revert LengthMismatch();
+
+        // Full-funding precondition: every seat funded. `n` is 2..=MAX_FIELD (64) from open,
+        // so `(1<<n)-1` fits a word and is non-zero — a zero-stake field (which can never
+        // fund a seat) therefore also fails here, never reaching a payout.
+        if (fm.fundedBits != (uint256(1) << n) - 1) revert NotFullyFunded();
+
+        // The pot the contract actually holds for this match: every one of `n` seats funded
+        // exactly `stake`. Checked mul — a pathological `stake * n` overflow reverts (and
+        // such a pot could never have been funded in the first place).
+        uint256 pot = fm.stake * n;
+
+        // Validate BOTH vectors before any effect (CEI). `cap` is a safe cast —
+        // `setMaxRatingDelta` bounds `maxRatingDelta <= int256.max`. `sum`/`paid` accumulate
+        // in checked arithmetic, so a pathological vector reverts rather than wrapping past
+        // the equality checks below.
+        int256 cap = int256(maxRatingDelta);
+        int256 sum = 0;
+        uint256 paid = 0;
+        for (uint256 i = 0; i < n; i++) {
+            int256 d = deltas[i];
+            if (d > cap || d < -cap) revert RatingDeltaTooLarge();
+            sum += d;
+            paid += payouts[i];
+        }
+        if (sum != 0) revert NonZeroSum(sum);
+        if (paid != pot) revert PayoutMismatch(paid, pot);
+
+        fm.status = Status.Settled;
+        fm.replayHash = replayHash;
+
+        // Reputation first (all trusted-registry writes), then the pot release (the only
+        // possibly-hooked external calls); both are already fenced by `Settled` above, so a
+        // reentrant token reverts and a revert in either rolls the whole settle back.
+        for (uint256 i = 0; i < n; i++) {
+            registry.recordMatchResult(roster[i], deltas[i]);
+        }
+        for (uint256 i = 0; i < n; i++) {
+            uint256 p = payouts[i];
+            if (p != 0) token.safeTransfer(roster[i], p);
+        }
+        emit FieldMatchWagerSettled(matchId, replayHash, n, pot);
     }
 
     /// @dev Shared void-and-refund mechanics for `cancelMatch` and `refundExpired`: flip

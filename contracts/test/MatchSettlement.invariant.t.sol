@@ -163,7 +163,7 @@ contract MatchSettlementHandler is Test {
         view
         returns (uint256 stake, uint256 fundedBits, MatchSettlement.Status s)
     {
-        (stake, fundedBits, s,) = settlement.fieldMatches(id);
+        (stake, fundedBits, s,,) = settlement.fieldMatches(id);
     }
 
     /// @notice Open an N-seat field-wager escrow over a distinct prefix of the registered
@@ -222,7 +222,7 @@ contract MatchSettlementHandler is Test {
         bytes32 id = fieldMatchIds[mSeed % fieldMatchIds.length];
         (,, MatchSettlement.Status s) = _fieldMatch(id);
         if (s != MatchSettlement.Status.Open) return;
-        (,,, uint64 deadline) = settlement.fieldMatches(id);
+        (,,, uint64 deadline,) = settlement.fieldMatches(id);
         if (block.timestamp < deadline) vm.warp(deadline);
         settlement.refundFieldExpired(id);
     }

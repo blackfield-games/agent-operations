@@ -134,6 +134,11 @@
         "internalType": "uint64",
         "name": "deadline",
         "type": "uint64"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "replayHash",
+        "type": "bytes32"
       }
     ],
     "stateMutability": "view",
@@ -594,6 +599,34 @@
         "type": "bytes32"
       },
       {
+        "internalType": "uint256[]",
+        "name": "payouts",
+        "type": "uint256[]"
+      },
+      {
+        "internalType": "int256[]",
+        "name": "deltas",
+        "type": "int256[]"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "replayHash",
+        "type": "bytes32"
+      }
+    ],
+    "name": "settleFieldWager",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
         "internalType": "address",
         "name": "winner",
         "type": "address"
@@ -783,6 +816,37 @@
       }
     ],
     "name": "FieldMatchReclaimed",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "bytes32",
+        "name": "replayHash",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "seats",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "pot",
+        "type": "uint256"
+      }
+    ],
+    "name": "FieldMatchWagerSettled",
     "type": "event"
   },
   {
@@ -1214,6 +1278,22 @@
       }
     ],
     "name": "OwnableUnauthorizedAccount",
+    "type": "error"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
+        "name": "paid",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "pot",
+        "type": "uint256"
+      }
+    ],
+    "name": "PayoutMismatch",
     "type": "error"
   },
   {

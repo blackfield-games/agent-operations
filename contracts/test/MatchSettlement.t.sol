@@ -1549,11 +1549,11 @@ contract MatchSettlementTest is Test {
     }
 
     function _fieldStatus(bytes32 id) internal view returns (MatchSettlement.Status s) {
-        (,, s,) = settlement.fieldMatches(id);
+        (,, s,,) = settlement.fieldMatches(id);
     }
 
     function _fundedBits(bytes32 id) internal view returns (uint256 bits) {
-        (, bits,,) = settlement.fieldMatches(id);
+        (, bits,,,) = settlement.fieldMatches(id);
     }
 
     // --- openFieldMatch: roster integrity + shared fence (FM2) ---
@@ -1571,7 +1571,7 @@ contract MatchSettlementTest is Test {
         assertEq(stored[0], alice);
         assertEq(stored[1], bob);
         assertEq(stored[2], dave);
-        (uint256 stake, uint256 bits, MatchSettlement.Status status, uint64 deadline) =
+        (uint256 stake, uint256 bits, MatchSettlement.Status status, uint64 deadline,) =
             settlement.fieldMatches(FIELD);
         assertEq(stake, STAKE);
         assertEq(bits, 0, "nothing funded at open");
@@ -1921,7 +1921,7 @@ contract MatchSettlementTest is Test {
         _fundField(FIELD, bob);
         _fundField(FIELD, dave);
 
-        (,,, uint64 deadline) = settlement.fieldMatches(FIELD);
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
         vm.warp(deadline);
 
         uint256 carolBefore = token.balanceOf(carol);
@@ -1960,7 +1960,7 @@ contract MatchSettlementTest is Test {
         vm.prank(attester);
         settlement.cancelFieldMatch(FIELD);
 
-        (,,, uint64 deadline) = settlement.fieldMatches(FIELD);
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
         vm.warp(deadline);
         vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
         settlement.refundFieldExpired(FIELD); // can't expire an already-cancelled field
@@ -2324,7 +2324,7 @@ contract MatchSettlementFieldRefundReentrancyTest is Test {
     }
 
     function test_refundField_reentrantClaimerCannotDoubleRefund() public {
-        (,,, uint64 deadline) = settlement.fieldMatches(FIELD);
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
         vm.warp(deadline);
         uint256 attackerBefore = token.balanceOf(address(attacker));
         uint256 bobBefore = token.balanceOf(bob);
