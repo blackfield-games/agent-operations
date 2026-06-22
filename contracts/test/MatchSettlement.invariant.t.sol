@@ -28,6 +28,10 @@ contract MatchSettlementHandler is Test {
     /// @notice Matches resolved via settle or settleDraw (NOT cancel). Each bumps both
     ///         agents' `matchesSettled` by one, so the per-agent sum is twice this.
     uint256 public ghost_settledCount;
+    /// @notice Seats settled via settleFieldWager. Each seat's recordMatchResult bumps its
+    ///         agent's `matchesSettled` once, so a field settle adds `seats` (not a multiple
+    ///         of two) to the per-agent sum — tracked apart from the 1v1 count.
+    uint256 public ghost_fieldSeatsSettled;
 
     constructor(
         MatchSettlement settlement_,
@@ -227,6 +231,53 @@ contract MatchSettlementHandler is Test {
         settlement.refundFieldExpired(id);
     }
 
+    /// @notice Settle a field wager: winner-takes-all pot split (sum == pot) plus a zero-sum
+    ///         +d/-d reputation pair, interleaved with the rest. The handler FULLY FUNDS the
+    ///         chosen field inline first — the random sequencer effectively never assembles a
+    ///         full fund-then-settle on its own, so without this the settle path is dead and
+    ///         the field-wager terms of the invariants are never exercised. Holding the
+    ///         escrow invariant over this proves the pot payout releases EXACTLY the pot (the
+    ///         settled match then holds nothing), the zero-sum invariant proves the per-seat
+    ///         deltas conserve reputation, and each seat's recordMatchResult bump is tracked
+    ///         in `ghost_fieldSeatsSettled` for the settled-count invariant.
+    function settleFieldWager(uint256 winnerSeed, int256 dSeed) external {
+        if (fieldMatchIds.length == 0) return;
+        // Prefer the most recently opened field (likeliest still Open) so the path is reached
+        // reliably; scan back for any Open, non-zero-stake field whose seats can all pay.
+        if (settlement.maxRatingDelta() == 0) return;
+        for (uint256 k = fieldMatchIds.length; k > 0; k--) {
+            bytes32 id = fieldMatchIds[k - 1];
+            (uint256 stake, uint256 fundedBits, MatchSettlement.Status s) = _fieldMatch(id);
+            if (s != MatchSettlement.Status.Open || stake == 0) continue;
+            address[] memory ag = settlement.fieldRoster(id);
+            uint256 n = ag.length;
+
+            bool canFundAll = true;
+            for (uint256 i = 0; i < n; i++) {
+                if (fundedBits & (1 << i) == 0 && token.balanceOf(ag[i]) < stake) {
+                    canFundAll = false;
+                    break;
+                }
+            }
+            if (!canFundAll) continue;
+            for (uint256 i = 0; i < n; i++) {
+                if (fundedBits & (1 << i) != 0) continue;
+                vm.prank(ag[i]);
+                settlement.fundField(id);
+            }
+
+            uint256[] memory ps = new uint256[](n);
+            ps[winnerSeed % n] = stake * n; // winner-takes-all: a conserving split (sum == pot)
+            int256[] memory ds = new int256[](n);
+            int256 d = bound(dSeed, int256(0), int256(settlement.maxRatingDelta()));
+            ds[0] = d; // n >= 2 from open, so seats 0/1 carry the zero-sum pair
+            ds[1] = -d;
+            settlement.settleFieldWager(id, ps, ds, keccak256(abi.encode("field-replay", id)));
+            ghost_fieldSeatsSettled += n;
+            return;
+        }
+    }
+
     /// @notice The escrow the contract MUST be holding: per open 1v1 match, `stake` for each
     ///         funded seat; per open field match, `stake` for each set bit of `fundedBits`.
     ///         Settled/cancelled/expired matches of either kind hold nothing.
@@ -320,10 +371,22 @@ contract MatchSettlementInvariantTest is Test {
         assertEq(handler.sumReputation(), int256(0));
     }
 
-    /// @dev Each settled match (decisive or draw, never a cancel) counts exactly once
-    ///      for BOTH agents, so the per-agent `matchesSettled` sum is twice the settled
-    ///      count — proving no settlement double-counts or under-counts the match.
+    /// @dev Each settled 1v1 match (decisive or draw, never a cancel) counts exactly once
+    ///      for BOTH agents (so it adds two to the per-agent sum), and each field-wager
+    ///      settle counts once for each of its seats — so the per-agent `matchesSettled` sum
+    ///      is `2 * 1v1-settles + field-seats-settled`, proving no settlement double-counts
+    ///      or under-counts a played match across either kind.
     function invariant_matchesSettledCount() public view {
-        assertEq(handler.sumMatchesSettled(), 2 * handler.ghost_settledCount());
+        assertEq(
+            handler.sumMatchesSettled(), 2 * handler.ghost_settledCount() + handler.ghost_fieldSeatsSettled()
+        );
+    }
+
+    /// @dev Coverage guard: prove the field-wager SETTLE path was actually exercised (not just
+    ///      open/fund/recover). Without the handler's inline full-funding the random sequencer
+    ///      effectively never reaches settleFieldWager, which would silently make the
+    ///      field-wager terms of the invariants above a no-op. Fails if that path goes dead.
+    function afterInvariant() public view {
+        assertGt(handler.ghost_fieldSeatsSettled(), 0, "field-wager settle path never exercised");
     }
 }
