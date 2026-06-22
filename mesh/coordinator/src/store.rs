@@ -1694,6 +1694,41 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Re-arm a dead-lettered debit so the next `drain_debits` tick re-attempts it —
+    /// the operator recovery a dead-lettered row needs after the underlying
+    /// `Permanent` cause is fixed (e.g. an underfunded buyer tops up the credit the
+    /// `InsufficientCredit` revert was about). Clears `dead_lettered_at` back to NULL
+    /// ONLY where the row is dead-lettered AND not yet settled
+    /// (`dead_lettered_at IS NOT NULL AND tx_hash IS NULL`); returns whether a row was
+    /// re-armed. A dead-lettered row is NEVER auto-re-claimed (the drain skips it on
+    /// `dead_lettered_at IS NOT NULL`), so this explicit, operator-gated call is the
+    /// only way one re-enters the drainable backlog.
+    ///
+    /// The double guard is the safety boundary, mirroring `mark_debit_dead_lettered`
+    /// inverted:
+    /// * a still-pending row (`dead_lettered_at IS NULL`) is not re-armed — it is
+    ///   already in the drainable backlog, so re-arming is meaningless (returns false);
+    /// * an already-settled row (`tx_hash` set) is NEVER re-armed — clearing the mark
+    ///   on a paid charge would resurrect it into the backlog and re-submit it; the
+    ///   only thing then standing between it and a double-debit is `ComputeMeter.spendOnce`'s
+    ///   on-chain `jobId` fence, so this guard refuses it off-chain too (defense in depth).
+    ///
+    /// Re-arming is idempotent + safe under a concurrent drain: a re-armed row
+    /// re-enters the oldest-first drain (it keeps its original `created_at`, so it is
+    /// re-attempted ahead of newer debits) and, if the `Permanent` cause is STILL
+    /// present, simply re-dead-letters on the next error — one more attempt per
+    /// re-drive, never an infinite auto-retry. A second re-drive of the same row once
+    /// it has settled is a no-op (`tx_hash` set), so an operator double-call can't
+    /// double-charge.
+    pub fn redrive_dead_lettered_debit(&self, job_id: &uuid::Uuid) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_debits SET dead_lettered_at = NULL
+             WHERE job_id = ?1 AND dead_lettered_at IS NOT NULL AND tx_hash IS NULL",
+            (job_id.to_string(),),
+        )?;
+        Ok(updated > 0)
+    }
+
     /// The oldest still-pending attestation (`uid IS NULL`), oldest-first by
     /// insert order, as `(job_id, PendingAttestation)` — or `None` when the
     /// backlog is empty. A pure read: it does NOT reserve or mutate the row, so
