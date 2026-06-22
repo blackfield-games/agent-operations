@@ -382,6 +382,27 @@ def test_start_carries_static_cover_blockers_and_defaults_empty():
     assert isinstance(without, Start) and without.blockers == []
 
 
+def test_blocker_carries_a_height_and_defaults_to_infinitely_tall():
+    # A blocker may carry a top `height` (a pawn high enough sees/shoots over it); a
+    # blocker WITHOUT the field — an older server, or an infinitely-tall wall —
+    # decodes to height 0, the historical occlude-any-crossing behavior.
+    tall = decode_gateway({
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+        "blockers": [{"min": {"x": 0, "y": 0}, "max": {"x": 500, "y": 500}, "height": 2000}],
+    })
+    assert isinstance(tall, Start)
+    assert tall.blockers == [Blocker(min=Vec2(x=0, y=0), max=Vec2(x=500, y=500), height=2000)]
+
+    # The field is optional and defaults to 0 (infinitely tall) for back-compat.
+    short = decode_gateway({
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+        "blockers": [{"min": {"x": 0, "y": 0}, "max": {"x": 500, "y": 500}}],
+    })
+    assert isinstance(short, Start) and short.blockers[0].height == 0
+
+
 def test_connect_exposes_the_static_blockers():
     # The client surfaces the cover layout learned at Start (the twin of c.config),
     # so a policy can read c.blockers to path around physical cover.

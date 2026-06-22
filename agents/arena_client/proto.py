@@ -207,10 +207,17 @@ class Blocker(_Wire):
     """A static axis-aligned cover box on the ground plane, mirroring
     `arena_proto::Blocker` (`min`/`max` corners, `min <= max` per axis). Physical
     cover: it stops movement, fire, and sightlines in the reference core. Carried in
-    `Start.blockers` so an agent learns the arena's static cover layout."""
+    `Start.blockers` so an agent learns the arena's static cover layout.
+
+    `height` is the wall's top in position units: `0` (the default) is an
+    infinitely-tall wall (the historical behavior — occludes any sightline crossing
+    its footprint), a positive value lets a pawn high enough see/shoot OVER it. The
+    field defaults to `0`, so a `Start` from a server that predates it parses to the
+    infinitely-tall behavior."""
 
     min: Vec2
     max: Vec2
+    height: I32 = 0
 
 
 class Start(_Wire):
