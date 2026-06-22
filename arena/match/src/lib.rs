@@ -252,6 +252,15 @@ pub struct MatchParams {
     /// finite tolerance (the magnitude is a balance decision, like the K-factor). Only
     /// the Agent (ranked) queue reads it.
     pub ranked_rating_tolerance: i32,
+    /// The most formed-but-unsettled ranked registrations the matchmaker holds before
+    /// it evicts the OLDEST to bound memory. A registration leaks if its match's result
+    /// never reports back; this caps that leak. A backstop, not a normal-operation
+    /// limit — under prompt settling `pending_ranked` stays far below it and nothing is
+    /// ever evicted, so a healthy deployment is byte-identical to the pre-cap behaviour;
+    /// eviction only fires once the registry is already pathologically deep. `0` opts
+    /// out (unbounded — the exact pre-cap behaviour). Only the Agent (ranked) queue
+    /// grows this map. Mirrors the mesh registration-bucket cap.
+    pub max_pending_ranked: usize,
 }
 
 impl Default for MatchParams {
@@ -264,6 +273,7 @@ impl Default for MatchParams {
             bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
             arena: "",
             ranked_rating_tolerance: i32::MAX,
+            max_pending_ranked: 4096,
         }
     }
 }
@@ -355,13 +365,33 @@ struct State {
     /// and replay-determinism properties depend on it.
     ratings: BTreeMap<String, i32>,
     /// Ranked matches that have FORMED but not yet been settled into the ladder,
-    /// `match_id → the two seats' agent identities in seat order`. Only a 2-seat
-    /// Agent-mode match registers here at formation; [`Matchmaker::apply_ranked_result`]
-    /// removes its entry and applies the delta. This is what makes the rating update
-    /// safe: a casual/human/unknown match was never registered, so applying its result
-    /// is a no-op (FM1), and resolving a match removes its entry, so a replayed result
-    /// cannot double-apply (FM3).
-    pending_ranked: BTreeMap<Uuid, Vec<String>>,
+    /// `match_id → the two seats' agent identities (in seat order) + an insertion seq`.
+    /// Only a 2-seat Agent-mode match registers here at formation;
+    /// [`Matchmaker::apply_ranked_result`] removes its entry and applies the delta. This
+    /// is what makes the rating update safe: a casual/human/unknown match was never
+    /// registered, so applying its result is a no-op (FM1), and resolving a match
+    /// removes its entry, so a replayed result cannot double-apply (FM3). The registry
+    /// is bounded by `MatchParams::max_pending_ranked` — a match whose result never
+    /// reports back would otherwise leak its entry forever, so over the cap the OLDEST
+    /// (lowest `seq`) registration is evicted.
+    pending_ranked: BTreeMap<Uuid, PendingRanked>,
+    /// Monotonic stamp assigned to each `pending_ranked` insertion. `BTreeMap` is
+    /// `Uuid`-keyed (not insertion-ordered), so this is what lets the cap evict the
+    /// genuinely OLDEST registration deterministically. Only ever increments
+    /// (saturating); never reused.
+    next_pending_seq: u64,
+    /// How many `pending_ranked` registrations the cap has evicted — surfaced via
+    /// [`Matchmaker::ranked_evictions`] for observability. A rising count means matches
+    /// are forming faster than their results report back (the leak the cap bounds).
+    ranked_evictions: usize,
+}
+
+/// A formed-but-unsettled ranked registration: the two seats' agents (in seat order)
+/// plus the insertion sequence the cap uses to evict the OLDEST entry — the one most
+/// likely abandoned (its result never came back) — when the registry is over its bound.
+struct PendingRanked {
+    seq: u64,
+    agents: Vec<String>,
 }
 
 /// Forms matches from waiting participants by [`MatchMode`], over the arena-02
@@ -502,7 +532,23 @@ impl<V: IdentityVerifier> Matchmaker<V> {
         // carrying that id resolves exactly this match.
         if mode == MatchMode::Agent && seats.len() == 2 {
             let agents: Vec<String> = seats.iter().map(|s| s.controller.clone()).collect();
-            self.state.lock().expect("matchmaker mutex poisoned").pending_ranked.insert(match_id, agents);
+            let mut st = self.state.lock().expect("matchmaker mutex poisoned");
+            let seq = st.next_pending_seq;
+            st.next_pending_seq = st.next_pending_seq.saturating_add(1);
+            st.pending_ranked.insert(match_id, PendingRanked { seq, agents });
+            // Bound the registry: a match whose result never reports back would otherwise
+            // leak its entry forever. Over the cap, evict the OLDEST (lowest seq) — the one
+            // most likely abandoned. Inert until the cap is reached (and `cap == 0` opts
+            // out), so a healthy, prompt-settling deployment never evicts and stays
+            // byte-identical to the pre-cap behaviour.
+            let cap = self.params.max_pending_ranked;
+            if cap != 0 && st.pending_ranked.len() > cap {
+                let oldest = st.pending_ranked.iter().min_by_key(|(_, p)| p.seq).map(|(id, _)| *id);
+                if let Some(id) = oldest {
+                    st.pending_ranked.remove(&id);
+                    st.ranked_evictions = st.ranked_evictions.saturating_add(1);
+                }
+            }
         }
         let config = MatchConfig {
             tick_hz: self.params.tick_hz,
@@ -565,8 +611,9 @@ impl<V: IdentityVerifier> Matchmaker<V> {
         // Peek (do not remove yet): `ranked_delta` orders the two seats by ascending
         // seat id (canonical), so pair each outcome's seat to the agent the roster
         // seated there. Bail — registration intact — if either seat is out of range.
-        let agents = st.pending_ranked.get(&result.match_id)?;
-        let (Some(agent_a), Some(agent_b)) = (agents.get(oa.seat as usize), agents.get(ob.seat as usize))
+        let pending = st.pending_ranked.get(&result.match_id)?;
+        let (Some(agent_a), Some(agent_b)) =
+            (pending.agents.get(oa.seat as usize), pending.agents.get(ob.seat as usize))
         else {
             return None;
         };
@@ -589,6 +636,14 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// results are never reported back).
     pub fn unsettled_ranked(&self) -> usize {
         self.state.lock().expect("matchmaker mutex poisoned").pending_ranked.len()
+    }
+
+    /// How many formed-but-unsettled ranked registrations the cap has evicted to bound
+    /// the registry. Zero under healthy operation (results report back before the cap is
+    /// reached); a rising count signals matches forming faster than they settle — the
+    /// leak [`MatchParams::max_pending_ranked`] bounds. For observability and tests.
+    pub fn ranked_evictions(&self) -> usize {
+        self.state.lock().expect("matchmaker mutex poisoned").ranked_evictions
     }
 }
 
@@ -1247,6 +1302,101 @@ mod tests {
         assert!(mm.apply_ranked_result(&result, 32).is_none(), "a second settle of the same match is a no-op");
         assert_eq!((mm.rating("0xa"), mm.rating("0xb")), after, "the replay left ratings unchanged");
         assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
+    /// A ranked matchmaker with a custom `max_pending_ranked` cap (and an open
+    /// tolerance), for the eviction tests.
+    fn ranked_mm_cap(authorized: &[(&str, &str)], cap: usize) -> Matchmaker<StubIdentityVerifier> {
+        let mut v = StubIdentityVerifier::new();
+        for (id, token) in authorized {
+            v.authorize(*id, *token);
+        }
+        Matchmaker::new(v, MatchParams { max_pending_ranked: cap, ..MatchParams::default() })
+    }
+
+    /// Form one ranked 1v1 between two already-authorized agents in `mm`, returning the
+    /// formed match. Reusable across many formations: the pair leaves the queue on
+    /// forming, so the next call forms a fresh `match_id`.
+    fn form_ranked(mm: &Matchmaker<StubIdentityVerifier>, a: &str, b: &str) -> Match {
+        assert!(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent(a, "t")).unwrap().is_queued());
+        mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent(b, "t"))
+            .unwrap()
+            .into_formed()
+            .expect("two ranked agents form a 1v1")
+    }
+
+    #[test]
+    fn pending_ranked_is_bounded_by_the_cap() {
+        // FM2: a stream of formations whose results never report back must not grow the
+        // registry without bound — it caps at max_pending_ranked, evicting the overflow.
+        let cap = 3;
+        let mm = ranked_mm_cap(&[("0xa", "t"), ("0xb", "t")], cap);
+        for _ in 0..(cap + 5) {
+            form_ranked(&mm, "0xa", "0xb");
+        }
+        assert_eq!(mm.unsettled_ranked(), cap, "the registry never exceeds the cap");
+        assert_eq!(mm.ranked_evictions(), 5, "every formation past the cap evicts exactly one");
+    }
+
+    #[test]
+    fn eviction_drops_the_oldest_registration_keeping_recent_ones() {
+        // FM1 + FM4: when capped, the OLDEST (first-formed) registration is evicted — the
+        // match most likely abandoned — while just-formed matches still settle. Eviction
+        // is age-based (insertion seq), NOT Uuid-order, so the first-formed loses
+        // regardless of its random id — the determinism the seq stamp buys.
+        let cap = 2;
+        let mm = ranked_mm_cap(&[("0xa", "t"), ("0xb", "t")], cap);
+        let first = form_ranked(&mm, "0xa", "0xb"); // oldest (seq 0)
+        let second = form_ranked(&mm, "0xa", "0xb");
+        let third = form_ranked(&mm, "0xa", "0xb"); // this formation evicts `first`
+        assert_eq!(mm.unsettled_ranked(), cap);
+        assert_eq!(mm.ranked_evictions(), 1);
+
+        // The evicted oldest no longer settles — a clean no-op, no panic, no rating move.
+        assert!(
+            mm.apply_ranked_result(&decisive_result(first.match_id(), 0), 32).is_none(),
+            "the evicted oldest match is a clean no-op"
+        );
+        // The two surviving recent matches still settle normally.
+        assert!(
+            mm.apply_ranked_result(&decisive_result(third.match_id(), 0), 32).is_some(),
+            "a surviving recent match still settles"
+        );
+        assert!(
+            mm.apply_ranked_result(&decisive_result(second.match_id(), 0), 32).is_some(),
+            "the other survivor settles too"
+        );
+        assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
+    #[test]
+    fn eviction_does_not_fire_below_the_cap() {
+        // Byte-identical default: at or under the cap nothing is evicted and every match
+        // settles, exactly as before the cap existed.
+        let cap = 8;
+        let mm = ranked_mm_cap(&[("0xa", "t"), ("0xb", "t")], cap);
+        let matches: Vec<Match> = (0..cap).map(|_| form_ranked(&mm, "0xa", "0xb")).collect();
+        assert_eq!(mm.unsettled_ranked(), cap, "exactly at the cap, nothing evicted");
+        assert_eq!(mm.ranked_evictions(), 0);
+        for m in &matches {
+            assert!(
+                mm.apply_ranked_result(&decisive_result(m.match_id(), 0), 32).is_some(),
+                "every below-cap match settles"
+            );
+        }
+        assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
+    #[test]
+    fn an_unbounded_cap_never_evicts() {
+        // cap == 0 opts out: the exact pre-cap behaviour — the registry grows with each
+        // unreported formation, nothing is ever evicted.
+        let mm = ranked_mm_cap(&[("0xa", "t"), ("0xb", "t")], 0);
+        for _ in 0..50 {
+            form_ranked(&mm, "0xa", "0xb");
+        }
+        assert_eq!(mm.unsettled_ranked(), 50, "cap 0 = unbounded, nothing evicted");
+        assert_eq!(mm.ranked_evictions(), 0);
     }
 
     #[test]
