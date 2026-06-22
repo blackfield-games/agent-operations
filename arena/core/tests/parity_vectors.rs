@@ -62,7 +62,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v5");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v6");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -195,6 +195,32 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         "high vs infinite differ ONLY in the wall height"
     );
     assert!(voc("rising_look_still_in_band_blocked").occluded, "a look still below the top where it crosses is blocked");
+
+    // z-aware traversal (v6): the physical twin of the sight rule — a height-bounded wall
+    // stops a ground path but is cleared by a high-enough level path; an infinitely-tall
+    // wall stops it at any elevation; grazing the top still blocks; and travel is
+    // DIRECTIONAL (start exempt, destination not). A twin that ignores height fails the
+    // high case; one that exempts the destination fails the end-inside case.
+    let moc = |label: &str| v.movement_over_cover.iter().find(|c| c.label == label).unwrap();
+    let mground = moc("ground_path_blocked");
+    assert!(mground.blocked && mground.blocker.height > 0, "a ground path is blocked by the finite wall");
+    let mhigh = moc("high_path_clears_the_wall");
+    assert!(!mhigh.blocked, "a level path over the top is not blocked by a height-bounded wall");
+    let minf = moc("infinite_wall_blocks_high_path");
+    assert!(minf.blocked && minf.blocker.height == 0, "an infinitely-tall wall blocks the high path");
+    assert_eq!(
+        (mhigh.from, mhigh.from_z, mhigh.to, mhigh.to_z),
+        (minf.from, minf.from_z, minf.to, minf.to_z),
+        "high vs infinite differ ONLY in the wall height"
+    );
+    assert!(moc("grazing_top_blocked").blocked, "a path grazing the wall top is blocked (conservative boundary)");
+    // The directional exemption — the movement/sight divergence (sight exempts both ends).
+    assert!(!moc("start_inside_is_exempt").blocked, "a path starting inside the wall may leave it");
+    assert!(moc("end_inside_is_blocked").blocked, "a path ending inside the wall is still blocked");
+    // Sight and traversal AGREE on what a given elevation clears (the same Blocker.height
+    // bounds both), so a twin cannot satisfy one rule while diverging on the other.
+    assert_eq!(high.occluded, mhigh.blocked, "sight and traversal agree: the high wall is cleared by both");
+    assert_eq!(infinite.occluded, minf.blocked, "sight and traversal agree: the infinite wall blocks both");
 
     // Full matches: every committed record re-runs to its own committed result
     // (self-consistency); the v5 digest commits the inputs, the rules, AND the config. The octant

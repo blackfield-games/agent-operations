@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v5",
+  "domain": "blackfield/arena/parity-vectors/v6",
   "protocol_version": 1,
   "spawns": [
     {
@@ -782,6 +782,158 @@
         "height": 2000
       },
       "occluded": true
+    }
+  ],
+  "movement_over_cover": [
+    {
+      "label": "ground_path_blocked",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 0,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 0,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "blocked": true
+    },
+    {
+      "label": "high_path_clears_the_wall",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 5000,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 5000,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "blocked": false
+    },
+    {
+      "label": "infinite_wall_blocks_high_path",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 5000,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 5000,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "grazing_top_blocked",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 2000,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 2000,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "blocked": true
+    },
+    {
+      "label": "start_inside_is_exempt",
+      "from": {
+        "x": 5000,
+        "y": 0
+      },
+      "from_z": 0,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 0,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "blocked": false
+    },
+    {
+      "label": "end_inside_is_blocked",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 0,
+      "to": {
+        "x": 5000,
+        "y": 0
+      },
+      "to_z": 0,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "blocked": true
     }
   ],
   "matches": [

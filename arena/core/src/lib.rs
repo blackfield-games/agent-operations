@@ -2985,6 +2985,28 @@ pub struct VisionOverCoverCase {
     pub occluded: bool,
 }
 
+/// A pinned z-aware-traversal case: a level path from `(from, from_z)` to `(to, to_z)`
+/// against a single height-bounded [`Blocker`], and whether that wall blocks it — the
+/// physical twin of [`VisionOverCoverCase`]. The rule a twin must reproduce: a wall
+/// with `height > 0` stops a ground path but NOT one that travels over its top, a
+/// `height == 0` wall is infinitely tall and stops it at any elevation, and travel is
+/// DIRECTIONAL — only the START is exempt (a path beginning inside a wall may leave it),
+/// so a path ENDING inside a wall is still blocked (unlike sight, which exempts both
+/// ends). A twin that ignores the height, or that exempts the destination, fails the
+/// matching case. Movement and a level projectile share the predicate, so one set pins
+/// both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovementOverCoverCase {
+    pub label: String,
+    pub from: Vec2,
+    pub from_z: i32,
+    pub to: Vec2,
+    pub to_z: i32,
+    pub blocker: Blocker,
+    /// `true` iff the wall blocks this path (movement holds / a projectile is absorbed).
+    pub blocked: bool,
+}
+
 /// The canonical cross-implementation parity-vector set — the conformance spec
 /// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
 /// and the bytes are the contract.
@@ -3004,6 +3026,10 @@ pub struct ParityVectors {
     /// z-aware-occlusion cases (domain v5): a height-bounded wall is cleared by a
     /// high-enough sightline.
     pub vision_over_cover: Vec<VisionOverCoverCase>,
+    /// z-aware-traversal cases (domain v6): a height-bounded wall is cleared by a
+    /// high-enough level path — the physical twin of `vision_over_cover` (movement and a
+    /// level projectile share the collision predicate).
+    pub movement_over_cover: Vec<MovementOverCoverCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3015,9 +3041,12 @@ pub struct ParityVectors {
 /// committed match hash moved) and a new `vertical_hits` category pins the rule;
 /// bumped to v5 when blockers gained a `height` (the replay digest folds it at tag
 /// v6, moving every committed match hash, and a positive height bounds vision
-/// occlusion so a pawn high enough sees over low cover). Each is a deliberate
+/// occlusion so a pawn high enough sees over low cover); bumped to v6 when that height
+/// also bounds physical TRAVERSAL (movement + a level projectile pass over low cover,
+/// the twin of the v5 sight rule) and a new `movement_over_cover` category pins it — a
+/// pure-logic change, so no replay-digest tag move this time. Each is a deliberate
 /// convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v5";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v6";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -3323,6 +3352,20 @@ fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: 
     }
 }
 
+/// Build a z-aware-traversal case: test the one level path against the one wall and
+/// record whether it is blocked — the predicate movement and a level projectile share.
+fn movement_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> MovementOverCoverCase {
+    MovementOverCoverCase {
+        label: label.to_string(),
+        from,
+        from_z,
+        to,
+        to_z,
+        blocker,
+        blocked: path_hits_blocker(&[blocker], from, from_z, to, to_z),
+    }
+}
+
 /// Build a full-match case under a fixed, tiny scripted action stream: seat 0
 /// steps east on the opening tick, fires due east on the next, then everyone
 /// idles. A hitscan match ends on the kill; a projectile match runs on until the
@@ -3508,6 +3551,26 @@ pub fn parity_vectors() -> ParityVectors {
                 // A look rising from the ground but still below the top where it crosses
                 // the wall (z ~720 at the near edge) enters the box -> blocked.
                 vision_over_cover_case("rising_look_still_in_band_blocked", Vec2::ZERO, 0, target, 1_800, wall),
+            ]
+        },
+        movement_over_cover: {
+            // The same 2 m wall the sight set uses, now as a physical occluder: a level
+            // path from the origin to 10 m east crosses its footprint.
+            let wall = Blocker { min: Vec2 { x: 4_000, y: -1_000 }, max: Vec2 { x: 6_000, y: 1_000 }, height: 2_000 };
+            let target = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
+            vec![
+                // On the ground: the wall stops the path.
+                movement_over_cover_case("ground_path_blocked", Vec2::ZERO, 0, target, 0, wall),
+                // Above the top: the path travels over -> clear.
+                movement_over_cover_case("high_path_clears_the_wall", Vec2::ZERO, 5_000, target, 5_000, wall),
+                // The same high path against an infinitely-tall (height 0) twin -> blocked.
+                movement_over_cover_case("infinite_wall_blocks_high_path", Vec2::ZERO, 5_000, target, 5_000, Blocker { height: 0, ..wall }),
+                // Grazing the top exactly (z == height): boundary contact counts -> blocked.
+                movement_over_cover_case("grazing_top_blocked", Vec2::ZERO, 2_000, target, 2_000, wall),
+                // Directional exemption: a path STARTING inside the wall may leave it.
+                movement_over_cover_case("start_inside_is_exempt", Vec2 { x: 5_000, y: 0 }, 0, target, 0, wall),
+                // ...but a path ENDING inside the wall is still blocked (unlike sight).
+                movement_over_cover_case("end_inside_is_blocked", Vec2::ZERO, 0, Vec2 { x: 5_000, y: 0 }, 0, wall),
             ]
         },
         matches: vec![
