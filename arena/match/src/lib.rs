@@ -29,7 +29,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use arena_core::{arena_map, Match, MatchRecord, ReplayError, Rules, SplitMix64, DEFAULT_RATING};
+use arena_core::{
+    arena_map, ranked_delta, Match, MatchRecord, RatingDelta, ReplayError, Rules, SplitMix64,
+    DEFAULT_RATING,
+};
 use arena_proto::{
     verify_join_signature, ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode,
     MatchPhase, MatchResult, SeatId, SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
@@ -337,6 +340,14 @@ struct State {
     /// `BTreeMap`, not `HashMap`, so iteration is order-deterministic — the pairing
     /// and replay-determinism properties depend on it.
     ratings: BTreeMap<String, i32>,
+    /// Ranked matches that have FORMED but not yet been settled into the ladder,
+    /// `match_id → the two seats' agent identities in seat order`. Only a 2-seat
+    /// Agent-mode match registers here at formation; [`Matchmaker::apply_ranked_result`]
+    /// removes its entry and applies the delta. This is what makes the rating update
+    /// safe: a casual/human/unknown match was never registered, so applying its result
+    /// is a no-op (FM1), and resolving a match removes its entry, so a replayed result
+    /// cannot double-apply (FM3).
+    pending_ranked: BTreeMap<Uuid, Vec<String>>,
 }
 
 /// Forms matches from waiting participants by [`MatchMode`], over the arena-02
@@ -463,6 +474,16 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             .enumerate()
             .map(|(i, s)| SeatInfo { seat: i as SeatId, team: teams[i], controller: s.agent_id.clone() })
             .collect();
+        // Register a ranked 1v1 (Agent mode, exactly 2 seats) so its terminal result
+        // can later settle into the ladder. Only a head-to-head agent match is rated —
+        // ranked_delta is 1v1, and a casual/human/team match has no A-vs-B rating to
+        // move (FM1). The brief re-lock keeps the heavy Match::new off the formation
+        // lock, as build already does. Keyed by the freshly minted id, so the result
+        // carrying that id resolves exactly this match.
+        if mode == MatchMode::Agent && seats.len() == 2 {
+            let agents: Vec<String> = seats.iter().map(|s| s.controller.clone()).collect();
+            self.state.lock().expect("matchmaker mutex poisoned").pending_ranked.insert(match_id, agents);
+        }
         let config = MatchConfig {
             tick_hz: self.params.tick_hz,
             max_ticks: self.params.max_ticks,
@@ -496,6 +517,45 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// [`DEFAULT_RATING`] until a terminal ranked match moves it.
     pub fn rating(&self, agent_id: &str) -> Option<i32> {
         self.state.lock().expect("matchmaker mutex poisoned").ratings.get(agent_id).copied()
+    }
+
+    /// Settle a terminal ranked match's `result` into the ladder, returning the
+    /// zero-sum [`RatingDelta`] applied (or `None` if nothing moved).
+    ///
+    /// The match must have been formed by this matchmaker as a ranked 1v1 (Agent
+    /// mode, 2 seats) — identified by `result.match_id`. A result for a casual, human,
+    /// team, or unknown match is a no-op (it was never registered, FM1), as is a
+    /// second call for the same match (its registration is removed on the first, so a
+    /// replayed result cannot double-apply, FM3). On a hit, each seat's rating moves
+    /// by exactly the [`ranked_delta`] the core computes from the two pre-match
+    /// ratings and the outcome — `delta.a` to the seat the result orders first,
+    /// `delta.b == -delta.a` to the other — so the ladder conserves total rating.
+    /// `k` is the owner-set K-factor (operator-gated magnitude); the caller supplies
+    /// it rather than the matchmaker baking it in.
+    pub fn apply_ranked_result(&self, result: &MatchResult, k: i32) -> Option<RatingDelta> {
+        let mut st = self.state.lock().expect("matchmaker mutex poisoned");
+        // Remove-on-resolve: absent ⇒ not a registered ranked match, or already
+        // settled. Either way the ladder is left untouched.
+        let agents = st.pending_ranked.remove(&result.match_id)?;
+        // ranked_delta orders the two seats by ascending seat id (canonical); pair
+        // each outcome's seat to the agent the roster seated there.
+        let [oa, ob] = result.outcomes.as_slice() else { return None };
+        let (agent_a, agent_b) = (agents.get(oa.seat as usize)?, agents.get(ob.seat as usize)?);
+        let ra = st.ratings.get(agent_a).copied().unwrap_or(DEFAULT_RATING);
+        let rb = st.ratings.get(agent_b).copied().unwrap_or(DEFAULT_RATING);
+        let delta = ranked_delta(result, ra, rb, k)?;
+        let (agent_a, agent_b) = (agent_a.clone(), agent_b.clone());
+        st.ratings.insert(agent_a, ra.saturating_add(delta.a));
+        st.ratings.insert(agent_b, rb.saturating_add(delta.b));
+        Some(delta)
+    }
+
+    /// How many ranked matches have formed but not yet been settled into the ladder —
+    /// the depth of the pending-result registry. For observability and tests (a real
+    /// deployment would alarm on this growing without bound, signalling matches whose
+    /// results are never reported back).
+    pub fn unsettled_ranked(&self) -> usize {
+        self.state.lock().expect("matchmaker mutex poisoned").pending_ranked.len()
     }
 }
 
@@ -781,7 +841,7 @@ pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError
 mod tests {
     use super::*;
     use arena_proto::MatchPhase;
-    use arena_proto::{ActionButtons, PickupKind, PickupSpawn};
+    use arena_proto::{ActionButtons, PickupKind, PickupSpawn, SeatOutcome};
     use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
     #[test]
@@ -1040,6 +1100,119 @@ mod tests {
         assert!(
             select_ranked(&queue, &rating_book(&[("A", 1500)]), 2).is_none(),
             "one waiter cannot form a 2-seat match"
+        );
+    }
+
+    /// Form a ranked 2-seat Agent match between two authorized agents (`a` at seat 0,
+    /// `b` at seat 1), returning the matchmaker and the formed match so its id can
+    /// settle a result. Extra agents may be pre-authorized for follow-on rounds.
+    fn ranked_pair(a: &str, b: &str, extra: &[&str]) -> (Matchmaker<StubIdentityVerifier>, Match) {
+        let mut authorized: Vec<(&str, &str)> = vec![(a, "t"), (b, "t")];
+        authorized.extend(extra.iter().map(|id| (*id, "t")));
+        let mm = ranked_mm(&authorized);
+        assert!(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent(a, "t")).unwrap().is_queued());
+        let m = mm
+            .join(MatchMode::Agent, b"", JoinRequest::ranked_agent(b, "t"))
+            .unwrap()
+            .into_formed()
+            .expect("two ranked agents form a 1v1");
+        (mm, m)
+    }
+
+    /// A decisive [`MatchResult`] for `match_id`: `winner_seat` placed first, the
+    /// other second, so [`settlement`] reads a clean `Win { winner_seat }`.
+    fn decisive_result(match_id: Uuid, winner_seat: SeatId) -> MatchResult {
+        let outcome = |seat: SeatId| SeatOutcome {
+            seat,
+            team: seat as TeamId,
+            placement: if seat == winner_seat { 1 } else { 2 },
+            score: 0,
+            alive_at_end: seat == winner_seat,
+        };
+        MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id,
+            final_tick: 10,
+            outcomes: vec![outcome(0), outcome(1)],
+            replay_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_ranked_result_moves_both_seats_by_exactly_the_core_delta() {
+        // FM3: a terminal ranked match settles into the ladder — both seats start at
+        // the seed and move by EXACTLY ranked_delta (no off-by-one, no divergence from
+        // the core), zero-sum.
+        let (mm, m) = ranked_pair("0xa", "0xb", &[]);
+        assert_eq!(mm.rating("0xa"), Some(DEFAULT_RATING));
+        assert_eq!(mm.rating("0xb"), Some(DEFAULT_RATING));
+        assert_eq!(mm.unsettled_ranked(), 1, "the formed ranked match is registered");
+
+        let result = decisive_result(m.match_id(), 0); // 0xa (seat 0) wins
+        let k = 32;
+        let applied = mm.apply_ranked_result(&result, k).expect("a registered ranked match settles");
+
+        let expected = ranked_delta(&result, DEFAULT_RATING, DEFAULT_RATING, k).unwrap();
+        assert_eq!(applied, expected, "the matchmaker applies the core delta verbatim");
+        assert_eq!(mm.rating("0xa"), Some(DEFAULT_RATING + expected.a), "the winner gains exactly delta.a");
+        assert_eq!(mm.rating("0xb"), Some(DEFAULT_RATING + expected.b), "the loser moves exactly delta.b");
+        assert_eq!(expected.a, -expected.b, "zero-sum: total ladder rating is conserved");
+        assert!(expected.a > 0, "an even-match win raises the winner");
+        assert_eq!(mm.unsettled_ranked(), 0, "settling consumes the registration");
+    }
+
+    #[test]
+    fn a_ranked_result_settles_at_most_once() {
+        // FM3 (no double-apply): the registration is removed on the first settle, so a
+        // replayed or duplicate result for the same match is a no-op — the ladder holds.
+        let (mm, m) = ranked_pair("0xa", "0xb", &[]);
+        let result = decisive_result(m.match_id(), 0);
+        assert!(mm.apply_ranked_result(&result, 32).is_some(), "the first settle applies");
+        let after = (mm.rating("0xa"), mm.rating("0xb"));
+        assert!(mm.apply_ranked_result(&result, 32).is_none(), "a second settle of the same match is a no-op");
+        assert_eq!((mm.rating("0xa"), mm.rating("0xb")), after, "the replay left ratings unchanged");
+        assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
+    #[test]
+    fn a_casual_or_human_result_never_touches_the_ladder() {
+        // FM1: only a registered ranked (Agent 1v1) match moves ratings. A human match
+        // and a casual Mixed match are never registered, so applying their results is a
+        // no-op, and neither seats a laddered rating.
+        let mm = open_mm();
+        mm.join(MatchMode::Human, b"", JoinRequest::human("alice")).unwrap();
+        let human = mm.join(MatchMode::Human, b"", JoinRequest::human("bob")).unwrap().into_formed().unwrap();
+
+        mm.join(MatchMode::Mixed, b"", JoinRequest::human("h1")).unwrap();
+        let mixed = mm
+            .join(MatchMode::Mixed, b"", JoinRequest::casual_agent("0xcasual"))
+            .unwrap()
+            .into_formed()
+            .unwrap();
+
+        assert_eq!(mm.unsettled_ranked(), 0, "neither a human nor a casual match is registered as ranked");
+        assert!(mm.apply_ranked_result(&decisive_result(human.match_id(), 0), 32).is_none(), "a human result settles nothing");
+        assert!(mm.apply_ranked_result(&decisive_result(mixed.match_id(), 0), 32).is_none(), "a casual result settles nothing");
+        assert_eq!(mm.rating("alice"), None, "no human is laddered");
+        assert_eq!(mm.rating("0xcasual"), None, "a casual cross-play agent is not laddered");
+
+        // A result for a match this matchmaker never formed is likewise a no-op.
+        assert!(mm.apply_ranked_result(&decisive_result(Uuid::new_v4(), 0), 32).is_none(), "an unknown match settles nothing");
+    }
+
+    #[test]
+    fn the_loser_seat_drives_the_sign_of_the_delta() {
+        // FM3 (mapping): the delta is paired to the right seats — when seat 1 wins, it
+        // is seat 1's agent that rises and seat 0's that falls (the mirror of the WinA
+        // case), so the matchmaker never credits the wrong agent.
+        let (mm, m) = ranked_pair("0xa", "0xb", &[]);
+        mm.apply_ranked_result(&decisive_result(m.match_id(), 1), 32).unwrap(); // seat 1 (0xb) wins
+        assert!(mm.rating("0xb").unwrap() > DEFAULT_RATING, "the seat-1 winner rose");
+        assert!(mm.rating("0xa").unwrap() < DEFAULT_RATING, "the seat-0 loser fell");
+        assert_eq!(
+            mm.rating("0xa").unwrap() - DEFAULT_RATING,
+            -(mm.rating("0xb").unwrap() - DEFAULT_RATING),
+            "the two moves are exact negatives"
         );
     }
 
