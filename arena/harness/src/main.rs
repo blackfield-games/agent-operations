@@ -817,6 +817,40 @@ mod tests {
     }
 
     #[test]
+    fn a_field_settle_keys_the_controller_by_seat_id_not_roster_position() {
+        // FM1 (position-vs-seat-id): the controller is keyed by SEAT ID, not by the
+        // delta's position in the roster Vec — a roster stored out of seat order would
+        // make a positional lookup credit the wrong agent. The identity-roster test above
+        // can't see this (there seat == position == name), so build a roster whose Vec
+        // order (seats 2, 0, 1) is decoupled from seat id and pin that each seat's delta
+        // still lands on the controller whose seat matches.
+        let seats = vec![
+            SeatInfo { seat: 2, team: 2, controller: "carol".into() },
+            SeatInfo { seat: 0, team: 0, controller: "alice".into() },
+            SeatInfo { seat: 1, team: 1, controller: "bob".into() },
+        ];
+        let replay = replay_for(seats);
+        let result = three_seat_result(); // outcomes sorted ascending: seats 0, 1, 2
+        let k = 32;
+        let ratings = vec![1500, 1400, 1600];
+        let core = ranked_field_delta(&result, &ratings, k).unwrap();
+
+        let settler = MockSettler::default();
+        settle_field_match(&settler, &result, &replay, field(ratings, k)).expect("settles");
+
+        let expected = vec![
+            FieldEntry { agent: "alice".into(), delta: core[0].delta }, // seat 0
+            FieldEntry { agent: "bob".into(), delta: core[1].delta },   // seat 1
+            FieldEntry { agent: "carol".into(), delta: core[2].delta }, // seat 2
+        ];
+        assert_eq!(
+            settler.resolution(id()),
+            Some(Resolution::Field { entries: expected, replay_digest: replay.digest() }),
+            "each seat's delta lands on the controller whose seat matches, not roster position",
+        );
+    }
+
+    #[test]
     fn the_field_seam_refuses_a_pair_so_n2_keeps_the_single_delta_shape() {
         // FM2: a 2-seat result must never be emitted as a 2-vector. The field seam refuses
         // a pair (NotRankedField), so the ONLY n=2 settle path is settle_match's single
