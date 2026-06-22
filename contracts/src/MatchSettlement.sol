@@ -44,14 +44,18 @@ interface IAgentRegistry {
 ///           arbitrarily. WHO wins is always the attester's to name; HOW MUCH is either
 ///           fixed or attester-chosen within a cap — never unbounded.
 ///
-///         Idempotency: a `matchId` (the arena match UUID) is single-use. `openMatch`
-///         requires a fresh slot, and every resolution (`settle` / `settleRanked` /
-///         `settleDraw` / `settleDrawRanked` / `cancelMatch` / `refundExpired`)
-///         requires the match is still `Open`, flipping it to a terminal state BEFORE
-///         any external call (checks-effects-interactions) — the variable paths inherit
-///         the fence by sharing the same internal mechanics as the fixed ones. A
-///         replayed settlement is therefore rejected, not a double-pay or a
-///         double-count — the same per-id fence as `ComputeMeter.spendOnce`.
+///         Idempotency: a `matchId` (the arena match UUID) is single-use across ALL
+///         entrypoints. The three openers (`openMatch`, `settleField`, and the N-seat
+///         `openFieldMatch`) share ONE id claim (`_requireFreshId`), so a given id is at
+///         most one record — a field-wager id can never also be a 1v1 (or `settleField`)
+///         id, nor vice-versa. Every resolution (`settle` / `settleRanked` / `settleDraw`
+///         / `settleDrawRanked` / `cancelMatch` / `refundExpired`, and the field
+///         `cancelFieldMatch` / `refundFieldExpired`) requires the match is still `Open`,
+///         flipping it to a terminal state BEFORE any external call
+///         (checks-effects-interactions) — the variable paths inherit the fence by sharing
+///         the same internal mechanics as the fixed ones. A replayed settlement is
+///         therefore rejected, not a double-pay or a double-count — the same per-id fence
+///         as `ComputeMeter.spendOnce`.
 contract MatchSettlement is Ownable2Step {
     using SafeERC20 for IERC20;
 
@@ -90,6 +94,39 @@ contract MatchSettlement is Ownable2Step {
         ///      settleWindow`) at and after which either side may `refundExpired` a
         ///      still-`Open` match. Packs into the same slot as `winner`/the flags/
         ///      `status`, so recording it is free on the SSTORE `openMatch` already does.
+        uint64 deadline;
+    }
+
+    /// @notice An N-seat (FFA / 3+) field-wager escrow — the multi-seat analog of the
+    ///         1v1 `Match`. A roster of 2..=`MAX_FIELD` registered, distinct agents each
+    ///         funds its OWN seat with the uniform per-seat `stake`; `fundedBits` is the
+    ///         funded set (bit `i` set iff `agents[i]` funded), which ONE `uint256` holds
+    ///         exactly because `MAX_FIELD == 64` — giving O(1) fund and an O(1) clear-all
+    ///         on void. The two-bool `aFunded/bFunded` 1v1 design does not generalize to N,
+    ///         so a field match lives in its own `fieldMatches` mapping rather than the
+    ///         `Match` struct; the `matchId` SPACE is still shared with the 1v1 /
+    ///         `settleField` records via `_requireFreshId`, so one id is at most one record
+    ///         across all opening entrypoints.
+    ///
+    ///         This slice is the OPEN / FUND / RECOVER half only: the resolutions are
+    ///         `reclaimField` (before any peer funds), `cancelFieldMatch` (attester void),
+    ///         and `refundFieldExpired` (permissionless past the deadline) — all FULL
+    ///         refunds. The placement-ordered pot distribution (a `Settled` resolution) is
+    ///         the sibling slice; until it lands a funded field is always fully recoverable,
+    ///         so no stake is ever stranded.
+    struct FieldMatch {
+        /// @dev The roster in seat order, set once at open. Iterated on refund (O(n),
+        ///      bounded by `MAX_FIELD`) to pay each funded seat; `fieldSeatPlus1` is the
+        ///      O(1) inverse (agent -> seat) used by `fundField`/`reclaimField`.
+        address[] agents;
+        /// @dev Uniform per-seat wager in $BLCKFLD (each seat funds exactly this). 0 = a
+        ///      no-escrow field; `fundField` then reverts and only cancel/expire void it.
+        uint256 stake;
+        /// @dev Funded set: bit `i` set iff `agents[i]` has funded. One word covers all
+        ///      `MAX_FIELD` seats; cleared to 0 before refunding (CEI).
+        uint256 fundedBits;
+        Status status;
+        /// @dev Self-refund instant, frozen at open from `settleWindow` (see `Match.deadline`).
         uint64 deadline;
     }
 
@@ -154,6 +191,19 @@ contract MatchSettlement is Ownable2Step {
     uint64 public settleWindow;
 
     mapping(bytes32 matchId => Match) public matches;
+
+    /// @notice The N-seat field-wager escrows, keyed by the SAME `matchId` space as
+    ///         `matches` (a given id lives in at most one of the two — `_requireFreshId`).
+    ///         The auto getter omits the dynamic `agents` array; read it via `fieldRoster`.
+    mapping(bytes32 matchId => FieldMatch) public fieldMatches;
+
+    /// @dev Inverse of a field roster: `fieldSeatPlus1[matchId][agent]` is the agent's seat
+    ///      index PLUS ONE (0 = not a roster member), giving `fundField`/`reclaimField` an
+    ///      O(1) seat lookup + membership test and `openFieldMatch` an O(n) distinctness
+    ///      check (vs `settleField`'s O(n^2) scan). Written once at open; never read after a
+    ///      match leaves `Open` (the id can't be reused), so it is intentionally not cleared.
+    mapping(bytes32 matchId => mapping(address agent => uint256 seatPlus1)) private fieldSeatPlus1;
+
     mapping(address attester => bool authorized) public resultAttesters;
 
     event MatchOpened(bytes32 indexed matchId, address indexed agentA, address indexed agentB, uint256 stake);
@@ -176,6 +226,14 @@ contract MatchSettlement is Ownable2Step {
     event MatchFieldSettled(bytes32 indexed matchId, bytes32 replayHash, uint256 seats);
     event MatchCancelled(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event MatchExpired(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
+    /// @dev The roster is carried in event DATA (a dynamic array can't be indexed) so an
+    ///      indexer learns the full field without a storage read; `agents.length` is the
+    ///      seat count.
+    event FieldMatchOpened(bytes32 indexed matchId, address[] agents, uint256 stake);
+    event FieldMatchFunded(bytes32 indexed matchId, address indexed agent, uint256 stake);
+    event FieldMatchReclaimed(bytes32 indexed matchId, address indexed agent, uint256 stake);
+    event FieldMatchCancelled(bytes32 indexed matchId, uint256 totalRefunded);
+    event FieldMatchExpired(bytes32 indexed matchId, uint256 totalRefunded);
     event AttesterSet(address indexed attester, bool authorized);
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
@@ -291,8 +349,8 @@ contract MatchSettlement is Ownable2Step {
         if (agentA == agentB) revert SameAgent();
         if (!registry.isRegistered(agentA)) revert AgentNotRegistered(agentA);
         if (!registry.isRegistered(agentB)) revert AgentNotRegistered(agentB);
+        _requireFreshId(matchId);
         Match storage m = matches[matchId];
-        if (m.status != Status.None) revert MatchExists();
         m.agentA = agentA;
         m.agentB = agentB;
         m.stake = stake;
@@ -458,8 +516,8 @@ contract MatchSettlement is Ownable2Step {
         if (deltas.length != n) revert LengthMismatch();
         if (replayHash == bytes32(0)) revert ZeroReplayHash();
 
+        _requireFreshId(matchId);
         Match storage m = matches[matchId];
-        if (m.status != Status.None) revert MatchExists();
 
         // Validate the entire vector first (CEI: no effects, no reputation write until the
         // whole field is proven well-formed). `cap` is a safe cast — `setMaxRatingDelta`
@@ -526,6 +584,116 @@ contract MatchSettlement is Ownable2Step {
         emit MatchExpired(matchId, refundA, refundB);
     }
 
+    /// @notice Open a fresh N-seat field-wager escrow over a roster of 2..=`MAX_FIELD`
+    ///         registered, DISTINCT agents with a uniform per-seat `stake` (0 for a
+    ///         no-escrow field). Attester-gated: the match service declares the roster and
+    ///         the agreed stake; each agent then consents by funding its own seat
+    ///         (`fundField`). The N-seat analog of `openMatch` — the fixed `agentA/agentB`
+    ///         become an arbitrary roster, the two `aFunded/bFunded` flags a `fundedBits`
+    ///         word. `matchId` is single-use across all entrypoints (`_requireFreshId`).
+    ///
+    ///         Roster integrity is enforced before the match is recorded (a revert unwinds
+    ///         every partial write): the field must be 2..=`MAX_FIELD` seats
+    ///         (`FieldTooSmall` rejects empty/singleton, `FieldTooLarge` the gas bound),
+    ///         and every agent must be registered (`AgentNotRegistered`) and DISTINCT
+    ///         (`DuplicateAgent`) — a duplicate seat would double-fund/double-refund one
+    ///         identity and corrupt the per-seat accounting. Distinctness is O(n) via
+    ///         `fieldSeatPlus1` (guaranteed empty for a fresh id), not an O(n^2) scan.
+    function openFieldMatch(bytes32 matchId, address[] calldata agents, uint256 stake) external onlyAttester {
+        uint256 n = agents.length;
+        if (n < 2) revert FieldTooSmall();
+        if (n > MAX_FIELD) revert FieldTooLarge();
+        _requireFreshId(matchId);
+
+        // The seat map doubles as the distinctness check: a fresh id has an empty map (the
+        // fence guarantees the id was never opened), so a repeat agent reads a non-zero
+        // seat. Writing it during validation is safe — a later revert unwinds it all.
+        for (uint256 i = 0; i < n; i++) {
+            address a = agents[i];
+            if (!registry.isRegistered(a)) revert AgentNotRegistered(a);
+            if (fieldSeatPlus1[matchId][a] != 0) revert DuplicateAgent(a);
+            fieldSeatPlus1[matchId][a] = i + 1;
+        }
+
+        FieldMatch storage fm = fieldMatches[matchId];
+        fm.agents = agents;
+        fm.stake = stake;
+        fm.status = Status.Open;
+        // Same checked, bounded freeze as `openMatch` (block.timestamp + <=30 days).
+        fm.deadline = uint64(block.timestamp) + settleWindow;
+        emit FieldMatchOpened(matchId, agents, stake);
+    }
+
+    /// @notice Fund the caller's own seat of an open field-wager match. O(1): the seat is
+    ///         looked up in `fieldSeatPlus1`, which also proves membership (a non-member
+    ///         reverts `NotParticipant`); fundable exactly once (`AlreadyFunded`). The
+    ///         funded bit is set BEFORE the token pull (CEI), so a reentrant token can
+    ///         neither double-fund nor be double-charged. No payer parameter — an agent
+    ///         only ever funds, and is only ever charged for, its OWN seat.
+    function fundField(bytes32 matchId) external {
+        FieldMatch storage fm = fieldMatches[matchId];
+        if (fm.status != Status.Open) revert MatchNotOpen();
+        if (fm.stake == 0) revert NoWager();
+        uint256 seatPlus1 = fieldSeatPlus1[matchId][msg.sender];
+        if (seatPlus1 == 0) revert NotParticipant();
+        uint256 bit = 1 << (seatPlus1 - 1);
+        if (fm.fundedBits & bit != 0) revert AlreadyFunded();
+        fm.fundedBits |= bit;
+        token.safeTransferFrom(msg.sender, address(this), fm.stake);
+        emit FieldMatchFunded(matchId, msg.sender, fm.stake);
+    }
+
+    /// @notice Reclaim the caller's own stake while NO peer seat has funded — the N-seat
+    ///         no-show self-rescue, the exact analog of the 1v1 `reclaim`. Permitted only
+    ///         while the caller is the SOLE funder (`fundedBits == caller's bit`); once any
+    ///         peer has also funded the field is live and only `cancelFieldMatch` (attester)
+    ///         or `refundFieldExpired` (deadline) can release it. Clears the caller's bit
+    ///         before refunding (CEI); the match stays `Open` and re-fundable.
+    function reclaimField(bytes32 matchId) external {
+        FieldMatch storage fm = fieldMatches[matchId];
+        if (fm.status != Status.Open) revert MatchNotOpen();
+        uint256 seatPlus1 = fieldSeatPlus1[matchId][msg.sender];
+        if (seatPlus1 == 0) revert NotParticipant();
+        uint256 bit = 1 << (seatPlus1 - 1);
+        if (fm.fundedBits & bit == 0) revert NotFunded();
+        if (fm.fundedBits != bit) revert OpponentFunded();
+        fm.fundedBits &= ~bit;
+        token.safeTransfer(msg.sender, fm.stake);
+        emit FieldMatchReclaimed(matchId, msg.sender, fm.stake);
+    }
+
+    /// @notice Void an open field-wager match and refund EVERY funded seat — the N-seat
+    ///         analog of `cancelMatch`, for a field that cannot produce a result (or a
+    ///         no-show no one self-`reclaimField`ed). Attester-gated. Records no reputation
+    ///         and commits no replay. Flips to `Cancelled` and clears `fundedBits` before
+    ///         any refund (CEI, via `_refundField`).
+    function cancelFieldMatch(bytes32 matchId) external onlyAttester {
+        FieldMatch storage fm = fieldMatches[matchId];
+        if (fm.status != Status.Open) revert MatchNotOpen();
+        uint256 refunded = _refundField(fm, Status.Cancelled);
+        emit FieldMatchCancelled(matchId, refunded);
+    }
+
+    /// @notice Permissionless self-refund of an open field-wager match the attester has not
+    ///         resolved by its `deadline` — the N-seat analog of `refundExpired`. Callable
+    ///         by anyone once `block.timestamp >= deadline`; every refund goes to a funded
+    ///         roster member (never the caller), so there is no griefing incentive and no
+    ///         need to gate the caller. Behaves exactly like `cancelFieldMatch` (full
+    ///         refund, no result), resolving to the distinct `Expired` state.
+    function refundFieldExpired(bytes32 matchId) external {
+        FieldMatch storage fm = fieldMatches[matchId];
+        if (fm.status != Status.Open) revert MatchNotOpen();
+        if (block.timestamp < fm.deadline) revert NotExpired();
+        uint256 refunded = _refundField(fm, Status.Expired);
+        emit FieldMatchExpired(matchId, refunded);
+    }
+
+    /// @notice The seat-ordered roster of a field-wager match — the auto getter for
+    ///         `fieldMatches` omits the dynamic array. Empty for an unknown id.
+    function fieldRoster(bytes32 matchId) external view returns (address[] memory) {
+        return fieldMatches[matchId].agents;
+    }
+
     /// @dev Shared void-and-refund mechanics for `cancelMatch` and `refundExpired`: flip
     ///      to the given terminal `status` and clear the funded flags BEFORE refunding
     ///      (checks-effects-interactions), so neither path can double-refund a stake nor
@@ -544,6 +712,41 @@ contract MatchSettlement is Ownable2Step {
         m.bFunded = false;
         if (refundA != 0) token.safeTransfer(m.agentA, refundA);
         if (refundB != 0) token.safeTransfer(m.agentB, refundB);
+    }
+
+    /// @dev The single-use id claim shared by ALL three openers (`openMatch`,
+    ///      `settleField`, `openFieldMatch`). A `matchId` is at most ONE record: a 1v1 /
+    ///      field-settle slot lives in `matches`, a field-wager slot in `fieldMatches`, and
+    ///      a fresh id must be untouched in BOTH — so a field-wager id can never also be a
+    ///      1v1 (or `settleField`) id, nor vice-versa. Reverts `MatchExists` on any prior
+    ///      use, before any state write. Each resolution path then reads only its own
+    ///      mapping's `status`, so the two record kinds can never cross-contaminate.
+    function _requireFreshId(bytes32 matchId) private view {
+        if (matches[matchId].status != Status.None) revert MatchExists();
+        if (fieldMatches[matchId].status != Status.None) revert MatchExists();
+    }
+
+    /// @dev Shared void-and-refund mechanics for `cancelFieldMatch` and
+    ///      `refundFieldExpired`: snapshot the funded set, flip to the terminal `status`
+    ///      and clear `fundedBits` BEFORE any transfer (checks-effects-interactions), then
+    ///      pay each funded seat its `stake` back over the roster (O(n), bounded by
+    ///      `MAX_FIELD`). Neither path can double-refund a seat nor be reentered to drain
+    ///      another (a reentrant token re-enters a non-`Open` match and reverts), and a
+    ///      voided field can never later settle. Returns the total refunded to event. One
+    ///      helper for both paths so their refund logic can never drift apart.
+    function _refundField(FieldMatch storage fm, Status terminal) private returns (uint256 totalRefunded) {
+        uint256 stake = fm.stake;
+        uint256 bits = fm.fundedBits;
+        address[] storage roster = fm.agents;
+        uint256 n = roster.length;
+        fm.status = terminal;
+        fm.fundedBits = 0;
+        for (uint256 i = 0; i < n; i++) {
+            if (bits & (1 << i) != 0) {
+                totalRefunded += stake;
+                token.safeTransfer(roster[i], stake);
+            }
+        }
     }
 
     /// @dev Shared decisive-settlement mechanics for the fixed `settle` and the variable

@@ -87,6 +87,19 @@
         "type": "bytes32"
       }
     ],
+    "name": "cancelFieldMatch",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
     "name": "cancelMatch",
     "outputs": [],
     "stateMutability": "nonpayable",
@@ -100,7 +113,73 @@
         "type": "bytes32"
       }
     ],
+    "name": "fieldMatches",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "stake",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "fundedBits",
+        "type": "uint256"
+      },
+      {
+        "internalType": "enum MatchSettlement.Status",
+        "name": "status",
+        "type": "uint8"
+      },
+      {
+        "internalType": "uint64",
+        "name": "deadline",
+        "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
+    "name": "fieldRoster",
+    "outputs": [
+      {
+        "internalType": "address[]",
+        "name": "",
+        "type": "address[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
     "name": "fund",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
+    "name": "fundField",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -185,6 +264,29 @@
         "type": "bytes32"
       },
       {
+        "internalType": "address[]",
+        "name": "agents",
+        "type": "address[]"
+      },
+      {
+        "internalType": "uint256",
+        "name": "stake",
+        "type": "uint256"
+      }
+    ],
+    "name": "openFieldMatch",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
         "internalType": "address",
         "name": "agentA",
         "type": "address"
@@ -252,7 +354,33 @@
         "type": "bytes32"
       }
     ],
+    "name": "reclaimField",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
     "name": "refundExpired",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
+    "name": "refundFieldExpired",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -542,6 +670,119 @@
       }
     ],
     "name": "AttesterSet",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "totalRefunded",
+        "type": "uint256"
+      }
+    ],
+    "name": "FieldMatchCancelled",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "totalRefunded",
+        "type": "uint256"
+      }
+    ],
+    "name": "FieldMatchExpired",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "agent",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "stake",
+        "type": "uint256"
+      }
+    ],
+    "name": "FieldMatchFunded",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": false,
+        "internalType": "address[]",
+        "name": "agents",
+        "type": "address[]"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "stake",
+        "type": "uint256"
+      }
+    ],
+    "name": "FieldMatchOpened",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "agent",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "stake",
+        "type": "uint256"
+      }
+    ],
+    "name": "FieldMatchReclaimed",
     "type": "event"
   },
   {
