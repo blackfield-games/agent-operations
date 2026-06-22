@@ -556,6 +556,20 @@ pub struct Blocker {
     pub min: Vec2,
     /// The high corner: the maximum on each axis.
     pub max: Vec2,
+    /// The wall's top, in position units (see [`POSITION_SCALE`]): the box rises from
+    /// the ground (`z == 0`) to this height. `0` (the `serde(default)`) is an
+    /// INFINITELY-TALL wall — it occludes any sightline crossing its footprint,
+    /// byte-identical to every pre-height blocker — so a record written before this
+    /// field deserializes to the historical behavior. A positive value bounds the wall
+    /// vertically: a sightline that passes OVER the top (both ends, and the crossing,
+    /// above `height`) is no longer occluded, so a pawn high enough (mid-jump, with
+    /// [`Rules::vertical_hit_tolerance`] gating the shot) can see and shoot over low
+    /// cover. Height bounds SIGHT only in this cut — movement and a clean projectile's
+    /// travel still treat every wall as full-height (you cannot yet walk or arc a
+    /// shot over a low wall); both are follow-ups. The field is folded into
+    /// [`digest`](ReplayRecord::digest), so a tampered height yields a different hash.
+    #[serde(default)]
+    pub height: i32,
 }
 
 /// What a collectible world pickup grants the pawn that reaches it. The reference
@@ -662,8 +676,9 @@ impl ReplayRecord {
         let mut h = Keccak256::new();
         // v2 folded in the static `blockers` set; v3 folds in the static `pickups`
         // set; v4 folds in the `rules_commit` (the combat tuning); v5 folds in the
-        // `config` DETERMINANTS (arena bounds + tick cap). The bump is honest about
-        // each encoding change. Blockers are physical cover now (they stop movement
+        // `config` DETERMINANTS (arena bounds + tick cap); v6 folds each blocker's
+        // `height` (the z-extent that bounds vision occlusion). The bump is honest
+        // about each encoding change. Blockers are physical cover now (they stop movement
         // and fire, which a re-run DOES reproduce), but their VISION effect still
         // cannot be bound by re-execution alone — outcomes never reveal what a seat
         // perceived — so committing the geometry here is what pins a match's
@@ -675,7 +690,7 @@ impl ReplayRecord {
         // outcome yet, like the rules, rode only on the parent `MatchRecord.config`.
         // Folding them all keeps the digest a complete, self-identifying commitment to
         // the match world, the rules, AND the arena it ran under.
-        h.update(b"blackfield/arena/replay/v5");
+        h.update(b"blackfield/arena/replay/v6");
         h.update(self.protocol_version.to_be_bytes());
         h.update(self.match_id.as_bytes());
         h.update(self.seed.to_be_bytes());
@@ -692,6 +707,7 @@ impl ReplayRecord {
             h.update(b.min.y.to_be_bytes());
             h.update(b.max.x.to_be_bytes());
             h.update(b.max.y.to_be_bytes());
+            h.update(b.height.to_be_bytes());
         }
         h.update((self.pickups.len() as u32).to_be_bytes());
         for p in &self.pickups {
@@ -1552,11 +1568,11 @@ mod tests {
     fn replay_digest_golden() {
         // A fixed record must hash to a fixed value. Any change to the canonical
         // encoding (field order, prefixing, domain tag, the v2 blockers / v3 pickups /
-        // v4 rules_commit / v5 config-determinant sections) flips this — the hard
-        // byte-stability pin for on-chain attestation.
+        // v4 rules_commit / v5 config-determinant / v6 blocker-height sections) flips
+        // this — the hard byte-stability pin for on-chain attestation.
         assert_eq!(
             hex::encode(sample_replay().digest()),
-            "d8629dc300a459192a2d6c7ca72a4763c8f70416283ec4e5f29d084185ccb4c0"
+            "b5af35731ce5cfd34bc3e8774e575f5929bc5bc6a59555255dc881722e4f46c0"
         );
     }
 
@@ -1582,14 +1598,21 @@ mod tests {
         // An added vision blocker -> different commitment: the perception geometry
         // is bound even though it does not alter the re-run outcome (FM1).
         let mut r = sample_replay();
-        r.blockers.push(Blocker { min: Vec2 { x: 1, y: 2 }, max: Vec2 { x: 3, y: 4 } });
+        r.blockers.push(Blocker { min: Vec2 { x: 1, y: 2 }, max: Vec2 { x: 3, y: 4 }, height: 0 });
         assert_ne!(base, r.digest(), "a blocker must bind");
         // A moved blocker corner -> different commitment.
         let mut r = sample_replay();
-        r.blockers.push(Blocker { min: Vec2 { x: 1, y: 2 }, max: Vec2 { x: 3, y: 4 } });
+        r.blockers.push(Blocker { min: Vec2 { x: 1, y: 2 }, max: Vec2 { x: 3, y: 4 }, height: 0 });
         let with_blocker = r.digest();
         r.blockers[0].max.x += 1;
         assert_ne!(with_blocker, r.digest(), "a blocker's geometry must bind");
+        // A changed blocker height -> different commitment (v6): the z-extent that
+        // bounds vision occlusion is a determinant, so a tampered height is caught.
+        let mut r = sample_replay();
+        r.blockers.push(Blocker { min: Vec2 { x: 1, y: 2 }, max: Vec2 { x: 3, y: 4 }, height: 0 });
+        let infinite = r.digest();
+        r.blockers[0].height = 5000;
+        assert_ne!(infinite, r.digest(), "a blocker's height must bind");
         // An added pickup -> different commitment: the item layout is bound (v3), the
         // same role blockers play — an uncollected pickup is invisible to re-execution.
         let mut r = sample_replay();
@@ -1716,7 +1739,7 @@ mod tests {
         let start = serde_json::json!({
             "type": "start", "match_id": FIXED_MATCH,
             "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 },
-            "blockers": [ { "min": { "x": -1000, "y": -2000 }, "max": { "x": 1000, "y": 2000 } } ],
+            "blockers": [ { "min": { "x": -1000, "y": -2000 }, "max": { "x": 1000, "y": 2000 }, "height": 2000 } ],
             "pickup_points": [ { "x": 1500, "y": 0 }, { "x": -1500, "y": 0 } ]
         });
         assert_round::<GatewayMsg>(&start, "GatewayMsg::Start");

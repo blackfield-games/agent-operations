@@ -2909,9 +2909,12 @@ pub struct ParityVectors {
 /// them); bumped to v3 when the replay digest began committing the `MatchConfig`
 /// determinants (arena bounds + tick cap); bumped to v4 for z-coupled combat — the
 /// gated [`Rules::vertical_hit_tolerance`] widened `canonical_encoding` (so every
-/// committed match hash moved) and a new `vertical_hits` category pins the rule. Each
-/// is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v4";
+/// committed match hash moved) and a new `vertical_hits` category pins the rule;
+/// bumped to v5 when blockers gained a `height` (the replay digest folds it at tag
+/// v6, moving every committed match hash, and a positive height bounds vision
+/// occlusion so a pawn high enough sees over low cover). Each is a deliberate
+/// convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v5";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -3286,10 +3289,10 @@ pub fn parity_vectors() -> ParityVectors {
     let default = Rules::default();
     let (range, radius) = (default.weapon_range, default.hit_radius);
     let jittered = Rules { spawn_radius: 20 * POSITION_SCALE, spawn_jitter: 2 * POSITION_SCALE, ..Default::default() };
-    let wall = Blocker { min: Vec2 { x: 8_000, y: 800 }, max: Vec2 { x: 12_000, y: 2_200 } };
+    let wall = Blocker { min: Vec2 { x: 8_000, y: 800 }, max: Vec2 { x: 12_000, y: 2_200 }, height: 0 };
     // A wall astride the +X axis between origin and 10 m, the physical-cover
     // occluder the movement/hitscan/projectile cases fire against.
-    let east_wall = Blocker { min: Vec2 { x: 4_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 } };
+    let east_wall = Blocker { min: Vec2 { x: 4_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 }, height: 0 };
 
     ParityVectors {
         domain: PARITY_VECTORS_DOMAIN.to_string(),
@@ -3325,10 +3328,10 @@ pub fn parity_vectors() -> ParityVectors {
             move_case("alongside_wall_allowed", Vec2::ZERO, Vec2 { x: 0, y: MOVE_INTENT_SCALE }, 5 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![east_wall]),
             // A 20 m/tick step over a ZERO-width wall is still stopped — a point test
             // at the destination (past the wall) would tunnel; the swept test catches it.
-            move_case("fast_step_no_tunnel", Vec2::ZERO, Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, 20 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![Blocker { min: Vec2 { x: 5_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 } }]),
+            move_case("fast_step_no_tunnel", Vec2::ZERO, Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, 20 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![Blocker { min: Vec2 { x: 5_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 }, height: 0 }]),
             // Spawned INSIDE a wall, a pawn can still step out (start-containment
             // exemption) — the seed-spawn-in-cover safety valve, no trap.
-            move_case("spawn_in_wall_escapes", Vec2::ZERO, Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, 5 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![Blocker { min: Vec2 { x: -2_000, y: -2_000 }, max: Vec2 { x: 2_000, y: 2_000 } }]),
+            move_case("spawn_in_wall_escapes", Vec2::ZERO, Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, 5 * POSITION_SCALE, Vec2 { x: 50_000, y: 50_000 }, vec![Blocker { min: Vec2 { x: -2_000, y: -2_000 }, max: Vec2 { x: 2_000, y: 2_000 }, height: 0 }]),
         ],
         hits: vec![
             hit_case("dead_on_octant", Vec2::ZERO, EAST, Vec2 { x: 10 * POSITION_SCALE, y: 0 }, range, radius, vec![], AimMode::Octant),
@@ -3353,7 +3356,7 @@ pub fn parity_vectors() -> ParityVectors {
             // A target IN FRONT of a wall is still hit on the same swept step that also
             // reaches the wall — the shot resolves the body first, so cover behind the
             // target gives it nothing (a wall-first twin would wrongly absorb the shot).
-            projectile_case("pawn_in_front_of_wall_is_hit", Vec2::ZERO, EAST, Vec2 { x: 3 * POSITION_SCALE, y: 0 }, 5 * POSITION_SCALE, range, radius, vec![Blocker { min: Vec2 { x: 3_200, y: -2_000 }, max: Vec2 { x: 4_000, y: 2_000 } }]),
+            projectile_case("pawn_in_front_of_wall_is_hit", Vec2::ZERO, EAST, Vec2 { x: 3 * POSITION_SCALE, y: 0 }, 5 * POSITION_SCALE, range, radius, vec![Blocker { min: Vec2 { x: 3_200, y: -2_000 }, max: Vec2 { x: 4_000, y: 2_000 }, height: 0 }]),
         ],
         vertical_hits: vec![
             // Tolerance off: z is ignored, so a target 5 m up is hit exactly as on the
@@ -3419,7 +3422,7 @@ mod tests {
         // The accessor is the source the harness fills GatewayMsg::Start.blockers
         // from, so it must return EXACTLY the set the match runs under — the FM3
         // exact-geometry pin (an agent must never path against a phantom map).
-        let wall = Blocker { min: Vec2 { x: 4_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 } };
+        let wall = Blocker { min: Vec2 { x: 4_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 }, height: 0 };
         let m = Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), vec![wall], 1);
         assert_eq!(m.blockers(), &[wall]);
 
@@ -4002,7 +4005,7 @@ mod tests {
     }
 
     fn box_of(min: (i32, i32), max: (i32, i32)) -> Blocker {
-        Blocker { min: Vec2 { x: min.0, y: min.1 }, max: Vec2 { x: max.0, y: max.1 } }
+        Blocker { min: Vec2 { x: min.0, y: min.1 }, max: Vec2 { x: max.0, y: max.1 }, height: 0 }
     }
 
     #[test]
@@ -4124,6 +4127,7 @@ mod tests {
         let wall = Blocker {
             min: Vec2 { x: 9 * POSITION_SCALE, y: -2 * POSITION_SCALE },
             max: Vec2 { x: 11 * POSITION_SCALE, y: 2 * POSITION_SCALE },
+            height: 0,
         };
         let make = |blockers: Vec<Blocker>| {
             let rules = Rules { perception_range: 100 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
@@ -4163,6 +4167,7 @@ mod tests {
         let wall = Blocker {
             min: Vec2 { x: 9 * POSITION_SCALE, y: -2 * POSITION_SCALE },
             max: Vec2 { x: 11 * POSITION_SCALE, y: 2 * POSITION_SCALE },
+            height: 0,
         };
         let rules = Rules {
             perception_range: 100 * POSITION_SCALE,
@@ -4208,6 +4213,7 @@ mod tests {
         let wall = Blocker {
             min: Vec2 { x: -500, y: -3 * POSITION_SCALE },
             max: Vec2 { x: 500, y: 3 * POSITION_SCALE },
+            height: 0,
         };
         let rules = Rules {
             spawn_radius: 2 * POSITION_SCALE,
@@ -4607,6 +4613,7 @@ mod tests {
         let around_spawn0 = Blocker {
             min: Vec2 { x: -3 * POSITION_SCALE, y: -POSITION_SCALE },
             max: Vec2 { x: -POSITION_SCALE, y: POSITION_SCALE },
+            height: 0,
         };
         let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![around_spawn0], 1);
         let spawn0 = m.pawns.iter().find(|p| p.seat == 0).unwrap().pos;
@@ -4627,7 +4634,7 @@ mod tests {
         // implementations agree on what a path crosses, and it exempts ONLY the start
         // corner (a body leaving a wall it is in) — never the destination, so a step
         // that would END inside a wall is still refused.
-        let wall = Blocker { min: Vec2 { x: 5000, y: -2000 }, max: Vec2 { x: 6000, y: 2000 } };
+        let wall = Blocker { min: Vec2 { x: 5000, y: -2000 }, max: Vec2 { x: 6000, y: 2000 }, height: 0 };
         let o = Vec2::ZERO;
         assert!(path_hits_blocker(&[wall], o, Vec2 { x: 10_000, y: 0 }), "dead-centre through the wall is blocked");
         assert!(!path_hits_blocker(&[wall], o, Vec2 { x: 3_000, y: 0 }), "a path short of the wall is clear");
@@ -4641,7 +4648,7 @@ mod tests {
         assert!(blocker_contains(&wall, inside), "the start point is genuinely inside the wall");
         assert!(!path_hits_blocker(&[wall], inside, Vec2 { x: 10_000, y: 0 }), "a path starting inside the wall is exempt");
         // ...but a DIFFERENT wall ahead still stops a path that left the first.
-        let ahead = Blocker { min: Vec2 { x: 8000, y: -2000 }, max: Vec2 { x: 9000, y: 2000 } };
+        let ahead = Blocker { min: Vec2 { x: 8000, y: -2000 }, max: Vec2 { x: 9000, y: 2000 }, height: 0 };
         assert!(path_hits_blocker(&[wall, ahead], inside, Vec2 { x: 10_000, y: 0 }), "a wall ahead still stops a path that left another");
     }
 
@@ -4651,7 +4658,7 @@ mod tests {
         // crosses a wall is refused (the pawn holds, velocity zero); the SAME step
         // with no wall advances by max_speed, so the wall is load-bearing and the
         // no-blocker path is unchanged.
-        let wall = Blocker { min: Vec2 { x: 50, y: -2 * POSITION_SCALE }, max: Vec2 { x: 150, y: 2 * POSITION_SCALE } };
+        let wall = Blocker { min: Vec2 { x: 50, y: -2 * POSITION_SCALE }, max: Vec2 { x: 150, y: 2 * POSITION_SCALE }, height: 0 };
         let east = intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false);
         let place = |blockers: Vec<Blocker>| {
             let rules = Rules { spawn_jitter: 0, ..Default::default() };
@@ -4682,7 +4689,7 @@ mod tests {
             m.pawns[1].pos = Vec2 { x: 5 * POSITION_SCALE, y: 0 };
             m
         };
-        let wall = Blocker { min: Vec2 { x: -500, y: -2 * POSITION_SCALE }, max: Vec2 { x: 500, y: 2 * POSITION_SCALE } };
+        let wall = Blocker { min: Vec2 { x: -500, y: -2 * POSITION_SCALE }, max: Vec2 { x: 500, y: 2 * POSITION_SCALE }, height: 0 };
         let mut walled = place(vec![wall]);
         let hp = walled.pawns[1].health;
         step_with(&mut walled, &[(0, intent(Vec2::ZERO, EAST, true))]);
@@ -4698,7 +4705,7 @@ mod tests {
         // FM3: a fast projectile whose single swept step jumps a THIN wall is still
         // absorbed (no tunnel) and a target behind the wall is never hit; a target IN
         // FRONT of the same wall is hit on that step — cover behind it shields nothing.
-        let thin = Blocker { min: Vec2 { x: 5 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 5 * POSITION_SCALE, y: 2 * POSITION_SCALE } };
+        let thin = Blocker { min: Vec2 { x: 5 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 5 * POSITION_SCALE, y: 2 * POSITION_SCALE }, height: 0 };
         let rules = Rules { weapon_mode: WeaponMode::Projectile, projectile_speed: 20 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
         let place = |target_x: i32| {
             let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![thin], 1);
@@ -4730,7 +4737,7 @@ mod tests {
         // not trapped — it steps out via the start-containment exemption — and a
         // zero-extent thin wall on the path stops the move without dividing by zero or
         // panicking the clamp.
-        let around = Blocker { min: Vec2 { x: -2 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 2 * POSITION_SCALE, y: 2 * POSITION_SCALE } };
+        let around = Blocker { min: Vec2 { x: -2 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 2 * POSITION_SCALE, y: 2 * POSITION_SCALE }, height: 0 };
         let rules = Rules { max_speed: 5 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
         let east = intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false);
         let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![around], 1);
@@ -4742,7 +4749,7 @@ mod tests {
 
         // A zero-extent thin wall (a vertical line at x = 3 m) exactly on the path:
         // the step is refused deterministically with no panic.
-        let thin = Blocker { min: Vec2 { x: 3 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 3 * POSITION_SCALE, y: 2 * POSITION_SCALE } };
+        let thin = Blocker { min: Vec2 { x: 3 * POSITION_SCALE, y: -2 * POSITION_SCALE }, max: Vec2 { x: 3 * POSITION_SCALE, y: 2 * POSITION_SCALE }, height: 0 };
         let mut d = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![thin], 1);
         d.pawns[0].pos = Vec2::ZERO;
         d.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 };
@@ -5117,7 +5124,7 @@ mod tests {
         // (a) Wall: seat 0 at (-2000,0) walks +200 to (-1800,0); the dash from there to
         // (1200,0) crosses a wall at x∈[-1000,-800], so the burst is refused and the
         // pawn holds at its post-walk position — it does NOT punch through.
-        let wall = Blocker { min: Vec2 { x: -1000, y: -2000 }, max: Vec2 { x: -800, y: 2000 } };
+        let wall = Blocker { min: Vec2 { x: -1000, y: -2000 }, max: Vec2 { x: -800, y: 2000 }, height: 0 };
         let mut m = dash_match(10, Vec2 { x: 50_000, y: 50_000 }, vec![wall], 1);
         assert_eq!(m.pawns[0].pos, Vec2 { x: -2000, y: 0 }, "seat 0 spawns at -spawn_radius");
         step_with(&mut m, &[(0, dash_intent(east))]);
@@ -5234,7 +5241,7 @@ mod tests {
         let ne = Vec2 { x: 600, y: 800 }; // mag 1000 -> dx=120, dy=160 at max_speed 200
         // A tall vertical wall east of the origin: it refuses the eastward component but
         // never the pure-north one.
-        let east_wall = Blocker { min: Vec2 { x: 100, y: -5000 }, max: Vec2 { x: 300, y: 5000 } };
+        let east_wall = Blocker { min: Vec2 { x: 100, y: -5000 }, max: Vec2 { x: 300, y: 5000 }, height: 0 };
 
         // Off: the diagonal into the wall dead-stops at the origin (the historical rule).
         let mut off = slide_match(false, vec![east_wall]);
@@ -5250,7 +5257,7 @@ mod tests {
 
         // Inside corner: a wall to the east AND one to the north refuse BOTH axis-
         // separated retries, so even with wall_slide on the pawn holds at the origin.
-        let north_wall = Blocker { min: Vec2 { x: -5000, y: 100 }, max: Vec2 { x: 5000, y: 300 } };
+        let north_wall = Blocker { min: Vec2 { x: -5000, y: 100 }, max: Vec2 { x: 5000, y: 300 }, height: 0 };
         let mut corner = slide_match(true, vec![east_wall, north_wall]);
         step_with(&mut corner, &[(0, intent(ne, EAST, false))]);
         assert_eq!(corner.pawns[0].pos, Vec2::ZERO, "an inside corner (both axes refused) still full-stops");
@@ -5264,7 +5271,7 @@ mod tests {
         // identical to the pre-slide rule, and the flag is the sole load-bearing
         // difference on a block (the parity golden regenerated with zero outcome drift).
         let ne = Vec2 { x: 600, y: 800 };
-        let east_wall = Blocker { min: Vec2 { x: 100, y: -5000 }, max: Vec2 { x: 300, y: 5000 } };
+        let east_wall = Blocker { min: Vec2 { x: 100, y: -5000 }, max: Vec2 { x: 300, y: 5000 }, height: 0 };
 
         // Unobstructed: no wall, so the full diagonal applies — identical on and off.
         let mut clear_off = slide_match(false, Vec::new());
@@ -5297,7 +5304,7 @@ mod tests {
         let ne = Vec2 { x: 600, y: 800 }; // dx=120, dy=160
         // (60,80) is the midpoint of the (0,0)->(120,160) diagonal; this box straddles it
         // but lies clear of both the y=0 (X-only) and x=0 (Y-only) paths.
-        let nub = Blocker { min: Vec2 { x: 50, y: 70 }, max: Vec2 { x: 70, y: 90 } };
+        let nub = Blocker { min: Vec2 { x: 50, y: 70 }, max: Vec2 { x: 70, y: 90 }, height: 0 };
 
         let mut a = slide_match(true, vec![nub]);
         step_with(&mut a, &[(0, intent(ne, EAST, false))]);
@@ -5317,7 +5324,7 @@ mod tests {
         let ne = Vec2 { x: 600, y: 800 }; // walk dx,dy = 120,160 / dash burst = 1800,2400
         // A tall vertical wall east of the post-walk position: the walk (to x=120) clears
         // it, the dash burst (to x~1920) is refused on X, the north component is clear.
-        let east_wall = Blocker { min: Vec2 { x: 300, y: -10_000 }, max: Vec2 { x: 500, y: 10_000 } };
+        let east_wall = Blocker { min: Vec2 { x: 300, y: -10_000 }, max: Vec2 { x: 500, y: 10_000 }, height: 0 };
         let dash = |wall_slide: bool| {
             let rules = Rules { wall_slide, dash_cooldown: 5, spawn_jitter: 0, ..Default::default() };
             let cfg = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 };
@@ -5753,6 +5760,7 @@ mod tests {
         Blocker {
             min: Vec2 { x: 30 * POSITION_SCALE, y: 30 * POSITION_SCALE },
             max: Vec2 { x: 31 * POSITION_SCALE, y: 31 * POSITION_SCALE },
+            height: 0,
         }
     }
 
@@ -6172,11 +6180,11 @@ mod tests {
         // FM3: an inverted AABB (min greater than max) is geometry the sim never
         // produces; rejected as MalformedBlocker BEFORE the re-run, naming its index.
         let mut r = play_with_blockers(1, vec![off_line_blocker()]).to_record().unwrap();
-        r.replay.blockers[0] = Blocker { min: Vec2 { x: 10, y: 0 }, max: Vec2 { x: 0, y: 0 } };
+        r.replay.blockers[0] = Blocker { min: Vec2 { x: 10, y: 0 }, max: Vec2 { x: 0, y: 0 }, height: 0 };
         assert_eq!(r.verify(), Err(ReplayError::MalformedBlocker { index: 0 }), "inverted on x");
 
         let mut r = play_with_blockers(1, vec![off_line_blocker()]).to_record().unwrap();
-        r.replay.blockers[0] = Blocker { min: Vec2 { x: 0, y: 10 }, max: Vec2 { x: 0, y: 0 } };
+        r.replay.blockers[0] = Blocker { min: Vec2 { x: 0, y: 10 }, max: Vec2 { x: 0, y: 0 }, height: 0 };
         assert_eq!(r.verify(), Err(ReplayError::MalformedBlocker { index: 0 }), "inverted on y");
     }
 
@@ -6209,9 +6217,9 @@ mod tests {
         // correct result — is the assertion.
         let from = Vec2 { x: i32::MIN, y: i32::MIN };
         let to = Vec2 { x: i32::MAX, y: i32::MAX };
-        let full_height = Blocker { min: Vec2 { x: -1, y: i32::MIN }, max: Vec2 { x: 1, y: i32::MAX } };
+        let full_height = Blocker { min: Vec2 { x: -1, y: i32::MIN }, max: Vec2 { x: 1, y: i32::MAX }, height: 0 };
         assert!(segment_intersects_aabb(from, to, &full_height), "the extreme diagonal crosses a full-height slab");
-        let off = Blocker { min: Vec2 { x: i32::MIN, y: i32::MAX - 1 }, max: Vec2 { x: i32::MIN + 1, y: i32::MAX } };
+        let off = Blocker { min: Vec2 { x: i32::MIN, y: i32::MAX - 1 }, max: Vec2 { x: i32::MIN + 1, y: i32::MAX }, height: 0 };
         assert!(!segment_intersects_aabb(from, to, &off), "the diagonal misses a far extreme corner box");
     }
 
@@ -7030,7 +7038,7 @@ mod tests {
         // or arena_map("reference") shifts value and the matchmaker + any record drift.
         let m = POSITION_SCALE;
         let expected = ArenaMap {
-            blockers: vec![Blocker { min: Vec2 { x: -3 * m, y: -3 * m }, max: Vec2 { x: 3 * m, y: 3 * m } }],
+            blockers: vec![Blocker { min: Vec2 { x: -3 * m, y: -3 * m }, max: Vec2 { x: 3 * m, y: 3 * m }, height: 0 }],
             pickups: vec![
                 PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: -20 * m, y: 0 }, amount: 50 },
                 PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: 20 * m, y: 0 }, amount: 50 },
@@ -7069,7 +7077,7 @@ mod tests {
         // Serialize -> from_json reproduces the map exactly: the data-driven format
         // is the map's own serde form, so an authored map and a loaded one agree.
         let map = ArenaMap {
-            blockers: vec![Blocker { min: Vec2 { x: -3000, y: -3000 }, max: Vec2 { x: 3000, y: 3000 } }],
+            blockers: vec![Blocker { min: Vec2 { x: -3000, y: -3000 }, max: Vec2 { x: 3000, y: 3000 }, height: 0 }],
             pickups: vec![health_pickup(-20000, 0, 50), ammo_pickup(20000, 0, 30)],
         };
         let json = serde_json::to_string(&map).unwrap();
@@ -7104,13 +7112,13 @@ mod tests {
         // movement clamp; reject it. A zero-AREA blocker (min == max) is a harmless
         // point and is allowed.
         for bad in [
-            ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 10, y: 0 }, max: Vec2 { x: 0, y: 0 } }], pickups: vec![] },
-            ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 0, y: 10 }, max: Vec2 { x: 0, y: 0 } }], pickups: vec![] },
+            ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 10, y: 0 }, max: Vec2 { x: 0, y: 0 }, height: 0 }], pickups: vec![] },
+            ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 0, y: 10 }, max: Vec2 { x: 0, y: 0 }, height: 0 }], pickups: vec![] },
         ] {
             let json = serde_json::to_string(&bad).unwrap();
             assert_eq!(ArenaMap::from_json(&json), Err(ArenaMapError::DegenerateBlocker { index: 0 }), "an inverted AABB is rejected");
         }
-        let point = ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 5, y: 5 }, max: Vec2 { x: 5, y: 5 } }], pickups: vec![] };
+        let point = ArenaMap { blockers: vec![Blocker { min: Vec2 { x: 5, y: 5 }, max: Vec2 { x: 5, y: 5 }, height: 0 }], pickups: vec![] };
         let json = serde_json::to_string(&point).unwrap();
         assert!(ArenaMap::from_json(&json).is_ok(), "a zero-area point blocker (min == max) is allowed");
     }
@@ -7128,7 +7136,7 @@ mod tests {
     fn from_json_enforces_the_verify_caps_so_a_loadable_map_always_verifies() {
         // The loader caps at exactly the bounds MatchRecord::verify enforces, so a map
         // the loader accepts can never be rejected downstream. At the cap: ok; over: rejected.
-        let blocker = Blocker { min: Vec2 { x: 0, y: 0 }, max: Vec2 { x: 1, y: 1 } };
+        let blocker = Blocker { min: Vec2 { x: 0, y: 0 }, max: Vec2 { x: 1, y: 1 }, height: 0 };
         let at_cap = ArenaMap { blockers: vec![blocker; MAX_REPLAY_BLOCKERS], pickups: vec![] };
         assert!(ArenaMap::from_json(&serde_json::to_string(&at_cap).unwrap()).is_ok(), "exactly MAX_REPLAY_BLOCKERS loads");
         let over = ArenaMap { blockers: vec![blocker; MAX_REPLAY_BLOCKERS + 1], pickups: vec![] };

@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v4",
+  "domain": "blackfield/arena/parity-vectors/v5",
   "protocol_version": 1,
   "spawns": [
     {
@@ -194,7 +194,8 @@
           "max": {
             "x": 12000,
             "y": 2200
-          }
+          },
+          "height": 0
         }
       ],
       "candidates": [
@@ -269,7 +270,8 @@
           "max": {
             "x": 5000,
             "y": 2000
-          }
+          },
+          "height": 0
         }
       ],
       "end": {
@@ -302,7 +304,8 @@
           "max": {
             "x": 5000,
             "y": 2000
-          }
+          },
+          "height": 0
         }
       ],
       "end": {
@@ -335,7 +338,8 @@
           "max": {
             "x": 5000,
             "y": 2000
-          }
+          },
+          "height": 0
         }
       ],
       "end": {
@@ -368,7 +372,8 @@
           "max": {
             "x": 2000,
             "y": 2000
-          }
+          },
+          "height": 0
         }
       ],
       "end": {
@@ -469,7 +474,8 @@
           "max": {
             "x": 5000,
             "y": 2000
-          }
+          },
+          "height": 0
         }
       ],
       "aim_mode": "octant",
@@ -538,7 +544,8 @@
           "max": {
             "x": 5000,
             "y": 2000
-          }
+          },
+          "height": 0
         }
       ],
       "ticks_to_hit": null,
@@ -568,7 +575,8 @@
           "max": {
             "x": 4000,
             "y": 2000
-          }
+          },
+          "height": 0
         }
       ],
       "ticks_to_hit": 1,
@@ -883,7 +891,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "06e92d78c6d71031d0e17b67968042c5672a9bcaabbab2e21e6e6324e73fc51c"
+          "replay_hash": "3651885e936f89bce82a4ecaaa84d84a1d0d62d103d52d6856d87cb0ec533f5a"
         }
       }
     },
@@ -1095,7 +1103,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "2a945b17cd414326025936e8e51a613f85b5f43142f144e9a1c4a856be20ab30"
+          "replay_hash": "9ebefbca925d4cb08d565239af1e6ef67f475bb9f6b716f7aced9f08783a6aa9"
         }
       }
     },
@@ -1311,7 +1319,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "356a9f3235eb9481c5feebcb720d63abf596bdc41985e16e6fdd7f12d06a227b"
+          "replay_hash": "23d1d87901eb1b350d4d1f8f90c902a23f0967eda08843d927b84fd7466f3409"
         }
       }
     },
@@ -1532,7 +1540,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "5c599d85abf162048211021f210371ec4e82214fb9e1813c14f4083d3ad5a099"
+          "replay_hash": "db04d32febdabe5653174778b84fe294eb1c00d8fdf1c05fba763b9ab3686131"
         }
       }
     }
