@@ -5349,6 +5349,176 @@ mod tests {
         assert_eq!(body_json(resp).await["rearmed"], false);
     }
 
+    // -- POST /debits/redrive-all — operator bulk re-drive of all dead-lettered debits --
+
+    /// `POST /debits/redrive-all` with an optional `Authorization` header (body-less).
+    async fn post_redrive_all(state: Arc<AppState>, authorization: Option<&str>) -> axum::response::Response {
+        let mut builder = Request::builder().method("POST").uri("/debits/redrive-all");
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// FM1 (over-reach): the bulk re-drive re-arms ONLY dead-lettered, unsettled rows —
+    /// never a still-pending (already drainable) row and never a settled (paid) one. With
+    /// two dead-lettered, one settled, and one pending row present, it re-arms exactly the
+    /// two, leaves the pending row pending, and never resurrects the paid charge.
+    #[tokio::test]
+    async fn redrive_all_rearms_only_dead_lettered_unsettled_debits() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        // Two poison heads → dead-lettered.
+        let poison_a = seed_job();
+        let poison_b = seed_job();
+        settle_one_metered(&state, &poison_a).await;
+        settle_one_metered(&state, &poison_b).await;
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 2);
+
+        // One good debit → settled (the poisons are skipped, stay quarantined).
+        let good = seed_job();
+        settle_one_metered(&state, &good).await;
+        drain_debits(&state, &MockSpender::succeeding()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 2, "the poisons stay quarantined");
+
+        // One fresh debit → still pending (never drained).
+        let fresh = seed_job();
+        settle_one_metered(&state, &fresh).await;
+        assert_eq!(pending_debits(&state).await, 1, "fresh is drainable");
+
+        // Bulk re-drive: only the two dead-lettered rows match.
+        let rearmed = state.store.lock().await.redrive_all_dead_lettered_debits().unwrap();
+        assert_eq!(rearmed, 2, "exactly the two dead-lettered rows, not the pending or settled one");
+        assert_eq!(dead_lettered_debits(&state).await, 0, "both poisons re-armed");
+        assert_eq!(pending_debits(&state).await, 3, "the two re-armed poisons joined the fresh pending row");
+
+        // The settled `good` was untouched: a succeeding drain settles exactly the 3
+        // pending rows and never re-charges the paid one.
+        let good_hex = eas::job_id_hex(&good.id);
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender).await;
+        assert_eq!(spender.calls(), 3, "the 3 pending rows, not the settled good");
+        assert!(!spender.spent().contains(&good_hex), "the paid charge is never re-driven");
+    }
+
+    /// FM2 (auth): the bulk re-drive is a privileged mass-recovery action — a missing,
+    /// blank, or wrong bearer token is `401` and re-arms NOTHING; the correct token
+    /// re-arms the whole set (`200 {"rearmed": 2}`).
+    #[tokio::test]
+    async fn redrive_all_endpoint_rejects_unauthenticated_and_accepts_the_token() {
+        let state = test_state_metered_with_token(TEST_INGEST_TOKEN).await;
+        let a = seed_job();
+        let b = seed_job();
+        settle_one_metered(&state, &a).await;
+        settle_one_metered(&state, &b).await;
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 2);
+
+        // Missing / blank / wrong token → 401, nothing re-armed.
+        assert_eq!(post_redrive_all(state.clone(), None).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_redrive_all(state.clone(), Some("Bearer ")).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_redrive_all(state.clone(), Some("Bearer wrong-token")).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_debits(&state).await, 2, "every unauthenticated bulk re-drive re-armed nothing");
+
+        // Correct token → 200 {"rearmed": 2}.
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_redrive_all(state.clone(), Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], 2);
+        assert_eq!(dead_lettered_debits(&state).await, 0, "the authenticated bulk re-drive re-armed both");
+        assert_eq!(pending_debits(&state).await, 2);
+    }
+
+    /// FM3 (no double-charge): every bulk-re-armed row settles AT MOST ONCE under the
+    /// next drain, and a second bulk re-drive after they settle charges nothing — the
+    /// off-chain `tx_hash IS NULL` guard plus the on-chain `spendOnce` fence hold across
+    /// the whole re-armed set.
+    #[tokio::test]
+    async fn redrive_all_then_drain_settles_each_re_armed_debit_exactly_once() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let jobs: Vec<JobSpec> = (0..3).map(|_| seed_job()).collect();
+        for j in &jobs {
+            settle_one_metered(&state, j).await;
+        }
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 3);
+
+        // Bulk re-drive after the broad cause is fixed, then drain once.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 3);
+        assert_eq!(pending_debits(&state).await, 3);
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender).await;
+        assert_eq!(spender.calls(), 3);
+        let mut spent = spender.spent();
+        spent.sort();
+        let mut want: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
+        want.sort();
+        assert_eq!(spent, want, "each re-armed debit settles exactly once");
+        assert_eq!(pending_debits(&state).await, 0);
+        assert_eq!(dead_lettered_debits(&state).await, 0);
+
+        // A second bulk re-drive once settled re-arms nothing, and a further drain charges nothing.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 0, "all settled — nothing to re-arm");
+        let spender2 = MockSpender::succeeding();
+        drain_debits(&state, &spender2).await;
+        assert_eq!(spender2.calls(), 0, "no second charge on a double bulk call");
+    }
+
+    /// FM4 (zero / still-failing): a bulk re-drive with no dead-lettered rows is a clean
+    /// `rearmed: 0` (not an error); and if the broad cause is NOT actually fixed the
+    /// re-armed rows simply re-dead-letter on the next drain — one attempt each, never a
+    /// hot loop, and not auto-re-claimed afterward.
+    #[tokio::test]
+    async fn redrive_all_is_zero_when_empty_and_re_dead_letters_if_still_failing() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+
+        // Zero case: nothing dead-lettered → rearmed 0, no error.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 0);
+
+        // Two dead-lettered rows.
+        let a = seed_job();
+        let b = seed_job();
+        settle_one_metered(&state, &a).await;
+        settle_one_metered(&state, &b).await;
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 2);
+
+        // Bulk re-drive, but the cause is still present → both re-dead-letter (one attempt each).
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 2);
+        let spender = MockSpender::permanent();
+        drain_debits(&state, &spender).await;
+        assert_eq!(spender.calls(), 2, "one more attempt per row — not a hot loop");
+        assert_eq!(dead_lettered_debits(&state).await, 2, "re-dead-lettered, not dropped");
+        assert_eq!(pending_debits(&state).await, 0);
+
+        // Not auto-re-claimed: a succeeding drain claims nothing until the next explicit bulk re-drive.
+        let spender2 = MockSpender::succeeding();
+        drain_debits(&state, &spender2).await;
+        assert_eq!(spender2.calls(), 0, "a re-dead-lettered set is not auto-re-claimed");
+        assert_eq!(dead_lettered_debits(&state).await, 2);
+    }
+
+    /// The bulk endpoint mirrors `POST /jobs`' unconfigured-open posture: with no token a
+    /// bulk re-drive needs no auth, and the empty no-op is a clean `200 {"rearmed": 0}`.
+    #[tokio::test]
+    async fn redrive_all_endpoint_open_and_idempotent_without_token() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await; // no token configured
+        assert!(state.ingest_token.is_none());
+        let job = seed_job();
+        dead_letter_one(&state, &job).await;
+
+        // Open: a bulk re-drive with no auth re-arms the dead-lettered debit.
+        let resp = post_redrive_all(state.clone(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], 1);
+        assert_eq!(pending_debits(&state).await, 1);
+
+        // Idempotent: a second bulk re-drive (nothing dead-lettered now) is 200 {"rearmed": 0}.
+        let resp = post_redrive_all(state.clone(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], 0);
+    }
+
     // -- GET /debits/dead-lettered — operator listing of quarantined debits --------
 
     /// A GET with an optional `Authorization` header.
