@@ -35,14 +35,21 @@ interface IAgentRegistry {
 ///           (`msg.sender`, no payer parameter), and an agent whose opponent never
 ///           funds can `reclaim` without involving the attester. Reputation, by
 ///           contrast, an agent can never move itself — only this contract (an
-///           authorized AgentRegistry writer) does, and only by a fixed owner-set
-///           magnitude, so the attester decides WHO won, never HOW MUCH standing
-///           moves.
+///           authorized AgentRegistry writer) does. The fixed `settle`/`settleDraw`
+///           move a fixed owner-set magnitude (the attester names only WHO won). The
+///           variable `settleRanked`/`settleDrawRanked` (inert until the owner sets a
+///           `maxRatingDelta` cap) let the attester ALSO supply the skill-scaled Elo
+///           magnitude the off-chain rating curve computed — but BOUNDED by that cap,
+///           so it can scale standing within an owner-set ceiling, never inflate it
+///           arbitrarily. WHO wins is always the attester's to name; HOW MUCH is either
+///           fixed or attester-chosen within a cap — never unbounded.
 ///
 ///         Idempotency: a `matchId` (the arena match UUID) is single-use. `openMatch`
-///         requires a fresh slot, and every resolution (`settle` / `settleDraw` /
-///         `cancelMatch`) requires the match is still `Open`, flipping it to a
-///         terminal state BEFORE any external call (checks-effects-interactions). A
+///         requires a fresh slot, and every resolution (`settle` / `settleRanked` /
+///         `settleDraw` / `settleDrawRanked` / `cancelMatch` / `refundExpired`)
+///         requires the match is still `Open`, flipping it to a terminal state BEFORE
+///         any external call (checks-effects-interactions) — the variable paths inherit
+///         the fence by sharing the same internal mechanics as the fixed ones. A
 ///         replayed settlement is therefore rejected, not a double-pay or a
 ///         double-count — the same per-id fence as `ComputeMeter.spendOnce`.
 contract MatchSettlement is Ownable2Step {
@@ -101,6 +108,23 @@ contract MatchSettlement is Ownable2Step {
     ///         magnitude, so it can never inflate an agent's standing arbitrarily.
     uint256 public reputationDelta;
 
+    /// @notice The cap on the MAGNITUDE of a variable reputation delta supplied to
+    ///         `settleRanked`/`settleDrawRanked` — the bound that keeps the attester's
+    ///         per-match power finite once it can choose how much standing moves. The
+    ///         attester names the winner AND (for the variable path) the skill-scaled
+    ///         Elo magnitude the off-chain rating curve computed, but never beyond this
+    ///         owner-set ceiling, so a compromised attester can mis-scale a single match
+    ///         within the cap but can never inflate standing arbitrarily.
+    ///
+    ///         Zero (the default) DISABLES the variable path entirely — every
+    ///         `settleRanked`/`settleDrawRanked` reverts, and the contract behaves
+    ///         exactly as the fixed-magnitude-only design until the owner opts in. Set it
+    ///         >= the largest K-factor the rating curve is configured with, since the
+    ///         core `ranked_delta` is bounded by K; a cap below K would reject a
+    ///         legitimate settlement. Bounded `<= int256.max` so the signed application
+    ///         and its negation can never overflow.
+    uint256 public maxRatingDelta;
+
     /// @notice Lower/upper bounds and the construction default for `settleWindow`. The
     ///         floor is generous (a match plays in seconds and an attester settles in
     ///         one tx, so an hour is ~60× headroom) so a still-in-progress match can
@@ -140,6 +164,7 @@ contract MatchSettlement is Ownable2Step {
     event MatchExpired(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event AttesterSet(address indexed attester, bool authorized);
     event ReputationDeltaSet(uint256 reputationDelta);
+    event MaxRatingDeltaSet(uint256 maxRatingDelta);
     event SettleWindowSet(uint64 settleWindow);
 
     error NotAttester();
@@ -161,6 +186,9 @@ contract MatchSettlement is Ownable2Step {
     error ZeroReplayHash();
     error NotExpired();
     error SettleWindowOutOfRange();
+    error VariableSettleDisabled();
+    error NegativeWinnerDelta();
+    error RatingDeltaTooLarge();
 
     constructor(address registry_, address owner_, uint256 reputationDelta_) Ownable(owner_) {
         if (registry_ == address(0)) revert ZeroRegistry();
@@ -202,6 +230,17 @@ contract MatchSettlement is Ownable2Step {
         if (newDelta > uint256(type(int256).max)) revert ReputationDeltaTooLarge();
         reputationDelta = newDelta;
         emit ReputationDeltaSet(newDelta);
+    }
+
+    /// @notice Owner sets the variable-delta magnitude cap. Zero is allowed and DISABLES
+    ///         the variable settle path (the default posture — the contract is
+    ///         fixed-magnitude-only until the owner opts in); a positive value enables
+    ///         `settleRanked`/`settleDrawRanked` with `|delta| <= newMax`. Rejected above
+    ///         `int256.max` so the signed application and its negation can never overflow.
+    function setMaxRatingDelta(uint256 newMax) external onlyOwner {
+        if (newMax > uint256(type(int256).max)) revert RatingDeltaTooLarge();
+        maxRatingDelta = newMax;
+        emit MaxRatingDeltaSet(newMax);
     }
 
     /// @notice Owner sets the attester-resolution window. Bounded to
@@ -300,26 +339,33 @@ contract MatchSettlement is Ownable2Step {
     ///         idempotency fence) before any external call, then writes reputation
     ///         (+delta winner / −delta loser) and pays the winner the `2 * stake` pot.
     function settle(bytes32 matchId, address winner, bytes32 replayHash) external onlyAttester {
-        Match storage m = matches[matchId];
-        if (m.status != Status.Open) revert MatchNotOpen();
-        if (replayHash == bytes32(0)) revert ZeroReplayHash();
-        bool winnerIsA = winner == m.agentA;
-        if (!winnerIsA && winner != m.agentB) revert InvalidWinner();
-        uint256 stake = m.stake;
-        if (stake != 0 && !(m.aFunded && m.bFunded)) revert NotFullyFunded();
+        _applyDecisive(matchId, winner, replayHash, int256(reputationDelta));
+    }
 
-        address loser = winnerIsA ? m.agentB : m.agentA;
-        m.status = Status.Settled;
-        m.winner = winner;
-        m.replayHash = replayHash;
-
-        int256 delta = int256(reputationDelta);
-        registry.recordMatchResult(winner, delta);
-        registry.recordMatchResult(loser, -delta);
-
-        uint256 payout = stake * 2;
-        if (payout != 0) token.safeTransfer(winner, payout);
-        emit MatchSettled(matchId, winner, loser, replayHash, payout);
+    /// @notice Settle a decisive match with a per-match VARIABLE reputation magnitude —
+    ///         the skill-scaled Elo delta the off-chain rating curve (arena
+    ///         `ranked_delta`) computed for THIS pairing, the winner's signed gain. The
+    ///         winner receives `+ratingDelta`, the loser `-ratingDelta` (the contract
+    ///         owns the negation, so the on-chain pair stays zero-sum from the single
+    ///         delta the match service carries). Attester-gated, same escrow/winner/
+    ///         replay rules and idempotency fence as `settle`.
+    ///
+    ///         The delta is BOUNDED `0 <= ratingDelta <= maxRatingDelta`: a decisive Elo
+    ///         result never moves the winner DOWN (`K*(1-E) >= 0`), and it can be exactly
+    ///         0 when a heavy favourite's expected score rounds the gain away — so a
+    ///         zero-gain win still settles (pays the pot, counts the match) rather than
+    ///         reverting. A negative delta (a "win" that penalizes the winner) is
+    ///         rejected, and a delta over the cap is rejected — the attester scales
+    ///         standing only within the owner-set ceiling. Reverts `VariableSettleDisabled`
+    ///         while the cap is 0 (the variable path is off by default).
+    function settleRanked(bytes32 matchId, address winner, bytes32 replayHash, int256 ratingDelta)
+        external
+        onlyAttester
+    {
+        if (maxRatingDelta == 0) revert VariableSettleDisabled();
+        if (ratingDelta < 0) revert NegativeWinnerDelta();
+        if (uint256(ratingDelta) > maxRatingDelta) revert RatingDeltaTooLarge();
+        _applyDecisive(matchId, winner, replayHash, ratingDelta);
     }
 
     /// @notice Settle an open match as a DRAW: commit the replay hash, count the match
@@ -329,25 +375,26 @@ contract MatchSettlement is Ownable2Step {
     ///         so it must be settleable without stranding the escrow. Same both-funded
     ///         precondition and idempotency fence as `settle`.
     function settleDraw(bytes32 matchId, bytes32 replayHash) external onlyAttester {
-        Match storage m = matches[matchId];
-        if (m.status != Status.Open) revert MatchNotOpen();
-        if (replayHash == bytes32(0)) revert ZeroReplayHash();
-        uint256 stake = m.stake;
-        if (stake != 0 && !(m.aFunded && m.bFunded)) revert NotFullyFunded();
+        _applyDraw(matchId, replayHash, int256(0));
+    }
 
-        address agentA = m.agentA;
-        address agentB = m.agentB;
-        m.status = Status.Settled;
-        m.replayHash = replayHash;
-
-        registry.recordMatchResult(agentA, int256(0));
-        registry.recordMatchResult(agentB, int256(0));
-
-        if (stake != 0) {
-            token.safeTransfer(agentA, stake);
-            token.safeTransfer(agentB, stake);
-        }
-        emit MatchDrawn(matchId, agentA, agentB, replayHash);
+    /// @notice Settle a draw with a per-match VARIABLE reputation delta — `agentA`'s
+    ///         signed change (`agentB` receives its negation). Unlike `settleDraw`, which
+    ///         moves no standing, a real Elo draw between UNEQUAL agents moves the
+    ///         favourite DOWN toward the underdog, so `ratingDeltaA` may be negative,
+    ///         zero (an even pairing), or positive (`agentA` the underdog). Bounded by
+    ///         magnitude only — `|ratingDeltaA| <= maxRatingDelta`, either sign — since a
+    ///         draw carries no winner. Attester-gated, same both-funded precondition,
+    ///         per-seat refund, and idempotency fence as `settleDraw`; reverts
+    ///         `VariableSettleDisabled` while the cap is 0.
+    function settleDrawRanked(bytes32 matchId, bytes32 replayHash, int256 ratingDeltaA)
+        external
+        onlyAttester
+    {
+        if (maxRatingDelta == 0) revert VariableSettleDisabled();
+        int256 cap = int256(maxRatingDelta);
+        if (ratingDeltaA > cap || ratingDeltaA < -cap) revert RatingDeltaTooLarge();
+        _applyDraw(matchId, replayHash, ratingDeltaA);
     }
 
     /// @notice Void an open match and refund every funded seat — the recovery path for
@@ -403,5 +450,66 @@ contract MatchSettlement is Ownable2Step {
         m.bFunded = false;
         if (refundA != 0) token.safeTransfer(m.agentA, refundA);
         if (refundB != 0) token.safeTransfer(m.agentB, refundB);
+    }
+
+    /// @dev Shared decisive-settlement mechanics for the fixed `settle` and the variable
+    ///      `settleRanked`. `deltaWinner` is the signed reputation the WINNER receives;
+    ///      the loser receives its exact negation, so reputation stays zero-sum for ANY
+    ///      delta the caller supplies. The caller validates the delta per its policy
+    ///      (a fixed non-zero magnitude, or a bounded variable one) BEFORE this runs;
+    ///      here the negation is always safe because both callers bound
+    ///      `|deltaWinner| <= int256.max`, so it is never `int256.min`. Flips the match
+    ///      to `Settled` (the idempotency fence) BEFORE any external call (CEI), so a
+    ///      replayed or reentrant settle reverts `MatchNotOpen`. Keeping both settle
+    ///      paths on ONE helper means their escrow, fence, and CEI ordering can never
+    ///      drift apart — only the magnitude policy differs.
+    function _applyDecisive(bytes32 matchId, address winner, bytes32 replayHash, int256 deltaWinner) private {
+        Match storage m = matches[matchId];
+        if (m.status != Status.Open) revert MatchNotOpen();
+        if (replayHash == bytes32(0)) revert ZeroReplayHash();
+        bool winnerIsA = winner == m.agentA;
+        if (!winnerIsA && winner != m.agentB) revert InvalidWinner();
+        uint256 stake = m.stake;
+        if (stake != 0 && !(m.aFunded && m.bFunded)) revert NotFullyFunded();
+
+        address loser = winnerIsA ? m.agentB : m.agentA;
+        m.status = Status.Settled;
+        m.winner = winner;
+        m.replayHash = replayHash;
+
+        registry.recordMatchResult(winner, deltaWinner);
+        registry.recordMatchResult(loser, -deltaWinner);
+
+        uint256 payout = stake * 2;
+        if (payout != 0) token.safeTransfer(winner, payout);
+        emit MatchSettled(matchId, winner, loser, replayHash, payout);
+    }
+
+    /// @dev Shared draw-settlement mechanics for the fixed `settleDraw` (delta 0) and the
+    ///      variable `settleDrawRanked`. `deltaA` is `agentA`'s signed change; `agentB`
+    ///      receives its exact negation, keeping a draw zero-sum too. Same both-funded
+    ///      precondition, `Settled` fence, per-seat refund, and CEI ordering as the
+    ///      decisive path. The negation is safe for the same reason: both callers bound
+    ///      `|deltaA| <= int256.max`.
+    function _applyDraw(bytes32 matchId, bytes32 replayHash, int256 deltaA) private {
+        Match storage m = matches[matchId];
+        if (m.status != Status.Open) revert MatchNotOpen();
+        if (replayHash == bytes32(0)) revert ZeroReplayHash();
+        uint256 stake = m.stake;
+        if (stake != 0 && !(m.aFunded && m.bFunded)) revert NotFullyFunded();
+
+        address agentA = m.agentA;
+        address agentB = m.agentB;
+        m.status = Status.Settled;
+        m.replayHash = replayHash;
+
+        registry.recordMatchResult(agentA, deltaA);
+        registry.recordMatchResult(agentB, -deltaA);
+
+        if (stake != 0) {
+            token.safeTransfer(agentA, stake);
+            token.safeTransfer(agentB, stake);
+        }
+        emit MatchDrawn(matchId, agentA, agentB, replayHash);
     }
 }

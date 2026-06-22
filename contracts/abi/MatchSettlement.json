@@ -152,6 +152,19 @@
     "type": "function"
   },
   {
+    "inputs": [],
+    "name": "maxRatingDelta",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [
       {
         "internalType": "bytes32",
@@ -305,6 +318,19 @@
     "inputs": [
       {
         "internalType": "uint256",
+        "name": "newMax",
+        "type": "uint256"
+      }
+    ],
+    "name": "setMaxRatingDelta",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256",
         "name": "newDelta",
         "type": "uint256"
       }
@@ -364,6 +390,57 @@
       }
     ],
     "name": "settleDraw",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "replayHash",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "int256",
+        "name": "ratingDeltaA",
+        "type": "int256"
+      }
+    ],
+    "name": "settleDrawRanked",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "address",
+        "name": "winner",
+        "type": "address"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "replayHash",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "int256",
+        "name": "ratingDelta",
+        "type": "int256"
+      }
+    ],
+    "name": "settleRanked",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -629,6 +706,19 @@
     "anonymous": false,
     "inputs": [
       {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "maxRatingDelta",
+        "type": "uint256"
+      }
+    ],
+    "name": "MaxRatingDeltaSet",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
         "indexed": true,
         "internalType": "address",
         "name": "previousOwner",
@@ -722,6 +812,11 @@
   },
   {
     "inputs": [],
+    "name": "NegativeWinnerDelta",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "NoWager",
     "type": "error"
   },
@@ -779,6 +874,11 @@
   },
   {
     "inputs": [],
+    "name": "RatingDeltaTooLarge",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "ReputationDeltaTooLarge",
     "type": "error"
   },
@@ -801,6 +901,11 @@
   {
     "inputs": [],
     "name": "SettleWindowOutOfRange",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "VariableSettleDisabled",
     "type": "error"
   },
   {
