@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use arena_core::{
-    arena_map, ranked_delta, Match, MatchRecord, RatingDelta, ReplayError, Rules, SplitMix64,
-    DEFAULT_RATING,
+    arena_map, ranked_delta, ranked_field_delta, Match, MatchRecord, RatingDelta, ReplayError,
+    Rules, SeatDelta, SplitMix64, DEFAULT_RATING,
 };
 use arena_proto::{
     verify_join_signature, ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode,
@@ -700,7 +700,9 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// ratings and the outcome — `delta.a` to the seat the result orders first,
     /// `delta.b == -delta.a` to the other — so the ladder conserves total rating.
     /// `k` is the owner-set K-factor (operator-gated magnitude); the caller supplies
-    /// it rather than the matchmaker baking it in.
+    /// it rather than the matchmaker baking it in. For a multi-seat (FFA / 3+ / team)
+    /// ranked match, settle with [`apply_ranked_field_result`](Self::apply_ranked_field_result)
+    /// instead — this 1v1 route returns `None` for anything but a two-seat result.
     pub fn apply_ranked_result(&self, result: &MatchResult, k: i32) -> Option<RatingDelta> {
         // Treat the result as UNTRUSTED and validate-then-commit: a malformed result
         // (not exactly two distinct seats, or a seat outside the registered roster) is
@@ -731,6 +733,76 @@ impl<V: IdentityVerifier> Matchmaker<V> {
         st.ratings.insert(agent_a, ra.saturating_add(delta.a));
         st.ratings.insert(agent_b, rb.saturating_add(delta.b));
         Some(delta)
+    }
+
+    /// Settle a terminal multi-seat (FFA / 3+ / team) ranked match's `result` into the
+    /// ladder, returning the zero-sum per-seat [`SeatDelta`]s applied (or `None` if
+    /// nothing moved). The multi-seat generalization of [`apply_ranked_result`]: that
+    /// settles a 1v1 via [`ranked_delta`], this settles a full placement field via the
+    /// core's [`ranked_field_delta`].
+    ///
+    /// The match must have been formed by this matchmaker as a ranked match (Agent
+    /// mode) — identified by `result.match_id`. Each seat's pre-match rating is sourced
+    /// from the live ladder in the result's canonical ascending-seat order, so
+    /// `ratings[i]` pairs to `result.outcomes[i].seat` exactly as [`ranked_field_delta`]
+    /// requires; the field's per-seat deltas are then applied back to each seat's agent.
+    /// The field sums to exactly `0`, so the ladder conserves total reputation across
+    /// the whole roster, not just two seats.
+    ///
+    /// Treats the result as UNTRUSTED, validate-then-commit: the registration is
+    /// consumed and the ladder written ONLY when the result covers the full registered
+    /// roster — exactly one outcome per registered seat, every seat in range and
+    /// distinct (with the exact count, distinct in-range seats are a permutation of the
+    /// roster). A result for a casual/human/unknown match (never registered, FM1), or a
+    /// malformed one — wrong seat count, an out-of-roster seat, or a duplicated seat
+    /// that would double-apply and break zero-sum (FM2) — is a no-op that LEAVES the
+    /// match registered, so a later well-formed result can still settle it. A second
+    /// call for the same match is a no-op (the registration is removed on the first, so
+    /// a replay cannot double-apply, FM3). On a well-formed two-seat result this settles
+    /// the ladder byte-identically to [`apply_ranked_result`] — [`ranked_field_delta`]
+    /// agrees with [`ranked_delta`] at n=2 (FM4). `k` is the owner-set K-factor.
+    pub fn apply_ranked_field_result(&self, result: &MatchResult, k: i32) -> Option<Vec<SeatDelta>> {
+        let mut st = self.state.lock().expect("matchmaker mutex poisoned");
+        // Peek (do not remove yet): bail with the registration intact on any malformed
+        // result, so a bad report never silently burns it.
+        let pending = st.pending_ranked.get(&result.match_id)?;
+        let n = pending.agents.len();
+        // Full-roster coverage: exactly one outcome per registered seat. A short or long
+        // result is malformed — settling it would apply a partial (non-zero-sum) field.
+        if result.outcomes.len() != n {
+            return None;
+        }
+        // Map each outcome's seat to the agent the roster seated there, in the result's
+        // canonical order, and source that agent's live rating — so ratings[i] pairs to
+        // outcomes[i] exactly as ranked_field_delta requires, and agents[i] is the agent
+        // its delta lands on. Reject an out-of-roster seat (get == None) or a duplicate:
+        // with the exact-count check above, n distinct in-range seats are a permutation
+        // of the roster, so a duplicate (which would double-apply, breaking zero-sum) is
+        // provably caught here.
+        let mut seen = vec![false; n];
+        let mut agents: Vec<String> = Vec::with_capacity(n);
+        let mut ratings: Vec<i32> = Vec::with_capacity(n);
+        for o in &result.outcomes {
+            let idx = o.seat as usize;
+            let agent = pending.agents.get(idx)?;
+            if std::mem::replace(&mut seen[idx], true) {
+                return None;
+            }
+            ratings.push(st.ratings.get(agent).copied().unwrap_or(DEFAULT_RATING));
+            agents.push(agent.clone());
+        }
+        // The deltas come back in outcome order (canonical), so deltas[i], agents[i], and
+        // ratings[i] all describe the same seat — apply each to its agent. None here only
+        // for a degenerate field (<2 seats), which the coverage check already precludes.
+        let deltas = ranked_field_delta(result, &ratings, k)?;
+        // Commit: consume the registration and write each seat's rating. Each base is the
+        // rating sourced above, so base + delta matches the value ranked_field_delta
+        // computed from; the field is zero-sum, so the ladder total is conserved.
+        st.pending_ranked.remove(&result.match_id);
+        for ((delta, agent), base) in deltas.iter().zip(agents).zip(ratings) {
+            st.ratings.insert(agent, base.saturating_add(delta.delta));
+        }
+        Some(deltas)
     }
 
     /// How many ranked matches have formed but not yet been settled into the ladder —
