@@ -5291,6 +5291,117 @@ mod tests {
         assert_eq!(body_json(resp).await["rearmed"], false);
     }
 
+    // -- GET /debits/dead-lettered — operator listing of quarantined debits --------
+
+    /// A GET with an optional `Authorization` header.
+    async fn get_auth(
+        state: Arc<AppState>,
+        uri: &str,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// FM1: the listing returns ONLY dead-lettered, not-yet-settled debits — a
+    /// still-pending row (drainable) and an already-settled row (paid, tx_hash set)
+    /// are both excluded, so every listed debit is genuinely re-armable.
+    #[tokio::test]
+    async fn dead_lettered_listing_returns_only_dead_lettered_unsettled_debits() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let poison = seed_job();
+        let good = seed_job();
+        let pending = seed_job();
+        settle_one_metered(&state, &poison).await; // settled first → claimed first (the head)
+        settle_one_metered(&state, &good).await;
+        // poison dead-letters, good settles in the same pass.
+        drain_debits(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
+        // A third debit left pending (settled-metered, never drained).
+        settle_one_metered(&state, &pending).await;
+
+        let listing = body_json(get(state.clone(), "/debits/dead-lettered").await).await;
+        let debits = listing["debits"].as_array().unwrap();
+        assert_eq!(debits.len(), 1, "only the dead-lettered debit is listed");
+        assert_eq!(debits[0]["job_id"], poison.id.to_string(), "the dead-lettered one (not good/pending)");
+        assert_eq!(listing["total"], 1);
+        assert_eq!(listing["truncated"], false);
+    }
+
+    /// FM2: the listing exposes buyer addresses + owed amounts, so it requires the same
+    /// bearer token as POST /jobs — a missing or wrong token is 401 and lists nothing;
+    /// the correct token returns the dead-lettered debit.
+    #[tokio::test]
+    async fn dead_lettered_listing_requires_the_ingest_token() {
+        let state = test_state_metered_with_token(TEST_INGEST_TOKEN).await;
+        let job = seed_job();
+        dead_letter_one(&state, &job).await;
+
+        assert_eq!(
+            get(state.clone(), "/debits/dead-lettered").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "no Authorization header → 401"
+        );
+        assert_eq!(
+            get_auth(state.clone(), "/debits/dead-lettered", Some("Bearer wrong-token")).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token → 401"
+        );
+
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = get_auth(state.clone(), "/debits/dead-lettered", Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listing = body_json(resp).await;
+        assert_eq!(listing["debits"].as_array().unwrap().len(), 1, "the authenticated listing shows the debit");
+        assert_eq!(listing["debits"][0]["job_id"], job.id.to_string());
+    }
+
+    /// FM3: the store listing is capped and oldest-first — a limit smaller than the
+    /// dead-letter backlog returns the OLDEST `limit` rows in insertion order, and the
+    /// full count exceeds the page (the `total > len` the endpoint reports as
+    /// `truncated`, so a capped page is never mistaken for the whole set).
+    #[tokio::test]
+    async fn list_dead_lettered_debits_caps_and_orders_oldest_first() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let jobs = [seed_job(), seed_job(), seed_job()];
+        for job in &jobs {
+            settle_one_metered(&state, job).await;
+            drain_debits(&state, &MockSpender::permanent()).await; // dead-letter each in turn
+        }
+        let store = state.store.lock().await;
+        // Capped: a limit of 2 over 3 dead-lettered returns the 2 OLDEST, in order.
+        let page = store.list_dead_lettered_debits(2).unwrap();
+        assert_eq!(page.iter().map(|d| d.0).collect::<Vec<_>>(), vec![jobs[0].id, jobs[1].id], "oldest two, in order");
+        // total exceeds the page → the endpoint's `truncated` signal (total > len).
+        assert_eq!(store.dead_lettered_debit_count().unwrap(), 3);
+        // Uncapped (limit >= total) returns all three, oldest-first.
+        let all = store.list_dead_lettered_debits(10).unwrap();
+        assert_eq!(
+            all.iter().map(|d| d.0).collect::<Vec<_>>(),
+            jobs.iter().map(|j| j.id).collect::<Vec<_>>(),
+            "all three, oldest-first"
+        );
+    }
+
+    /// FM4: the listed `amount_wei` is the exact decimal-wei string persisted at settle
+    /// (never re-derived or coerced to a number), alongside the buyer and a present
+    /// quarantine stamp — so an operator sees exactly what is owed.
+    #[tokio::test]
+    async fn dead_lettered_listing_carries_the_exact_persisted_fields() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        dead_letter_one(&state, &job).await;
+
+        let listing = body_json(get(state.clone(), "/debits/dead-lettered").await).await;
+        let d = &listing["debits"][0];
+        assert_eq!(d["job_id"], job.id.to_string());
+        assert_eq!(d["amount_wei"], "1000000000000", "DRAIN_RATE * 1, the persisted decimal string, exact");
+        assert_eq!(d["buyer"], TEST_BUYER);
+        assert!(d["dead_lettered_at"].as_i64().unwrap() > 0, "the quarantine stamp is present");
+    }
+
     /// FM2: the drain must not hold the store mutex across the slow on-chain spend,
     /// or every settle/stats stalls behind RPC latency. The gated spender holds the
     /// spend in-flight while we prove the store lock is still acquirable.
