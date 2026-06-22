@@ -480,6 +480,14 @@ struct RedriveResponse {
     rearmed: bool,
 }
 
+/// Response for `POST /debits/redrive-all`: how many dead-lettered debits the bulk
+/// re-drive re-armed. `0` is a successful no-op (nothing was dead-lettered) — the bulk
+/// re-drive is idempotent, so an operator can replay it safely.
+#[derive(Debug, Serialize)]
+struct BulkRedriveResponse {
+    rearmed: usize,
+}
+
 /// One dead-lettered ComputeMeter debit in the operator listing (`GET
 /// /debits/dead-lettered`). `job_id` is the UUID an operator passes to `POST
 /// /debits/{id}/redrive`; `amount_wei` is the owed charge as the persisted decimal
@@ -1833,9 +1841,11 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/jobs/{id}/submit", post(submit).layer(body_guard()))
         .route("/jobs/{id}/status", get(job_status))
         // Operator recovery: re-arm a dead-lettered debit (body-less; the same
-        // bearer-token gate as POST /jobs, enforced inside the handler).
+        // bearer-token gate as POST /jobs, enforced inside the handler). /redrive-all
+        // is a one-segment sibling of /dead-lettered, distinct from /{id}/redrive.
         .route("/debits/dead-lettered", get(dead_lettered_debits))
         .route("/debits/{id}/redrive", post(redrive_debit))
+        .route("/debits/redrive-all", post(redrive_all_debits))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -2158,6 +2168,47 @@ async fn redrive_debit(
         }
         Err(e) => {
             tracing::error!(%id, ?e, "re-drive: redrive_dead_lettered_debit failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// `POST /debits/redrive-all` — operator bulk recovery: re-arm EVERY dead-lettered
+/// ComputeMeter debit in one call, used after a BROAD `Permanent` cause is fixed (the
+/// spender key re-authorized via `setSpender`, or a whole class of underfunded buyers
+/// tops up) — the bulk twin of `POST /debits/{id}/redrive` that saves enumerating
+/// `GET /debits/dead-lettered` and issuing N single re-drives.
+///
+/// A privileged MASS-recovery action, so it carries the SAME bearer-token gate as
+/// `POST /jobs` and the single re-drive: when a token is configured, a request without
+/// `Authorization: Bearer <token>` is rejected `401` before any store work — nothing is
+/// re-armed for an unauthorized caller. Open when no token is configured (the dev
+/// posture). The store clears only `dead_lettered_at IS NOT NULL AND tx_hash IS NULL`
+/// rows, so a pending (drainable) or settled (paid) debit is never touched.
+///
+/// Returns `200` with `{"rearmed": count}` — the number re-armed, `0` for the
+/// idempotent no-op (nothing dead-lettered). Each re-armed debit re-enters the
+/// oldest-first drain and, if the broad cause is NOT actually fixed, simply
+/// re-dead-letters on the next `Permanent` error — one attempt per re-drive, never an
+/// auto-retry loop.
+async fn redrive_all_debits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<BulkRedriveResponse>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!("rejected: POST /debits/redrive-all missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    match store.redrive_all_dead_lettered_debits() {
+        Ok(rearmed) => {
+            tracing::info!(rearmed, "bulk re-drive: dead-lettered debits re-armed for the next drain");
+            Ok(Json(BulkRedriveResponse { rearmed }))
+        }
+        Err(e) => {
+            tracing::error!(?e, "bulk re-drive: redrive_all_dead_lettered_debits failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
