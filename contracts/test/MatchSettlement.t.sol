@@ -1127,6 +1127,304 @@ contract MatchSettlementTest is Test {
         vm.prank(bob);
         settlement.settleDrawRanked(MATCH, HASH, 0);
     }
+
+    // --- settleField (multi-seat FFA/3+ reputation-only settle of ranked_field_delta) ---
+    //
+    // The arena rating curve generalizes the 1v1 Elo delta to an N-seat placement field
+    // (arena-core ranked_field_delta): a zero-sum per-seat vector the match service submits.
+    // These pin the on-chain consumer: the +Σ=0 conservation the contract enforces, the
+    // distinct-registered-agent integrity, the per-seat magnitude cap, and that a field
+    // settle reuses the shared Status fence (one settlement record per matchId).
+
+    address dave = address(0xDA1E);
+    address eve = address(0xE7E);
+
+    event MatchFieldSettled(bytes32 indexed matchId, bytes32 replayHash, uint256 seats);
+
+    function _registerAgent(address who, bytes32 handle) internal {
+        assertTrue(token.transfer(who, 10_000 ether));
+        vm.startPrank(who);
+        token.approve(address(registry), type(uint256).max);
+        registry.register(handle, 0);
+        vm.stopPrank();
+    }
+
+    function _field(address a0, address a1, address a2) internal pure returns (address[] memory ag) {
+        ag = new address[](3);
+        ag[0] = a0;
+        ag[1] = a1;
+        ag[2] = a2;
+    }
+
+    function _deltas(int256 d0, int256 d1, int256 d2) internal pure returns (int256[] memory ds) {
+        ds = new int256[](3);
+        ds[0] = d0;
+        ds[1] = d1;
+        ds[2] = d2;
+    }
+
+    /// @dev FM1 conservation: a balanced 3-seat field settles each seat to EXACTLY its own
+    ///      signed delta, the reputations sum to 0 (nothing minted/burned), each match is
+    ///      counted, and the seat-count event fires. Distinct non-zero deltas make a
+    ///      mis-indexed or dropped write observable.
+    function test_settleField_balancedVectorConservesReputation() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether); // Σ = 0
+
+        vm.expectEmit(true, false, false, true);
+        emit MatchFieldSettled(MATCH, HASH, 3);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(registry.reputationOf(alice), 30 ether, "seat 0 gains its delta");
+        assertEq(registry.reputationOf(bob), -10 ether, "seat 1 takes its delta");
+        assertEq(registry.reputationOf(dave), -20 ether, "seat 2 takes its delta");
+        assertEq(
+            registry.reputationOf(alice) + registry.reputationOf(bob) + registry.reputationOf(dave),
+            0,
+            "the field is zero-sum on-chain"
+        );
+        (,, uint64 aMatches,,,) = registry.agents(alice);
+        (,, uint64 dMatches,,,) = registry.agents(dave);
+        assertEq(aMatches, 1, "alice's match counted");
+        assertEq(dMatches, 1, "dave's match counted");
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Settled, "field settle flips the shared fence");
+    }
+
+    /// @dev FM1 revert: a vector that does NOT sum to zero would mint/burn reputation, so it
+    ///      reverts NonZeroSum and writes nothing — the matchId stays free for a corrected
+    ///      result (the registration is never burned by a bad report).
+    function test_settleField_revertsNonZeroSum() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -10 ether); // Σ = +10 ether
+
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.NonZeroSum.selector, int256(10 ether)));
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(registry.reputationOf(alice), 0, "no seat moved");
+        assertEq(registry.reputationOf(bob), 0);
+        assertEq(registry.reputationOf(dave), 0);
+        assertTrue(
+            _status(MATCH) == MatchSettlement.Status.None, "the matchId is still free after a bad report"
+        );
+    }
+
+    /// @dev FM1 n=2: the field path reduces to the 1v1 +d/-d symmetry at two seats — a
+    ///      reputation-only 2-seat field with no escrow settles zero-sum.
+    function test_settleField_twoSeatFieldIsZeroSumSymmetry() public {
+        _enableVariable(RATING_CAP);
+        address[] memory ag = new address[](2);
+        ag[0] = alice;
+        ag[1] = bob;
+        int256[] memory ds = new int256[](2);
+        ds[0] = 14 ether;
+        ds[1] = -14 ether;
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+        assertEq(registry.reputationOf(alice), 14 ether);
+        assertEq(registry.reputationOf(bob), -14 ether);
+    }
+
+    /// @dev FM2: agents/deltas length mismatch reverts before any write (a read past the
+    ///      shorter vector would mis-settle).
+    function test_settleField_revertsLengthMismatch() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = new int256[](2); // shorter than agents
+        ds[0] = 5 ether;
+        ds[1] = -5 ether;
+        vm.expectRevert(MatchSettlement.LengthMismatch.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+    }
+
+    /// @dev FM2: an empty field and a one-seat field both revert FieldTooSmall — a field is
+    ///      >= 2 seats (a singleton is degenerate; sum-zero would force its sole delta to 0).
+    function test_settleField_revertsEmptyAndSingleton() public {
+        _enableVariable(RATING_CAP);
+        address[] memory empty = new address[](0);
+        int256[] memory emptyD = new int256[](0);
+        vm.expectRevert(MatchSettlement.FieldTooSmall.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, empty, emptyD, HASH);
+
+        address[] memory one = new address[](1);
+        one[0] = alice;
+        int256[] memory oneD = new int256[](1);
+        oneD[0] = 0;
+        vm.expectRevert(MatchSettlement.FieldTooSmall.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, one, oneD, HASH);
+    }
+
+    /// @dev FM2: a duplicated agent reverts DuplicateAgent (it would double-write that agent's
+    ///      reputation and break the field's zero-sum intent) — caught before any write even
+    ///      though the vector sums to zero.
+    function test_settleField_revertsDuplicateAgent() public {
+        _enableVariable(RATING_CAP);
+        address[] memory ag = _field(alice, bob, alice); // alice twice
+        int256[] memory ds = _deltas(10 ether, -20 ether, 10 ether); // Σ = 0
+
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.DuplicateAgent.selector, alice));
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(registry.reputationOf(alice), 0, "no partial write on a duplicate");
+        assertEq(registry.reputationOf(bob), 0);
+        assertTrue(_status(MATCH) == MatchSettlement.Status.None);
+    }
+
+    /// @dev FM2: an unregistered seat reverts AgentNotRegistered (carol never registered) —
+    ///      the same liveness guard as the 1v1 paths, applied per seat.
+    function test_settleField_revertsUnregisteredAgent() public {
+        _enableVariable(RATING_CAP);
+        address[] memory ag = _field(alice, bob, carol); // carol unregistered
+        int256[] memory ds = _deltas(10 ether, -5 ether, -5 ether); // Σ = 0
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.AgentNotRegistered.selector, carol));
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+    }
+
+    /// @dev FM3 cap: a per-seat delta over the owner-set ceiling reverts RatingDeltaTooLarge,
+    ///      either sign — the attester scales standing only within the cap, same as the 1v1
+    ///      variable path. The over-cap seat is balanced so ONLY the cap (not the sum) trips.
+    function test_settleField_revertsDeltaOverCap() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        int256 over = int256(RATING_CAP) + 1;
+        address[] memory ag = _field(alice, bob, dave);
+
+        int256[] memory hi = _deltas(over, -over, 0); // Σ = 0 but seat 0 over +cap
+        vm.expectRevert(MatchSettlement.RatingDeltaTooLarge.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, hi, HASH);
+
+        int256[] memory lo = _deltas(-over, over, 0); // Σ = 0 but seat 0 below -cap
+        vm.expectRevert(MatchSettlement.RatingDeltaTooLarge.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, lo, HASH);
+    }
+
+    /// @dev FM3 boundary: deltas exactly at ±cap (and a 0 seat) settle — the cap is inclusive.
+    function test_settleField_atCapBoundarySettles() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(int256(RATING_CAP), -int256(RATING_CAP), 0); // Σ = 0, at ±cap
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+        assertEq(registry.reputationOf(alice), int256(RATING_CAP));
+        assertEq(registry.reputationOf(bob), -int256(RATING_CAP));
+        assertEq(registry.reputationOf(dave), 0);
+    }
+
+    /// @dev FM3 idempotency: a re-settle of the same matchId reverts on the Status fence and
+    ///      writes no second time — the reputations hold at their first-settle values.
+    function test_settleField_idempotentOnReSettle() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(registry.reputationOf(alice), 30 ether, "no second write");
+        (,, uint64 aMatches,,,) = registry.agents(alice);
+        assertEq(aMatches, 1, "still one counted match");
+    }
+
+    /// @dev FM3 disabled-by-default: while maxRatingDelta is 0 the field path reverts
+    ///      VariableSettleDisabled — even a perfectly balanced vector — so the contract is
+    ///      byte-identical to fixed-only until the owner opts in.
+    function test_settleField_revertsDisabledByDefault() public {
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+        vm.expectRevert(MatchSettlement.VariableSettleDisabled.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+    }
+
+    /// @dev FM4 authority: a non-attester caller reverts NotAttester BEFORE any state change
+    ///      (the matchId stays free) — only the authorized match service names results.
+    function test_settleField_revertsNotAttester() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        vm.prank(bob);
+        settlement.settleField(MATCH, ag, ds, HASH);
+        assertTrue(
+            _status(MATCH) == MatchSettlement.Status.None, "no state change from an unauthorized caller"
+        );
+    }
+
+    /// @dev FM4 writer authority: if AgentRegistry has not authorized this contract as a
+    ///      reputation writer the per-seat record reverts NotReputationWriter — the same
+    ///      dependency the 1v1 paths have. CEI means the fence has already flipped, but the
+    ///      revert rolls the whole settle back, so nothing is half-written.
+    function test_settleField_revertsWhenNotReputationWriter() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        vm.prank(owner);
+        registry.setReputationWriter(address(settlement), false); // revoke
+
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+        vm.expectRevert(AgentRegistry.NotReputationWriter.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertTrue(_status(MATCH) == MatchSettlement.Status.None, "the failed settle rolled the fence back");
+        assertEq(registry.reputationOf(alice), 0, "nothing half-written");
+    }
+
+    /// @dev Cross-path exclusivity (the reused fence): a field-settled matchId can never be
+    ///      reopened as a 1v1, and an opened 1v1 matchId can never be field-settled — one
+    ///      settlement record per matchId, both directions.
+    function test_settleField_oneRecordPerMatchId_bothDirections() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+
+        // field-settle, then a 1v1 openMatch on the same id is refused.
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.openMatch(MATCH, alice, bob, 0);
+
+        // the other direction: an opened 1v1 id cannot be field-settled.
+        bytes32 id2 = bytes32("match-2");
+        _open(id2, 0);
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.settleField(id2, ag, ds, HASH);
+    }
+
+    /// @dev A zero replay hash reverts — a field settle commits a real replay digest, same as
+    ///      the decisive/draw paths.
+    function test_settleField_revertsZeroReplayHash() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+        vm.expectRevert(MatchSettlement.ZeroReplayHash.selector);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, bytes32(0));
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
