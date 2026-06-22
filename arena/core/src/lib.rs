@@ -1046,6 +1046,19 @@ impl Match {
         self.pawns.iter().any(|p| p.seat == seat && p.alive)
     }
 
+    /// Whether an observer at `(eye, facing)` perceives a target at `target` this
+    /// tick: inside `perception_range`, within the forward FOV cone, and with a clear
+    /// line of sight past every [`Blocker`]. The ONE perception test, shared by the
+    /// live visible set ([`observe`](Self::observe)) and the perception-memory refresh
+    /// ([`refresh_perception_memory`](Self::refresh_perception_memory)) — so a
+    /// remembered entity can never be one the observer could not actually see, the
+    /// parity bound holding identically across both channels.
+    fn perceives(&self, eye: Vec2, facing: Bam, target: Vec2) -> bool {
+        within(eye, target, self.rules.perception_range)
+            && in_fov(facing, eye, target, self.rules.fov_octant_spread)
+            && has_line_of_sight(&self.blockers, eye, target)
+    }
+
     /// Build the parity-bounded observation for one seat: its own pawn in full,
     /// plus only the entities it can perceive this tick (alive pawns within
     /// `perception_range`, inside the seat's forward FOV cone
@@ -1063,9 +1076,7 @@ impl Match {
             .pawns
             .iter()
             .filter(|p| p.seat != seat && p.alive)
-            .filter(|p| within(me.pos, p.pos, self.rules.perception_range))
-            .filter(|p| in_fov(me.facing, me.pos, p.pos, self.rules.fov_octant_spread))
-            .filter(|p| has_line_of_sight(&self.blockers, me.pos, p.pos))
+            .filter(|p| self.perceives(me.pos, me.facing, p.pos))
             .map(|p| arena_proto::VisibleEntity {
                 entity_id: p.seat as u32,
                 kind: arena_proto::EntityKind::Player,
@@ -1086,10 +1097,7 @@ impl Match {
         // contract. It is reported as the neutral team and carries no shooter/target,
         // so an observed shot reveals only its position and travel heading.
         for proj in &self.projectiles {
-            if within(me.pos, proj.pos, self.rules.perception_range)
-                && in_fov(me.facing, me.pos, proj.pos, self.rules.fov_octant_spread)
-                && has_line_of_sight(&self.blockers, me.pos, proj.pos)
-            {
+            if self.perceives(me.pos, me.facing, proj.pos) {
                 visible.push(arena_proto::VisibleEntity {
                     entity_id: proj.id,
                     kind: arena_proto::EntityKind::Projectile,
@@ -1106,11 +1114,7 @@ impl Match {
         // tracks its real state; a perceived pickup carries only its id and position
         // (neutral team, no facing) and NEVER its kind, amount, or respawn timer.
         for pk in &self.pickups {
-            if pk.active
-                && within(me.pos, pk.pos, self.rules.perception_range)
-                && in_fov(me.facing, me.pos, pk.pos, self.rules.fov_octant_spread)
-                && has_line_of_sight(&self.blockers, me.pos, pk.pos)
-            {
+            if pk.active && self.perceives(me.pos, me.facing, pk.pos) {
                 visible.push(arena_proto::VisibleEntity {
                     entity_id: pk.id,
                     kind: arena_proto::EntityKind::Pickup,
