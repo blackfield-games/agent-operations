@@ -1318,6 +1318,35 @@ mod tests {
     }
 
     #[test]
+    fn the_ladder_and_pairings_are_deterministic_across_replays() {
+        // FM4: the book + pairing are order-deterministic (BTreeMap, no HashMap), so
+        // the SAME join+result sequence yields identical pairings AND identical final
+        // ratings — independent of the random match ids, which steer only spawns/teams,
+        // never the ladder. Run the whole scripted sequence twice and compare.
+        let run = || {
+            let mm = ranked_mm_tol(&[("0xa", "t"), ("0xb", "t"), ("0xc", "t"), ("0xd", "t")], 20);
+            let mut rosters: Vec<Vec<String>> = Vec::new();
+            for id in ["0xa", "0xb", "0xc", "0xd", "0xa", "0xc"] {
+                if let Some(m) =
+                    mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent(id, "t")).unwrap().into_formed()
+                {
+                    rosters.push(controllers(&m));
+                    // The head (seat 0) wins each time, a fixed scripted outcome.
+                    mm.apply_ranked_result(&decisive_result(m.match_id(), 0), 32).unwrap();
+                }
+            }
+            let book: Vec<(&str, i32)> =
+                ["0xa", "0xb", "0xc", "0xd"].into_iter().filter_map(|id| mm.rating(id).map(|r| (id, r))).collect();
+            (rosters, book)
+        };
+        let (rosters_1, book_1) = run();
+        let (rosters_2, book_2) = run();
+        assert_eq!(rosters_1, rosters_2, "the same join sequence forms the same pairings every run");
+        assert_eq!(book_1, book_2, "the same join+result sequence yields the same final ratings every run");
+        assert_eq!(rosters_1.len(), 3, "the scripted sequence formed three matches (the test is non-vacuous)");
+    }
+
+    #[test]
     fn a_formed_match_starts_on_the_real_core() {
         let mm = open_mm();
         mm.join(MatchMode::Human, b"", JoinRequest::human("p0")).unwrap();
