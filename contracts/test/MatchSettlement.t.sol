@@ -1230,6 +1230,61 @@ contract MatchSettlementTest is Test {
         assertEq(registry.reputationOf(bob), -14 ether);
     }
 
+    /// @dev FM1 (fuzzed revert): over ARBITRARY signed 3-seat vectors within the cap, any
+    ///      vector that does not sum to exactly 0 reverts NonZeroSum(sum) and moves no
+    ///      reputation — the conservation law holds across the fuzz domain, not just the
+    ///      hand-picked points above. Each seat is bounded within ±cap so only the sum
+    ///      check (never the per-seat cap) can trip, isolating the zero-sum invariant.
+    function testFuzz_settleField_revertsAnyNonZeroSum(int256 d0, int256 d1, int256 d2) public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        int256 cap = int256(RATING_CAP);
+        d0 = bound(d0, -cap, cap);
+        d1 = bound(d1, -cap, cap);
+        d2 = bound(d2, -cap, cap);
+        int256 sum = d0 + d1 + d2;
+        vm.assume(sum != 0);
+
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(d0, d1, d2);
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.NonZeroSum.selector, sum));
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(registry.reputationOf(alice), 0, "no seat moved on a non-zero-sum field");
+        assertEq(registry.reputationOf(bob), 0);
+        assertEq(registry.reputationOf(dave), 0);
+        assertTrue(_status(MATCH) == MatchSettlement.Status.None, "matchId stays free after a bad report");
+    }
+
+    /// @dev FM1 (fuzzed conservation): a balanced vector built from two fuzzed seats (the
+    ///      third absorbs the negation of their sum) settles each seat to EXACTLY its own
+    ///      delta and sums to 0 on-chain — conservation pinned over the fuzz domain, not a
+    ///      single fixed triple. The two free seats are bounded to ±cap/2 so the absorbing
+    ///      seat stays within ±cap (the cap is never the reason this path settles).
+    function testFuzz_settleField_balancedVectorConserves(int256 d0, int256 d1) public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        int256 half = int256(RATING_CAP) / 2;
+        d0 = bound(d0, -half, half);
+        d1 = bound(d1, -half, half);
+        int256 d2 = -(d0 + d1);
+
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(d0, d1, d2);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(registry.reputationOf(alice), d0, "seat 0 settled to its own delta");
+        assertEq(registry.reputationOf(bob), d1, "seat 1 settled to its own delta");
+        assertEq(registry.reputationOf(dave), d2, "seat 2 absorbs the negation");
+        assertEq(
+            registry.reputationOf(alice) + registry.reputationOf(bob) + registry.reputationOf(dave),
+            0,
+            "the fuzzed field is zero-sum on-chain"
+        );
+    }
+
     /// @dev FM2: agents/deltas length mismatch reverts before any write (a read past the
     ///      shorter vector would mis-settle).
     function test_settleField_revertsLengthMismatch() public {
