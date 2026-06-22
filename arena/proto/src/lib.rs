@@ -265,12 +265,15 @@ pub struct VisibleEntity {
     /// Last perceived elevation (see [`POSITION_SCALE`]).
     pub z: i32,
     pub facing: Bam,
-    /// `true` if in the seat's line of sight this tick. The reference core occludes
-    /// by EXCLUSION — an entity whose sightline crosses a vision [`Blocker`] is
-    /// dropped from the visible set entirely (it never widens perception), so every
-    /// entry it emits is in sight and this field is `true`. The `false` value is
-    /// reserved for a future perception-memory model that would surface a
-    /// last-known, since-lost position; the first-cut core produces no such entry.
+    /// `true` if in the seat's line of sight this tick — a currently-perceived entity.
+    /// The reference core occludes by EXCLUSION: an entity out of range, outside the
+    /// FOV cone, or whose sightline crosses a vision [`Blocker`] is dropped from the
+    /// live visible set entirely (it never widens perception), and every such live
+    /// entry is in sight, so this is `true`. `false` marks a PERCEPTION-MEMORY entry —
+    /// the last-known, since-lost position of an entity the seat previously perceived,
+    /// surfaced for the gated `perception_memory_ticks` window after it left sight (a
+    /// stale echo of a real prior sighting, never a never-seen entity). With perception
+    /// memory off (the default) the core emits no such entry and this is always `true`.
     pub in_line_of_sight: bool,
 }
 
