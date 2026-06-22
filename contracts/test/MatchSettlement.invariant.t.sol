@@ -23,6 +23,7 @@ contract MatchSettlementHandler is Test {
 
     address[] public actors;
     bytes32[] public matchIds;
+    bytes32[] public fieldMatchIds;
     uint256 internal nonce;
     /// @notice Matches resolved via settle or settleDraw (NOT cancel). Each bumps both
     ///         agents' `matchesSettled` by one, so the per-agent sum is twice this.
@@ -157,14 +158,93 @@ contract MatchSettlementHandler is Test {
         settlement.refundExpired(id);
     }
 
-    /// @notice The escrow the contract MUST be holding: per open match, `stake` for
-    ///         each funded seat. Settled/cancelled matches hold nothing.
+    function _fieldMatch(bytes32 id)
+        internal
+        view
+        returns (uint256 stake, uint256 fundedBits, MatchSettlement.Status s)
+    {
+        (stake, fundedBits, s,) = settlement.fieldMatches(id);
+    }
+
+    /// @notice Open an N-seat field-wager escrow over a distinct prefix of the registered
+    ///         actors (all are registered + approved in setUp), interleaved with the 1v1
+    ///         lifecycle. The field path writes no reputation, so only the escrow invariant
+    ///         is exercised by it — its job here is to prove per-seat funded escrow is
+    ///         conserved over an arbitrary fund/reclaim/cancel/expire interleaving.
+    function openFieldMatch(uint256 nSeed, uint256 stake) external {
+        uint256 n = bound(nSeed, 2, actors.length);
+        address[] memory ag = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ag[i] = actors[i]; // a distinct prefix -> a valid roster
+        }
+        stake = bound(stake, 0, 100 ether);
+        bytes32 id = keccak256(abi.encode("field", nonce++));
+        settlement.openFieldMatch(id, ag, stake);
+        fieldMatchIds.push(id);
+    }
+
+    function fundFieldSeat(uint256 mSeed, uint256 seatSeed) external {
+        if (fieldMatchIds.length == 0) return;
+        bytes32 id = fieldMatchIds[mSeed % fieldMatchIds.length];
+        (uint256 stake, uint256 fundedBits, MatchSettlement.Status s) = _fieldMatch(id);
+        if (s != MatchSettlement.Status.Open || stake == 0) return;
+        address[] memory ag = settlement.fieldRoster(id);
+        uint256 seat = seatSeed % ag.length;
+        if (fundedBits & (1 << seat) != 0) return; // seat already funded
+        address who = ag[seat];
+        if (token.balanceOf(who) < stake) return;
+        vm.prank(who);
+        settlement.fundField(id);
+    }
+
+    function reclaimFieldSeat(uint256 mSeed, uint256 seatSeed) external {
+        if (fieldMatchIds.length == 0) return;
+        bytes32 id = fieldMatchIds[mSeed % fieldMatchIds.length];
+        (, uint256 fundedBits, MatchSettlement.Status s) = _fieldMatch(id);
+        if (s != MatchSettlement.Status.Open) return;
+        address[] memory ag = settlement.fieldRoster(id);
+        uint256 bit = 1 << (seatSeed % ag.length);
+        if (fundedBits & bit == 0 || fundedBits != bit) return; // funded only if it is the SOLE funder
+        vm.prank(ag[seatSeed % ag.length]);
+        settlement.reclaimField(id);
+    }
+
+    function cancelFieldMatch(uint256 mSeed) external {
+        if (fieldMatchIds.length == 0) return;
+        bytes32 id = fieldMatchIds[mSeed % fieldMatchIds.length];
+        (,, MatchSettlement.Status s) = _fieldMatch(id);
+        if (s != MatchSettlement.Status.Open) return;
+        settlement.cancelFieldMatch(id);
+    }
+
+    function refundFieldExpired(uint256 mSeed) external {
+        if (fieldMatchIds.length == 0) return;
+        bytes32 id = fieldMatchIds[mSeed % fieldMatchIds.length];
+        (,, MatchSettlement.Status s) = _fieldMatch(id);
+        if (s != MatchSettlement.Status.Open) return;
+        (,,, uint64 deadline) = settlement.fieldMatches(id);
+        if (block.timestamp < deadline) vm.warp(deadline);
+        settlement.refundFieldExpired(id);
+    }
+
+    /// @notice The escrow the contract MUST be holding: per open 1v1 match, `stake` for each
+    ///         funded seat; per open field match, `stake` for each set bit of `fundedBits`.
+    ///         Settled/cancelled/expired matches of either kind hold nothing.
     function expectedEscrow() external view returns (uint256 total) {
         for (uint256 i = 0; i < matchIds.length; i++) {
             (,, uint256 stake, bool aF, bool bF, MatchSettlement.Status s) = _match(matchIds[i]);
             if (s != MatchSettlement.Status.Open) continue;
             if (aF) total += stake;
             if (bF) total += stake;
+        }
+        for (uint256 i = 0; i < fieldMatchIds.length; i++) {
+            bytes32 id = fieldMatchIds[i];
+            (uint256 stake, uint256 fundedBits, MatchSettlement.Status s) = _fieldMatch(id);
+            if (s != MatchSettlement.Status.Open) continue;
+            address[] memory ag = settlement.fieldRoster(id);
+            for (uint256 j = 0; j < ag.length; j++) {
+                if (fundedBits & (1 << j) != 0) total += stake;
+            }
         }
     }
 
