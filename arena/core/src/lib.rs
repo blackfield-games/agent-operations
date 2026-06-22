@@ -4905,6 +4905,101 @@ mod tests {
     }
 
     #[test]
+    fn path_hits_blocker_is_z_aware_and_clears_a_low_wall_over_the_top() {
+        // FM2 (z-sampling) + FM1 (byte-identity) + FM3 (sight/traversal agree): the
+        // shared collision predicate clears a height-bounded wall when the level path
+        // runs above its top, blocks it on the ground or through the body, treats an
+        // infinitely-tall (height 0) wall as full-height at every elevation, and agrees
+        // with the sight rule on what a given elevation clears.
+        let from = Vec2::ZERO;
+        let to = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
+        let low = Blocker { min: Vec2 { x: 4 * POSITION_SCALE, y: -POSITION_SCALE }, max: Vec2 { x: 6 * POSITION_SCALE, y: POSITION_SCALE }, height: 2000 };
+        assert!(path_hits_blocker(&[low], from, 0, to, 0), "a grounded path into the wall is blocked");
+        assert!(path_hits_blocker(&[low], from, 1000, to, 1000), "a path through the wall body (below the top) is blocked");
+        assert!(path_hits_blocker(&[low], from, 2000, to, 2000), "a path grazing the top is blocked (conservative boundary, matches the SAT)");
+        assert!(!path_hits_blocker(&[low], from, 2001, to, 2001), "a path just above the top clears");
+        assert!(!path_hits_blocker(&[low], from, 5000, to, 5000), "a path well above the top clears");
+        // An infinitely-tall twin blocks at any elevation (byte-identical to the old rule).
+        let infinite = Blocker { height: 0, ..low };
+        assert!(path_hits_blocker(&[infinite], from, 5000, to, 5000), "an infinitely-tall wall blocks at any height");
+        // FM1: on the ground a height-bounded and a full-height wall collide IDENTICALLY.
+        assert_eq!(
+            path_hits_blocker(&[low], from, 0, to, 0),
+            path_hits_blocker(&[infinite], from, 0, to, 0),
+            "grounded: a height-bounded wall collides exactly like a full-height one",
+        );
+        // FM3: with both endpoints OUTSIDE the wall (so the exemptions are inert), what
+        // bounds SIGHT bounds TRAVERSAL — see-over iff move-over, no confusing split.
+        for z in [0, 1000, 2000, 2001, 5000] {
+            assert_eq!(
+                !path_hits_blocker(&[low], from, z, to, z),
+                has_line_of_sight(&[low], from, z, to, z),
+                "movement and sight agree on clearing the wall at z={z}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_airborne_pawn_walks_over_low_cover_and_a_grounded_one_is_stopped() {
+        // End to end through step: a low wall in seat 0's path stops a grounded step
+        // (held, velocity zero) but not one taken above the wall top — the movement twin
+        // of a_low_wall_is_seen_and_shot_over. z is set directly to isolate the collision
+        // rule (the jump arc that produces a non-zero z is covered by the gravity tests);
+        // gravity stays 0 so the manual z persists through the tick.
+        let low = Blocker { min: Vec2 { x: 50, y: -2 * POSITION_SCALE }, max: Vec2 { x: 150, y: 2 * POSITION_SCALE }, height: 800 };
+        let east = intent(Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, false);
+        let place = |z: i32| {
+            let rules = Rules { spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![low], 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[0].z = z;
+            m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 }; // far idle, keeps the match Live
+            m
+        };
+        let mut grounded = place(0);
+        step_with(&mut grounded, &[(0, east)]);
+        assert_eq!(grounded.pawns[0].pos, Vec2::ZERO, "a grounded pawn is stopped by the low wall");
+        assert_eq!(grounded.observe(0).own.velocity, Vec2::ZERO, "the refused move reports zero velocity");
+
+        let mut airborne = place(900); // above the 800 wall top
+        step_with(&mut airborne, &[(0, east)]);
+        assert_eq!(airborne.pawns[0].pos.x, Rules::default().max_speed, "an airborne pawn walks over the low wall");
+        assert_eq!(airborne.pawns[0].pos.y, 0, "the over-the-wall step holds its lateral line");
+    }
+
+    #[test]
+    fn a_level_shot_flies_over_low_cover_when_launched_above_it() {
+        // The projectile twin: a low wall between shooter and target absorbs a grounded
+        // shot (target spared, shot despawned) but not one launched above the wall top —
+        // fired from and at the wall-clearing elevation the shot flies over and lands.
+        // Mirrors a_blocker_between_two_pawns_stops_the_shot with elevation added.
+        let low = Blocker { min: Vec2 { x: -500, y: -2 * POSITION_SCALE }, max: Vec2 { x: 500, y: 2 * POSITION_SCALE }, height: 800 };
+        let rules = Rules { weapon_mode: WeaponMode::Projectile, projectile_speed: 20 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let place = |z: i32| {
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![low], 1);
+            m.pawns[0].pos = Vec2 { x: -5 * POSITION_SCALE, y: 0 };
+            m.pawns[0].facing = EAST;
+            m.pawns[0].z = z;
+            m.pawns[1].pos = Vec2 { x: 5 * POSITION_SCALE, y: 0 };
+            m.pawns[1].z = z; // target at the same elevation so the level shot can strike
+            m
+        };
+        // Grounded: the shot is absorbed by the wall; the target behind it is spared.
+        let mut grounded = place(0);
+        let hp = grounded.pawns[1].health;
+        grounded.spawn_projectile(0);
+        grounded.advance_projectiles();
+        assert_eq!(grounded.pawns[1].health, hp, "a grounded shot is absorbed by the low wall");
+        assert!(grounded.projectiles.is_empty(), "the absorbed shot is despawned");
+        // Launched above the top (both ends elevated): flies over the wall and lands.
+        let mut high = place(900);
+        let hp2 = high.pawns[1].health;
+        high.spawn_projectile(0);
+        high.advance_projectiles();
+        assert_eq!(high.pawns[1].health, hp2 - Rules::default().damage, "an elevated shot flies over the low wall and lands");
+    }
+
+    #[test]
     fn a_pawn_cannot_walk_through_a_blocker() {
         // FM2 (intended change + no-blocker byte-identity): a step whose swept path
         // crosses a wall is refused (the pawn holds, velocity zero); the SAME step
