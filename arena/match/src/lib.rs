@@ -1401,6 +1401,148 @@ mod tests {
         assert_eq!(mm.unsettled_ranked(), 0);
     }
 
+    // -- ladder snapshot persistence --------------------------------------------
+
+    /// Just the `StubIdentityVerifier` (not a whole matchmaker), for `from_snapshot`,
+    /// which takes a fresh verifier alongside the restored ladder.
+    fn ranked_verifier(authorized: &[(&str, &str)]) -> StubIdentityVerifier {
+        let mut v = StubIdentityVerifier::new();
+        for (id, token) in authorized {
+            v.authorize(*id, *token);
+        }
+        v
+    }
+
+    #[test]
+    fn snapshot_round_trips_byte_identically_through_serde() {
+        // FM1: snapshot -> serialize -> deserialize -> restore reproduces the ladder
+        // EXACTLY. Ratings are i32, so equality is exact and the serialized form is
+        // byte-stable — re-serializing the restored ladder yields the identical bytes.
+        let (mm, m) = ranked_pair("0xa", "0xb", &[]);
+        mm.apply_ranked_result(&decisive_result(m.match_id(), 0), 32).unwrap(); // move off the seed
+        let snap = mm.snapshot();
+        assert_eq!(snap.version, LADDER_SNAPSHOT_VERSION);
+
+        let bytes = serde_json::to_vec(&snap).expect("snapshot serializes");
+        let decoded: LadderSnapshot = serde_json::from_slice(&bytes).expect("snapshot deserializes");
+        assert_eq!(decoded, snap, "the snapshot round-trips losslessly");
+
+        let restored = Matchmaker::from_snapshot(
+            ranked_verifier(&[("0xa", "t"), ("0xb", "t")]),
+            MatchParams::default(),
+            decoded,
+        )
+        .expect("a current-version snapshot restores");
+        assert_eq!(restored.rating("0xa"), mm.rating("0xa"), "0xa's rating survives the restart exactly");
+        assert_eq!(restored.rating("0xb"), mm.rating("0xb"), "0xb's rating survives the restart exactly");
+        assert_eq!(
+            serde_json::to_vec(&restored.snapshot()).unwrap(),
+            bytes,
+            "re-snapshotting the restored ladder is byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_post_restore_settle_matches_the_never_restarted_path() {
+        // FM1: a snapshot -> restore -> settle yields a delta IDENTICAL to the
+        // never-restarted matchmaker settling the same match from the same ladder, so
+        // restoring carries the full rating context (not a reset to the seed, which
+        // would erase every agent's history). Move the ladder well off the seed, then
+        // run the SAME next match on both the original (continuing) and the restored mm.
+        let authorized = [("0xa", "t"), ("0xb", "t")];
+        let mm = ranked_mm(&authorized);
+        for _ in 0..4 {
+            let m = form_ranked(&mm, "0xa", "0xb");
+            mm.apply_ranked_result(&decisive_result(m.match_id(), 0), 32).unwrap(); // 0xa keeps winning
+        }
+        assert_ne!(mm.rating("0xa"), Some(DEFAULT_RATING), "precondition: the ladder moved off the seed");
+
+        let restored = Matchmaker::from_snapshot(
+            ranked_verifier(&authorized),
+            MatchParams::default(),
+            mm.snapshot(),
+        )
+        .unwrap();
+        assert_eq!(restored.rating("0xa"), mm.rating("0xa"), "restored ratings match the original");
+        assert_eq!(restored.rating("0xb"), mm.rating("0xb"));
+
+        // The same next match, settled on both, applies the same delta and lands the
+        // same ladder — proving the restored ratings drive settlement identically.
+        let m_orig = form_ranked(&mm, "0xa", "0xb");
+        let m_rest = form_ranked(&restored, "0xa", "0xb");
+        let d_orig = mm.apply_ranked_result(&decisive_result(m_orig.match_id(), 0), 32).unwrap();
+        let d_rest = restored.apply_ranked_result(&decisive_result(m_rest.match_id(), 0), 32).unwrap();
+        assert_eq!(d_rest, d_orig, "the restored matchmaker applies the same delta as the never-restarted one");
+        assert_eq!(restored.rating("0xa"), mm.rating("0xa"), "and lands the same ladder");
+        assert_eq!(restored.rating("0xb"), mm.rating("0xb"));
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_fails_to_deserialize_without_panicking() {
+        // FM2: a malformed, truncated, or wrong-typed blob fails at the serde boundary
+        // as a clean Result error — never a panic, never a silent wrong/zero ladder.
+        let snap = ranked_mm(&[("0xa", "t")]).snapshot();
+        let bytes = serde_json::to_vec(&snap).unwrap();
+        assert!(
+            serde_json::from_slice::<LadderSnapshot>(&bytes[..bytes.len() / 2]).is_err(),
+            "a truncated snapshot is a clean Err"
+        );
+        assert!(serde_json::from_slice::<LadderSnapshot>(b"not a snapshot").is_err(), "non-JSON is a clean Err");
+        assert!(
+            serde_json::from_str::<LadderSnapshot>(r#"{"version":1,"ratings":{"0xa":"high"}}"#).is_err(),
+            "a non-i32 rating is a clean Err, never a silent wrong rating"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_rejects_a_version_mismatch() {
+        // FM3: a snapshot from a different schema version (older OR newer) is detected
+        // via the version tag and rejected, not misread into wrong ratings.
+        for bad in [0, LADDER_SNAPSHOT_VERSION + 1, 999] {
+            let snap = LadderSnapshot { version: bad, ratings: BTreeMap::from([("0xa".to_string(), 1700)]) };
+            let err = Matchmaker::from_snapshot(ranked_verifier(&[("0xa", "t")]), MatchParams::default(), snap)
+                .err()
+                .expect("a version mismatch is rejected");
+            assert_eq!(err, SnapshotError::Version { found: bad, expected: LADDER_SNAPSHOT_VERSION });
+        }
+        // The current version restores fine — the boundary holds both ways.
+        let ok = LadderSnapshot {
+            version: LADDER_SNAPSHOT_VERSION,
+            ratings: BTreeMap::from([("0xa".to_string(), 1700)]),
+        };
+        let mm = Matchmaker::from_snapshot(ranked_verifier(&[("0xa", "t")]), MatchParams::default(), ok)
+            .expect("the current version restores");
+        assert_eq!(mm.rating("0xa"), Some(1700), "the restored rating is exact");
+    }
+
+    #[test]
+    fn a_pre_restart_match_settles_to_a_noop_after_restore() {
+        // FM4 (chosen design): pending_ranked is intentionally NOT persisted, so a
+        // result for a match that FORMED before the restart settles to a clean no-op on
+        // the restored matchmaker — its play wasn't persisted either, so the fresh
+        // process can't trust the result (the chain is the authoritative settle record).
+        let (mm, m) = ranked_pair("0xa", "0xb", &[]);
+        assert_eq!(mm.unsettled_ranked(), 1, "the match is registered before the restart");
+
+        let restored = Matchmaker::from_snapshot(
+            ranked_verifier(&[("0xa", "t"), ("0xb", "t")]),
+            MatchParams::default(),
+            mm.snapshot(),
+        )
+        .unwrap();
+        assert_eq!(restored.unsettled_ranked(), 0, "no pending registration survives the restart");
+        let before = (restored.rating("0xa"), restored.rating("0xb"));
+        assert!(
+            restored.apply_ranked_result(&decisive_result(m.match_id(), 0), 32).is_none(),
+            "a pre-restart match's result is a clean no-op after restore"
+        );
+        assert_eq!(
+            (restored.rating("0xa"), restored.rating("0xb")),
+            before,
+            "the no-op left the restored ladder untouched"
+        );
+    }
+
     /// A ranked matchmaker with a custom `max_pending_ranked` cap (and an open
     /// tolerance), for the eviction tests.
     fn ranked_mm_cap(authorized: &[(&str, &str)], cap: usize) -> Matchmaker<StubIdentityVerifier> {
