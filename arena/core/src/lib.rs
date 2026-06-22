@@ -2861,6 +2861,30 @@ pub struct MoveCase {
     pub blocked: bool,
 }
 
+/// A pinned z-coupled-combat case: a shot fired DEAD-ON in the plane (the target is
+/// in range, in front, and on a clear sightline) at a target at elevation `target_z`,
+/// under a given weapon `mode` and [`Rules::vertical_hit_tolerance`], and the damage
+/// it deals (`0` == cleared by elevation). The planar geometry is a point-blank shot
+/// that lands in EVERY weapon mode under [`Rules::default`] tuning, so the only thing
+/// that can produce `damage == 0` is the vertical rule: with the tolerance off (`0`)
+/// `z` is ignored and any elevation is hit; with it on, a target within `tolerance` is
+/// hit (the boundary is INCLUSIVE) and one above it clears the shot — for hitscan, a
+/// melee swing, and the level-flying projectile alike. A twin that ignores `z` under a
+/// set tolerance, that uses an exclusive boundary, or that couples only some weapon
+/// modes fails the matching case. All other tuning is [`Rules::default`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerticalHitCase {
+    pub label: String,
+    pub weapon_mode: WeaponMode,
+    pub shooter_position: Vec2,
+    pub shooter_z: i32,
+    pub target_position: Vec2,
+    pub target_z: i32,
+    pub vertical_hit_tolerance: i32,
+    /// Damage the one shot deals — `0` iff elevation cleared it (never the planar setup).
+    pub damage: u16,
+}
+
 /// The canonical cross-implementation parity-vector set — the conformance spec
 /// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
 /// and the bytes are the contract.
@@ -2875,6 +2899,8 @@ pub struct ParityVectors {
     pub moves: Vec<MoveCase>,
     pub hits: Vec<HitCase>,
     pub projectiles: Vec<ProjectileCase>,
+    /// z-coupled-combat cases (domain v4): the vertical hit rule across every weapon mode.
+    pub vertical_hits: Vec<VerticalHitCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3131,6 +3157,49 @@ fn move_case(
     MoveCase { label: label.to_string(), start, move_dir, max_speed, bounds, blockers, end, blocked: end == start }
 }
 
+/// Build a z-coupled-combat case: place shooter (seat 0) at the origin facing east
+/// and target (seat 1) point-blank dead ahead — a planar setup that lands in EVERY
+/// weapon mode under default tuning — set their elevations and the tolerance, fire
+/// once in `mode`, and record the damage. `damage == 0` therefore isolates the
+/// vertical rule (elevation cleared the shot), never the planar geometry.
+fn vertical_hit_case(label: &str, mode: WeaponMode, shooter_z: i32, target_z: i32, tolerance: i32) -> VerticalHitCase {
+    let rules = Rules { weapon_mode: mode, vertical_hit_tolerance: tolerance, spawn_jitter: 0, ..Default::default() };
+    let shooter = Vec2::ZERO;
+    // Point-blank (1.5 m) so the shot lands in melee range AND on the projectile's
+    // first swept step AND down the hitscan beam — one geometry, all three modes.
+    let target = Vec2 { x: 1500, y: 0 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = shooter;
+    m.pawns[0].facing = EAST;
+    m.pawns[0].z = shooter_z;
+    m.pawns[1].pos = target;
+    m.pawns[1].z = target_z;
+    let before = m.pawns[1].health;
+    match mode {
+        WeaponMode::Hitscan => m.resolve_fire(0),
+        WeaponMode::Melee => m.resolve_melee(0),
+        WeaponMode::Projectile => {
+            m.spawn_projectile(0);
+            let mut age = 0u16;
+            while !m.projectiles.is_empty() && age < MAX_PROJECTILE_LIFETIME {
+                m.advance_projectiles();
+                age += 1;
+            }
+        }
+    }
+    VerticalHitCase {
+        label: label.to_string(),
+        weapon_mode: mode,
+        shooter_position: shooter,
+        shooter_z,
+        target_position: target,
+        target_z,
+        vertical_hit_tolerance: tolerance,
+        damage: before - m.pawns[1].health,
+    }
+}
+
 /// Build a full-match case under a fixed, tiny scripted action stream: seat 0
 /// steps east on the opening tick, fires due east on the next, then everyone
 /// idles. A hitscan match ends on the kill; a projectile match runs on until the
@@ -3185,16 +3254,21 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// thin wall, a wall-spawned pawn that can still leave, a hitscan beam blocked by a
 /// wall, a projectile absorbed by a wall, and a target in front of a wall still
 /// hit), the octant-vs-fine sub-octant hit boundary, a swept fast projectile that
-/// must not tunnel, and four full-match records proving the digest commits the
-/// inputs, the rules, AND the config determinants (v5) — the octant and fine cases
-/// run the identical action stream yet hash differently because their aim_mode
-/// differs — while the rules also bind the outcomes a re-run reproduces.
+/// must not tunnel, the z-coupled-combat rule across every weapon mode (a target
+/// above [`Rules::vertical_hit_tolerance`] clears a hitscan/melee/projectile shot,
+/// the boundary inclusive, the tolerance-off default ignoring elevation), and four
+/// full-match records proving the digest commits the inputs, the rules, AND the
+/// config determinants — the octant and fine cases run the identical action stream
+/// yet hash differently because their aim_mode differs — while the rules also bind
+/// the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v3`: the digest now binds the combat `rules` (v4)
-/// and the `config` determinants — arena bounds + tick cap (v5) — so a twin must
-/// fold both into its match digest or its hashes diverge; the v2 blockers-as-
-/// physical-cover convention (movement, hitscan, and projectiles respect them) still
-/// holds. These are deliberate conventions every twin must follow.
+/// Set domain is `parity-vectors/v4`: the digest binds the combat `rules` and the
+/// `config` determinants (arena bounds + tick cap), and v4 adds the z-coupled-combat
+/// rule — [`Rules::vertical_hit_tolerance`] widened the rules encoding (moving every
+/// committed match hash) and the `vertical_hits` cases pin the rule — so a twin must
+/// fold the wider encoding into its match digest and reproduce the vertical rule or it
+/// diverges; the v2 blockers-as-physical-cover convention still holds. These are
+/// deliberate conventions every twin must follow.
 ///
 /// The generator is pure integer, ordered, and float/map-free, so the set is
 /// byte-stable on every platform and the same on every run. It realizes the
@@ -3280,6 +3354,19 @@ pub fn parity_vectors() -> ParityVectors {
             // reaches the wall — the shot resolves the body first, so cover behind the
             // target gives it nothing (a wall-first twin would wrongly absorb the shot).
             projectile_case("pawn_in_front_of_wall_is_hit", Vec2::ZERO, EAST, Vec2 { x: 3 * POSITION_SCALE, y: 0 }, 5 * POSITION_SCALE, range, radius, vec![Blocker { min: Vec2 { x: 3_200, y: -2_000 }, max: Vec2 { x: 4_000, y: 2_000 } }]),
+        ],
+        vertical_hits: vec![
+            // Tolerance off: z is ignored, so a target 5 m up is hit exactly as on the
+            // ground — the default-off (planar) behavior, for hitscan and the projectile.
+            vertical_hit_case("hitscan_off_ignores_elevation", WeaponMode::Hitscan, 0, 5_000, 0),
+            vertical_hit_case("projectile_off_ignores_elevation", WeaponMode::Projectile, 0, 5_000, 0),
+            // Tolerance on: a target 2 m up under a 1 m tolerance clears the shot — for
+            // hitscan, a melee swing, AND the level-flying projectile alike (one rule).
+            vertical_hit_case("hitscan_above_tolerance_cleared", WeaponMode::Hitscan, 0, 2_000, 1_000),
+            vertical_hit_case("melee_above_tolerance_cleared", WeaponMode::Melee, 0, 2_000, 1_000),
+            vertical_hit_case("projectile_above_tolerance_cleared", WeaponMode::Projectile, 0, 2_000, 1_000),
+            // The boundary is INCLUSIVE: a target exactly at the tolerance is still hit.
+            vertical_hit_case("hitscan_at_tolerance_lands", WeaponMode::Hitscan, 0, 1_000, 1_000),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

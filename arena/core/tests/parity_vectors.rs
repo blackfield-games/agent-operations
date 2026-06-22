@@ -146,6 +146,35 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(front.ticks_to_hit, Some(1), "a target in front of a wall is hit on the first swept step");
     assert!(front.damage > 0 && !front.blockers.is_empty(), "cover behind the target shields nothing");
 
+    // z-coupled combat (v4): the vertical hit rule gates every weapon mode. With the
+    // tolerance off a high target is hit (z ignored); with it on, a target above the
+    // tolerance is cleared for hitscan, melee, AND the level projectile; and the boundary
+    // is inclusive. A twin that ignores z under a set tolerance, that couples only some
+    // modes, or that uses an exclusive boundary fails one of these.
+    let vh = |label: &str| v.vertical_hits.iter().find(|c| c.label == label).unwrap();
+    assert!(vh("hitscan_off_ignores_elevation").damage > 0, "tolerance off: an elevated target is still hit (planar)");
+    assert!(vh("projectile_off_ignores_elevation").damage > 0, "tolerance off: a projectile ignores elevation too");
+    assert_eq!(vh("hitscan_above_tolerance_cleared").damage, 0, "hitscan: a target above the tolerance is cleared");
+    assert_eq!(vh("melee_above_tolerance_cleared").damage, 0, "melee shares the one vertical rule");
+    assert_eq!(vh("projectile_above_tolerance_cleared").damage, 0, "the level projectile clears a high target");
+    let boundary = vh("hitscan_at_tolerance_lands");
+    assert_eq!(
+        (boundary.shooter_z - boundary.target_z).abs(),
+        boundary.vertical_hit_tolerance,
+        "the boundary case sits exactly at the tolerance"
+    );
+    assert!(boundary.damage > 0, "a target exactly at the tolerance is hit — the bound is inclusive");
+    // The cleared cases are gated by ELEVATION, not the planar setup: each is genuinely
+    // above its (non-zero) tolerance, and the matching tolerance-off case at z=5000 lands,
+    // so z alone produced the miss.
+    for label in ["hitscan_above_tolerance_cleared", "melee_above_tolerance_cleared", "projectile_above_tolerance_cleared"] {
+        let c = vh(label);
+        assert!(
+            c.vertical_hit_tolerance > 0 && (c.shooter_z - c.target_z).abs() > c.vertical_hit_tolerance,
+            "{label} must be strictly above its tolerance for the clear to mean z-coupling"
+        );
+    }
+
     // Full matches: every committed record re-runs to its own committed result
     // (self-consistency); the v5 digest commits the inputs, the rules, AND the config. The octant
     // and fine matches run the IDENTICAL action stream and differ ONLY in aim_mode, so
