@@ -2004,6 +2004,337 @@ contract MatchSettlementTest is Test {
         }
         assertEq(token.balanceOf(address(settlement)), 0, "no stranded stake");
     }
+
+    // --- settleFieldWager: placement pot distribution + reputation (FM1-FM4) ---
+    //
+    // The Settled resolution of a field wager: one attester-gated, fenced call distributes
+    // the funded pot by an attester-supplied placement split (bounded to sum == pot) AND
+    // writes the zero-sum per-seat reputation, atomically. payouts/deltas align 1:1 with
+    // the stored roster in canonical seat order. Requires every seat funded.
+
+    event FieldMatchWagerSettled(bytes32 indexed matchId, bytes32 replayHash, uint256 seats, uint256 pot);
+
+    function _openFundField3(uint256 stake) internal returns (address[] memory ag) {
+        ag = _roster3(); // [alice, bob, dave]; registers + funds dave
+        _openField(FIELD, ag, stake);
+        _fundField(FIELD, alice);
+        _fundField(FIELD, bob);
+        _fundField(FIELD, dave);
+    }
+
+    function _payouts3(uint256 p0, uint256 p1, uint256 p2) internal pure returns (uint256[] memory ps) {
+        ps = new uint256[](3);
+        ps[0] = p0;
+        ps[1] = p1;
+        ps[2] = p2;
+    }
+
+    function _fieldReplayHash(bytes32 id) internal view returns (bytes32 rh) {
+        (,,,, rh) = settlement.fieldMatches(id);
+    }
+
+    // FM1 + FM2: a placement split distributes the pot to EXACTLY the right seats and writes
+    // the reputation vector. Distinct payouts make the seat->payout mapping mutation-checkable
+    // (a positional swap fails). Pins the pot conservation, the event, and the replay commit.
+    function test_settleFieldWager_distributesPotAndWritesReputation() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        uint256 dBefore = token.balanceOf(dave);
+
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether); // sum == pot (300)
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether); // zero-sum, within cap
+
+        vm.expectEmit(true, false, false, true);
+        emit FieldMatchWagerSettled(FIELD, HASH, 3, pot);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertEq(token.balanceOf(alice), aBefore + 150 ether, "seat 0 paid its placement share");
+        assertEq(token.balanceOf(bob), bBefore + 90 ether, "seat 1 paid its placement share");
+        assertEq(token.balanceOf(dave), dBefore + 60 ether, "seat 2 paid its placement share");
+        assertEq(token.balanceOf(address(settlement)), 0, "pot fully distributed, nothing stranded");
+        assertEq(registry.reputationOf(alice), int256(20 ether), "seat 0 reputation");
+        assertEq(registry.reputationOf(bob), 0, "seat 1 reputation");
+        assertEq(registry.reputationOf(dave), -int256(20 ether), "seat 2 reputation");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Settled, "settled");
+        assertEq(_fieldReplayHash(FIELD), HASH, "replay digest committed durably");
+    }
+
+    // A zero payout for a last-place seat is valid as long as the whole vector sums to the
+    // pot — winner-takes-all still writes every seat's reputation.
+    function test_settleFieldWager_winnerTakesAllZeroForOthers() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        uint256 dBefore = token.balanceOf(dave);
+
+        uint256[] memory ps = _payouts3(pot, 0, 0);
+        int256[] memory ds = _deltas(40 ether, -20 ether, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertEq(token.balanceOf(alice), aBefore + pot, "winner takes the whole pot");
+        assertEq(token.balanceOf(bob), bBefore, "a zero-payout seat receives nothing");
+        assertEq(token.balanceOf(dave), dBefore, "a zero-payout seat receives nothing");
+        assertEq(registry.reputationOf(bob), -int256(20 ether), "a zero-payout seat still moves reputation");
+    }
+
+    // FM1: sum(payouts) must equal the pot EXACTLY — both an under- and over-payment revert.
+    function test_settleFieldWager_revertsUnderConservingPot() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 59 ether); // sum = pot - 1
+        int256[] memory ds = _deltas(0, 0, 0);
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.PayoutMismatch.selector, pot - 1 ether, pot));
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        assertEq(token.balanceOf(address(settlement)), pot, "no payout on an under-conserving split");
+    }
+
+    function test_settleFieldWager_revertsOverConservingPot() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 61 ether); // sum = pot + 1
+        int256[] memory ds = _deltas(0, 0, 0);
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.PayoutMismatch.selector, pot + 1 ether, pot));
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        assertEq(token.balanceOf(address(settlement)), pot, "no payout on an over-conserving split");
+    }
+
+    // FM1 fuzz: ANY non-conserving split reverts and moves nothing, leaving the id free.
+    function testFuzz_settleFieldWager_revertsNonConservingPot(uint256 p0, uint256 p1, uint256 p2) public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        p0 = bound(p0, 0, pot);
+        p1 = bound(p1, 0, pot);
+        p2 = bound(p2, 0, pot);
+        uint256 sum = p0 + p1 + p2;
+        vm.assume(sum != pot);
+        uint256[] memory ps = _payouts3(p0, p1, p2);
+        int256[] memory ds = _deltas(0, 0, 0); // zero-sum, so only the pot check can trip
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.PayoutMismatch.selector, sum, pot));
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        assertEq(token.balanceOf(address(settlement)), pot, "no value minted or stranded");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open, "id free for a corrected split");
+    }
+
+    // FM1 fuzz: any conserving split distributes the WHOLE pot, each seat exactly its share.
+    function testFuzz_settleFieldWager_conservingPotDistributes(uint256 p0, uint256 p1) public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        p0 = bound(p0, 0, pot);
+        p1 = bound(p1, 0, pot - p0);
+        uint256 p2 = pot - p0 - p1; // the third seat absorbs the remainder => sum == pot exactly
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        uint256 dBefore = token.balanceOf(dave);
+
+        uint256[] memory ps = _payouts3(p0, p1, p2);
+        int256[] memory ds = _deltas(0, 0, 0);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertEq(token.balanceOf(alice), aBefore + p0, "seat 0 share");
+        assertEq(token.balanceOf(bob), bBefore + p1, "seat 1 share");
+        assertEq(token.balanceOf(dave), dBefore + p2, "seat 2 share");
+        assertEq(token.balanceOf(address(settlement)), 0, "the whole pot is distributed");
+    }
+
+    // FM2: the payout/delta vectors must match the seat count.
+    function test_settleFieldWager_revertsPayoutLengthMismatch() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = new uint256[](2); // n == 3
+        ps[0] = 150 ether;
+        ps[1] = 150 ether;
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(MatchSettlement.LengthMismatch.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    function test_settleFieldWager_revertsDeltaLengthMismatch() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(100 ether, 100 ether, 100 ether);
+        int256[] memory ds = new int256[](2); // n == 3
+        ds[0] = 10 ether;
+        ds[1] = -10 ether;
+        vm.expectRevert(MatchSettlement.LengthMismatch.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    // FM3: a non-zero-sum reputation vector reverts BEFORE any payout (atomicity — even a
+    // perfectly-conserving pot is not released if the reputation half is invalid).
+    function test_settleFieldWager_revertsNonZeroSumDeltas() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        uint256[] memory ps = _payouts3(100 ether, 100 ether, 100 ether); // conserving
+        int256[] memory ds = _deltas(20 ether, 0, -10 ether); // sum = +10
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.NonZeroSum.selector, int256(10 ether)));
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        assertEq(token.balanceOf(address(settlement)), pot, "no pot released when reputation is invalid");
+    }
+
+    // FM3: each |delta| is bounded by the same per-match magnitude cap as settleField.
+    function test_settleFieldWager_revertsDeltaOverCap() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(100 ether, 100 ether, 100 ether);
+        int256[] memory ds = _deltas(int256(RATING_CAP) + 1, -int256(RATING_CAP) - 1, 0);
+        vm.expectRevert(MatchSettlement.RatingDeltaTooLarge.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    // FM3 atomicity: if the registry rejects the reputation write the WHOLE settle reverts —
+    // no pot is released, the match stays Open, and the escrow is still recoverable via cancel
+    // (escrow liveness does not hard-depend on the reputation-writer grant). Mirrors the 1v1.
+    function test_settleFieldWager_revertsWhenNotReputationWriter() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 pot = 3 * STAKE;
+        vm.prank(owner);
+        registry.setReputationWriter(address(settlement), false);
+
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(AgentRegistry.NotReputationWriter.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        assertEq(token.balanceOf(address(settlement)), pot, "no half-settle: pot untouched on revert");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open, "match remains Open");
+
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        assertEq(token.balanceOf(address(settlement)), 0, "funds recovered via cancel");
+    }
+
+    // FM3 idempotency: a replayed settle reverts on the fence — no second payout or reputation.
+    function test_settleFieldWager_idempotentReSettleReverts() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        int256 aRep = registry.reputationOf(alice);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        assertEq(registry.reputationOf(alice), aRep, "no second reputation write");
+        assertEq(token.balanceOf(address(settlement)), 0, "no second payout");
+    }
+
+    // FM3: the reputation path must be enabled (a wager settle always writes per-seat deltas).
+    function test_settleFieldWager_revertsVariableDisabled() public {
+        _openFundField3(STAKE); // variable NOT enabled
+        uint256[] memory ps = _payouts3(100 ether, 100 ether, 100 ether);
+        int256[] memory ds = _deltas(0, 0, 0);
+        vm.expectRevert(MatchSettlement.VariableSettleDisabled.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    function test_settleFieldWager_revertsZeroReplayHash() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(MatchSettlement.ZeroReplayHash.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, bytes32(0));
+    }
+
+    // FM4: a wager settle requires EVERY seat funded — a partial field reverts, untouched.
+    function test_settleFieldWager_revertsPartiallyFunded() public {
+        _enableVariable(RATING_CAP);
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        _fundField(FIELD, bob); // dave's seat is NOT funded
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(MatchSettlement.NotFullyFunded.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE, "no payout on a partial field");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open);
+    }
+
+    function test_settleFieldWager_revertsUnfundedField() public {
+        _enableVariable(RATING_CAP);
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE); // nobody funds
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(MatchSettlement.NotFullyFunded.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    // FM4: a zero-stake field can never fund a seat, so it can never be wager-settled.
+    function test_settleFieldWager_revertsZeroStakeField() public {
+        _enableVariable(RATING_CAP);
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, 0);
+        uint256[] memory ps = _payouts3(0, 0, 0);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(MatchSettlement.NotFullyFunded.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    function test_settleFieldWager_revertsNonAttester() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        vm.prank(alice); // a participant, not the attester
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    function test_settleFieldWager_revertsAfterCancel() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+    }
+
+    // Cross-kind: a 1v1 openMatch id is not a field record, so a wager settle of it reverts
+    // on the field status fence (the shared id space never cross-contaminates).
+    function test_settleFieldWager_revertsOn1v1Id() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        uint256[] memory ps = new uint256[](0);
+        int256[] memory ds = new int256[](0);
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settleFieldWager(MATCH, ps, ds, HASH);
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE, "the 1v1 escrow is untouched");
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
@@ -2339,5 +2670,88 @@ contract MatchSettlementFieldRefundReentrancyTest is Test {
         );
         assertEq(token.balanceOf(bob), bobBefore + STAKE, "peer still refunded after the reentry attempt");
         assertEq(token.balanceOf(address(settlement)), 0, "no escrow drained beyond the two stakes");
+    }
+}
+
+contract MatchSettlementFieldSettleReentrancyTest is Test {
+    MatchSettlement settlement;
+    AgentRegistry registry;
+    HookToken token;
+    ReentrantFieldClaimer attacker;
+
+    address owner = address(0xA11CE);
+    address attester = address(0xA77E57E5);
+    address bob = address(0xB0B);
+
+    uint256 constant STAKE = 100 ether;
+    uint256 constant REP_DELTA = 10 ether;
+    uint256 constant RATING_CAP = 50 ether;
+    bytes32 constant FIELD = bytes32("field-settle-evil");
+    bytes32 constant HASH = bytes32("replay-digest");
+
+    function setUp() public {
+        token = new HookToken();
+        registry = new AgentRegistry(address(token), 0, owner);
+        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        attacker = new ReentrantFieldClaimer(settlement, registry, token);
+
+        vm.startPrank(owner);
+        registry.setReputationWriter(address(settlement), true);
+        settlement.setAttester(attester, true);
+        settlement.setMaxRatingDelta(RATING_CAP); // wager settle writes per-seat reputation
+        vm.stopPrank();
+
+        token.transfer(bob, 10_000 ether);
+        vm.startPrank(bob);
+        token.approve(address(registry), type(uint256).max);
+        token.approve(address(settlement), type(uint256).max);
+        registry.register(bytes32("bob-bot"), 0);
+        vm.stopPrank();
+
+        token.transfer(address(attacker), 10_000 ether);
+        attacker.setup(FIELD);
+
+        address[] memory ag = new address[](2);
+        ag[0] = address(attacker);
+        ag[1] = bob;
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, ag, STAKE);
+        attacker.fund();
+        vm.prank(bob);
+        settlement.fundField(FIELD);
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE);
+    }
+
+    /// @dev settleFieldWager's CEI fence in isolation. The attacker reenters the
+    ///      permissionless refundFieldExpired when it receives its pot share, AFTER the
+    ///      deadline — so the reentrant refund would double-drain the pot if the settle had
+    ///      not flipped the match to `Settled` BEFORE paying. The terminal fence is the only
+    ///      thing stopping it; this fails if the status flip moves after the payout loop.
+    function test_settleFieldWager_reentrantClaimerCannotDoubleDrain() public {
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline); // past the deadline: a reentrant refundFieldExpired is otherwise live
+        uint256 attackerBefore = token.balanceOf(address(attacker));
+        uint256 bobBefore = token.balanceOf(bob);
+
+        uint256[] memory ps = new uint256[](2);
+        ps[0] = STAKE + 10 ether; // attacker (seat 0) — non-zero so the payout hook fires
+        ps[1] = STAKE - 10 ether; // bob (seat 1); sum == 2*STAKE (the pot)
+        int256[] memory ds = new int256[](2);
+        ds[0] = 20 ether;
+        ds[1] = -20 ether;
+
+        token.arm();
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertTrue(attacker.reentered(), "reentry fired on payout");
+        assertTrue(attacker.reentryReverted(), "reentry blocked by the CEI terminal-state fence");
+        assertEq(
+            token.balanceOf(address(attacker)),
+            attackerBefore + STAKE + 10 ether,
+            "attacker paid its share once"
+        );
+        assertEq(token.balanceOf(bob), bobBefore + STAKE - 10 ether, "peer paid its share once");
+        assertEq(token.balanceOf(address(settlement)), 0, "pot distributed exactly once, no double-drain");
     }
 }
