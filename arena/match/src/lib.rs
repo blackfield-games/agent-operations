@@ -717,6 +717,14 @@ impl<V: IdentityVerifier> Matchmaker<V> {
         // seat id (canonical), so pair each outcome's seat to the agent the roster
         // seated there. Bail — registration intact — if either seat is out of range.
         let pending = st.pending_ranked.get(&result.match_id)?;
+        // This is the 1v1 route: it settles ONLY a 2-seat registration. Every Agent
+        // match registers now (not just 1v1s), so a 3+/team match shares this registry;
+        // settling one here would apply a partial 2-seat delta and burn its registration,
+        // leaving the rest of the field unsettled. Bail (registration intact) so it
+        // settles through `apply_ranked_field_result` instead.
+        if pending.agents.len() != 2 {
+            return None;
+        }
         let (Some(agent_a), Some(agent_b)) =
             (pending.agents.get(oa.seat as usize), pending.agents.get(ob.seat as usize))
         else {
@@ -1682,6 +1690,39 @@ mod tests {
         assert!(mm.apply_ranked_field_result(&full(third.match_id()), 32).is_some(), "a surviving recent match still settles");
         assert!(mm.apply_ranked_field_result(&full(second.match_id()), 32).is_some(), "the other survivor settles too");
         assert_eq!(mm.unsettled_ranked(), 0);
+    }
+
+    #[test]
+    fn the_1v1_route_refuses_a_multiseat_registration_leaving_it_for_the_field_path() {
+        // Every Agent match registers now, so a 3+/team match shares the registry the 1v1
+        // route reads. apply_ranked_result MUST refuse it: a 2-outcome result against a
+        // 3-seat roster would partial-settle two seats and burn the registration, leaving
+        // the rest of the field unsettled. It bails with the registration intact so the
+        // field path settles the full roster — and a genuine 1v1 still settles via the
+        // 1v1 route.
+        let (mm, m) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1600), ("0xc", 1400)]);
+        let mid = m.match_id();
+        assert!(
+            mm.apply_ranked_result(&decisive_result(mid, 0), 32).is_none(),
+            "the 1v1 route refuses a 3-seat registration"
+        );
+        assert_eq!(mm.unsettled_ranked(), 1, "the registration is intact — not burned by the 1v1 route");
+        assert_eq!(
+            ["0xa", "0xb", "0xc"].map(|a| mm.rating(a).unwrap()),
+            [1500, 1600, 1400],
+            "no rating moved"
+        );
+        assert!(
+            mm.apply_ranked_field_result(&field_result(mid, &[(0, 1), (1, 2), (2, 3)]), 32).is_some(),
+            "the field path settles the full 3-seat roster"
+        );
+        assert_eq!(mm.unsettled_ranked(), 0);
+
+        let (mm2, m2) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1600)]);
+        assert!(
+            mm2.apply_ranked_result(&decisive_result(m2.match_id(), 0), 32).is_some(),
+            "a genuine 1v1 still settles through the 1v1 route"
+        );
     }
 
     // -- ladder snapshot persistence --------------------------------------------
