@@ -26,6 +26,7 @@ contract MatchSettlementTest is Test {
 
     uint256 constant STAKE = 100 ether;
     uint256 constant REP_DELTA = 10 ether;
+    uint256 constant RATING_CAP = 50 ether;
     bytes32 constant MATCH = bytes32("match-1");
     bytes32 constant HASH = bytes32("replay-digest");
 
@@ -46,6 +47,7 @@ contract MatchSettlementTest is Test {
     event MatchExpired(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event AttesterSet(address indexed attester, bool authorized);
     event ReputationDeltaSet(uint256 reputationDelta);
+    event MaxRatingDeltaSet(uint256 maxRatingDelta);
     event SettleWindowSet(uint64 settleWindow);
 
     function setUp() public {
@@ -839,6 +841,291 @@ contract MatchSettlementTest is Test {
         settlement.settle(MATCH, alice, HASH);
         assertEq(registry.reputationOf(alice), 42 ether);
         assertEq(registry.reputationOf(bob), -42 ether);
+    }
+
+    // --- variable-delta settle (settleRanked / settleDrawRanked + maxRatingDelta) ---
+    //
+    // The arena rating curve computes a skill-scaled Elo delta off-chain (a favoured win
+    // earns less, an upset more; a draw moves the favourite down) and the match service
+    // submits it. These pin the on-chain consumer: the owner-set cap that bounds the
+    // attester's per-match magnitude power, the +d/-d zero-sum split the contract owns,
+    // and the sign rules (a decisive winner never moves down; a draw moves either way).
+
+    function _enableVariable(uint256 cap) internal {
+        vm.prank(owner);
+        settlement.setMaxRatingDelta(cap);
+    }
+
+    function test_setMaxRatingDelta_onlyOwnerAndEmits() public {
+        assertEq(settlement.maxRatingDelta(), 0, "variable path off by default");
+        vm.expectEmit(false, false, false, true);
+        emit MaxRatingDeltaSet(RATING_CAP);
+        vm.prank(owner);
+        settlement.setMaxRatingDelta(RATING_CAP);
+        assertEq(settlement.maxRatingDelta(), RATING_CAP);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        settlement.setMaxRatingDelta(1);
+    }
+
+    function test_setMaxRatingDelta_allowsZeroToDisable() public {
+        _enableVariable(RATING_CAP);
+        _enableVariable(0); // owner can turn the variable path back off
+        assertEq(settlement.maxRatingDelta(), 0);
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.VariableSettleDisabled.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, 1 ether);
+    }
+
+    function test_setMaxRatingDelta_revertsTooLarge() public {
+        vm.expectRevert(MatchSettlement.RatingDeltaTooLarge.selector);
+        vm.prank(owner);
+        settlement.setMaxRatingDelta(uint256(type(int256).max) + 1);
+    }
+
+    function test_settleRanked_paysWinnerAndRecordsVariableReputation() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        int256 delta = 25 ether;
+
+        uint256 aBefore = token.balanceOf(alice);
+        vm.expectEmit(true, true, true, true);
+        emit MatchSettled(MATCH, alice, bob, HASH, 2 * STAKE);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, delta);
+
+        assertEq(token.balanceOf(alice), aBefore + 2 * STAKE, "winner takes the pot");
+        assertEq(token.balanceOf(address(settlement)), 0, "escrow emptied");
+        assertEq(registry.reputationOf(alice), delta, "winner gains the variable delta");
+        assertEq(registry.reputationOf(bob), -delta, "loser loses exactly the negation");
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Settled);
+        (,, uint64 aMatches,,,) = registry.agents(alice);
+        assertEq(aMatches, 1);
+    }
+
+    function test_settleRanked_winnerCanBeB() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        int256 delta = 18 ether;
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, bob, HASH, delta);
+        assertEq(registry.reputationOf(bob), delta);
+        assertEq(registry.reputationOf(alice), -delta);
+    }
+
+    /// @dev A heavily-favoured winner's Elo gain can round to 0 (K*(1-E) truncates); the
+    ///      match must still settle — pot paid, match counted — not revert. A d>0-only
+    ///      misread would wrongly reject this legitimate win.
+    function test_settleRanked_zeroDeltaStillSettles() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        uint256 aBefore = token.balanceOf(alice);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, 0);
+        assertEq(token.balanceOf(alice), aBefore + 2 * STAKE, "zero-gain win still takes the pot");
+        assertEq(registry.reputationOf(alice), 0, "no reputation moved on a rounded-to-zero win");
+        assertEq(registry.reputationOf(bob), 0);
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Settled);
+        (,, uint64 aMatches,,,) = registry.agents(alice);
+        assertEq(aMatches, 1, "a zero-delta win still counts");
+    }
+
+    function test_settleRanked_atCapBoundary() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, int256(RATING_CAP));
+        assertEq(registry.reputationOf(alice), int256(RATING_CAP));
+        assertEq(registry.reputationOf(bob), -int256(RATING_CAP));
+    }
+
+    function test_settleRanked_revertsDisabledByDefault() public {
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.VariableSettleDisabled.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, 1 ether);
+    }
+
+    /// @dev A decisive winner must never LOSE reputation on a win — a negative delta is
+    ///      a malformed result, rejected before any state change.
+    function test_settleRanked_revertsNegativeDelta() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.NegativeWinnerDelta.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, -1);
+    }
+
+    function test_settleRanked_revertsTooLarge() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.RatingDeltaTooLarge.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, int256(RATING_CAP) + 1);
+    }
+
+    function test_settleRanked_revertsNotAttester() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        vm.prank(alice);
+        settlement.settleRanked(MATCH, alice, HASH, 1 ether);
+    }
+
+    /// @dev The variable path shares _applyDecisive with the fixed settle, so it inherits
+    ///      the escrow + winner-validity + replay-hash guards once the magnitude checks
+    ///      pass.
+    function test_settleRanked_inheritsDecisiveGuards() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        vm.prank(alice);
+        settlement.fund(MATCH);
+        vm.expectRevert(MatchSettlement.NotFullyFunded.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, 5 ether);
+
+        vm.prank(bob);
+        settlement.fund(MATCH);
+        vm.expectRevert(MatchSettlement.InvalidWinner.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, carol, HASH, 5 ether);
+
+        vm.expectRevert(MatchSettlement.ZeroReplayHash.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, bytes32(0), 5 ether);
+    }
+
+    /// @dev FM1 across the variable surface: a settled match is single-shot regardless of
+    ///      which settle form resolved it — a settleRanked replay AND a fixed settle both
+    ///      revert MatchNotOpen.
+    function test_settleRanked_idempotentAcrossForms() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, 7 ether);
+        int256 repAfter = registry.reputationOf(alice);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, alice, HASH, 7 ether);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        assertEq(registry.reputationOf(alice), repAfter, "no second reputation move");
+    }
+
+    /// @dev The signature Elo behaviour the fixed settleDraw cannot express: a draw between
+    ///      a favourite (agentA) and an underdog moves the favourite DOWN. agentA takes the
+    ///      negative delta, agentB its positive negation — still zero-sum, stakes refunded.
+    function test_settleDrawRanked_favouriteMovesDown() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        int256 deltaA = -12 ether; // agentA was favoured; a draw costs it standing
+
+        vm.expectEmit(true, true, true, true);
+        emit MatchDrawn(MATCH, alice, bob, HASH);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, deltaA);
+
+        assertEq(token.balanceOf(alice), aBefore + STAKE, "alice refunded own stake");
+        assertEq(token.balanceOf(bob), bBefore + STAKE, "bob refunded own stake");
+        assertEq(registry.reputationOf(alice), deltaA, "favourite moves down on a draw");
+        assertEq(registry.reputationOf(bob), -deltaA, "underdog moves up by the negation");
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Settled);
+    }
+
+    function test_settleDrawRanked_underdogMovesUp() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        int256 deltaA = 9 ether; // agentA the underdog; a draw earns it standing
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, deltaA);
+        assertEq(registry.reputationOf(alice), deltaA);
+        assertEq(registry.reputationOf(bob), -deltaA);
+    }
+
+    /// @dev An even pairing draws to no movement — identical to the fixed settleDraw.
+    function test_settleDrawRanked_zeroDeltaIsEvenDraw() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, 0);
+        assertEq(registry.reputationOf(alice), 0);
+        assertEq(registry.reputationOf(bob), 0);
+        assertEq(token.balanceOf(address(settlement)), 0, "both refunded");
+    }
+
+    function test_settleDrawRanked_atCapBoundaryBothSigns() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, int256(RATING_CAP));
+        assertEq(registry.reputationOf(alice), int256(RATING_CAP));
+        assertEq(registry.reputationOf(bob), -int256(RATING_CAP));
+
+        bytes32 id2 = bytes32("match-2");
+        _open(id2, 0);
+        vm.prank(attester);
+        settlement.settleDrawRanked(id2, HASH, -int256(RATING_CAP));
+        assertEq(registry.reputationOf(alice), 0, "+cap then -cap nets to zero");
+        assertEq(registry.reputationOf(bob), 0);
+        assertTrue(_status(id2) == MatchSettlement.Status.Settled);
+    }
+
+    /// @dev Even a zero delta reverts while the cap is 0 — the explicit disabled guard,
+    ///      not merely the magnitude bound, gates the path off by default.
+    function test_settleDrawRanked_revertsDisabledByDefault() public {
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.VariableSettleDisabled.selector);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, 0);
+    }
+
+    function test_settleDrawRanked_revertsTooLargePositive() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.RatingDeltaTooLarge.selector);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, int256(RATING_CAP) + 1);
+    }
+
+    function test_settleDrawRanked_revertsTooLargeNegative() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.RatingDeltaTooLarge.selector);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, -int256(RATING_CAP) - 1);
+    }
+
+    function test_settleDrawRanked_idempotent() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, 3 ether);
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, 3 ether);
+    }
+
+    function test_settleDrawRanked_revertsNotAttester() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, 0);
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        vm.prank(bob);
+        settlement.settleDrawRanked(MATCH, HASH, 0);
     }
 }
 
