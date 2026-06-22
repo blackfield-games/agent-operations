@@ -464,6 +464,22 @@ pub struct Rules {
     /// segment test the UE5 twin reproduces exactly.
     #[serde(default)]
     pub wall_slide: bool,
+    /// Ticks a seat remembers the LAST-KNOWN position of an entity it has lost sight
+    /// of — the perception-memory window. `serde(default)` (`0`) DISABLES memory: a
+    /// lost entity vanishes from the visible set the instant it leaves
+    /// perception ([`observe`](Match::observe) reports only currently-perceived
+    /// entities, every one `in_line_of_sight == true`), byte-identical to every
+    /// pre-memory record. A non-zero value turns memory on — once a seat has
+    /// perceived an entity, when it later passes out of perception its last PERCEIVED
+    /// position is surfaced as a [`VisibleEntity`] with `in_line_of_sight == false`,
+    /// for this many ticks, then dropped. Only an entity the seat ACTUALLY perceived
+    /// can be remembered (the memory refresh uses the same [`perceives`](Match::perceives)
+    /// test the visible set does), so memory adds no omniscient signal — it is the
+    /// realistic "you remember where you last saw someone". Memory is DERIVED from the
+    /// action stream (never recorded), so a replay re-runs it bit-for-bit; this field
+    /// folds into [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
+    #[serde(default)]
+    pub perception_memory_ticks: u16,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -501,6 +517,7 @@ impl Default for Rules {
             gravity: 0,    // vertical physics off by default — jump inert, z stays 0
             dash_cooldown: 0, // dash disabled by default — ability press inert
             wall_slide: false, // a grazing step stops at its origin (no slide) by default
+            perception_memory_ticks: 0, // perception memory off — a lost entity vanishes at once
         }
     }
 }
@@ -554,6 +571,7 @@ impl Rules {
         b.extend_from_slice(&self.gravity.to_be_bytes());
         b.extend_from_slice(&self.dash_cooldown.to_be_bytes());
         b.push(self.wall_slide as u8);
+        b.extend_from_slice(&self.perception_memory_ticks.to_be_bytes());
         b
     }
 }
@@ -693,6 +711,24 @@ struct Pickup {
     active: bool,
     /// Ticks remaining dormant; `0` while active. Counts down to a respawn.
     respawn_in: u16,
+}
+
+/// One entity a seat has perceived, frozen at the LAST tick it was in sight — the
+/// per-seat perception-memory entry (gated by [`Rules::perception_memory_ticks`]).
+/// The stored facets are exactly the perceivable ones a live [`VisibleEntity`]
+/// carries, captured at `last_seen`; [`observe`](Match::observe) re-surfaces them
+/// with `in_line_of_sight == false` while the entry is within the memory window.
+/// Never the entity's current (unseen) state — only what the seat actually saw.
+#[derive(Clone, Copy)]
+struct Remembered {
+    kind: arena_proto::EntityKind,
+    team: TeamId,
+    pos: Vec2,
+    z: i32,
+    facing: Bam,
+    /// The tick the seat last perceived this entity; the entry decays
+    /// `perception_memory_ticks` after it.
+    last_seen: u64,
 }
 
 /// A named arena's static geometry — the vision [`Blocker`]s and world
@@ -868,6 +904,13 @@ pub struct Match {
     /// the digest stay stable). Derived — never recorded; rebuilt from the config on
     /// replay.
     pickups: Vec<Pickup>,
+    /// Per-seat perception memory (index == seat), each a map from `entity_id` to the
+    /// last-perceived snapshot of that entity. Populated only when
+    /// [`Rules::perception_memory_ticks`] is non-zero; refreshed and pruned in
+    /// [`step`](Match::step), read by [`observe`](Match::observe). Derived state — never
+    /// recorded; reconstructed identically on replay because `step` is deterministic.
+    /// A `BTreeMap` so iteration is canonical (ascending `entity_id`).
+    seat_memory: Vec<BTreeMap<u32, Remembered>>,
     tick: u64,
     phase: MatchPhase,
     seed: u64,
@@ -982,6 +1025,7 @@ impl Match {
             next_projectile_id: PROJECTILE_ID_BASE,
             pickup_config: pickups,
             pickups: live_pickups,
+            seat_memory: (0..n).map(|_| BTreeMap::new()).collect(),
             tick: 0,
             phase: MatchPhase::Live,
             seed,
@@ -1059,6 +1103,56 @@ impl Match {
             && has_line_of_sight(&self.blockers, eye, target)
     }
 
+    /// Refresh every alive seat's perception memory at `tick`: record each entity the
+    /// seat perceives right now (the SAME [`perceives`](Self::perceives) test the live
+    /// visible set uses, so memory can only ever hold an actually-seen entity) as its
+    /// last-known snapshot, then drop entries older than the window so memory stays
+    /// bounded. Called at the START of [`step`](Self::step) — before any movement — so
+    /// the snapshot is the tick-`tick` state the seat's `observe` reported. Runs only
+    /// when [`Rules::perception_memory_ticks`] is non-zero (the caller gates it).
+    fn refresh_perception_memory(&mut self, tick: u64) {
+        let window = self.rules.perception_memory_ticks as u64;
+        // Snapshot the alive observers first, so the perceive-and-gather below borrows
+        // self immutably and never overlaps the mutable seat_memory write that applies it.
+        let observers: Vec<(Vec2, Bam, SeatId)> =
+            self.pawns.iter().filter(|p| p.alive).map(|p| (p.pos, p.facing, p.seat)).collect();
+        for (eye, facing, seat) in observers {
+            let mut seen: Vec<(u32, Remembered)> = Vec::new();
+            for p in &self.pawns {
+                if p.seat != seat && p.alive && self.perceives(eye, facing, p.pos) {
+                    seen.push((p.seat as u32, Remembered {
+                        kind: arena_proto::EntityKind::Player,
+                        team: p.team, pos: p.pos, z: p.z, facing: p.facing, last_seen: tick,
+                    }));
+                }
+            }
+            for proj in &self.projectiles {
+                if self.perceives(eye, facing, proj.pos) {
+                    seen.push((proj.id, Remembered {
+                        kind: arena_proto::EntityKind::Projectile,
+                        team: 0, pos: proj.pos, z: 0, facing: proj.facing, last_seen: tick,
+                    }));
+                }
+            }
+            for pk in &self.pickups {
+                if pk.active && self.perceives(eye, facing, pk.pos) {
+                    seen.push((pk.id, Remembered {
+                        kind: arena_proto::EntityKind::Pickup,
+                        team: 0, pos: pk.pos, z: 0, facing: 0, last_seen: tick,
+                    }));
+                }
+            }
+            let mem = &mut self.seat_memory[seat as usize];
+            for (id, snap) in seen {
+                mem.insert(id, snap);
+            }
+            // Decay: drop anything last seen more than `window` ticks ago. Pruning at
+            // age > window never removes a still-surfaceable entry — the last tick an
+            // entry surfaces is age == window, and that observe runs before this prune.
+            mem.retain(|_, r| tick.saturating_sub(r.last_seen) <= window);
+        }
+    }
+
     /// Build the parity-bounded observation for one seat: its own pawn in full,
     /// plus only the entities it can perceive this tick (alive pawns within
     /// `perception_range`, inside the seat's forward FOV cone
@@ -1124,6 +1218,34 @@ impl Match {
                     facing: 0,
                     in_line_of_sight: true,
                 });
+            }
+        }
+        // Perception memory (gated default-off): surface the last-known position of an
+        // entity this seat has lost sight of, as a VisibleEntity with
+        // in_line_of_sight == false, until it decays past the window. An entity still in
+        // `visible` this tick is skipped (no duplicate); a remembered entry is never one
+        // the seat did not actually perceive (the refresh that stored it used the same
+        // `perceives` test), so memory surfaces no omniscient signal — only a stale,
+        // honestly-flagged echo of a real prior sighting. Off (window 0) adds nothing.
+        if self.rules.perception_memory_ticks > 0 {
+            let window = self.rules.perception_memory_ticks as u64;
+            let live: BTreeSet<u32> = visible.iter().map(|e| e.entity_id).collect();
+            for (&id, r) in &self.seat_memory[seat as usize] {
+                if live.contains(&id) {
+                    continue;
+                }
+                let age = self.tick.saturating_sub(r.last_seen);
+                if age >= 1 && age <= window {
+                    visible.push(arena_proto::VisibleEntity {
+                        entity_id: id,
+                        kind: r.kind,
+                        team: r.team,
+                        position: r.pos,
+                        z: r.z,
+                        facing: r.facing,
+                        in_line_of_sight: false,
+                    });
+                }
             }
         }
         visible.sort_by_key(|e| e.entity_id);
@@ -1315,6 +1437,14 @@ impl Match {
             return;
         }
         let current = self.tick;
+
+        // Perception memory (gated default-off): record what each seat perceives at
+        // THIS tick's pre-movement state — the same state its observe(current) reported
+        // — so a later tick can surface a since-lost entity's last-known position. Off
+        // (window 0) skips this entirely, byte-identical to exclusion-only perception.
+        if self.rules.perception_memory_ticks > 0 {
+            self.refresh_perception_memory(current);
+        }
 
         // Accept only intents from seats alive at the start of the tick, each
         // defensively clamped — this is what gets applied AND recorded, so no
@@ -3163,6 +3293,122 @@ mod tests {
 
         // A no-pickup match surfaces an explicit empty layout.
         assert!(new_match(1).pickup_spawns().is_empty());
+    }
+
+    // Build a 2-seat match with perception memory set to `window`, pawn 0 at the
+    // origin and pawn 1 a controllable enemy — the fixture for the memory tests.
+    fn memory_match(window: u16) -> Match {
+        let rules = Rules { perception_memory_ticks: window, ..Rules::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m
+    }
+    const SEEN_AT: Vec2 = Vec2 { x: 5 * POSITION_SCALE, y: 0 }; // inside the 40 m range
+    const OUT_OF_RANGE: Vec2 = Vec2 { x: 45 * POSITION_SCALE, y: 0 }; // beyond it
+
+    #[test]
+    fn perception_memory_surfaces_a_lost_enemys_last_known_position() {
+        // FM1: once seat 0 has perceived seat 1, losing sight of it surfaces its LAST
+        // PERCEIVED position with in_line_of_sight == false — never its live, unseen one.
+        let mut m = memory_match(3);
+        m.pawns[1].pos = SEEN_AT;
+        m.step(&BTreeMap::new()); // tick 0: memory records seat 1 at SEEN_AT; tick -> 1
+        m.pawns[1].pos = OUT_OF_RANGE; // seat 1 moves out of sight
+
+        let visible = m.observe(0).visible;
+        assert_eq!(visible.len(), 1, "the lost enemy is surfaced from memory");
+        assert_eq!(visible[0].entity_id, 1);
+        assert!(!visible[0].in_line_of_sight, "a remembered entity is flagged out of sight");
+        assert_eq!(visible[0].position, SEEN_AT, "memory holds the last PERCEIVED position, not the live one");
+    }
+
+    #[test]
+    fn perception_memory_never_remembers_a_never_perceived_enemy() {
+        // FM1 leak guard: memory can ONLY hold an entity the seat actually perceived. An
+        // enemy never in sight is never surfaced — the memory channel adds no omniscience.
+        let mut m = memory_match(5);
+        m.pawns[1].pos = OUT_OF_RANGE; // out of range the whole match
+        for _ in 0..4 {
+            assert!(m.observe(0).visible.is_empty(), "a never-seen enemy is never remembered");
+            m.step(&BTreeMap::new());
+        }
+        assert!(m.seat_memory[0].is_empty(), "nothing about it was ever recorded");
+    }
+
+    #[test]
+    fn perception_memory_decays_and_is_dropped_after_the_window() {
+        // FM2: a remembered entry surfaces for exactly `window` ticks past the last
+        // sighting, then is dropped from the store — bounded memory, not a permanent x-ray.
+        let mut m = memory_match(2);
+        m.pawns[1].pos = SEEN_AT;
+        m.step(&BTreeMap::new()); // tick 0 -> 1: records seat 1 at last_seen 0
+        m.pawns[1].pos = OUT_OF_RANGE; // lost
+
+        let remembered = |m: &Match| m.observe(0).visible.iter().any(|e| e.entity_id == 1 && !e.in_line_of_sight);
+        assert!(remembered(&m), "age 1: within the window");
+        m.step(&BTreeMap::new()); // -> tick 2
+        assert!(remembered(&m), "age 2 == window: still surfaced");
+        m.step(&BTreeMap::new()); // -> tick 3
+        assert!(!remembered(&m), "age 3 > window: decayed");
+        m.step(&BTreeMap::new()); // -> tick 4: the stale entry is pruned
+        assert!(m.seat_memory[0].is_empty(), "the decayed entry is dropped, so memory stays bounded");
+    }
+
+    #[test]
+    fn perception_memory_off_is_identical_to_exclusion() {
+        // FM2 default-off: window 0 (the default) records nothing and surfaces nothing —
+        // a lost enemy vanishes at once, byte-identical to exclusion-only perception.
+        let mut m = memory_match(0);
+        m.pawns[1].pos = SEEN_AT;
+        m.step(&BTreeMap::new());
+        m.pawns[1].pos = OUT_OF_RANGE; // lost
+        assert!(m.observe(0).visible.is_empty(), "off: a lost enemy is not remembered");
+        assert!(m.seat_memory[0].is_empty(), "off: the refresh is skipped, no memory accrues");
+    }
+
+    #[test]
+    fn perception_memory_skips_a_still_visible_entity_and_keeps_canonical_order() {
+        // FM4: the merged visible set stays ascending by entity_id and never duplicates a
+        // still-visible entity. Seat 0 sees seats 1 and 2, then loses 1 while 2 stays in
+        // view: 2 is reported live, 1 from memory, once each, ordered.
+        let rules = Rules { perception_memory_ticks: 3, ..Rules::default() };
+        let roster = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xa".into() },
+            SeatInfo { seat: 1, team: 1, controller: "0xb".into() },
+            SeatInfo { seat: 2, team: 2, controller: "0xc".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, roster, Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        let two_at = Vec2 { x: 0, y: 5 * POSITION_SCALE };
+        m.pawns[1].pos = SEEN_AT;
+        m.pawns[2].pos = two_at;
+        m.step(&BTreeMap::new()); // records seats 1 and 2
+        m.pawns[1].pos = OUT_OF_RANGE; // seat 1 lost; seat 2 stays in view
+
+        let visible = m.observe(0).visible;
+        let ids: Vec<u32> = visible.iter().map(|e| e.entity_id).collect();
+        assert_eq!(ids, vec![1, 2], "ascending entity_id, each exactly once (no live/remembered dup)");
+        let one = visible.iter().find(|e| e.entity_id == 1).unwrap();
+        let two = visible.iter().find(|e| e.entity_id == 2).unwrap();
+        assert!(!one.in_line_of_sight, "the lost enemy is remembered (out of sight)");
+        assert!(two.in_line_of_sight, "the still-visible enemy is live, not a stale memory echo");
+        assert_eq!(two.position, two_at, "the live entity carries its current position");
+    }
+
+    #[test]
+    fn perception_memory_is_deterministic_across_identical_runs() {
+        // FM3: memory is a pure function of the deterministic step loop, so two identical
+        // runs surface byte-identical observations — including the remembered entries.
+        let run = || {
+            let mut m = memory_match(3);
+            m.pawns[1].pos = SEEN_AT;
+            m.step(&BTreeMap::new());
+            m.pawns[1].pos = OUT_OF_RANGE;
+            m.step(&BTreeMap::new());
+            m.observe(0).visible
+        };
+        assert_eq!(run(), run(), "identical runs produce identical memory surfacing");
     }
 
     fn intent(move_dir: Vec2, aim: Bam, fire: bool) -> ActionIntent {
@@ -5506,9 +5752,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 10×i32 + 1×u32 + 9×u16 + 5×u8 = 67 bytes. A new sim field added to the
+        // 10×i32 + 1×u32 + 10×u16 + 5×u8 = 69 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 67, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 69, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -5536,8 +5782,9 @@ mod tests {
             ("gravity", Rules { gravity: base.gravity + 1, ..base }),
             ("dash_cooldown", Rules { dash_cooldown: base.dash_cooldown + 1, ..base }),
             ("wall_slide", Rules { wall_slide: !base.wall_slide, ..base }),
+            ("perception_memory_ticks", Rules { perception_memory_ticks: base.perception_memory_ticks + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 25, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 26, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
