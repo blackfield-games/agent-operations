@@ -417,6 +417,70 @@ def test_static_geometry_never_rides_the_parity_bounded_observation():
         })
 
 
+def test_start_carries_static_pickup_points_and_defaults_empty():
+    # Decode side: a Start with the static pickup layout decodes into typed Vec2
+    # spawn points an agent can path toward; a Start WITHOUT the field (an older
+    # server, or a no-pickup match) decodes to an empty list — the back-compat default.
+    with_points = decode_gateway({
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+        "pickup_points": [{"x": 100, "y": 200}, {"x": -100, "y": -200}],
+    })
+    assert isinstance(with_points, Start)
+    assert with_points.pickup_points == [Vec2(x=100, y=200), Vec2(x=-100, y=-200)]
+
+    without = decode_gateway(_start_frame())  # no "pickup_points" key
+    assert isinstance(without, Start) and without.pickup_points == []
+
+
+def test_connect_exposes_the_static_pickup_points():
+    # The client surfaces the pickup layout learned at Start (the twin of c.blockers),
+    # so a policy can read c.pickup_points to path toward where items spawn.
+    from arena_client.sdk import ArenaClient
+    start = {
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+        "pickup_points": [{"x": 500, "y": 0}],
+    }
+    c = ArenaClient(MockTransport([_challenge_frame(), _welcome_frame(), start]), agent_id="a").connect()
+    assert c.pickup_points == [Vec2(x=500, y=0)]
+
+    # A match with no pickups (the default Start) exposes an empty layout.
+    c2 = ArenaClient(
+        MockTransport([_challenge_frame(), _welcome_frame(), _start_frame()]), agent_id="a"
+    ).connect()
+    assert c2.pickup_points == []
+
+
+def test_pickup_points_are_position_only_never_kind_or_amount():
+    # FM1 (no full-reveal): the surfaced layout is position-only by construction — a
+    # bare Vec2 list. The pickup kind/amount stays empirical (learned by collecting),
+    # so a spawn point carrying a kind/amount is REJECTED (extra=forbid on Vec2): the
+    # channel structurally cannot leak the effect, on either side of a drift.
+    with pytest.raises(pydantic.ValidationError):
+        decode_gateway({
+            "type": "start", "match_id": FIXED_MATCH,
+            "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+            "pickup_points": [{"x": 100, "y": 200, "kind": "health", "amount": 25}],
+        })
+
+
+def test_static_pickup_layout_never_rides_the_parity_bounded_observation():
+    # FM2 (dynamic-availability): only the STATIC layout is surfaced (once, at Start).
+    # Whether a pickup is currently collectible or on respawn-cooldown is dynamic state
+    # that stays parity-bounded — a pickup_points field on an Observation is rejected
+    # (extra=forbid), so no static-layout channel can be added to the per-tick snapshot.
+    with pytest.raises(pydantic.ValidationError):
+        Observation.model_validate({
+            "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 1,
+            "phase": "live", "deadline_micros": 50_000,
+            "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+                    "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
+                    "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": True},
+            "visible": [], "pickup_points": [],
+        })
+
+
 def test_connect_refuses_version_skew():
     # FM3: a version skew is a clean refusal at connect, before any match state.
     from arena_client.sdk import ArenaClient, VersionMismatch
