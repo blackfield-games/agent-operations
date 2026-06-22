@@ -5017,6 +5017,193 @@ mod tests {
         assert!(spender.spent().is_empty());
     }
 
+    // -- POST /debits/{id}/redrive — operator re-drive of a dead-lettered debit --
+
+    /// Settle one metered job and drain it through a permanent-failing spender so it
+    /// is dead-lettered — the precondition for every re-drive test.
+    async fn dead_letter_one(state: &Arc<AppState>, job: &JobSpec) {
+        settle_one_metered(state, job).await;
+        drain_debits(state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(state).await, 1, "precondition: one dead-lettered debit");
+        assert_eq!(pending_debits(state).await, 0, "precondition: nothing drainable");
+    }
+
+    /// FM1: re-drive re-arms ONLY a dead-lettered, not-yet-settled debit. A
+    /// dead-lettered row is re-armed (→ drainable again); an already-settled row
+    /// (re-arming would resurrect a paid charge), an unknown job, and a still-pending
+    /// row (already drainable) are all refused — the store method returns false and
+    /// nothing changes.
+    #[tokio::test]
+    async fn redrive_rearms_only_a_dead_lettered_unsettled_debit() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let poison = seed_job();
+        let good = seed_job();
+        settle_one_metered(&state, &poison).await; // settled first → claimed first (the head)
+        settle_one_metered(&state, &good).await;
+
+        // Dead-letter the poison head; the good debit settles in the same pass.
+        drain_debits(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
+        assert_eq!(dead_lettered_debits(&state).await, 1);
+        assert_eq!(pending_debits(&state).await, 0, "good settled, poison quarantined");
+
+        {
+            let store = state.store.lock().await;
+            // Already-settled (good): tx_hash set → never re-armed (no resurrecting a paid charge).
+            assert!(!store.redrive_dead_lettered_debit(&good.id).unwrap(), "a settled debit is not re-armed");
+            // Unknown job: nothing to re-arm.
+            assert!(!store.redrive_dead_lettered_debit(&Uuid::new_v4()).unwrap(), "an unknown debit is not re-armed");
+            // Dead-lettered (poison): re-armed.
+            assert!(store.redrive_dead_lettered_debit(&poison.id).unwrap(), "a dead-lettered debit is re-armed");
+        }
+        assert_eq!(dead_lettered_debits(&state).await, 0, "poison left the dead-letter set");
+        assert_eq!(pending_debits(&state).await, 1, "poison re-entered the drainable backlog");
+
+        // Now-pending poison: a second re-drive is a no-op (already drainable).
+        let store = state.store.lock().await;
+        assert!(!store.redrive_dead_lettered_debit(&poison.id).unwrap(), "a still-pending debit is not re-armed");
+    }
+
+    /// FM2: a re-armed debit settles EXACTLY ONCE on the next drain, and a repeat
+    /// re-drive after it has settled is a no-op — no double-charge. The off-chain
+    /// double guard (`tx_hash IS NULL AND dead_lettered_at IS NULL`) plus the on-chain
+    /// `spendOnce` fence keep a re-driven charge to at most one settle.
+    #[tokio::test]
+    async fn redrive_then_drain_settles_the_re_armed_debit_exactly_once() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        dead_letter_one(&state, &job).await;
+
+        // Operator re-drives after the buyer tops up.
+        assert!(state.store.lock().await.redrive_dead_lettered_debit(&job.id).unwrap());
+        assert_eq!(pending_debits(&state).await, 1, "re-armed back into the backlog");
+
+        // Next drain settles it once.
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender).await;
+        assert_eq!(spender.calls(), 1);
+        assert_eq!(spender.spent(), vec![eas::job_id_hex(&job.id)], "the re-armed debit settles exactly once");
+        assert_eq!(pending_debits(&state).await, 0);
+        assert_eq!(dead_lettered_debits(&state).await, 0);
+
+        // A repeat re-drive once settled is a no-op (tx_hash set), and a further drain
+        // claims nothing — no double-charge on an operator double-call.
+        assert!(
+            !state.store.lock().await.redrive_dead_lettered_debit(&job.id).unwrap(),
+            "a settled debit can't be re-armed"
+        );
+        let spender2 = MockSpender::succeeding();
+        drain_debits(&state, &spender2).await;
+        assert_eq!(spender2.calls(), 0, "nothing left to claim — no second charge");
+    }
+
+    /// FM3: if the buyer is STILL underfunded, re-driving then re-draining simply
+    /// re-dead-letters the row — one more attempt per re-drive, never an infinite
+    /// auto-retry and never a panic. It stays quarantined until the next EXPLICIT
+    /// re-drive (a dead-lettered row is never auto-re-claimed).
+    #[tokio::test]
+    async fn redrive_re_dead_letters_on_a_repeat_permanent_error() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let job = seed_job();
+        dead_letter_one(&state, &job).await;
+
+        // Re-drive, then drain while the buyer is still underfunded (permanent again).
+        assert!(state.store.lock().await.redrive_dead_lettered_debit(&job.id).unwrap());
+        let spender = MockSpender::permanent();
+        drain_debits(&state, &spender).await;
+        assert_eq!(spender.calls(), 1, "one more attempt — not a hot loop");
+        assert_eq!(dead_lettered_debits(&state).await, 1, "re-dead-lettered, not dropped");
+        assert_eq!(pending_debits(&state).await, 0);
+
+        // NOT auto-re-driven: a succeeding drain claims nothing until the next explicit re-drive.
+        let spender2 = MockSpender::succeeding();
+        drain_debits(&state, &spender2).await;
+        assert_eq!(spender2.calls(), 0, "a re-dead-lettered debit is not auto-re-claimed");
+        assert_eq!(dead_lettered_debits(&state).await, 1, "still quarantined");
+    }
+
+    /// Empty-queue state with BOTH a compute rate (so debits accrue) and an ingest
+    /// token (so the re-drive endpoint is gated) — for the endpoint auth tests.
+    async fn test_state_metered_with_token(token: &str) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap().with_compute_rate_wei(DRAIN_RATE),
+            StoreConfig { ingest_token: Some(token.to_string()), ..test_config() },
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
+    /// `POST /debits/{id}/redrive` with an optional `Authorization` header (body-less).
+    async fn post_redrive(
+        state: Arc<AppState>,
+        id: Uuid,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/debits/{id}/redrive"));
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state)
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// FM4: the re-drive endpoint requires the same bearer token as `POST /jobs`. A
+    /// missing-header and a wrong-token call are both `401` and re-arm NOTHING (the
+    /// debit stays dead-lettered); the correct token re-arms it (`200 {"rearmed": true}`).
+    #[tokio::test]
+    async fn redrive_endpoint_rejects_unauthenticated_and_accepts_the_token() {
+        let state = test_state_metered_with_token(TEST_INGEST_TOKEN).await;
+        let job = seed_job();
+        dead_letter_one(&state, &job).await;
+
+        // No Authorization header → 401, nothing re-armed.
+        let resp = post_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_debits(&state).await, 1, "an unauthenticated re-drive re-arms nothing");
+        assert_eq!(pending_debits(&state).await, 0);
+
+        // Wrong token → 401, still nothing re-armed.
+        let resp = post_redrive(state.clone(), job.id, Some("Bearer wrong-token")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_debits(&state).await, 1);
+
+        // Correct token → 200, re-armed.
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_redrive(state.clone(), job.id, Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], true);
+        assert_eq!(dead_lettered_debits(&state).await, 0, "the authenticated re-drive re-armed it");
+        assert_eq!(pending_debits(&state).await, 1);
+    }
+
+    /// The endpoint mirrors `POST /jobs`' unconfigured-open posture: with no token a
+    /// re-drive needs no auth. Also pins that the no-op path (the row no longer
+    /// dead-lettered) is a successful `200 {"rearmed": false}`, not an error — so an
+    /// operator can replay a re-drive idempotently.
+    #[tokio::test]
+    async fn redrive_endpoint_open_and_idempotent_without_token() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await; // no token configured
+        assert!(state.ingest_token.is_none());
+        let job = seed_job();
+        dead_letter_one(&state, &job).await;
+
+        // Open: re-drive with no auth re-arms the dead-lettered debit.
+        let resp = post_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], true);
+        assert_eq!(pending_debits(&state).await, 1);
+
+        // Idempotent no-op: a second re-drive (now pending, not dead-lettered) is a
+        // successful 200 false.
+        let resp = post_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], false);
+    }
+
     /// FM2: the drain must not hold the store mutex across the slow on-chain spend,
     /// or every settle/stats stalls behind RPC latency. The gated spender holds the
     /// spend in-flight while we prove the store lock is still acquirable.
