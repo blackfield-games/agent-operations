@@ -203,9 +203,26 @@ class Reject(_Wire):
     reason: str
 
 
+class Blocker(_Wire):
+    """A static axis-aligned cover box on the ground plane, mirroring
+    `arena_proto::Blocker` (`min`/`max` corners, `min <= max` per axis). Physical
+    cover: it stops movement, fire, and sightlines in the reference core. Carried in
+    `Start.blockers` so an agent learns the arena's static cover layout."""
+
+    min: Vec2
+    max: Vec2
+
+
 class Start(_Wire):
     match_id: MatchIdStr
     config: MatchConfig
+    # The static vision/cover blockers the match runs under — the arena's cover
+    # layout, the same map knowledge a human player has. Surfaced ONCE at match
+    # start (never on the per-tick parity-bounded Observation, whose security
+    # boundary is unchanged) so an AgentController can path around physical cover.
+    # Mirrors the Rust GatewayMsg::Start field; defaults to empty so a Start without
+    # it — an older server, or a match with no occluders — decodes unchanged.
+    blockers: list[Blocker] = Field(default_factory=list)
 
 
 GatewayMsg = Challenge | Welcome | Reject | Start | Observation | MatchResult
