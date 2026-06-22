@@ -631,9 +631,10 @@ mod tests {
 
     #[test]
     fn a_non_pair_match_is_not_settleable() {
-        // MatchSettlement settles exactly two agents, so a 3-seat FFA (and likewise
-        // a single/empty result) is refused rather than emitted as an unsettleable
-        // Win/Draw — and nothing is recorded.
+        // settle_match is the 1v1 seam: MatchSettlement's settle/settleDraw take exactly
+        // two agents, so a 3-seat FFA (and a single/empty result) is refused here rather
+        // than emitted as an unsettleable Win/Draw — settle_field_match is what settles a
+        // 3+ field. Nothing is recorded.
         let replay = replay_for(roster(3));
         let result =
             result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 3, true), outcome(2, 3, 1, false)]);
@@ -771,5 +772,138 @@ mod tests {
         settle_match(&variable, &result, &replay, Some(ranked(1700, 1400, 32))).unwrap();
         assert_eq!(dig(&fixed), dig(&variable), "the reputation delta does not change the committed digest");
         assert_eq!(dig(&variable), replay.digest(), "still the canonical core digest");
+    }
+
+    fn field(ratings: Vec<i32>, k: i32) -> FieldContext {
+        FieldContext { ratings, k }
+    }
+
+    fn three_seat_result() -> MatchResult {
+        // Strict 1/2/3 finish so every pairwise game is decisive (no ties to flatten the
+        // per-seat deltas).
+        result_for(vec![outcome(0, 1, 9, true), outcome(1, 2, 5, true), outcome(2, 3, 1, false)])
+    }
+
+    #[test]
+    fn a_field_settle_maps_each_canonical_seat_to_its_controller_and_core_delta() {
+        // FM1: a 3-seat result emits the zero-sum per-seat vector in canonical
+        // ascending-seat order, each delta paired to ITS seat's controller. Distinct
+        // ratings + a strict placement make the three deltas distinct, so a seat→agent
+        // swap or a dropped seat is observable; the carried deltas equal arena-core's
+        // ranked_field_delta verbatim.
+        let replay = replay_for(roster(3));
+        let result = three_seat_result();
+        let k = 32;
+        let ratings = vec![1500, 1400, 1600];
+        let core = ranked_field_delta(&result, &ratings, k).expect("3-seat field has deltas");
+        assert_eq!(core.iter().map(|d| i64::from(d.delta)).sum::<i64>(), 0, "the field is zero-sum");
+        let ds: Vec<i32> = core.iter().map(|d| d.delta).collect();
+        assert!(ds[0] != ds[1] && ds[1] != ds[2] && ds[0] != ds[2], "distinct deltas make a swap observable: {ds:?}");
+
+        let settler = MockSettler::default();
+        let n = settle_field_match(&settler, &result, &replay, field(ratings, k)).expect("settles");
+        assert_eq!(n, 3, "all three seats settled");
+
+        let expected: Vec<FieldEntry> = core
+            .iter()
+            .map(|d| FieldEntry { agent: format!("agent-{}", d.seat), delta: d.delta })
+            .collect();
+        assert_eq!(
+            settler.resolution(id()),
+            Some(Resolution::Field { entries: expected, replay_digest: replay.digest() }),
+            "each canonical seat maps to its controller + its exact core delta",
+        );
+    }
+
+    #[test]
+    fn the_field_seam_refuses_a_pair_so_n2_keeps_the_single_delta_shape() {
+        // FM2: a 2-seat result must never be emitted as a 2-vector. The field seam refuses
+        // a pair (NotRankedField), so the ONLY n=2 settle path is settle_match's single
+        // winner/agentA delta — the live 1v1 path is unchanged.
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 1, false)]);
+
+        let field_settler = MockSettler::default();
+        assert!(matches!(
+            settle_field_match(&field_settler, &result, &replay, field(vec![1500, 1500], 32)),
+            Err(SettleError::NotRankedField),
+        ));
+        assert_eq!(field_settler.resolution(id()), None, "a pair records no field resolution");
+
+        let pair_settler = MockSettler::default();
+        let k = 32;
+        let core = ranked_delta(&result, 1500, 1500, k).unwrap();
+        settle_match(&pair_settler, &result, &replay, Some(ranked(1500, 1500, k))).unwrap();
+        assert_eq!(
+            pair_settler.resolution(id()),
+            Some(Resolution::Win { winner: "agent-0".into(), reputation: Some(core.a), replay_digest: replay.digest() }),
+            "n=2 settles as the single winner delta, never a 2-vector",
+        );
+    }
+
+    #[test]
+    fn the_field_deltas_never_perturb_the_committed_digest() {
+        // FM3: the per-seat deltas are settlement metadata — the committed digest is
+        // identical across two settles of the SAME result with DIFFERENT ratings (hence
+        // different deltas), and equals the canonical core ReplayRecord.digest().
+        let replay = replay_for(roster(3));
+        let result = three_seat_result();
+        let ent = |s: &MockSettler| match s.resolution(id()).expect("resolved") {
+            Resolution::Field { entries, replay_digest } => (entries, replay_digest),
+            _ => unreachable!("a field settle records a Field"),
+        };
+        let a = MockSettler::default();
+        settle_field_match(&a, &result, &replay, field(vec![1500, 1500, 1500], 32)).unwrap();
+        let b = MockSettler::default();
+        settle_field_match(&b, &result, &replay, field(vec![1900, 1300, 1700], 64)).unwrap();
+        let (ea, da) = ent(&a);
+        let (eb, db) = ent(&b);
+        assert_ne!(ea, eb, "the two rating sets really produce different deltas");
+        assert_eq!(da, db, "the field deltas do not change the committed digest");
+        assert_eq!(da, replay.digest(), "still the canonical core digest");
+    }
+
+    #[test]
+    fn a_field_settle_is_fenced_against_a_replay() {
+        // The shared per-matchId fence: a second field settle of the same matchId is
+        // AlreadyResolved and the first recorded vector is untouched — the off-chain
+        // mirror of the on-chain Status fence (one settlement per matchId).
+        let replay = replay_for(roster(3));
+        let result = three_seat_result();
+        let settler = MockSettler::default();
+        settle_field_match(&settler, &result, &replay, field(vec![1500, 1500, 1500], 32)).expect("first settles");
+        let first = settler.resolution(id());
+        assert!(matches!(
+            settle_field_match(&settler, &result, &replay, field(vec![1900, 1300, 1700], 64)),
+            Err(SettleError::AlreadyResolved),
+        ));
+        assert_eq!(settler.resolution(id()), first, "the replay changes nothing");
+    }
+
+    #[test]
+    fn a_field_settle_refuses_a_misaligned_or_subfield_result() {
+        // RatingsMismatch: ratings must align 1:1 with the seats, else the positional
+        // seat→rating pairing is wrong — refused before any emit. NotRankedField: fewer
+        // than 3 seats is the 1v1 path's job, so a single/empty result is refused here.
+        let replay3 = replay_for(roster(3));
+        let result3 = three_seat_result();
+        let settler = MockSettler::default();
+        assert!(matches!(
+            settle_field_match(&settler, &result3, &replay3, field(vec![1500, 1500], 32)),
+            Err(SettleError::RatingsMismatch),
+        ));
+        assert_eq!(settler.resolution(id()), None, "a misaligned vector records nothing");
+
+        let single = result_for(vec![outcome(0, 1, 1, true)]);
+        assert!(matches!(
+            settle_field_match(&settler, &single, &replay_for(roster(1)), field(vec![1500], 32)),
+            Err(SettleError::NotRankedField),
+        ));
+        let empty = result_for(vec![]);
+        assert!(matches!(
+            settle_field_match(&settler, &empty, &replay_for(roster(0)), field(vec![], 32)),
+            Err(SettleError::NotRankedField),
+        ));
+        assert_eq!(settler.resolution(id()), None, "nothing recorded across the refusals");
     }
 }
