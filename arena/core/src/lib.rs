@@ -2845,6 +2845,61 @@ pub fn expected_score_bp(diff: i32) -> i32 {
     }
 }
 
+/// The result of a head-to-head ranked match from player A's point of view — the
+/// input to [`rating_delta`] alongside the two ratings. `Draw` is any shared top
+/// placement (see [`settlement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchOutcome {
+    /// Player A won (placed strictly first).
+    WinA,
+    /// The match was drawn (a shared first placement).
+    Draw,
+    /// Player B won.
+    WinB,
+}
+
+/// The signed reputation change a settled ranked match applies to each player.
+/// Always zero-sum (`a == -b`), so feeding `a` and `b` to the two
+/// `AgentRegistry.recordMatchResult` calls conserves total reputation exactly — no
+/// reputation is minted or burned by a match, the on-chain invariant the contract's
+/// symmetric +delta/-delta accounting relies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatingDelta {
+    /// Reputation change for player A (the first participant).
+    pub a: i32,
+    /// Reputation change for player B — exactly `-a`.
+    pub b: i32,
+}
+
+/// The zero-sum Elo reputation delta for a ranked match between players A and B at
+/// the given integer ratings, scaled by the owner-set K-factor.
+///
+/// `delta_a = K · (S_a − E_a)` where `S_a ∈ {1, ½, 0}` for A's win/draw/loss and
+/// `E_a` is A's [`expected_score_bp`]; `delta_b = −delta_a`. The product is taken in
+/// `i64` then divided by [`RATING_SCALE`], truncating toward zero — so `|delta| ≤ K`
+/// (an upset moves a full K, an expected win moves less), the result fits `i32` for
+/// any `i32` K, and the negation is exact (`(−x)/d == −(x/d)`), keeping it exactly
+/// zero-sum. A negative K is meaningless and clamped to `0` (an inert match).
+///
+/// Favouring falls out of the curve: the favourite gains LESS for a win, loses MORE
+/// for an upset, and a draw moves the favourite DOWN toward the underdog — the self-
+/// correcting pressure that keeps a ladder honest. The K MAGNITUDE is an owner-set
+/// economic decision (operator-gated before mainnet, like the rate params); only the
+/// shape is fixed here.
+pub fn rating_delta(rating_a: i32, rating_b: i32, outcome: MatchOutcome, k: i32) -> RatingDelta {
+    let k = k.max(0);
+    let e_a = expected_score_bp(rating_a.saturating_sub(rating_b));
+    let s_a = match outcome {
+        MatchOutcome::WinA => RATING_SCALE,
+        MatchOutcome::Draw => RATING_SCALE / 2,
+        MatchOutcome::WinB => 0,
+    };
+    let raw = i64::from(k) * i64::from(s_a - e_a);
+    let a = (raw / i64::from(RATING_SCALE)) as i32;
+    RatingDelta { a, b: -a }
+}
+
 // ===========================================================================
 // Cross-implementation parity vectors — the UE5-twin conformance set.
 //
@@ -3743,6 +3798,64 @@ mod tests {
         let mid = expected_score_bp(20);
         assert_eq!(mid, 5000 + (5573 - 5000) / 2);
         assert!(expected_score_bp(0) < mid && mid < expected_score_bp(40));
+    }
+
+    #[test]
+    fn rating_delta_is_zero_sum() {
+        // delta_a + delta_b == 0 for every outcome across a spread of ratings + K — the
+        // contract's reputation-conservation invariant (FM1).
+        for (ra, rb) in [(1500, 1500), (1800, 1200), (1200, 1800), (1500, 1505), (0, 3000)] {
+            for outcome in [MatchOutcome::WinA, MatchOutcome::Draw, MatchOutcome::WinB] {
+                for k in [0, 1, 16, 24, 32, 64, 1000] {
+                    let d = rating_delta(ra, rb, outcome, k);
+                    assert_eq!(d.a + d.b, 0, "not zero-sum at {ra}/{rb} {outcome:?} k={k}");
+                    assert_eq!(d.b, -d.a);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn favoured_winner_gains_less_than_an_upset() {
+        // The favourite winning earns less than a coin-flip win, which earns less than
+        // an upset — the monotone ordering that keeps the ladder honest (FM3).
+        let k = 32;
+        let favoured = rating_delta(1800, 1200, MatchOutcome::WinA, k).a;
+        let even = rating_delta(1500, 1500, MatchOutcome::WinA, k).a;
+        let upset = rating_delta(1200, 1800, MatchOutcome::WinA, k).a;
+        assert!(favoured < even && even < upset, "{favoured} < {even} < {upset}");
+        assert_eq!(even, k / 2, "an even win is half of K");
+    }
+
+    #[test]
+    fn a_draw_moves_the_favourite_down() {
+        let d = rating_delta(1800, 1200, MatchOutcome::Draw, 32);
+        assert!(d.a < 0 && d.b > 0, "favoured A loses, underdog B gains on a draw: {d:?}");
+        // An even draw moves nobody.
+        assert_eq!(rating_delta(1500, 1500, MatchOutcome::Draw, 32), RatingDelta { a: 0, b: 0 });
+    }
+
+    #[test]
+    fn winning_beats_drawing_beats_losing_for_one_pairing() {
+        let (ra, rb, k) = (1500, 1500, 32);
+        let win = rating_delta(ra, rb, MatchOutcome::WinA, k).a;
+        let draw = rating_delta(ra, rb, MatchOutcome::Draw, k).a;
+        let loss = rating_delta(ra, rb, MatchOutcome::WinB, k).a;
+        assert!(win > draw && draw > loss, "{win} > {draw} > {loss}");
+    }
+
+    #[test]
+    fn delta_is_bounded_by_k_and_a_nonpositive_k_is_inert() {
+        // |delta| <= K for any gap incl. the saturating extremes (FM4: the i64 product
+        // never overflows i32); a zero or negative K moves nothing.
+        for (ra, rb) in [(1500, 1500), (0, 5000), (5000, 0), (i32::MIN, i32::MAX)] {
+            for outcome in [MatchOutcome::WinA, MatchOutcome::Draw, MatchOutcome::WinB] {
+                let d = rating_delta(ra, rb, outcome, 40);
+                assert!(d.a.abs() <= 40, "|delta| exceeded K at {ra}/{rb}: {}", d.a);
+            }
+        }
+        assert_eq!(rating_delta(1200, 1800, MatchOutcome::WinA, 0), RatingDelta { a: 0, b: 0 });
+        assert_eq!(rating_delta(1200, 1800, MatchOutcome::WinA, -50), RatingDelta { a: 0, b: 0 });
     }
 
     #[test]
