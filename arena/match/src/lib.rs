@@ -239,6 +239,18 @@ pub struct MatchParams {
     /// byte-identical to the pre-map-loading behaviour; an unknown key degrades to
     /// that same empty arena rather than failing a formation.
     pub arena: &'static str,
+    /// The widest rating gap at which the ranked matchmaker will immediately pair the
+    /// longest-waiting agent with its nearest opponent. A finite value makes ranked
+    /// agents *wait in a pool* for a close-enough match instead of pairing the first
+    /// two that arrive — the gate that makes nearest-rated pairing meaningful (with
+    /// eager pairing the pool never exceeds one match, so there is nothing to choose).
+    /// A long-waiting agent is never starved: once the pool reaches
+    /// `RANKED_FORCE_POOL_MULTIPLE × seats` it is matched regardless (see
+    /// [`select_ranked`]). The default [`i32::MAX`] imposes no gate — ranked pairs as
+    /// soon as two agents wait, byte-identical to pre-ladder formation — so a ranked
+    /// deployment sets a finite tolerance (the magnitude is a balance decision, like
+    /// the K-factor). Only the Agent (ranked) queue reads it.
+    pub ranked_rating_tolerance: i32,
 }
 
 impl Default for MatchParams {
@@ -250,6 +262,7 @@ impl Default for MatchParams {
             max_ticks: 3600,
             bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
             arena: "",
+            ranked_rating_tolerance: i32::MAX,
         }
     }
 }
@@ -425,7 +438,13 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             let st = &mut *st;
             let queue = st.queues.for_mode(mode);
             queue.push(seated);
-            try_form(mode, queue, &st.ratings, self.params.seats_per_match as usize)
+            try_form(
+                mode,
+                queue,
+                &st.ratings,
+                self.params.seats_per_match as usize,
+                self.params.ranked_rating_tolerance,
+            )
         };
         Ok(match roster {
             Some(roster) => JoinOutcome::Formed(Box::new(self.build(mode, roster))),
@@ -567,6 +586,7 @@ fn try_form(
     queue: &mut Vec<Seated>,
     ratings: &BTreeMap<String, i32>,
     seats: usize,
+    ranked_tolerance: i32,
 ) -> Option<Vec<Seated>> {
     if seats == 0 || queue.len() < seats {
         return None;
@@ -575,8 +595,9 @@ fn try_form(
         // The Human queue is single-kind by admission, so the first `seats` waiting
         // (FIFO) already satisfy the composition.
         MatchMode::Human => (0..seats).collect::<Vec<usize>>(),
-        // The Agent queue is ranked: pair by rating, not arrival order alone.
-        MatchMode::Agent => select_ranked(queue, ratings, seats)?,
+        // The Agent queue is ranked: pair by rating within tolerance, not arrival
+        // order — and may return None to leave the agents waiting for a closer match.
+        MatchMode::Agent => select_ranked(queue, ratings, seats, ranked_tolerance)?,
         MatchMode::Mixed => select_mixed(queue, seats)?,
     };
     picks.sort_unstable();
@@ -588,24 +609,34 @@ fn try_form(
     Some(roster)
 }
 
-/// Select `seats` ranked agents from `queue`: anchor on the longest-waiting agent
-/// (the queue head) — so it is matched the instant `seats` agents are present, the
-/// structural anti-starvation guarantee — then fill the remaining seats with the
-/// agents NEAREST it in rating. FIFO decides *who waits least*; rating decides *who
-/// they face*. A rating tie breaks by arrival order (queue index), so selection is a
-/// pure function of `(ratings, queue order)` with no `HashMap` iteration — a
-/// replayed join sequence pairs identically. `None` if fewer than `seats` agents
-/// wait.
+/// Once this multiple of the seat count is waiting in the ranked pool, the
+/// longest-waiting agent is matched with its nearest opponent regardless of the
+/// rating tolerance — the structural anti-starvation fallback, which also bounds the
+/// pool size. The forced match is still anchored on the oldest, so it is precisely
+/// the agent that has waited longest that the fallback seats.
+const RANKED_FORCE_POOL_MULTIPLE: usize = 2;
+
+/// Select `seats` ranked agents from `queue`, or `None` to leave them waiting.
 ///
-/// Anchoring on the head IS the aging fallback: an isolated rating (a lone very-high
-/// or very-low agent) is never skipped over by tighter-rated pairs forming around
-/// it, because once it reaches the head it is always included in the next match. So
-/// "prefer the nearest-rated opponent" and "no rating is starved" both hold without a
-/// separate wait timer.
+/// Anchors on the longest-waiting agent (the queue head) and fills the seats with
+/// the agents NEAREST it in rating: FIFO decides *who waits least*, rating decides
+/// *who they face*. The cluster forms only if its widest gap from the anchor is
+/// within `tolerance` — otherwise the agents wait in the pool for a closer match,
+/// which is what lets the pool exceed one match and makes "nearest" a real choice.
+///
+/// Anchoring on the head, plus the force cap, is the anti-starvation fallback: a lone
+/// outlier rating is never skipped by tighter pairs forming around it, because once
+/// it reaches the head it anchors the next match, and once the pool reaches
+/// [`RANKED_FORCE_POOL_MULTIPLE`]`× seats` that match forms regardless of tolerance.
+/// So "prefer the nearest-rated opponent", "no rating is starved", and a bounded pool
+/// all hold. A rating tie breaks by arrival order (queue index), so the whole
+/// selection is a pure function of `(ratings, queue order, tolerance)` with no
+/// `HashMap` iteration — a replayed join sequence pairs identically.
 fn select_ranked(
     queue: &[Seated],
     ratings: &BTreeMap<String, i32>,
     seats: usize,
+    tolerance: i32,
 ) -> Option<Vec<usize>> {
     if seats == 0 || queue.len() < seats {
         return None;
@@ -614,10 +645,11 @@ fn select_ranked(
     let anchor = rating_of(0);
     let mut others: Vec<usize> = (1..queue.len()).collect();
     others.sort_by_key(|&i| (rating_of(i).abs_diff(anchor), i));
-    let mut picks = Vec::with_capacity(seats);
-    picks.push(0);
-    picks.extend(others.into_iter().take(seats - 1));
-    Some(picks)
+    let picks: Vec<usize> = std::iter::once(0).chain(others.into_iter().take(seats - 1)).collect();
+    let max_gap = picks.iter().map(|&i| rating_of(i).abs_diff(anchor)).max().unwrap_or(0);
+    let within_tolerance = i64::from(max_gap) <= i64::from(tolerance);
+    let pool_forces = queue.len() >= seats.saturating_mul(RANKED_FORCE_POOL_MULTIPLE);
+    (within_tolerance || pool_forces).then_some(picks)
 }
 
 /// Choose `seats` participants for a Mixed match guaranteed to hold at least one
@@ -918,11 +950,15 @@ mod tests {
     }
 
     fn ranked_mm(authorized: &[(&str, &str)]) -> Matchmaker<StubIdentityVerifier> {
+        ranked_mm_tol(authorized, i32::MAX)
+    }
+
+    fn ranked_mm_tol(authorized: &[(&str, &str)], tolerance: i32) -> Matchmaker<StubIdentityVerifier> {
         let mut v = StubIdentityVerifier::new();
         for (id, token) in authorized {
             v.authorize(*id, *token);
         }
-        Matchmaker::new(v, MatchParams::default())
+        Matchmaker::new(v, MatchParams { ranked_rating_tolerance: tolerance, ..MatchParams::default() })
     }
 
     fn controllers(m: &Match) -> Vec<String> {
@@ -1058,37 +1094,62 @@ mod tests {
         let queue = ranked_queue(&["A", "B", "C"]);
         let ratings = rating_book(&[("A", 1500), ("B", 1900), ("C", 1520)]);
         assert_eq!(
-            select_ranked(&queue, &ratings, 2).unwrap(),
+            select_ranked(&queue, &ratings, 2, i32::MAX).unwrap(),
             vec![0, 2],
             "the head is paired by rating distance, not arrival order"
         );
     }
 
     #[test]
-    fn ranked_pairing_never_starves_an_isolated_rating() {
-        // FM2 (aging/no-starvation): a lone outlier at the head is ALWAYS in the next
-        // match — tighter-rated pairs cannot form around it and skip it forever.
-        // Head X(3000) is included even though M1/M2 are far closer to each other.
-        let queue = ranked_queue(&["X", "M1", "M2"]);
-        let ratings = rating_book(&[("X", 3000), ("M1", 1500), ("M2", 1500)]);
-        let picks = select_ranked(&queue, &ratings, 2).unwrap();
-        assert!(picks.contains(&0), "the longest-waiting agent (head) is never skipped over");
+    fn ranked_pairing_defers_a_pair_outside_the_tolerance() {
+        // FM2 (tolerance gate): with a finite tolerance and no close-enough opponent in
+        // a sub-cap pool, no match forms — the agents wait for a nearer rating. This is
+        // what lets the ranked pool exceed one match, so "nearest" becomes a real
+        // choice. A(1500)'s only partner B(1900) is 400 apart, tolerance 100 ⇒ None.
+        let pair = ranked_queue(&["A", "B"]);
+        assert!(
+            select_ranked(&pair, &rating_book(&[("A", 1500), ("B", 1900)]), 2, 100).is_none(),
+            "a too-far pair waits rather than forming"
+        );
+        // A within-tolerance pair forms under the same tolerance.
+        assert_eq!(
+            select_ranked(&pair, &rating_book(&[("A", 1500), ("B", 1560)]), 2, 100).unwrap(),
+            vec![0, 1],
+            "a within-tolerance pair forms"
+        );
+    }
+
+    #[test]
+    fn ranked_pairing_forces_a_match_at_the_pool_cap_anchored_on_the_oldest() {
+        // FM2 (aging / no-starvation): a lone outlier is never starved. Below the cap
+        // with no within-tolerance partner it waits; once the pool reaches the force
+        // cap (RANKED_FORCE_POOL_MULTIPLE × seats = 4) the longest-waiting head forms
+        // with its nearest regardless of tolerance — and the head, the oldest, is in it.
+        let ratings = rating_book(&[("X", 3000), ("M1", 1500), ("M2", 1500), ("M3", 1500)]);
+        let under_cap = ranked_queue(&["X", "M1", "M2"]);
+        assert!(
+            select_ranked(&under_cap, &ratings, 2, 0).is_none(),
+            "under the cap, a far outlier waits for a closer match"
+        );
+        let at_cap = ranked_queue(&["X", "M1", "M2", "M3"]);
+        let picks = select_ranked(&at_cap, &ratings, 2, 0).expect("the pool cap forces a match");
+        assert!(picks.contains(&0), "the forced match seats the longest-waiting head — never starved");
         assert_eq!(picks.len(), 2, "exactly a full roster is taken");
     }
 
     #[test]
     fn ranked_pairing_is_deterministic_on_rating_ties() {
         // FM4 (determinism): equidistant opponents break by arrival order, so the
-        // selection is a pure function of (ratings, queue order) — no HashMap surprise.
-        // All seeded equal ⇒ head A pairs with B (arrived before C), every run.
+        // selection is a pure function of (ratings, queue order, tolerance) — no
+        // HashMap surprise. All seeded equal ⇒ head A pairs with B (before C), always.
         let queue = ranked_queue(&["A", "B", "C"]);
         let equal = rating_book(&[("A", DEFAULT_RATING), ("B", DEFAULT_RATING), ("C", DEFAULT_RATING)]);
-        assert_eq!(select_ranked(&queue, &equal, 2).unwrap(), vec![0, 1]);
+        assert_eq!(select_ranked(&queue, &equal, 2, i32::MAX).unwrap(), vec![0, 1]);
         // A rating the book has never seen defaults to DEFAULT_RATING in the metric —
         // the selector must not panic on a miss (the matchmaker seeds before queuing,
         // but the pure function stays total).
         assert_eq!(
-            select_ranked(&queue, &BTreeMap::new(), 2).unwrap(),
+            select_ranked(&queue, &BTreeMap::new(), 2, i32::MAX).unwrap(),
             vec![0, 1],
             "an unseeded rating defaults rather than panicking"
         );
@@ -1098,7 +1159,7 @@ mod tests {
     fn ranked_pairing_needs_a_full_roster() {
         let queue = ranked_queue(&["A"]);
         assert!(
-            select_ranked(&queue, &rating_book(&[("A", 1500)]), 2).is_none(),
+            select_ranked(&queue, &rating_book(&[("A", 1500)]), 2, i32::MAX).is_none(),
             "one waiter cannot form a 2-seat match"
         );
     }
@@ -1214,6 +1275,46 @@ mod tests {
             -(mm.rating("0xb").unwrap() - DEFAULT_RATING),
             "the two moves are exact negatives"
         );
+    }
+
+    #[test]
+    fn pairing_reflects_ratings_a_settled_match_moved() {
+        // FM2 + FM3 end to end, under a finite tolerance that builds a real pool:
+        // settling a result moves the book, and the NEXT formation pairs by those
+        // UPDATED ratings, not arrival order. After 0xa beats 0xb (a→1516, b→1484, 32
+        // apart > tolerance 20), the two re-queue but do NOT rematch — the gate holds
+        // them in the pool — and a third agent 0xc (1500) completes 0xb's match as the
+        // nearer rating, leaving 0xa. Pure arrival order would have rematched 0xb+0xa.
+        let mm = ranked_mm_tol(&[("0xa", "t"), ("0xb", "t"), ("0xc", "t")], 20);
+        // Round 1: both seed at 1500 (gap 0 ≤ 20), so they pair and play; 0xa wins.
+        assert!(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xa", "t")).unwrap().is_queued());
+        let m1 = mm
+            .join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xb", "t"))
+            .unwrap()
+            .into_formed()
+            .expect("two seed-rated agents pair within tolerance");
+        mm.apply_ranked_result(&decisive_result(m1.match_id(), 0), 32).unwrap();
+        assert_eq!(mm.rating("0xa"), Some(DEFAULT_RATING + 16), "a rose by K/2 on the even win");
+        assert_eq!(mm.rating("0xb"), Some(DEFAULT_RATING - 16), "b fell by K/2");
+
+        // Round 2: b(1484) then a(1516) re-queue — 32 apart, beyond tolerance 20, pool
+        // below the cap — so the gate defers their rematch and both wait.
+        assert!(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xb", "t")).unwrap().is_queued());
+        assert!(
+            mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xa", "t")).unwrap().is_queued(),
+            "a and b are too far apart to rematch — the pool grows instead of forming"
+        );
+        assert_eq!(mm.waiting(MatchMode::Agent), 2, "both wait under the tolerance gate");
+
+        // 0xc(1500) joins: nearest to head 0xb(1484) is 0xc (gap 16 ≤ 20), not 0xa
+        // (gap 32). So 0xb pairs with 0xc; 0xa, the farther rating, keeps waiting.
+        let m2 = mm
+            .join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xc", "t"))
+            .unwrap()
+            .into_formed()
+            .expect("the nearer third agent completes the head's match");
+        assert_eq!(controllers(&m2), ["0xb", "0xc"], "the head paired with the nearer rating, not the earlier arrival");
+        assert_eq!(mm.waiting(MatchMode::Agent), 1, "0xa, the farther rating, keeps waiting");
     }
 
     #[test]
