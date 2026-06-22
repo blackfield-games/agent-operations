@@ -710,6 +710,13 @@ struct Projectile {
     /// Travel heading (the snapped firing octant) — the only orientation a perceiver
     /// legitimately reads off a shot in flight.
     facing: Bam,
+    /// Launch elevation — the shooter's `z` when it fired. The shot flies LEVEL at this
+    /// `z` (the protocol has no vertical aim, so there is no ballistic arc), so it lands
+    /// only on a body within [`Rules::vertical_hit_tolerance`] of this elevation. Derived
+    /// from the recorded fire like every other projectile field, so replay rebuilds it.
+    /// Always `0` when gravity is off (the shooter is grounded), so a planar match is
+    /// byte-identical.
+    z: i32,
     /// Ticks in flight, checked against [`MAX_PROJECTILE_LIFETIME`].
     age: u16,
 }
@@ -1702,6 +1709,13 @@ impl Match {
             if !has_line_of_sight(&self.blockers, s.pos, t.pos) {
                 continue;
             }
+            // z-coupled combat (gated default-off): a target too far above/below the
+            // shooter's elevation clears the planar beam. A no-op when the tolerance is
+            // 0 (combat planar) or every z is 0 (gravity off), so a 2D match is
+            // byte-identical.
+            if !within_vertical_tolerance(s.z, t.z, self.rules.vertical_hit_tolerance) {
+                continue;
+            }
             if best.is_none_or(|(_, d)| dist2 < d) {
                 best = Some((j, dist2));
             }
@@ -1745,6 +1759,12 @@ impl Match {
                 continue;
             }
             if !has_line_of_sight(&self.blockers, s.pos, t.pos) {
+                continue;
+            }
+            // z-coupled combat (gated default-off): an enemy out of the shooter's
+            // vertical reach is not cleaved — the same rule the beam uses, so a
+            // mid-air enemy escapes a ground swing. No-op when planar (tolerance 0).
+            if !within_vertical_tolerance(s.z, t.z, self.rules.vertical_hit_tolerance) {
                 continue;
             }
             hits.push(j);
@@ -1792,6 +1812,7 @@ impl Match {
             pos: s.pos,
             vel,
             facing: (oct as u32 * 8192) as Bam, // each octant spans 8192 BAM (65536 / 8)
+            z: s.z, // launch elevation — the shot flies level at the shooter's z
             age: 0,
         });
     }
@@ -1838,6 +1859,12 @@ impl Match {
                 // a pawn IN FRONT of a wall (clear sightline from the shot) still
                 // takes the hit while one behind it is spared.
                 if !has_line_of_sight(&self.blockers, from, t.pos) {
+                    continue;
+                }
+                // z-coupled combat (gated default-off): the shot flies level at its
+                // launch z, so a target too far above/below it is not struck. No-op
+                // when planar (tolerance 0) or grounded (proj.z and t.z both 0).
+                if !within_vertical_tolerance(proj.z, t.z, self.rules.vertical_hit_tolerance) {
                     continue;
                 }
                 let dx = t.pos.x as i128 - from.x as i128;
@@ -2475,6 +2502,19 @@ fn within(a: Vec2, b: Vec2, range: i32) -> bool {
     let dy = b.y as i128 - a.y as i128;
     let r = range as i128;
     dx * dx + dy * dy <= r * r
+}
+
+/// `true` if a shot from elevation `shooter_z` may land on a target at elevation
+/// `target_z` under [`Rules::vertical_hit_tolerance`]. `tolerance == 0` DISABLES the
+/// bound — combat is planar, `z` is ignored, byte-identical to every pre-z-combat
+/// match — so a decoupled match short-circuits to `true` before touching `z`. A
+/// positive tolerance lands the shot only when the elevations are within `tolerance`
+/// units (INCLUSIVE), so a pawn that jumps higher than the tolerance clears it. The
+/// difference widens to `i64` so it never overflows at any (operator-set) `z`, and the
+/// rule is one integer compare a UE5 twin reproduces exactly. Shared by every weapon
+/// mode (hitscan, melee, projectile) so the vertical rule lives in ONE place.
+fn within_vertical_tolerance(shooter_z: i32, target_z: i32, tolerance: i32) -> bool {
+    tolerance == 0 || (shooter_z as i64 - target_z as i64).abs() <= tolerance as i64
 }
 
 /// `true` if `to` lies within the observer's forward field-of-view cone. The cone
@@ -4117,7 +4157,7 @@ mod tests {
     /// A projectile at a chosen position with a NON-neutral internal team, so a test
     /// can confirm the wire entry is reported as the neutral team regardless.
     fn test_projectile(id: u32, pos: Vec2) -> Projectile {
-        Projectile { id, shooter: 0, team: 7, origin: pos, pos, vel: Vec2::ZERO, facing: EAST, age: 0 }
+        Projectile { id, shooter: 0, team: 7, origin: pos, pos, vel: Vec2::ZERO, facing: EAST, z: 0, age: 0 }
     }
 
     #[test]
