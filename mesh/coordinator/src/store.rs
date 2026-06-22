@@ -1729,6 +1729,38 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Re-arm EVERY dead-lettered, not-yet-settled debit in one statement; returns the
+    /// count re-armed. The bulk twin of
+    /// [`redrive_dead_lettered_debit`](Self::redrive_dead_lettered_debit), for the
+    /// recovery after a BROAD `Permanent` cause is fixed (the spender key re-authorized
+    /// via `setSpender`, or a whole class of underfunded buyers tops up) — instead of
+    /// enumerating [`list_dead_lettered_debits`](Self::list_dead_lettered_debits) and
+    /// issuing N single re-drives, the operator re-arms the lot.
+    ///
+    /// Identical `WHERE dead_lettered_at IS NOT NULL AND tx_hash IS NULL` guard as the
+    /// single re-drive, just without the `job_id` filter, so the same safety boundary
+    /// holds set-wide: a still-pending row (already drainable) is untouched and an
+    /// already-settled row (`tx_hash` set, a paid charge) is NEVER cleared — mass-clearing
+    /// settled marks would resurrect a batch of paid charges into the drain, fenced only by
+    /// `ComputeMeter.spendOnce` on-chain, so this refuses them off-chain too (defense in
+    /// depth). Re-armed rows keep their `created_at`, so they re-enter the oldest-first
+    /// drain ahead of newer debits.
+    ///
+    /// Idempotent + safe under a concurrent drain, like the single re-drive but over the
+    /// whole set: each re-armed row gets exactly one more attempt and, if the broad cause
+    /// is NOT actually fixed, simply re-dead-letters on the next error (one attempt per
+    /// re-drive, never a hot loop). A second bulk call once the set has settled re-arms
+    /// nothing (every row now `tx_hash`-set), so an operator double-call can't double-charge.
+    /// `0` is returned when there is nothing to re-arm — a clean no-op, not an error.
+    pub fn redrive_all_dead_lettered_debits(&self) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE pending_debits SET dead_lettered_at = NULL
+             WHERE dead_lettered_at IS NOT NULL AND tx_hash IS NULL",
+            (),
+        )?;
+        Ok(updated)
+    }
+
     /// The dead-lettered, not-yet-settled debits (`dead_lettered_at IS NOT NULL AND
     /// tx_hash IS NULL`), oldest-first by insert order, as `(job_id, buyer,
     /// amount_wei, dead_lettered_at)` — the operator's enumeration of stuck charges so
