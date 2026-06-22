@@ -45,6 +45,11 @@ contract MatchSettlementTest is Test {
     );
     event MatchCancelled(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
     event MatchExpired(bytes32 indexed matchId, uint256 refundA, uint256 refundB);
+    event FieldMatchOpened(bytes32 indexed matchId, address[] agents, uint256 stake);
+    event FieldMatchFunded(bytes32 indexed matchId, address indexed agent, uint256 stake);
+    event FieldMatchReclaimed(bytes32 indexed matchId, address indexed agent, uint256 stake);
+    event FieldMatchCancelled(bytes32 indexed matchId, uint256 totalRefunded);
+    event FieldMatchExpired(bytes32 indexed matchId, uint256 totalRefunded);
     event AttesterSet(address indexed attester, bool authorized);
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
@@ -1517,6 +1522,488 @@ contract MatchSettlementTest is Test {
         vm.prank(attester);
         settlement.settleField(MATCH, ag, ds, bytes32(0));
     }
+
+    // --- field-wager escrow (N-seat open / fund / reclaim / cancel / expire) ---
+    //
+    // The N-seat analog of the 1v1 wager: openFieldMatch escrows an arbitrary 2..=MAX_FIELD
+    // roster, each agent funds its OWN seat (fundField) into a uint256 funded bitmap, and
+    // until the sibling payout settle lands the only resolutions are reclaimField (no-show
+    // self-rescue), cancelFieldMatch (attester void) and refundFieldExpired (deadline). These
+    // pin per-seat fund/refund integrity, roster validation, the shared id fence, and CEI.
+
+    bytes32 constant FIELD = bytes32("field-1");
+
+    function _roster3() internal returns (address[] memory ag) {
+        _registerAndFund(dave, "dave-bot"); // approves the settlement so dave can fund its seat
+        ag = _field(alice, bob, dave);
+    }
+
+    function _openField(bytes32 id, address[] memory ag, uint256 stake) internal {
+        vm.prank(attester);
+        settlement.openFieldMatch(id, ag, stake);
+    }
+
+    function _fundField(bytes32 id, address who) internal {
+        vm.prank(who);
+        settlement.fundField(id);
+    }
+
+    function _fieldStatus(bytes32 id) internal view returns (MatchSettlement.Status s) {
+        (,, s,) = settlement.fieldMatches(id);
+    }
+
+    function _fundedBits(bytes32 id) internal view returns (uint256 bits) {
+        (, bits,,) = settlement.fieldMatches(id);
+    }
+
+    // --- openFieldMatch: roster integrity + shared fence (FM2) ---
+
+    function test_openFieldMatch_storesRosterAndEmits() public {
+        address[] memory ag = _roster3();
+
+        vm.expectEmit(true, false, false, true);
+        emit FieldMatchOpened(FIELD, ag, STAKE);
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, ag, STAKE);
+
+        address[] memory stored = settlement.fieldRoster(FIELD);
+        assertEq(stored.length, 3, "roster length");
+        assertEq(stored[0], alice);
+        assertEq(stored[1], bob);
+        assertEq(stored[2], dave);
+        (uint256 stake, uint256 bits, MatchSettlement.Status status, uint64 deadline) =
+            settlement.fieldMatches(FIELD);
+        assertEq(stake, STAKE);
+        assertEq(bits, 0, "nothing funded at open");
+        assertTrue(status == MatchSettlement.Status.Open);
+        assertEq(deadline, uint64(block.timestamp) + settlement.settleWindow());
+    }
+
+    function test_openFieldMatch_revertsNonAttester() public {
+        address[] memory ag = _roster3();
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        settlement.openFieldMatch(FIELD, ag, STAKE); // no attester prank
+    }
+
+    function test_openFieldMatch_revertsEmptyAndSingleton() public {
+        address[] memory empty = new address[](0);
+        vm.expectRevert(MatchSettlement.FieldTooSmall.selector);
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, empty, STAKE);
+
+        address[] memory one = new address[](1);
+        one[0] = alice;
+        vm.expectRevert(MatchSettlement.FieldTooSmall.selector);
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, one, STAKE);
+    }
+
+    function test_openFieldMatch_revertsOverMaxField() public {
+        uint256 over = settlement.MAX_FIELD() + 1;
+        address[] memory big = new address[](over);
+        for (uint256 i = 0; i < over; i++) {
+            big[i] = address(uint160(0x6000 + i)); // size bound trips before any registry touch
+        }
+        vm.expectRevert(MatchSettlement.FieldTooLarge.selector);
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, big, STAKE);
+    }
+
+    /// @dev FM4 gas bound: MAX_FIELD seats open, fund (the bitmap fills to all-ones over
+    ///      MAX_FIELD bits), and cancel-refund all — the O(n) open/refund stays bounded at the
+    ///      ceiling, even though every seat is a distinct funded identity.
+    function test_openFieldMatch_atMaxFieldOpensFundsRefunds() public {
+        uint256 max = settlement.MAX_FIELD();
+        address[] memory full = new address[](max);
+        for (uint256 i = 0; i < max; i++) {
+            address a = address(uint160(0x7000 + i));
+            full[i] = a;
+            _registerAndFund(a, bytes32(uint256(0x9000 + i)));
+        }
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, full, STAKE);
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open, "MAX_FIELD opens inclusively");
+
+        for (uint256 i = 0; i < max; i++) {
+            _fundField(FIELD, full[i]);
+        }
+        assertEq(_fundedBits(FIELD), (uint256(1) << max) - 1, "all MAX_FIELD seats funded");
+        assertEq(token.balanceOf(address(settlement)), max * STAKE, "escrow holds every seat");
+
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        assertEq(token.balanceOf(address(settlement)), 0, "every seat refunded at the MAX_FIELD edge");
+    }
+
+    function test_openFieldMatch_revertsDuplicateAgent() public {
+        address[] memory ag = _field(alice, bob, alice); // alice in seats 0 and 2
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.DuplicateAgent.selector, alice));
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, ag, STAKE);
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.None, "no record on a duplicate roster");
+    }
+
+    function test_openFieldMatch_revertsUnregisteredAgent() public {
+        address[] memory ag = _field(alice, bob, carol); // carol never registered
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.AgentNotRegistered.selector, carol));
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, ag, STAKE);
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.None, "no record on an unregistered seat");
+    }
+
+    function test_openFieldMatch_revertsReopenSameId() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, ag, STAKE);
+    }
+
+    function test_openFieldMatch_zeroStakeAllowed() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, 0);
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open, "zero-stake field opens");
+        vm.prank(alice);
+        vm.expectRevert(MatchSettlement.NoWager.selector);
+        settlement.fundField(FIELD); // no escrow path on a zero-stake field
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Cancelled);
+    }
+
+    /// @dev FM2 shared fence: a matchId is at most ONE record across all three openers. A
+    ///      field-wager id can never also be a 1v1 (openMatch) nor a settleField id, and
+    ///      vice-versa — _requireFreshId cross-checks both mappings so no id collides.
+    function test_sharedFence_idIsExclusiveAcrossKinds() public {
+        _enableVariable(RATING_CAP); // settleField needs the variable path enabled
+        address[] memory ag = _roster3();
+        int256[] memory ds = _deltas(10 ether, -10 ether, 0); // Σ = 0, within cap
+
+        // 1v1 first -> a field reuse of that id is blocked.
+        _open(MATCH, STAKE);
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.openFieldMatch(MATCH, ag, STAKE);
+
+        // field first -> both a 1v1 open and a settleField on that id are blocked.
+        _openField(FIELD, ag, STAKE);
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.openMatch(FIELD, alice, bob, STAKE);
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.settleField(FIELD, ag, ds, HASH);
+
+        // settleField id -> a field reuse of that id is blocked.
+        bytes32 fid = bytes32("field-settled");
+        vm.prank(attester);
+        settlement.settleField(fid, ag, ds, HASH);
+        vm.expectRevert(MatchSettlement.MatchExists.selector);
+        vm.prank(attester);
+        settlement.openFieldMatch(fid, ag, STAKE);
+    }
+
+    /// @dev FM3 cross-contamination safety: the 1v1 resolution paths must NOT operate on a
+    ///      field id. A stray cancelMatch(fieldId) that ran would void the field WITHOUT
+    ///      refunding its seats, stranding stake. Each 1v1 path reads matches[id].status (None
+    ///      for a field id) -> MatchNotOpen, so the field stays Open and fully escrowed.
+    function test_crossKind_1v1PathsRejectFieldId() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        _fundField(FIELD, bob);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.cancelMatch(FIELD); // would strand the field's seats if it ran
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(alice);
+        settlement.fund(FIELD);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        settlement.refundExpired(FIELD);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.settle(FIELD, alice, HASH);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open, "field not voided by a 1v1 path");
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE, "field escrow intact");
+    }
+
+    /// @dev FM3 cross-contamination safety, reverse: the field resolution paths reject a 1v1
+    ///      id (fieldMatches[id].status is None), so a field call can never void a 1v1 escrow.
+    function test_crossKind_fieldPathsReject1v1Id() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(alice);
+        settlement.fundField(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(alice);
+        settlement.reclaimField(MATCH);
+
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        settlement.refundFieldExpired(MATCH);
+
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Open, "1v1 not voided by a field path");
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE);
+    }
+
+    // --- fundField + reclaimField: per-seat integrity (FM1) ---
+
+    function test_fundField_marksOnlyCallerSeatAndPulls() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+
+        vm.expectEmit(true, true, false, true);
+        emit FieldMatchFunded(FIELD, bob, STAKE);
+        _fundField(FIELD, bob); // seat 1
+
+        assertEq(_fundedBits(FIELD), uint256(1) << 1, "exactly seat 1 funded, not seat 0 or 2");
+        assertEq(token.balanceOf(address(settlement)), STAKE, "one seat escrowed");
+    }
+
+    function test_fundField_eachSeatFundsOwn() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        _fundField(FIELD, dave);
+        _fundField(FIELD, bob);
+        assertEq(_fundedBits(FIELD), 0x7, "all three seats funded (bits 0,1,2)");
+        assertEq(token.balanceOf(address(settlement)), 3 * STAKE);
+    }
+
+    function test_fundField_revertsNonMember() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _registerAgent(eve, "eve-bot"); // registered, but not on this roster
+        vm.expectRevert(MatchSettlement.NotParticipant.selector);
+        vm.prank(eve);
+        settlement.fundField(FIELD);
+    }
+
+    function test_fundField_revertsAlreadyFunded() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        vm.expectRevert(MatchSettlement.AlreadyFunded.selector);
+        vm.prank(alice);
+        settlement.fundField(FIELD);
+    }
+
+    function test_fundField_revertsNotOpen() public {
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(alice);
+        settlement.fundField(bytes32("never-opened"));
+    }
+
+    function test_reclaimField_soleFunderRescuesAndStaysOpen() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        uint256 before = token.balanceOf(alice);
+
+        vm.expectEmit(true, true, false, true);
+        emit FieldMatchReclaimed(FIELD, alice, STAKE);
+        vm.prank(alice);
+        settlement.reclaimField(FIELD);
+
+        assertEq(token.balanceOf(alice), before + STAKE, "stake returned");
+        assertEq(_fundedBits(FIELD), 0, "seat cleared");
+        assertEq(token.balanceOf(address(settlement)), 0, "no escrow held");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open, "match stays open, re-fundable");
+
+        _fundField(FIELD, alice); // re-fundable after a reclaim
+        assertEq(_fundedBits(FIELD), 1);
+    }
+
+    function test_reclaimField_revertsWhenPeerFunded() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        _fundField(FIELD, bob);
+        vm.expectRevert(MatchSettlement.OpponentFunded.selector);
+        vm.prank(alice);
+        settlement.reclaimField(FIELD); // a peer has funded -> the field is live
+    }
+
+    function test_reclaimField_revertsNotFunded() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, bob); // a peer funded, but alice never did
+        vm.expectRevert(MatchSettlement.NotFunded.selector);
+        vm.prank(alice);
+        settlement.reclaimField(FIELD);
+    }
+
+    function test_reclaimField_revertsNonMember() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _registerAgent(eve, "eve-bot");
+        vm.expectRevert(MatchSettlement.NotParticipant.selector);
+        vm.prank(eve);
+        settlement.reclaimField(FIELD);
+    }
+
+    // --- cancelFieldMatch + refundFieldExpired: refund every funded seat, no stranded stake (FM3) ---
+
+    function test_cancelFieldMatch_refundsExactlyFundedSeats() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice); // seat 0
+        _fundField(FIELD, dave); // seat 2 — bob (seat 1) does NOT fund
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        uint256 dBefore = token.balanceOf(dave);
+
+        vm.expectEmit(true, false, false, true);
+        emit FieldMatchCancelled(FIELD, 2 * STAKE);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+
+        assertEq(token.balanceOf(alice), aBefore + STAKE, "funded seat 0 refunded");
+        assertEq(token.balanceOf(dave), dBefore + STAKE, "funded seat 2 refunded");
+        assertEq(token.balanceOf(bob), bBefore, "unfunded seat 1 gets nothing");
+        assertEq(token.balanceOf(address(settlement)), 0, "no stranded stake");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Cancelled);
+        assertEq(_fundedBits(FIELD), 0, "funded set cleared");
+    }
+
+    function test_cancelFieldMatch_revertsNonAttester() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        settlement.cancelFieldMatch(FIELD);
+    }
+
+    function test_cancelFieldMatch_noFundedSeatsRefundsZero() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        vm.expectEmit(true, false, false, true);
+        emit FieldMatchCancelled(FIELD, 0);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Cancelled);
+    }
+
+    function test_cancelFieldMatch_revertsDoubleCancel() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+    }
+
+    function test_fundField_revertsAfterCancel() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        vm.prank(alice);
+        settlement.fundField(FIELD);
+    }
+
+    function test_refundFieldExpired_permissionlessPastDeadline() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        _fundField(FIELD, bob);
+        _fundField(FIELD, dave);
+
+        (,,, uint64 deadline) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+
+        uint256 carolBefore = token.balanceOf(carol);
+        uint256 aBefore = token.balanceOf(alice);
+        vm.expectEmit(true, false, false, true);
+        emit FieldMatchExpired(FIELD, 3 * STAKE);
+        vm.prank(carol); // an unrelated third party triggers the void
+        settlement.refundFieldExpired(FIELD);
+
+        assertEq(token.balanceOf(carol), carolBefore, "caller gains nothing");
+        assertEq(token.balanceOf(alice), aBefore + STAKE, "each funded seat refunded");
+        assertEq(token.balanceOf(address(settlement)), 0, "all escrow returned");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Expired);
+    }
+
+    function test_refundFieldExpired_revertsBeforeDeadline() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        vm.expectRevert(MatchSettlement.NotExpired.selector);
+        settlement.refundFieldExpired(FIELD);
+    }
+
+    function test_refundFieldExpired_revertsNotOpen() public {
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        settlement.refundFieldExpired(bytes32("never-opened"));
+    }
+
+    /// @dev FM4 single-shot: a voided field can never be re-resolved — a cancelled field can't
+    ///      then be expired (nor cancelled twice), so a void can't later become a settle nor a
+    ///      double-refund.
+    function test_fieldVoidIsSingleShot() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+
+        (,,, uint64 deadline) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+        vm.expectRevert(MatchSettlement.MatchNotOpen.selector);
+        settlement.refundFieldExpired(FIELD); // can't expire an already-cancelled field
+    }
+
+    /// @dev FM1/FM3: over a RANDOM funded subset of a roster, cancel refunds EXACTLY the funded
+    ///      seats — each once, none twice, no unfunded seat — and the contract holds no stranded
+    ///      stake afterward. The fund mask exercises an arbitrary per-seat pattern.
+    function testFuzz_cancelFieldMatch_refundsExactlyFundedSubset(uint256 mask, uint256 nSeed) public {
+        uint256 n = bound(nSeed, 2, 8);
+        address[] memory ag = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            address a = address(uint160(0xB000 + i));
+            ag[i] = a;
+            _registerAndFund(a, bytes32(uint256(0xC000 + i)));
+        }
+        _openField(FIELD, ag, STAKE);
+
+        uint256 funded;
+        uint256 fundedCount;
+        for (uint256 i = 0; i < n; i++) {
+            if (mask & (1 << i) != 0) {
+                _fundField(FIELD, ag[i]);
+                funded |= (1 << i);
+                fundedCount++;
+            }
+        }
+        assertEq(_fundedBits(FIELD), funded, "bitmap matches the funded mask");
+        assertEq(token.balanceOf(address(settlement)), fundedCount * STAKE, "escrow == funded seats");
+
+        uint256[] memory before = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            before[i] = token.balanceOf(ag[i]);
+        }
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+
+        for (uint256 i = 0; i < n; i++) {
+            uint256 expected = before[i] + ((funded & (1 << i)) != 0 ? STAKE : 0);
+            assertEq(token.balanceOf(ag[i]), expected, "each seat refunded iff it funded");
+        }
+        assertEq(token.balanceOf(address(settlement)), 0, "no stranded stake");
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
@@ -1746,6 +2233,111 @@ contract MatchSettlementRefundReentrancyTest is Test {
             token.balanceOf(address(attacker)), attackerBefore + STAKE, "refunded its stake exactly once"
         );
         assertEq(token.balanceOf(bob), bobBefore + STAKE, "opponent still refunded after the reentry attempt");
+        assertEq(token.balanceOf(address(settlement)), 0, "no escrow drained beyond the two stakes");
+    }
+}
+
+/// @notice A field-roster member that reenters refundFieldExpired when it receives its
+///         expired refund. refundFieldExpired is permissionless, so reentering it isolates
+///         the _refundField CEI fence shared by cancelFieldMatch and refundFieldExpired: the
+///         only thing stopping a second refund is that the helper flips the field terminal
+///         and clears fundedBits BEFORE any transfer. Fails if those effects move after the
+///         transfer (the N-seat analog of ReentrantRefundClaimer).
+contract ReentrantFieldClaimer is IPayoutReceiver {
+    MatchSettlement settlement;
+    AgentRegistry registry;
+    HookToken token;
+    bytes32 matchId;
+    bool public reentered;
+    bool public reentryReverted;
+
+    constructor(MatchSettlement settlement_, AgentRegistry registry_, HookToken token_) {
+        settlement = settlement_;
+        registry = registry_;
+        token = token_;
+    }
+
+    function setup(bytes32 matchId_) external {
+        matchId = matchId_;
+        token.approve(address(registry), type(uint256).max);
+        token.approve(address(settlement), type(uint256).max);
+        registry.register(bytes32("field-evil"), 0);
+    }
+
+    function fund() external {
+        settlement.fundField(matchId);
+    }
+
+    function onPayout() external {
+        reentered = true;
+        try settlement.refundFieldExpired(matchId) {}
+        catch {
+            reentryReverted = true;
+        }
+    }
+}
+
+contract MatchSettlementFieldRefundReentrancyTest is Test {
+    MatchSettlement settlement;
+    AgentRegistry registry;
+    HookToken token;
+    ReentrantFieldClaimer attacker;
+
+    address owner = address(0xA11CE);
+    address attester = address(0xA77E57E5);
+    address bob = address(0xB0B);
+
+    uint256 constant STAKE = 100 ether;
+    uint256 constant REP_DELTA = 10 ether;
+    bytes32 constant FIELD = bytes32("field-refund-evil");
+
+    function setUp() public {
+        token = new HookToken();
+        registry = new AgentRegistry(address(token), 0, owner);
+        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        attacker = new ReentrantFieldClaimer(settlement, registry, token);
+
+        vm.startPrank(owner);
+        registry.setReputationWriter(address(settlement), true);
+        settlement.setAttester(attester, true);
+        vm.stopPrank();
+
+        token.transfer(bob, 10_000 ether);
+        vm.startPrank(bob);
+        token.approve(address(registry), type(uint256).max);
+        token.approve(address(settlement), type(uint256).max);
+        registry.register(bytes32("bob-bot"), 0);
+        vm.stopPrank();
+
+        token.transfer(address(attacker), 10_000 ether);
+        attacker.setup(FIELD);
+
+        address[] memory ag = new address[](2);
+        ag[0] = address(attacker);
+        ag[1] = bob;
+        vm.prank(attester);
+        settlement.openFieldMatch(FIELD, ag, STAKE);
+        attacker.fund();
+        vm.prank(bob);
+        settlement.fundField(FIELD);
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE);
+    }
+
+    function test_refundField_reentrantClaimerCannotDoubleRefund() public {
+        (,,, uint64 deadline) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+        uint256 attackerBefore = token.balanceOf(address(attacker));
+        uint256 bobBefore = token.balanceOf(bob);
+
+        token.arm();
+        settlement.refundFieldExpired(FIELD);
+
+        assertTrue(attacker.reentered(), "reentry fired");
+        assertTrue(attacker.reentryReverted(), "reentry blocked by the CEI terminal-state fence");
+        assertEq(
+            token.balanceOf(address(attacker)), attackerBefore + STAKE, "refunded its stake exactly once"
+        );
+        assertEq(token.balanceOf(bob), bobBefore + STAKE, "peer still refunded after the reentry attempt");
         assertEq(token.balanceOf(address(settlement)), 0, "no escrow drained beyond the two stakes");
     }
 }
