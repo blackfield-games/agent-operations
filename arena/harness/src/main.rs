@@ -23,7 +23,9 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
-use arena_core::{ranked_delta, settlement, Match, Rules, Settlement};
+use arena_core::{
+    ranked_delta, ranked_field_delta, settlement, Match, Rules, SeatDelta, Settlement, DEFAULT_RATING,
+};
 use arena_proto::{
     check_version, ActionIntent, AgentMsg, GatewayMsg, MatchConfig, MatchPhase, MatchResult,
     ReplayRecord, SeatId, SeatInfo, Vec2, POSITION_SCALE, PROTOCOL_VERSION,
@@ -123,6 +125,19 @@ enum SettleError {
     /// on-chain `settle`/`settleDraw` form, so the driver refuses to emit an
     /// unsettleable resolution rather than commit one the contract can't accept.
     NotRankedPair,
+    /// The match is not a multi-seat (FFA / 3+) ranked field. The symmetric guard to
+    /// [`NotRankedPair`](SettleError::NotRankedPair) on the field seam
+    /// ([`settle_field_match`]): a 1v1 pair (or a degenerate single/empty result)
+    /// settles through [`settle_match`] in the single-delta `settle`/`settleDraw`
+    /// shape, so the field path refuses it rather than emit a per-seat vector for a
+    /// result the 1v1 path owns (and the contract's `settleField` itself rejects a
+    /// sub-2 field).
+    NotRankedField,
+    /// The supplied per-seat ratings do not align 1:1 with the result's seats. The
+    /// field delta pairs `ratings[i]` to `outcomes[i].seat` positionally, so a
+    /// wrong-length rating vector would mis-pair seats to ratings — refused before any
+    /// emit rather than settled against a misaligned vector.
+    RatingsMismatch,
 }
 
 /// The off-chain → on-chain settlement boundary for a finished match. Mirrors the
@@ -147,9 +162,26 @@ enum SettleError {
 /// participants' ratings: a favoured win earns less, an upset more.
 type ReputationDelta = Option<i32>;
 
+/// One seat's line in a settled multi-seat (FFA / 3+) ranked field: the agent identity
+/// (the seat's roster `controller`, the harness stand-in for the on-chain address) and
+/// its signed zero-sum reputation delta. The on-chain `settleField(agents[], deltas[])`
+/// consumes a field as two parallel arrays in this canonical ascending-seat order, so a
+/// reordering here would credit the wrong agent on-chain — the entries are built in the
+/// exact order [`ranked_field_delta`] returns and never re-sorted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FieldEntry {
+    agent: String,
+    delta: i32,
+}
+
 trait Settle {
     fn settle(&self, match_id: Uuid, winner: &str, reputation: ReputationDelta, replay_digest: [u8; 32]) -> Result<(), SettleError>;
     fn settle_draw(&self, match_id: Uuid, reputation: ReputationDelta, replay_digest: [u8; 32]) -> Result<(), SettleError>;
+    /// Settle a multi-seat (FFA / 3+) ranked result to reputation: the zero-sum per-seat
+    /// `entries` in canonical ascending-seat order, mirroring the on-chain `settleField`.
+    /// No winner — placement is folded into the per-seat deltas. Reputation-only (no
+    /// escrow), matching the contract slice.
+    fn settle_field(&self, match_id: Uuid, entries: Vec<FieldEntry>, replay_digest: [u8; 32]) -> Result<(), SettleError>;
     fn cancel(&self, match_id: Uuid) -> Result<(), SettleError>;
 }
 
@@ -158,6 +190,9 @@ trait Settle {
 enum Resolution {
     Win { winner: String, reputation: ReputationDelta, replay_digest: [u8; 32] },
     Draw { reputation: ReputationDelta, replay_digest: [u8; 32] },
+    /// A multi-seat (FFA / 3+) field: the zero-sum per-seat lines in canonical
+    /// ascending-seat order, the harness mirror of the on-chain `settleField`.
+    Field { entries: Vec<FieldEntry>, replay_digest: [u8; 32] },
     Cancelled,
 }
 
@@ -204,6 +239,10 @@ impl Settle for MockSettler {
         self.record(match_id, Resolution::Draw { reputation, replay_digest })
     }
 
+    fn settle_field(&self, match_id: Uuid, entries: Vec<FieldEntry>, replay_digest: [u8; 32]) -> Result<(), SettleError> {
+        self.record(match_id, Resolution::Field { entries, replay_digest })
+    }
+
     fn cancel(&self, match_id: Uuid) -> Result<(), SettleError> {
         self.record(match_id, Resolution::Cancelled)
     }
@@ -219,6 +258,18 @@ impl Settle for MockSettler {
 struct RankedContext {
     rating_a: i32,
     rating_b: i32,
+    k: i32,
+}
+
+/// The ranked context a MULTI-SEAT (FFA / 3+) settlement needs: every seat's pre-match
+/// rating in canonical ascending-seat order — `ratings[i]` is `result.outcomes[i].seat`'s
+/// rating, the same positional pairing [`ranked_field_delta`] requires — and the
+/// owner-set K-factor. Supplied by the live rating ladder; an unrated agent reads as
+/// [`DEFAULT_RATING`] (so a loopback field, whose agents are all unseen, settles at the
+/// default), and the owner-set multi-seat K is the live driver's to pass.
+#[derive(Clone)]
+struct FieldContext {
+    ratings: Vec<i32>,
     k: i32,
 }
 
@@ -277,6 +328,65 @@ fn settle_match(
     }
     Ok(outcome)
 }
+
+/// Drive a finished MULTI-SEAT (FFA / 3+) match through the settler — the sibling of
+/// [`settle_match`] for a result the 1v1 `settle`/`settleDraw` cannot express. Sources
+/// each seat's pre-match rating from `field` in canonical order, computes the zero-sum
+/// per-seat vector [`ranked_field_delta`], pairs each delta with its seat's roster
+/// `controller` (the on-chain address stand-in), and submits the whole field through
+/// [`Settle::settle_field`] carrying the canonical `replay.digest()`. Returns the seat
+/// count settled.
+///
+/// The per-seat deltas are settlement metadata: they do NOT touch `digest`, so the
+/// committed identity is byte-identical with or without them — the same property the 1v1
+/// reputation delta has.
+///
+/// Refuses anything the 1v1 path owns: fewer than 3 seats is [`SettleError::NotRankedField`]
+/// (a pair settles through [`settle_match`] in the single-delta shape, never as a
+/// 2-vector), and a `field` whose ratings do not align 1:1 with the seats is
+/// [`SettleError::RatingsMismatch`] — refused before any emit rather than mis-paired.
+fn settle_field_match(
+    settler: &impl Settle,
+    result: &MatchResult,
+    replay: &ReplayRecord,
+    field: FieldContext,
+) -> Result<usize, SettleError> {
+    let n = result.outcomes.len();
+    if n < 3 {
+        return Err(SettleError::NotRankedField);
+    }
+    if field.ratings.len() != n {
+        return Err(SettleError::RatingsMismatch);
+    }
+    let digest = replay.digest();
+    // n >= 3 and ratings aligned 1:1 ⇒ Some; the two guards above make this total, the
+    // same way the 2-seat guard makes `ranked_delta` total in `settle_match`.
+    let deltas = ranked_field_delta(result, &field.ratings, field.k)
+        .expect("a >=2-seat result with aligned ratings has a field delta");
+    let entries = deltas
+        .into_iter()
+        .map(|SeatDelta { seat, delta }| {
+            // Map each canonical seat to its roster controller — the same seat→identity
+            // lookup the 1v1 winner path does, per seat. The result's outcome seats are a
+            // subset of the roster, so the seat is always present.
+            let agent = replay
+                .seats
+                .iter()
+                .find(|s| s.seat == seat)
+                .map(|s| s.controller.clone())
+                .expect("a field seat is in the roster");
+            FieldEntry { agent, delta }
+        })
+        .collect();
+    settler.settle_field(result.match_id, entries, digest)?;
+    Ok(n)
+}
+
+/// The K-factor the `--settle-dev-mock` loopback uses for a multi-seat field settle. The
+/// loopback settles only an in-memory [`MockSettler`] (never a chain), so this sets the
+/// magnitude of the demonstrated deltas, not any production economic knob — the live
+/// driver passes the owner-set K. 32 matches the value the ranked unit tests use.
+const DEV_MOCK_K: i32 = 32;
 
 fn main() {
     let args = parse_args();
@@ -391,12 +501,20 @@ fn main() {
     if let Some(s) = &settler {
         let match_id = m.match_id();
         let replay = m.into_replay();
-        // The loopback agents are fresh, with no rating ladder, so settlement defers
-        // to the contract's fixed reputation delta — byte-identical to pre-ladder.
-        match settle_match(s, &result, &replay, None) {
-            Ok(outcome) => {
-                eprintln!("[settle-dev-mock] {match_id} settled as {outcome:?}: {:?}", s.resolution(match_id))
-            }
+        // Loopback agents are unrated, so each reads as DEFAULT_RATING — exactly what the
+        // live ladder returns for an unseen agent. A 1v1 then defers to the contract's
+        // fixed delta (None, byte-identical to pre-ladder); a 3+ field, which has no
+        // fixed-delta form, settles its zero-sum placement vector. The live driver passes
+        // real ladder ratings and the owner-set K in place of these.
+        let seats = result.outcomes.len();
+        let report = if seats > 2 {
+            let field = FieldContext { ratings: vec![DEFAULT_RATING; seats], k: DEV_MOCK_K };
+            settle_field_match(s, &result, &replay, field).map(|n| format!("field of {n} seats"))
+        } else {
+            settle_match(s, &result, &replay, None).map(|o| format!("{o:?}"))
+        };
+        match report {
+            Ok(desc) => eprintln!("[settle-dev-mock] {match_id} settled as {desc}: {:?}", s.resolution(match_id)),
             Err(e) => eprintln!("[settle-dev-mock] {match_id} settle failed: {e:?}"),
         }
     }
@@ -405,7 +523,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena_core::DEFAULT_RATING;
     use arena_proto::SeatOutcome;
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -552,7 +669,9 @@ mod tests {
 
         settle_match(&settler, &result, &replay, None).expect("settles");
         let committed = match settler.resolution(id()).expect("resolved") {
-            Resolution::Win { replay_digest, .. } | Resolution::Draw { replay_digest, .. } => replay_digest,
+            Resolution::Win { replay_digest, .. }
+            | Resolution::Draw { replay_digest, .. }
+            | Resolution::Field { replay_digest, .. } => replay_digest,
             Resolution::Cancelled => panic!("a played match is never a cancel"),
         };
         assert_eq!(committed, replay.digest(), "commits the exact core digest");
@@ -641,7 +760,9 @@ mod tests {
         let replay = replay_for(roster(2));
         let result = result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 1, false)]);
         let dig = |s: &MockSettler| match s.resolution(id()).expect("resolved") {
-            Resolution::Win { replay_digest, .. } | Resolution::Draw { replay_digest, .. } => replay_digest,
+            Resolution::Win { replay_digest, .. }
+            | Resolution::Draw { replay_digest, .. }
+            | Resolution::Field { replay_digest, .. } => replay_digest,
             Resolution::Cancelled => unreachable!("a settled win is never a cancel"),
         };
         let fixed = MockSettler::default();
