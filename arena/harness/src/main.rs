@@ -405,6 +405,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arena_core::DEFAULT_RATING;
     use arena_proto::SeatOutcome;
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -556,5 +557,98 @@ mod tests {
         };
         assert_eq!(committed, replay.digest(), "commits the exact core digest");
         assert_eq!(hex::encode(committed), result.replay_hash, "matches the published result hash");
+    }
+
+    fn ranked(rating_a: i32, rating_b: i32, k: i32) -> RankedContext {
+        RankedContext { rating_a, rating_b, k }
+    }
+
+    #[test]
+    fn a_ranked_win_carries_the_winners_exact_zero_sum_core_delta() {
+        // FM2: with a ranked context the settle carries EXACTLY the core ranked_delta's
+        // winner side; the loser's −d is the contract-applied negation the core
+        // guarantees (b == −a). Seat 1 (NOT the first outcome) wins from an even match,
+        // so this also pins the winner→delta mapping picks `.b`, not `.a`.
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 2, 1, false), outcome(1, 1, 5, true)]);
+        let k = 32;
+        let core = ranked_delta(&result, DEFAULT_RATING, DEFAULT_RATING, k).unwrap();
+        assert_eq!(core.a, -core.b, "the core delta is zero-sum");
+        assert!(core.b > 0, "seat 1 is the winner, so its side (.b) is the positive gain");
+
+        let settler = MockSettler::default();
+        settle_match(&settler, &result, &replay, Some(ranked(DEFAULT_RATING, DEFAULT_RATING, k))).unwrap();
+        assert_eq!(
+            settler.resolution(id()),
+            Some(Resolution::Win { winner: "agent-1".into(), reputation: Some(core.b), replay_digest: replay.digest() }),
+            "the settle carries the winning seat's exact core delta",
+        );
+    }
+
+    #[test]
+    fn a_favoured_win_carries_less_reputation_than_an_upset_win() {
+        // The variable delta tracks the rating gap: the SAME win (seat 0) earns the
+        // winner LESS when favoured than when the underdog. Pinned against the core,
+        // and the carried value matches the favoured computation verbatim.
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 1, false)]); // seat 0 (agentA) wins
+        let k = 32;
+        let favoured = ranked_delta(&result, 1900, 1500, k).unwrap().a; // agentA favoured
+        let upset = ranked_delta(&result, 1300, 1500, k).unwrap().a; // agentA underdog
+        assert!(favoured > 0 && upset > 0, "a win always gains");
+        assert!(favoured < upset, "the favourite earns less for the same win ({favoured} < {upset})");
+
+        let settler = MockSettler::default();
+        settle_match(&settler, &result, &replay, Some(ranked(1900, 1500, k))).unwrap();
+        assert_eq!(
+            settler.resolution(id()),
+            Some(Resolution::Win { winner: "agent-0".into(), reputation: Some(favoured), replay_digest: replay.digest() }),
+        );
+    }
+
+    #[test]
+    fn a_draw_carries_agent_a_signed_core_delta() {
+        // FM4 (draw): a draw between UNEQUAL ratings moves the favoured agentA (seat 0)
+        // DOWN — settle_draw carries agentA's negative core delta (the contract negates
+        // it onto agentB). Even ratings ⇒ a zero draw delta.
+        let replay = replay_for(roster(2));
+        let tie = result_for(vec![outcome(0, 1, 4, true), outcome(1, 1, 4, true)]);
+        let k = 32;
+        let core = ranked_delta(&tie, 1800, 1500, k).unwrap();
+        assert!(core.a < 0, "a draw moves the favoured agentA down");
+
+        let favoured = MockSettler::default();
+        settle_match(&favoured, &tie, &replay, Some(ranked(1800, 1500, k))).unwrap();
+        assert_eq!(
+            favoured.resolution(id()),
+            Some(Resolution::Draw { reputation: Some(core.a), replay_digest: replay.digest() }),
+        );
+
+        let even = MockSettler::default();
+        settle_match(&even, &tie, &replay, Some(ranked(DEFAULT_RATING, DEFAULT_RATING, k))).unwrap();
+        assert_eq!(
+            even.resolution(id()),
+            Some(Resolution::Draw { reputation: Some(0), replay_digest: replay.digest() }),
+            "an even draw carries a zero delta",
+        );
+    }
+
+    #[test]
+    fn the_reputation_delta_never_perturbs_the_committed_digest() {
+        // FM3: the delta is settlement metadata, not a digest input — the committed
+        // digest is identical with a fixed (None) or a variable (Some) reputation, and
+        // both equal the canonical core ReplayRecord.digest().
+        let replay = replay_for(roster(2));
+        let result = result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 1, false)]);
+        let dig = |s: &MockSettler| match s.resolution(id()).expect("resolved") {
+            Resolution::Win { replay_digest, .. } | Resolution::Draw { replay_digest, .. } => replay_digest,
+            Resolution::Cancelled => unreachable!("a settled win is never a cancel"),
+        };
+        let fixed = MockSettler::default();
+        settle_match(&fixed, &result, &replay, None).unwrap();
+        let variable = MockSettler::default();
+        settle_match(&variable, &result, &replay, Some(ranked(1700, 1400, 32))).unwrap();
+        assert_eq!(dig(&fixed), dig(&variable), "the reputation delta does not change the committed digest");
+        assert_eq!(dig(&variable), replay.digest(), "still the canonical core digest");
     }
 }
