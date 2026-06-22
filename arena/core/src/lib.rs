@@ -2944,6 +2944,24 @@ pub struct VerticalHitCase {
     pub damage: u16,
 }
 
+/// A pinned z-aware-occlusion case: a sightline from `(from, from_z)` to `(to, to_z)`
+/// against a single height-bounded [`Blocker`], and whether that wall occludes it. The
+/// rule a twin must reproduce: a wall with `height > 0` blocks a ground-level look but
+/// NOT one that passes over its top, while a `height == 0` wall is infinitely tall and
+/// occludes at any elevation. A twin that ignores the height (occludes the high look),
+/// or that lets a still-in-band rising look through, fails the matching case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisionOverCoverCase {
+    pub label: String,
+    pub from: Vec2,
+    pub from_z: i32,
+    pub to: Vec2,
+    pub to_z: i32,
+    pub blocker: Blocker,
+    /// `true` iff the wall blocks this sightline.
+    pub occluded: bool,
+}
+
 /// The canonical cross-implementation parity-vector set — the conformance spec
 /// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
 /// and the bytes are the contract.
@@ -2960,6 +2978,9 @@ pub struct ParityVectors {
     pub projectiles: Vec<ProjectileCase>,
     /// z-coupled-combat cases (domain v4): the vertical hit rule across every weapon mode.
     pub vertical_hits: Vec<VerticalHitCase>,
+    /// z-aware-occlusion cases (domain v5): a height-bounded wall is cleared by a
+    /// high-enough sightline.
+    pub vision_over_cover: Vec<VisionOverCoverCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3265,6 +3286,20 @@ fn vertical_hit_case(label: &str, mode: WeaponMode, shooter_z: i32, target_z: i3
     }
 }
 
+/// Build a z-aware-occlusion case: test the one sightline against the one wall and
+/// record whether it is occluded — the predicate the twin reproduces.
+fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
+    VisionOverCoverCase {
+        label: label.to_string(),
+        from,
+        from_z,
+        to,
+        to_z,
+        blocker,
+        occluded: !has_line_of_sight(&[blocker], from, from_z, to, to_z),
+    }
+}
+
 /// Build a full-match case under a fixed, tiny scripted action stream: seat 0
 /// steps east on the opening tick, fires due east on the next, then everyone
 /// idles. A hitscan match ends on the kill; a projectile match runs on until the
@@ -3321,19 +3356,21 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// hit), the octant-vs-fine sub-octant hit boundary, a swept fast projectile that
 /// must not tunnel, the z-coupled-combat rule across every weapon mode (a target
 /// above [`Rules::vertical_hit_tolerance`] clears a hitscan/melee/projectile shot,
-/// the boundary inclusive, the tolerance-off default ignoring elevation), and four
-/// full-match records proving the digest commits the inputs, the rules, AND the
-/// config determinants — the octant and fine cases run the identical action stream
-/// yet hash differently because their aim_mode differs — while the rules also bind
-/// the outcomes a re-run reproduces.
+/// the boundary inclusive, the tolerance-off default ignoring elevation), the
+/// z-aware-occlusion rule (a height-bounded [`Blocker`] is cleared by a high-enough
+/// sightline, an infinitely-tall one never is), and four full-match records proving
+/// the digest commits the inputs, the rules, AND the config determinants — the octant
+/// and fine cases run the identical action stream yet hash differently because their
+/// aim_mode differs — while the rules also bind the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v4`: the digest binds the combat `rules` and the
-/// `config` determinants (arena bounds + tick cap), and v4 adds the z-coupled-combat
-/// rule — [`Rules::vertical_hit_tolerance`] widened the rules encoding (moving every
-/// committed match hash) and the `vertical_hits` cases pin the rule — so a twin must
-/// fold the wider encoding into its match digest and reproduce the vertical rule or it
-/// diverges; the v2 blockers-as-physical-cover convention still holds. These are
-/// deliberate conventions every twin must follow.
+/// Set domain is `parity-vectors/v5`: the digest binds the combat `rules` and the
+/// `config` determinants (arena bounds + tick cap); v4 added the z-coupled-combat rule
+/// ([`Rules::vertical_hit_tolerance`] widened the rules encoding and the `vertical_hits`
+/// cases pin it); v5 adds blocker `height` — the digest folds it at replay tag v6
+/// (moving every committed match hash) and the `vision_over_cover` cases pin the
+/// see-over-low-cover rule — so a twin must fold the wider encodings into its match
+/// digest and reproduce both rules or it diverges; the v2 blockers-as-physical-cover
+/// convention still holds. These are deliberate conventions every twin must follow.
 ///
 /// The generator is pure integer, ordered, and float/map-free, so the set is
 /// byte-stable on every platform and the same on every run. It realizes the
@@ -3433,6 +3470,23 @@ pub fn parity_vectors() -> ParityVectors {
             // The boundary is INCLUSIVE: a target exactly at the tolerance is still hit.
             vertical_hit_case("hitscan_at_tolerance_lands", WeaponMode::Hitscan, 0, 1_000, 1_000),
         ],
+        vision_over_cover: {
+            // A 2 m wall astride the +X axis at x in [4 m, 6 m]; the sightline runs
+            // from the origin to 10 m east, crossing the wall footprint.
+            let wall = Blocker { min: Vec2 { x: 4_000, y: -1_000 }, max: Vec2 { x: 6_000, y: 1_000 }, height: 2_000 };
+            let target = Vec2 { x: 10 * POSITION_SCALE, y: 0 };
+            vec![
+                // Both ends on the ground: the wall blocks the look.
+                vision_over_cover_case("ground_look_blocked", Vec2::ZERO, 0, target, 0, wall),
+                // Both ends well above the top: the sightline passes over -> clear.
+                vision_over_cover_case("high_look_clears_the_wall", Vec2::ZERO, 5_000, target, 5_000, wall),
+                // The same high look against an infinitely-tall (height 0) twin -> blocked.
+                vision_over_cover_case("infinite_wall_blocks_high_look", Vec2::ZERO, 5_000, target, 5_000, Blocker { height: 0, ..wall }),
+                // A look rising from the ground but still below the top where it crosses
+                // the wall (z ~720 at the near edge) enters the box -> blocked.
+                vision_over_cover_case("rising_look_still_in_band_blocked", Vec2::ZERO, 0, target, 1_800, wall),
+            ]
+        },
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

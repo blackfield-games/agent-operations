@@ -175,6 +175,27 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         );
     }
 
+    // z-aware occlusion (v5): a height-bounded wall blocks a ground look but is cleared
+    // by a high-enough sightline; an infinitely-tall (height 0) wall blocks at any
+    // elevation; a rising look still in the wall's band where it crosses is blocked. A
+    // twin that ignores height fails the high-look case; one that lets the rising look
+    // through fails the in-band case.
+    let voc = |label: &str| v.vision_over_cover.iter().find(|c| c.label == label).unwrap();
+    let ground = voc("ground_look_blocked");
+    assert!(ground.occluded && ground.blocker.height > 0, "a ground look is blocked by the finite wall");
+    let high = voc("high_look_clears_the_wall");
+    assert!(!high.occluded, "a sightline over the top is not occluded by a height-bounded wall");
+    // The high look is the SAME geometry as the infinite case except for the wall
+    // height, so height alone decides — the discriminating pin.
+    let infinite = voc("infinite_wall_blocks_high_look");
+    assert!(infinite.occluded && infinite.blocker.height == 0, "an infinitely-tall wall blocks the high look");
+    assert_eq!(
+        (high.from, high.from_z, high.to, high.to_z),
+        (infinite.from, infinite.from_z, infinite.to, infinite.to_z),
+        "high vs infinite differ ONLY in the wall height"
+    );
+    assert!(voc("rising_look_still_in_band_blocked").occluded, "a look still below the top where it crosses is blocked");
+
     // Full matches: every committed record re-runs to its own committed result
     // (self-consistency); the v5 digest commits the inputs, the rules, AND the config. The octant
     // and fine matches run the IDENTICAL action stream and differ ONLY in aim_mode, so

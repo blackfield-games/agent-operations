@@ -682,6 +682,108 @@
       "damage": 25
     }
   ],
+  "vision_over_cover": [
+    {
+      "label": "ground_look_blocked",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 0,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 0,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "occluded": true
+    },
+    {
+      "label": "high_look_clears_the_wall",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 5000,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 5000,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "occluded": false
+    },
+    {
+      "label": "infinite_wall_blocks_high_look",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 5000,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 5000,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 0
+      },
+      "occluded": true
+    },
+    {
+      "label": "rising_look_still_in_band_blocked",
+      "from": {
+        "x": 0,
+        "y": 0
+      },
+      "from_z": 0,
+      "to": {
+        "x": 10000,
+        "y": 0
+      },
+      "to_z": 1800,
+      "blocker": {
+        "min": {
+          "x": 4000,
+          "y": -1000
+        },
+        "max": {
+          "x": 6000,
+          "y": 1000
+        },
+        "height": 2000
+      },
+      "occluded": true
+    }
+  ],
   "matches": [
     {
       "label": "octant_hitscan",
