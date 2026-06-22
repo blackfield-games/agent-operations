@@ -4157,6 +4157,97 @@ mod tests {
     }
 
     #[test]
+    fn segment_box_3d_differential_against_the_2d_test_and_an_exact_oracle() {
+        // The 3D SAT is cross-checked three sound ways over many deterministic
+        // pseudo-random integer cases: (1) when both endpoints sit within the box's
+        // z-band [0,height], z cannot separate, so the 3D test MUST equal the proven 2D
+        // segment_intersects_aabb; (2) when both endpoints are strictly above the top
+        // (or below the floor), the monotone z stays outside, so it MUST be clear;
+        // (3) an EXACT on-segment point (rational t = k/N, checked by scaling by N so
+        // there is no truncation) lying strictly inside the box forces a hit — no false
+        // negative. Pure integer + fixed seed, so the sweep is byte-reproducible.
+        let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let coord = |v: u64, lo: i32, hi: i32| lo + (v % ((hi - lo + 1) as u64)) as i32;
+        for _ in 0..50_000 {
+            let height = coord(next(), 1, 40); // > 0 so the 3D path runs (not the 2D delegate)
+            let minx = coord(next(), -20, 20);
+            let maxx = minx + coord(next(), 0, 20);
+            let miny = coord(next(), -20, 20);
+            let maxy = miny + coord(next(), 0, 20);
+            let b = Blocker { min: Vec2 { x: minx, y: miny }, max: Vec2 { x: maxx, y: maxy }, height };
+            let from = Vec2 { x: coord(next(), -30, 30), y: coord(next(), -30, 30) };
+            let to = Vec2 { x: coord(next(), -30, 30), y: coord(next(), -30, 30) };
+            let fz = coord(next(), -10, 60);
+            let tz = coord(next(), -10, 60);
+            let hit = segment_intersects_box_3d(from, fz, to, tz, &b);
+            // (1) both endpoints in the z-band -> reduces to the proven 2D test.
+            if (0..=height).contains(&fz) && (0..=height).contains(&tz) {
+                assert_eq!(hit, segment_intersects_aabb(from, to, &b), "in-band must match the 2D test");
+            }
+            // (2) wholly above the top, or wholly below the floor -> always clear.
+            if (fz > height && tz > height) || (fz < 0 && tz < 0) {
+                assert!(!hit, "a sightline wholly outside the z-band must clear");
+            }
+            // (3) an exact on-segment lattice point strictly inside the box forces a hit.
+            let n: i64 = 97; // prime, dense; scale by it to test exact rational points
+            let (dx, dy, dz) = (to.x as i64 - from.x as i64, to.y as i64 - from.y as i64, tz as i64 - fz as i64);
+            for k in 0..=n {
+                let (pxn, pyn, pzn) = (from.x as i64 * n + dx * k, from.y as i64 * n + dy * k, fz as i64 * n + dz * k);
+                if (minx as i64) * n < pxn && pxn < (maxx as i64) * n
+                    && (miny as i64) * n < pyn && pyn < (maxy as i64) * n
+                    && 0 < pzn && pzn < height as i64 * n
+                {
+                    assert!(hit, "an exact point strictly inside the box must register a hit");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_low_wall_is_seen_and_shot_over_when_the_pawn_is_elevated() {
+        // End to end: a wall of height 2000 directly between two grounded pawns blocks
+        // both perception and fire; lifting the shooter high enough that the sightline
+        // to the (grounded) enemy clears the top where it crosses the wall opens BOTH —
+        // it now perceives the enemy and its hitscan beam lands (the default
+        // vertical_hit_tolerance 0 leaves the shot itself z-uncoupled). Because the look
+        // dips toward the grounded target, the shooter must rise well above the 2 m top,
+        // not merely to it. The same wall with height 0 (infinitely tall) stays blocking.
+        let rules = Rules { spawn_radius: 5 * POSITION_SCALE, spawn_jitter: 0, perception_range: 100 * POSITION_SCALE, ..Default::default() };
+        // A wall spanning the midline between seat 0 (left) and seat 1 (right).
+        let low = Blocker { min: Vec2 { x: -500, y: -10 * POSITION_SCALE }, max: Vec2 { x: 500, y: 10 * POSITION_SCALE }, height: 2000 };
+        let setup = |wall: Blocker, shooter_z: i32| {
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![wall], 1);
+            m.pawns[0].pos = Vec2 { x: -5 * POSITION_SCALE, y: 0 };
+            m.pawns[0].facing = EAST;
+            m.pawns[0].z = shooter_z;
+            m.pawns[1].pos = Vec2 { x: 5 * POSITION_SCALE, y: 0 };
+            m
+        };
+        // Grounded: the wall occludes — seat 1 is not perceived and the shot is absorbed.
+        let mut grounded = setup(low, 0);
+        assert!(grounded.observe(0).visible.is_empty(), "the low wall hides the grounded enemy");
+        grounded.resolve_fire(0);
+        assert_eq!(grounded.pawns[1].health, rules.start_health, "the grounded shot is blocked by the wall");
+        // Elevated above the 2 m top: seat 1 comes into view and the shot lands.
+        let mut elevated = setup(low, 6000);
+        assert_eq!(elevated.observe(0).visible.len(), 1, "from above the wall the enemy is perceived");
+        elevated.resolve_fire(0);
+        assert!(elevated.pawns[1].health < rules.start_health, "from above the wall the shot lands");
+        // An infinitely-tall wall (height 0) keeps blocking even from the same height.
+        let mut infinite = setup(Blocker { height: 0, ..low }, 6000);
+        assert!(infinite.observe(0).visible.is_empty(), "an infinitely-tall wall blocks at any height");
+        infinite.resolve_fire(0);
+        assert_eq!(infinite.pawns[1].health, rules.start_health, "the infinite wall blocks the shot too");
+    }
+
+    #[test]
     fn observe_applies_the_fov_cone_and_does_not_leak_the_excluded_position() {
         // Integration: an enemy in range but directly behind is perceived under the
         // default full circle and EXCLUDED under a tight cone — and its position
