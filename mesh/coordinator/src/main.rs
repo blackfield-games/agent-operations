@@ -2195,6 +2195,13 @@ async fn dead_lettered_debits(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    // `total` is the dead-letter count (the same value `/stats dead_lettered_debits`
+    // shows). It equals the count of LISTABLE rows because no debit is ever both
+    // dead-lettered and settled — `mark_debit_dead_lettered` requires `tx_hash IS
+    // NULL` and `claim_oldest_pending_debit` skips dead-lettered rows, so the listing's
+    // extra `tx_hash IS NULL` filter never excludes a counted row. Thus `truncated` is
+    // exact today; if that state-machine invariant ever changes, count the listable
+    // predicate here instead.
     let total = match store.dead_lettered_debit_count() {
         Ok(n) => n,
         Err(e) => {
