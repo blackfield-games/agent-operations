@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use arena_core::{arena_map, Match, MatchRecord, ReplayError, Rules, SplitMix64};
+use arena_core::{arena_map, Match, MatchRecord, ReplayError, Rules, SplitMix64, DEFAULT_RATING};
 use arena_proto::{
     verify_join_signature, ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode,
     MatchPhase, MatchResult, SeatId, SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
@@ -324,6 +324,21 @@ impl Queues {
     }
 }
 
+/// All of the matchmaker's mutable state, behind its one lock: the per-mode waiting
+/// queues and the ranked rating ladder. Holding them under a single lock means a
+/// join that pairs by rating reads the book and the queue atomically — there is no
+/// window where a rating could move between selecting an opponent and seating it.
+#[derive(Default)]
+struct State {
+    queues: Queues,
+    /// The in-memory ranked rating ladder: agent identity → integer rating. A
+    /// ranked (Agent-mode) agent is seeded at [`DEFAULT_RATING`] on its first join
+    /// and moves only when a terminal ranked match applies its rating delta.
+    /// `BTreeMap`, not `HashMap`, so iteration is order-deterministic — the pairing
+    /// and replay-determinism properties depend on it.
+    ratings: BTreeMap<String, i32>,
+}
+
 /// Forms matches from waiting participants by [`MatchMode`], over the arena-02
 /// core. Every mode shares one combat core; the mode only governs which
 /// controller kinds may fill the seats and what composition is valid.
@@ -334,7 +349,7 @@ impl Queues {
 /// a match a seat short. Identity is checked *before* the lock, so an
 /// inadmissible join never touches a queue.
 pub struct Matchmaker<V> {
-    queues: Mutex<Queues>,
+    state: Mutex<State>,
     verifier: V,
     params: MatchParams,
 }
@@ -365,7 +380,7 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             params.seats_per_match,
             params.team_size
         );
-        Self { queues: Mutex::new(Queues::default()), verifier, params }
+        Self { state: Mutex::new(State::default()), verifier, params }
     }
 
     /// Admit `req` to `mode`'s queue, forming a match if it now can. Returns
@@ -388,8 +403,13 @@ impl<V: IdentityVerifier> Matchmaker<V> {
         self.admit(mode, nonce, &req)?;
         let seated = Seated { agent_id: req.agent_id, kind: req.kind };
         let roster = {
-            let mut q = self.queues.lock().expect("matchmaker mutex poisoned");
-            let queue = q.for_mode(mode);
+            let mut st = self.state.lock().expect("matchmaker mutex poisoned");
+            // A ranked (Agent-mode) seat enters the ladder at the seed rating on its
+            // first join, so every waiting ranked agent has a rating to pair on.
+            if mode == MatchMode::Agent {
+                st.ratings.entry(seated.agent_id.clone()).or_insert(DEFAULT_RATING);
+            }
+            let queue = st.queues.for_mode(mode);
             queue.push(seated);
             try_form(mode, queue, self.params.seats_per_match as usize)
         };
@@ -464,8 +484,15 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// How many participants are waiting in `mode`'s queue — for observability and
     /// tests.
     pub fn waiting(&self, mode: MatchMode) -> usize {
-        let mut q = self.queues.lock().expect("matchmaker mutex poisoned");
-        q.for_mode(mode).len()
+        let mut st = self.state.lock().expect("matchmaker mutex poisoned");
+        st.queues.for_mode(mode).len()
+    }
+
+    /// The current ranked rating of `agent_id`, or `None` if it has never joined a
+    /// ranked (Agent-mode) queue. A freshly seeded agent reads back
+    /// [`DEFAULT_RATING`] until a terminal ranked match moves it.
+    pub fn rating(&self, agent_id: &str) -> Option<i32> {
+        self.state.lock().expect("matchmaker mutex poisoned").ratings.get(agent_id).copied()
     }
 }
 
@@ -849,6 +876,21 @@ mod tests {
             .expect("two authorized agents form a ranked match");
         assert_eq!(controllers(&m), ["0xa", "0xb"]);
         assert_eq!(m.phase(), MatchPhase::Live);
+    }
+
+    #[test]
+    fn a_ranked_agent_seeds_at_the_default_rating() {
+        // FM3 (seed): a fresh ranked agent enters the ladder at exactly DEFAULT_RATING
+        // on its first Agent-mode join, and reads back that value until a match moves
+        // it. The ladder is ranked-only — a human seat is never rated.
+        let mm = ranked_mm(&[("0xa", "siga")]);
+        assert_eq!(mm.rating("0xa"), None, "no rating until the agent joins ranked");
+        assert!(mm.join(MatchMode::Agent, b"", JoinRequest::ranked_agent("0xa", "siga")).unwrap().is_queued());
+        assert_eq!(mm.rating("0xa"), Some(DEFAULT_RATING), "seeded at the default on the first ranked join");
+
+        let open = open_mm();
+        open.join(MatchMode::Human, b"", JoinRequest::human("alice")).unwrap();
+        assert_eq!(open.rating("alice"), None, "a human seat is never laddered");
     }
 
     #[test]
