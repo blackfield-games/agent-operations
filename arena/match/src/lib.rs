@@ -427,15 +427,17 @@ struct State {
     /// and replay-determinism properties depend on it.
     ratings: BTreeMap<String, i32>,
     /// Ranked matches that have FORMED but not yet been settled into the ladder,
-    /// `match_id → the two seats' agent identities (in seat order) + an insertion seq`.
-    /// Only a 2-seat Agent-mode match registers here at formation;
-    /// [`Matchmaker::apply_ranked_result`] removes its entry and applies the delta. This
-    /// is what makes the rating update safe: a casual/human/unknown match was never
-    /// registered, so applying its result is a no-op (FM1), and resolving a match
-    /// removes its entry, so a replayed result cannot double-apply (FM3). The registry
-    /// is bounded by `MatchParams::max_pending_ranked` — a match whose result never
-    /// reports back would otherwise leak its entry forever, so over the cap the OLDEST
-    /// (lowest `seq`) registration is evicted.
+    /// `match_id → the full seat-ordered roster's agent identities + an insertion seq`.
+    /// Every Agent-mode match registers here at formation (every seat is an
+    /// authenticated ranked agent); a 1v1 settles via
+    /// [`Matchmaker::apply_ranked_result`] and a 3+/team field via
+    /// [`Matchmaker::apply_ranked_field_result`], each removing its entry and applying
+    /// the delta. This is what makes the rating update safe: a casual/human/unknown
+    /// match was never registered, so applying its result is a no-op (FM1), and
+    /// resolving a match removes its entry, so a replayed result cannot double-apply
+    /// (FM3). The registry is bounded by `MatchParams::max_pending_ranked` — a match
+    /// whose result never reports back would otherwise leak its entry forever, so over
+    /// the cap the OLDEST (lowest `seq`) registration is evicted.
     pending_ranked: BTreeMap<Uuid, PendingRanked>,
     /// Monotonic stamp assigned to each `pending_ranked` insertion. `BTreeMap` is
     /// `Uuid`-keyed (not insertion-ordered), so this is what lets the cap evict the
@@ -448,9 +450,10 @@ struct State {
     ranked_evictions: usize,
 }
 
-/// A formed-but-unsettled ranked registration: the two seats' agents (in seat order)
-/// plus the insertion sequence the cap uses to evict the OLDEST entry — the one most
-/// likely abandoned (its result never came back) — when the registry is over its bound.
+/// A formed-but-unsettled ranked registration: the full roster's agents in seat order
+/// (so a multi-seat settle sources each seat's rating in canonical order) plus the
+/// insertion sequence the cap uses to evict the OLDEST entry — the one most likely
+/// abandoned (its result never came back) — when the registry is over its bound.
 struct PendingRanked {
     seq: u64,
     agents: Vec<String>,
@@ -612,13 +615,16 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             .enumerate()
             .map(|(i, s)| SeatInfo { seat: i as SeatId, team: teams[i], controller: s.agent_id.clone() })
             .collect();
-        // Register a ranked 1v1 (Agent mode, exactly 2 seats) so its terminal result
-        // can later settle into the ladder. Only a head-to-head agent match is rated —
-        // ranked_delta is 1v1, and a casual/human/team match has no A-vs-B rating to
-        // move (FM1). The brief re-lock keeps the heavy Match::new off the formation
-        // lock, as build already does. Keyed by the freshly minted id, so the result
-        // carrying that id resolves exactly this match.
-        if mode == MatchMode::Agent && seats.len() == 2 {
+        // Register every ranked match (Agent mode — every seat is an authenticated
+        // ranked agent) so its terminal result can later settle into the ladder: a 1v1
+        // via apply_ranked_result (ranked_delta), a 3+/team field via
+        // apply_ranked_field_result (ranked_field_delta). A casual/human/Mixed match has
+        // no rated field to move (FM1) and is never registered. The FULL seat-ordered
+        // roster is stored (not just two seats), so a multi-seat settle can source each
+        // seat's rating in canonical order. The brief re-lock keeps the heavy Match::new
+        // off the formation lock, as build already does. Keyed by the freshly minted id,
+        // so the result carrying that id resolves exactly this match.
+        if mode == MatchMode::Agent {
             let agents: Vec<String> = seats.iter().map(|s| s.controller.clone()).collect();
             let mut st = self.state.lock().expect("matchmaker mutex poisoned");
             let seq = st.next_pending_seq;
