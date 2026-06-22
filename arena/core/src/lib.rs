@@ -2924,6 +2924,81 @@ pub fn ranked_delta(result: &MatchResult, rating_a: i32, rating_b: i32, k: i32) 
     Some(rating_delta(rating_a, rating_b, outcome, k))
 }
 
+/// One seat's signed reputation change in a settled multi-seat ranked match — the
+/// multi-player analog of a single side of [`RatingDelta`], carrying its `seat` so a
+/// caller maps each delta to the right agent without re-deriving the canonical order
+/// (a swap would credit the wrong identity on-chain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatDelta {
+    /// The seat this delta applies to, from the result's canonical ascending order.
+    pub seat: SeatId,
+    /// The signed reputation change for this seat; the whole field's deltas sum to
+    /// exactly `0` (see [`ranked_field_delta`]).
+    pub delta: i32,
+}
+
+/// The zero-sum, pure-integer reputation deltas for a settled multi-seat (FFA / 3+)
+/// ranked match — the generalization of the 1v1 [`ranked_delta`] to a full placement
+/// field.
+///
+/// Each seat plays one virtual head-to-head against every other seat: the pairwise
+/// outcome is read from the two seats' `placement` (a lower placement places better —
+/// a win; equal placements — a draw), scored through the identical [`rating_delta`]
+/// curve, and the pairwise results summed per seat. This is the standard
+/// multiplayer-Elo "score against the field vs expected" rule, written as a sum of
+/// pairwise games so zero-sum is STRUCTURAL: every pair contributes `(x, -x)` (a
+/// [`RatingDelta`] is exactly mirrored), so the whole field sums to exactly `0` — no
+/// reputation minted or burned, the on-chain conservation invariant now across N
+/// settlements instead of two.
+///
+/// Deliberately NOT normalized by field size. A seat's swing grows with the field (it
+/// plays more pairwise games) and the MAGNITUDE is the owner-set K knob, exactly as in
+/// the 1v1 curve; averaging by `N − 1` would add a field-size divisor (a divide-by-zero
+/// edge) AND break exact zero-sum, because per-seat integer truncation would no longer
+/// cancel across the field. A raw pairwise sum needs no divisor and stays bit-exact.
+///
+/// `ratings[i]` is the pre-match rating of `result.outcomes[i].seat` — the same
+/// positional pairing [`ranked_delta`] uses for its two seats — and the returned
+/// [`SeatDelta`]s are in that canonical ascending-seat order. Returns `None` unless the
+/// field has at least two seats and `ratings` aligns 1:1 with the outcomes (a
+/// degenerate field has no rivalry to settle). On a well-formed two-seat result this
+/// agrees bit-for-bit with [`ranked_delta`] — a single pairwise game IS the 1v1.
+///
+/// Pure integer throughout: the per-seat sum is accumulated in `i64` so a large field
+/// never overflows mid-fold, then clamped into `i32` as a panic-free guard. Within the
+/// owner-set K band (`(N − 1)·|K|` inside `i32`) the clamp is inert and the field is
+/// exactly zero-sum; the computation is byte-stable across platforms and pinned in the
+/// `field_deltas` parity category.
+pub fn ranked_field_delta(result: &MatchResult, ratings: &[i32], k: i32) -> Option<Vec<SeatDelta>> {
+    let outcomes = &result.outcomes;
+    if outcomes.len() < 2 || ratings.len() != outcomes.len() {
+        return None;
+    }
+    let n = outcomes.len();
+    let mut sums = vec![0i64; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let outcome = if outcomes[i].placement < outcomes[j].placement {
+                MatchOutcome::WinA
+            } else if outcomes[i].placement > outcomes[j].placement {
+                MatchOutcome::WinB
+            } else {
+                MatchOutcome::Draw
+            };
+            let d = rating_delta(ratings[i], ratings[j], outcome, k);
+            sums[i] += i64::from(d.a);
+            sums[j] += i64::from(d.b);
+        }
+    }
+    Some(
+        outcomes
+            .iter()
+            .zip(sums)
+            .map(|(o, s)| SeatDelta { seat: o.seat, delta: s.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32 })
+            .collect(),
+    )
+}
+
 // ===========================================================================
 // Cross-implementation parity vectors — the UE5-twin conformance set.
 //
