@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
-use arena_core::{settlement, Match, Rules, Settlement};
+use arena_core::{ranked_delta, settlement, Match, Rules, Settlement};
 use arena_proto::{
     check_version, ActionIntent, AgentMsg, GatewayMsg, MatchConfig, MatchPhase, MatchResult,
     ReplayRecord, SeatId, SeatInfo, Vec2, POSITION_SCALE, PROTOCOL_VERSION,
@@ -135,17 +135,29 @@ enum SettleError {
 /// implementation (an RPC provider plus an authorized attester key with gas and
 /// real-fund custody) is operator-gated and not built here — it slots in behind
 /// this trait, the same Relay/Spender split mesh uses.
+/// The signed reputation a settlement applies to the FIRST-ordered party — the
+/// winner for [`settle`](Settle::settle), the lower-seat participant (`agentA`) for
+/// [`settle_draw`](Settle::settle_draw) — with the counterparty receiving the
+/// contract-applied negation, so the on-chain `recordMatchResult(+d)` /
+/// `recordMatchResult(-d)` pair stays zero-sum (the core guarantees `b == -a`).
+///
+/// `None` defers to the contract's own FIXED `reputationDelta` — the pre-ladder
+/// behaviour — so a settlement with no ranked context is byte-identical to before.
+/// `Some(d)` carries the variable Elo delta [`ranked_delta`] computed from the two
+/// participants' ratings: a favoured win earns less, an upset more.
+type ReputationDelta = Option<i32>;
+
 trait Settle {
-    fn settle(&self, match_id: Uuid, winner: &str, replay_digest: [u8; 32]) -> Result<(), SettleError>;
-    fn settle_draw(&self, match_id: Uuid, replay_digest: [u8; 32]) -> Result<(), SettleError>;
+    fn settle(&self, match_id: Uuid, winner: &str, reputation: ReputationDelta, replay_digest: [u8; 32]) -> Result<(), SettleError>;
+    fn settle_draw(&self, match_id: Uuid, reputation: ReputationDelta, replay_digest: [u8; 32]) -> Result<(), SettleError>;
     fn cancel(&self, match_id: Uuid) -> Result<(), SettleError>;
 }
 
 /// One recorded resolution, mirroring the terminal state the contract would hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Resolution {
-    Win { winner: String, replay_digest: [u8; 32] },
-    Draw { replay_digest: [u8; 32] },
+    Win { winner: String, reputation: ReputationDelta, replay_digest: [u8; 32] },
+    Draw { reputation: ReputationDelta, replay_digest: [u8; 32] },
     Cancelled,
 }
 
@@ -184,17 +196,30 @@ impl MockSettler {
 }
 
 impl Settle for MockSettler {
-    fn settle(&self, match_id: Uuid, winner: &str, replay_digest: [u8; 32]) -> Result<(), SettleError> {
-        self.record(match_id, Resolution::Win { winner: winner.to_string(), replay_digest })
+    fn settle(&self, match_id: Uuid, winner: &str, reputation: ReputationDelta, replay_digest: [u8; 32]) -> Result<(), SettleError> {
+        self.record(match_id, Resolution::Win { winner: winner.to_string(), reputation, replay_digest })
     }
 
-    fn settle_draw(&self, match_id: Uuid, replay_digest: [u8; 32]) -> Result<(), SettleError> {
-        self.record(match_id, Resolution::Draw { replay_digest })
+    fn settle_draw(&self, match_id: Uuid, reputation: ReputationDelta, replay_digest: [u8; 32]) -> Result<(), SettleError> {
+        self.record(match_id, Resolution::Draw { reputation, replay_digest })
     }
 
     fn cancel(&self, match_id: Uuid) -> Result<(), SettleError> {
         self.record(match_id, Resolution::Cancelled)
     }
+}
+
+/// The ranked-rating context a settlement needs to compute the variable reputation
+/// delta: the two seats' pre-match ratings — `rating_a` for the first canonical
+/// outcome seat (the lower seat id, `agentA`), `rating_b` for the second — and the
+/// owner-set K-factor. Supplied by the live rating ladder; the loopback driver has
+/// no ladder, so it passes `None` and the settlement defers to the contract's fixed
+/// delta (byte-identical).
+#[derive(Clone, Copy)]
+struct RankedContext {
+    rating_a: i32,
+    rating_b: i32,
+    k: i32,
 }
 
 /// Drive one finished match through the settler: classify it, then submit the
@@ -205,10 +230,18 @@ impl Settle for MockSettler {
 /// stand-in for the on-chain agent address. Returns the chosen [`Settlement`] for
 /// the caller to report. A cancel is NOT produced here: a finished match always
 /// has a result; `cancel` is the pre-play abort path.
+///
+/// When `ranked` is supplied, the settlement carries the variable Elo reputation
+/// delta [`ranked_delta`] derives from the two ratings and the outcome — the
+/// winner's signed gain for a decisive result, `agentA`'s signed change for a draw
+/// (negative when `agentA` was favoured). The delta is settlement metadata: it does
+/// NOT touch `digest`, so the committed identity is identical with or without it.
+/// `ranked == None` carries `None` (defer to the contract's fixed delta).
 fn settle_match(
     settler: &impl Settle,
     result: &MatchResult,
     replay: &ReplayRecord,
+    ranked: Option<RankedContext>,
 ) -> Result<Settlement, SettleError> {
     // MatchSettlement is strictly 1v1; a non-pair match (FFA, a single seat, an
     // empty result) has no on-chain settle form, so refuse it here rather than emit
@@ -218,6 +251,12 @@ fn settle_match(
     }
     let digest = replay.digest();
     let outcome = settlement(result);
+    // The zero-sum per-seat Elo delta (keyed to the canonical seat order: `.a` to the
+    // first outcome seat, `.b == -.a` to the second), when a ranked context is given.
+    // The 2-seat guard above means ranked_delta always yields Some here.
+    let delta = ranked.map(|r| {
+        ranked_delta(result, r.rating_a, r.rating_b, r.k).expect("a 2-seat result has a ranked delta")
+    });
     match outcome {
         Settlement::Win { seat } => {
             let winner = replay
@@ -226,9 +265,15 @@ fn settle_match(
                 .find(|s| s.seat == seat)
                 .map(|s| s.controller.as_str())
                 .expect("the winning seat is in the roster");
-            settler.settle(result.match_id, winner, digest)?;
+            // The winner's signed reputation: `.a` if it is the first outcome seat,
+            // else `.b` — always the positive side of the zero-sum split for a win.
+            let reputation = delta.map(|d| if seat == result.outcomes[0].seat { d.a } else { d.b });
+            settler.settle(result.match_id, winner, reputation, digest)?;
         }
-        Settlement::Draw => settler.settle_draw(result.match_id, digest)?,
+        // A draw carries `agentA`'s (the first outcome seat's) signed change; the
+        // contract applies its negation to `agentB`. Even ratings ⇒ 0; otherwise the
+        // favoured seat moves down.
+        Settlement::Draw => settler.settle_draw(result.match_id, delta.map(|d| d.a), digest)?,
     }
     Ok(outcome)
 }
@@ -346,7 +391,9 @@ fn main() {
     if let Some(s) = &settler {
         let match_id = m.match_id();
         let replay = m.into_replay();
-        match settle_match(s, &result, &replay) {
+        // The loopback agents are fresh, with no rating ladder, so settlement defers
+        // to the contract's fixed reputation delta — byte-identical to pre-ladder.
+        match settle_match(s, &result, &replay, None) {
             Ok(outcome) => {
                 eprintln!("[settle-dev-mock] {match_id} settled as {outcome:?}: {:?}", s.resolution(match_id))
             }
@@ -406,11 +453,12 @@ mod tests {
         let result = result_for(vec![outcome(0, 2, 1, false), outcome(1, 1, 5, true)]);
         let settler = MockSettler::default();
 
-        let chosen = settle_match(&settler, &result, &replay).expect("settles");
+        let chosen = settle_match(&settler, &result, &replay, None).expect("settles");
         assert_eq!(chosen, Settlement::Win { seat: 1 });
         assert_eq!(
             settler.resolution(id()),
-            Some(Resolution::Win { winner: "agent-1".into(), replay_digest: replay.digest() }),
+            Some(Resolution::Win { winner: "agent-1".into(), reputation: None, replay_digest: replay.digest() }),
+            "no ranked context ⇒ reputation None (defer to the contract's fixed delta), winner identity + core digest",
         );
     }
 
@@ -423,10 +471,10 @@ mod tests {
         let result = result_for(vec![outcome(0, 1, 5, true), outcome(1, 2, 1, false)]);
         let settler = MockSettler::default();
 
-        settle_match(&settler, &result, &replay).expect("first settles");
+        settle_match(&settler, &result, &replay, None).expect("first settles");
         let first = settler.resolution(id());
         assert!(matches!(
-            settle_match(&settler, &result, &replay),
+            settle_match(&settler, &result, &replay, None),
             Err(SettleError::AlreadyResolved)
         ));
         assert_eq!(settler.resolution(id()), first, "the retry changes nothing");
@@ -440,9 +488,9 @@ mod tests {
         let result = result_for(vec![outcome(0, 1, 4, true), outcome(1, 1, 4, true)]);
         let settler = MockSettler::default();
 
-        let chosen = settle_match(&settler, &result, &replay).expect("settles");
+        let chosen = settle_match(&settler, &result, &replay, None).expect("settles");
         assert_eq!(chosen, Settlement::Draw);
-        assert_eq!(settler.resolution(id()), Some(Resolution::Draw { replay_digest: replay.digest() }));
+        assert_eq!(settler.resolution(id()), Some(Resolution::Draw { reputation: None, replay_digest: replay.digest() }));
     }
 
     #[test]
@@ -457,7 +505,7 @@ mod tests {
         assert_eq!(settler.resolution(id()), Some(Resolution::Cancelled));
         assert!(matches!(settler.cancel(id()), Err(SettleError::AlreadyResolved)), "retry cancel is a no-op");
         assert!(
-            matches!(settle_match(&settler, &result, &replay), Err(SettleError::AlreadyResolved)),
+            matches!(settle_match(&settler, &result, &replay, None), Err(SettleError::AlreadyResolved)),
             "a cancelled match can never be settled",
         );
         assert_eq!(settler.resolution(id()), Some(Resolution::Cancelled), "still cancelled");
@@ -474,7 +522,7 @@ mod tests {
         let settler = MockSettler::default();
 
         assert!(matches!(
-            settle_match(&settler, &result, &replay),
+            settle_match(&settler, &result, &replay, None),
             Err(SettleError::NotRankedPair)
         ));
         assert_eq!(settler.resolution(id()), None, "a non-pair match records nothing");
@@ -501,9 +549,9 @@ mod tests {
         let replay = m.into_replay();
         let settler = MockSettler::default();
 
-        settle_match(&settler, &result, &replay).expect("settles");
+        settle_match(&settler, &result, &replay, None).expect("settles");
         let committed = match settler.resolution(id()).expect("resolved") {
-            Resolution::Win { replay_digest, .. } | Resolution::Draw { replay_digest } => replay_digest,
+            Resolution::Win { replay_digest, .. } | Resolution::Draw { replay_digest, .. } => replay_digest,
             Resolution::Cancelled => panic!("a played match is never a cancel"),
         };
         assert_eq!(committed, replay.digest(), "commits the exact core digest");
