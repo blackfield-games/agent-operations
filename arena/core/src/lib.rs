@@ -2773,6 +2773,79 @@ pub fn settlement(result: &MatchResult) -> Settlement {
 }
 
 // ===========================================================================
+// Ranked rating — the deterministic, zero-sum reputation delta a settled A2A
+// match applies. A sibling of `settlement()`: where that classifies a match's
+// OUTCOME, this turns the outcome plus the two participants' standing ratings
+// into the signed reputation each carries on-chain. It is the variable, skill-
+// scaled delta the on-chain `AgentRegistry.recordMatchResult(agent, delta)`
+// consumes — the fair-MMR curve the fixed win=+k/loss=-k placeholder deferred.
+// Pure integer (an Elo logistic sampled into an anchor table, no float), so it
+// is byte-stable and a UE5 / on-chain twin reproduces every delta bit-for-bit;
+// the `rating_deltas` parity category pins the curve as the cross-impl contract.
+// The K-factor MAGNITUDE is an owner-set economic knob (operator-gated before
+// mainnet, like the rate params); the COMPUTATION is the build.
+// ===========================================================================
+
+/// Conventional seed rating for a fresh ranked agent — the Elo midpoint a new
+/// identity starts from before its first match moves it. A ladder keeps the live
+/// per-agent value; this is only the centre the [`rating_delta`] curve is built
+/// around (two seed-rated agents are an even match, expected score
+/// `RATING_SCALE / 2`).
+pub const DEFAULT_RATING: i32 = 1500;
+
+/// Fixed-point scale for an expected score: [`expected_score_bp`] returns basis
+/// points in `0..=RATING_SCALE` (`10_000` = a certain win, `5_000` = an even
+/// match), so the whole rating computation stays in exact integers with no float.
+pub const RATING_SCALE: i32 = 10_000;
+
+/// The rating difference past which the expected score is treated as flat. At an
+/// 800-point gap the favourite already wins ~99% (the [`EXPECTED_SCORE_TABLE`]
+/// tail), so clamping here costs no meaningful resolution and bounds the table
+/// index — and, because the clamp is applied before the mirror negate, guarantees
+/// the negate can never overflow.
+pub const RATING_DIFF_CAP: i32 = 800;
+
+/// Rating-difference step between adjacent [`EXPECTED_SCORE_TABLE`] anchors.
+const RATING_DIFF_STEP: i32 = 40;
+
+/// Expected score (basis points) of the higher-rated side at rating differences
+/// `0, 40, 80, … 800` — the standard Elo logistic `1 / (1 + 10^(-d/400))` sampled
+/// every 40 points and rounded to the nearest basis point. Hand-authored integer
+/// constants (no float at runtime), so the curve is identical on every platform and
+/// a twin reproduces it exactly. Strictly increasing, so the expected score is
+/// monotonic in the rating gap.
+const EXPECTED_SCORE_TABLE: [i32; 21] = [
+    5000, 5573, 6131, 6661, 7153, 7597, 7992, 8337, 8632, 8882, 9091, 9264, 9407, 9523, 9617, 9693,
+    9755, 9804, 9844, 9876, 9901,
+];
+
+/// The Elo expected score (basis points, `0..=RATING_SCALE`) of player A against
+/// player B from the rating difference `diff = rating_a - rating_b`.
+///
+/// Pure integer: clamp `diff` to `±RATING_DIFF_CAP`, look up the bracketing
+/// [`EXPECTED_SCORE_TABLE`] anchors for its magnitude, linearly interpolate between
+/// them, and mirror for a negative difference, so the two sides' expected scores
+/// always sum to `RATING_SCALE` (`E(-d) == RATING_SCALE - E(d)`) and `E(0)` is the
+/// even-match midpoint. This is the curve a ranked twin and the on-chain reputation
+/// must agree on bit-for-bit; it is pinned in the `rating_deltas` parity vectors.
+pub fn expected_score_bp(diff: i32) -> i32 {
+    let d = diff.clamp(-RATING_DIFF_CAP, RATING_DIFF_CAP);
+    let mag = d.abs(); // <= RATING_DIFF_CAP, so the clamp already made the negate safe
+    let i = (mag / RATING_DIFF_STEP) as usize;
+    let e_pos = if i >= EXPECTED_SCORE_TABLE.len() - 1 {
+        EXPECTED_SCORE_TABLE[EXPECTED_SCORE_TABLE.len() - 1]
+    } else {
+        let (lo, hi) = (EXPECTED_SCORE_TABLE[i], EXPECTED_SCORE_TABLE[i + 1]);
+        lo + (hi - lo) * (mag % RATING_DIFF_STEP) / RATING_DIFF_STEP
+    };
+    if d < 0 {
+        RATING_SCALE - e_pos
+    } else {
+        e_pos
+    }
+}
+
+// ===========================================================================
 // Cross-implementation parity vectors — the UE5-twin conformance set.
 //
 // Every parity audit elsewhere in this crate checks the reference core against
@@ -3617,6 +3690,59 @@ mod tests {
 
     fn new_match(seed: u64) -> Match {
         Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), Vec::new(), seed)
+    }
+
+    #[test]
+    fn expected_score_is_even_at_equal_ratings() {
+        assert_eq!(expected_score_bp(0), RATING_SCALE / 2);
+    }
+
+    #[test]
+    fn expected_score_is_symmetric_and_sums_to_scale() {
+        // E(d) + E(-d) == RATING_SCALE for every difference, the property that makes
+        // the rating delta exactly zero-sum (FM1). Holds by construction (the mirror),
+        // including past the clamp where both sides saturate.
+        for d in [-5000, -800, -437, -40, -1, 0, 1, 25, 200, 401, 800, 5000] {
+            assert_eq!(
+                expected_score_bp(d) + expected_score_bp(-d),
+                RATING_SCALE,
+                "E(d) + E(-d) must equal RATING_SCALE at d={d}"
+            );
+        }
+    }
+
+    #[test]
+    fn expected_score_is_monotonic_in_the_rating_gap() {
+        // Non-decreasing across the whole clamped range, and strictly higher across a
+        // full anchor step — a bigger lead never lowers the favourite's expected score
+        // (FM3: wrong monotonicity would make the ladder farmable).
+        let mut prev = expected_score_bp(-RATING_DIFF_CAP);
+        for d in (-RATING_DIFF_CAP + 1)..=RATING_DIFF_CAP {
+            let e = expected_score_bp(d);
+            assert!(e >= prev, "expected score dipped at d={d}: {e} < {prev}");
+            prev = e;
+        }
+        assert!(expected_score_bp(40) > expected_score_bp(0));
+        assert!(expected_score_bp(800) > expected_score_bp(760));
+    }
+
+    #[test]
+    fn expected_score_clamps_beyond_the_cap() {
+        let cap = expected_score_bp(RATING_DIFF_CAP);
+        assert_eq!(expected_score_bp(RATING_DIFF_CAP + 1), cap);
+        assert_eq!(expected_score_bp(1_000_000), cap);
+        // The extreme inputs must not overflow on the mirror negate (FM4).
+        assert_eq!(expected_score_bp(i32::MAX), cap);
+        assert_eq!(expected_score_bp(i32::MIN), RATING_SCALE - cap);
+    }
+
+    #[test]
+    fn expected_score_interpolates_between_anchors() {
+        // Halfway through the first 40-point step is the mean of the two anchors —
+        // linear integer interpolation, not a step function.
+        let mid = expected_score_bp(20);
+        assert_eq!(mid, 5000 + (5573 - 5000) / 2);
+        assert!(expected_score_bp(0) < mid && mid < expected_score_bp(40));
     }
 
     #[test]
