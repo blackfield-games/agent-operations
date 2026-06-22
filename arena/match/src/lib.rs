@@ -1553,10 +1553,10 @@ mod tests {
         // FM1 (seat->rating mapping) + FM2 (zero-sum): a 3-seat FFA ranked match settles
         // every seat by EXACTLY core ranked_field_delta over the seats' LIVE ratings,
         // sourced in canonical seat order. Distinct ratings + an UPSET placement (the
-        // 1200 underdog wins, the 1800 favourite comes last) make every seat's delta
+        // 1300 underdog wins, the 1800 favourite comes last) make every seat's delta
         // distinct and sign-dependent on its own (rating, placement) pair, so a
         // seat->agent swap would settle the wrong reputation; the field stays zero-sum.
-        let (mm, m) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1800), ("0xc", 1200)]);
+        let (mm, m) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1800), ("0xc", 1300)]);
         assert_eq!(mm.unsettled_ranked(), 1, "the formed 3-seat ranked match is registered");
         let agent_at = agents_by_seat(&m);
         let rating_at: Vec<i32> = agent_at.iter().map(|a| mm.rating(a).unwrap()).collect();
@@ -1565,6 +1565,13 @@ mod tests {
         let result = field_result(m.match_id(), &[(0, 2), (1, 3), (2, 1)]);
         let k = 32;
         let expected = ranked_field_delta(&result, &rating_at, k).expect("a 3-seat field aligned to its ratings");
+        // The fixture is chosen so every seat moves by a distinct, non-zero delta — a
+        // seat whose delta were 0 would make its per-seat assertion below trivially true.
+        let mut distinct: Vec<i32> = expected.iter().map(|d| d.delta).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "every seat's delta is distinct: {expected:?}");
+        assert!(expected.iter().all(|d| d.delta != 0), "every seat actually moves: {expected:?}");
 
         let applied = mm.apply_ranked_field_result(&result, k).expect("a registered multi-seat match settles");
         assert_eq!(applied, expected, "the matchmaker feeds the core the seats' ratings in canonical order");
@@ -1581,6 +1588,34 @@ mod tests {
         let after: i64 = agent_at.iter().map(|a| i64::from(mm.rating(a).unwrap())).sum();
         assert_eq!(before, after, "total ladder reputation is conserved across the settle");
         assert_eq!(mm.unsettled_ranked(), 0, "settling consumes the registration");
+    }
+
+    #[test]
+    fn a_multiseat_settle_maps_by_seat_id_not_outcome_position() {
+        // FM1 (indexing): the settle pairs each rating and delta by the outcome's SEAT
+        // ID, not its position in the list. Feed a well-formed field whose outcomes are
+        // NOT in ascending-seat order and confirm each agent still moves by its own
+        // seat's delta — an implementation that indexed by position would mis-settle.
+        let (mm, m) = ranked_field_seeded(&[("0xa", 1500), ("0xb", 1800), ("0xc", 1300)]);
+        let agent_at = agents_by_seat(&m);
+        let rating_at: Vec<i32> = agent_at.iter().map(|a| mm.rating(a).unwrap()).collect();
+
+        // Outcomes deliberately out of canonical order: seat 2 listed first, then 0, 1.
+        let result = field_result(m.match_id(), &[(2, 1), (0, 2), (1, 3)]);
+        let applied =
+            mm.apply_ranked_field_result(&result, 32).expect("a well-formed (if unsorted) field settles");
+
+        for sd in &applied {
+            let seat = sd.seat as usize;
+            assert_eq!(
+                mm.rating(&agent_at[seat]),
+                Some(rating_at[seat] + sd.delta),
+                "seat {seat}'s agent moved by its own delta regardless of outcome position"
+            );
+        }
+        let before: i64 = rating_at.iter().map(|&r| i64::from(r)).sum();
+        let after: i64 = agent_at.iter().map(|a| i64::from(mm.rating(a).unwrap())).sum();
+        assert_eq!(before, after, "still zero-sum under a permuted outcome order");
     }
 
     #[test]
