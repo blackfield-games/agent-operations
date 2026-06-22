@@ -246,10 +246,11 @@ pub struct MatchParams {
     /// eager pairing the pool never exceeds one match, so there is nothing to choose).
     /// A long-waiting agent is never starved: once the pool reaches
     /// `RANKED_FORCE_POOL_MULTIPLE × seats` it is matched regardless (see
-    /// [`select_ranked`]). The default [`i32::MAX`] imposes no gate — ranked pairs as
-    /// soon as two agents wait, byte-identical to pre-ladder formation — so a ranked
-    /// deployment sets a finite tolerance (the magnitude is a balance decision, like
-    /// the K-factor). Only the Agent (ranked) queue reads it.
+    /// [`select_ranked`]). The default [`i32::MAX`] imposes no effective gate — for any
+    /// realistic rating spread the gap is far below it, so ranked pairs as soon as two
+    /// agents wait, identical to pre-ladder formation — so a ranked deployment sets a
+    /// finite tolerance (the magnitude is a balance decision, like the K-factor). Only
+    /// the Agent (ranked) queue reads it.
     pub ranked_rating_tolerance: i32,
 }
 
@@ -552,18 +553,31 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// `k` is the owner-set K-factor (operator-gated magnitude); the caller supplies
     /// it rather than the matchmaker baking it in.
     pub fn apply_ranked_result(&self, result: &MatchResult, k: i32) -> Option<RatingDelta> {
-        let mut st = self.state.lock().expect("matchmaker mutex poisoned");
-        // Remove-on-resolve: absent ⇒ not a registered ranked match, or already
-        // settled. Either way the ladder is left untouched.
-        let agents = st.pending_ranked.remove(&result.match_id)?;
-        // ranked_delta orders the two seats by ascending seat id (canonical); pair
-        // each outcome's seat to the agent the roster seated there.
+        // Treat the result as UNTRUSTED and validate-then-commit: a malformed result
+        // (not exactly two distinct seats, or a seat outside the registered roster) is
+        // a clean no-op that LEAVES the match registered, so a later well-formed result
+        // can still settle it — a bad report never silently burns the registration.
         let [oa, ob] = result.outcomes.as_slice() else { return None };
-        let (agent_a, agent_b) = (agents.get(oa.seat as usize)?, agents.get(ob.seat as usize)?);
-        let ra = st.ratings.get(agent_a).copied().unwrap_or(DEFAULT_RATING);
-        let rb = st.ratings.get(agent_b).copied().unwrap_or(DEFAULT_RATING);
-        let delta = ranked_delta(result, ra, rb, k)?;
+        if oa.seat == ob.seat {
+            return None;
+        }
+        let mut st = self.state.lock().expect("matchmaker mutex poisoned");
+        // Peek (do not remove yet): `ranked_delta` orders the two seats by ascending
+        // seat id (canonical), so pair each outcome's seat to the agent the roster
+        // seated there. Bail — registration intact — if either seat is out of range.
+        let agents = st.pending_ranked.get(&result.match_id)?;
+        let (Some(agent_a), Some(agent_b)) = (agents.get(oa.seat as usize), agents.get(ob.seat as usize))
+        else {
+            return None;
+        };
         let (agent_a, agent_b) = (agent_a.clone(), agent_b.clone());
+        let ra = st.ratings.get(&agent_a).copied().unwrap_or(DEFAULT_RATING);
+        let rb = st.ratings.get(&agent_b).copied().unwrap_or(DEFAULT_RATING);
+        let delta = ranked_delta(result, ra, rb, k)?;
+        // Commit: the apply is well-formed, so consume the registration and write the
+        // book. delta.a lands on the seat the result orders first, delta.b == -delta.a
+        // on the other, keeping the ladder zero-sum.
+        st.pending_ranked.remove(&result.match_id);
         st.ratings.insert(agent_a, ra.saturating_add(delta.a));
         st.ratings.insert(agent_b, rb.saturating_add(delta.b));
         Some(delta)
@@ -1275,6 +1289,55 @@ mod tests {
             -(mm.rating("0xb").unwrap() - DEFAULT_RATING),
             "the two moves are exact negatives"
         );
+    }
+
+    #[test]
+    fn a_drawn_ranked_match_settles_but_moves_nobody() {
+        // A draw between equals applies a zero delta yet still CONSUMES the
+        // registration — the match is settled, just with no rating change.
+        let (mm, m) = ranked_pair("0xa", "0xb", &[]);
+        let mut draw = decisive_result(m.match_id(), 0);
+        draw.outcomes[1].placement = 1; // both at placement 1 ⇒ Settlement::Draw
+        assert_eq!(mm.apply_ranked_result(&draw, 32), Some(RatingDelta { a: 0, b: 0 }), "an even draw moves nobody");
+        assert_eq!(mm.rating("0xa"), Some(DEFAULT_RATING));
+        assert_eq!(mm.rating("0xb"), Some(DEFAULT_RATING));
+        assert_eq!(mm.unsettled_ranked(), 0, "a draw still consumes the registration");
+    }
+
+    #[test]
+    fn a_malformed_result_is_a_no_op_that_leaves_the_match_settleable() {
+        // Cross-review hardening (validate-then-commit): apply_ranked_result treats the
+        // result as untrusted. A malformed result — wrong outcome count, duplicate
+        // seats, or an out-of-range seat — is a clean no-op that does NOT consume the
+        // registration, so a later well-formed result still settles the match (a bad
+        // report never silently burns it, and never corrupts a rating).
+        let (mm, m) = ranked_pair("0xa", "0xb", &[]);
+        let mid = m.match_id();
+
+        let mut one = decisive_result(mid, 0);
+        one.outcomes.truncate(1);
+        assert!(mm.apply_ranked_result(&one, 32).is_none(), "a one-outcome result settles nothing");
+        assert_eq!(mm.unsettled_ranked(), 1, "the registration survives a wrong-count result");
+
+        let mut dup = decisive_result(mid, 0);
+        dup.outcomes[1].seat = 0; // both seats 0 — would otherwise corrupt one agent
+        assert!(mm.apply_ranked_result(&dup, 32).is_none(), "duplicate-seat outcomes settle nothing");
+
+        let mut oor = decisive_result(mid, 0);
+        oor.outcomes[1].seat = 7; // a seat outside the 2-agent roster
+        assert!(mm.apply_ranked_result(&oor, 32).is_none(), "an out-of-range seat settles nothing");
+
+        assert_eq!(
+            (mm.rating("0xa"), mm.rating("0xb")),
+            (Some(DEFAULT_RATING), Some(DEFAULT_RATING)),
+            "no malformed attempt moved a rating"
+        );
+        assert_eq!(mm.unsettled_ranked(), 1, "still registered after every malformed attempt");
+
+        // The well-formed result still settles it — the registration was never burned.
+        let delta = mm.apply_ranked_result(&decisive_result(mid, 0), 32).expect("a well-formed result still settles");
+        assert!(delta.a > 0, "the winner finally rose");
+        assert_eq!(mm.unsettled_ranked(), 0, "now consumed");
     }
 
     #[test]
