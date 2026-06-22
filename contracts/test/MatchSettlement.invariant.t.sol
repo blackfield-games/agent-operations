@@ -102,6 +102,37 @@ contract MatchSettlementHandler is Test {
         ghost_settledCount++;
     }
 
+    /// @notice Variable decisive settle with a fuzzed winner gain bounded into the valid
+    ///         [0, cap] range, interleaved with the fixed path. Holding zero-sum over this
+    ///         proves the contract's +d/-d split conserves reputation for an ARBITRARY
+    ///         attester-supplied magnitude, not just the fixed one.
+    function settleRanked(uint256 mSeed, bool winnerB, int256 ratingDelta) external {
+        if (matchIds.length == 0) return;
+        bytes32 id = matchIds[mSeed % matchIds.length];
+        (address a, address b, uint256 stake, bool aF, bool bF, MatchSettlement.Status s) = _match(id);
+        if (s != MatchSettlement.Status.Open) return;
+        if (stake != 0 && !(aF && bF)) return;
+        ratingDelta = bound(ratingDelta, int256(0), int256(settlement.maxRatingDelta()));
+        settlement.settleRanked(id, winnerB ? b : a, keccak256(abi.encode("replay", id)), ratingDelta);
+        ghost_settledCount++;
+    }
+
+    /// @notice Variable draw settle with a fuzzed SIGNED agentA delta bounded into
+    ///         [-cap, cap] — the favourite-moves-down case the fixed draw can't express.
+    ///         A negative delta exercises the contract's negation of a negative value;
+    ///         zero-sum must still hold (agentB gets the positive negation).
+    function settleDrawRanked(uint256 mSeed, int256 ratingDeltaA) external {
+        if (matchIds.length == 0) return;
+        bytes32 id = matchIds[mSeed % matchIds.length];
+        (,, uint256 stake, bool aF, bool bF, MatchSettlement.Status s) = _match(id);
+        if (s != MatchSettlement.Status.Open) return;
+        if (stake != 0 && !(aF && bF)) return;
+        int256 cap = int256(settlement.maxRatingDelta());
+        ratingDeltaA = bound(ratingDeltaA, -cap, cap);
+        settlement.settleDrawRanked(id, keccak256(abi.encode("replay", id)), ratingDeltaA);
+        ghost_settledCount++;
+    }
+
     function cancel(uint256 mSeed) external {
         if (matchIds.length == 0) return;
         bytes32 id = matchIds[mSeed % matchIds.length];
@@ -159,6 +190,7 @@ contract MatchSettlementInvariantTest is Test {
 
     address owner = address(0xA11CE);
     uint256 constant REP_DELTA = 7 ether;
+    uint256 constant RATING_CAP = 1000 ether;
 
     function setUp() public {
         token = new MockToken();
@@ -176,6 +208,7 @@ contract MatchSettlementInvariantTest is Test {
         vm.startPrank(owner);
         registry.setReputationWriter(address(settlement), true);
         settlement.setAttester(address(handler), true);
+        settlement.setMaxRatingDelta(RATING_CAP); // enable the variable settle handlers
         vm.stopPrank();
 
         for (uint256 i = 0; i < actors.length; i++) {
@@ -197,9 +230,12 @@ contract MatchSettlementInvariantTest is Test {
         assertEq(token.balanceOf(address(settlement)), handler.expectedEscrow());
     }
 
-    /// @dev Reputation is zero-sum: every decisive settle moves +delta/−delta between
-    ///      the two participants and a draw moves nothing, so total standing across all
-    ///      agents is invariantly zero. A one-sided or double-counted write breaks it.
+    /// @dev Reputation is zero-sum: every settle — fixed or variable, decisive or draw —
+    ///      moves +d to one participant and exactly -d to the other (a fixed draw moves 0;
+    ///      a variable draw moves the favourite down and the underdog up by the same |d|),
+    ///      so total standing across all agents is invariantly zero for ANY bounded delta
+    ///      the attester supplies. A one-sided write, a wrong negation, or a double-count
+    ///      breaks it.
     function invariant_reputationIsZeroSum() public view {
         assertEq(handler.sumReputation(), int256(0));
     }
