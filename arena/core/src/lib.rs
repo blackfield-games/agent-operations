@@ -3141,6 +3141,26 @@ mod tests {
         assert!(new_match(1).blockers().is_empty());
     }
 
+    #[test]
+    fn pickup_spawns_accessor_returns_the_static_layout_sent_to_agents() {
+        // The accessor is the source the harness projects GatewayMsg::Start.pickup_points
+        // from, so it must return EXACTLY the static config the match runs under — the
+        // FM3 exact-layout pin. The harness drops kind/amount (position-only); the
+        // accessor itself keeps the full server-side config.
+        let health = PickupSpawn { kind: PickupKind::Health, position: Vec2 { x: 1_000, y: 500 }, amount: 25 };
+        let ammo = PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x: -1_000, y: -500 }, amount: 30 };
+        let m = Match::new_with_pickups(
+            MID.parse().unwrap(), config(2), Rules::default(), two_seats(), Vec::new(), vec![health, ammo], 1,
+        );
+        assert_eq!(m.pickup_spawns(), &[health, ammo]);
+        // The position-only projection the harness sends — the points, kind/amount dropped.
+        let points: Vec<Vec2> = m.pickup_spawns().iter().map(|p| p.position).collect();
+        assert_eq!(points, vec![Vec2 { x: 1_000, y: 500 }, Vec2 { x: -1_000, y: -500 }]);
+
+        // A no-pickup match surfaces an explicit empty layout.
+        assert!(new_match(1).pickup_spawns().is_empty());
+    }
+
     fn intent(move_dir: Vec2, aim: Bam, fire: bool) -> ActionIntent {
         ActionIntent {
             move_dir,

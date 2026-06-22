@@ -1756,6 +1756,37 @@ mod tests {
     }
 
     #[test]
+    fn start_pickup_points_decode_to_positions_and_default_to_empty() {
+        // A Start carrying the static pickup layout decodes to the exact Vec2 spawn
+        // points (FM3 — the wire carries the live set, position-only); a Start that
+        // omits the field — an older server or a no-pickup match — defaults to empty
+        // (serde(default) back-compat, the Python mirror defaults the same way).
+        let with_points = serde_json::json!({
+            "type": "start", "match_id": FIXED_MATCH,
+            "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 },
+            "pickup_points": [ { "x": 1500, "y": 0 }, { "x": -1500, "y": 250 } ]
+        });
+        match serde_json::from_value::<GatewayMsg>(with_points).unwrap() {
+            GatewayMsg::Start { pickup_points, .. } => assert_eq!(
+                pickup_points,
+                vec![Vec2 { x: 1500, y: 0 }, Vec2 { x: -1500, y: 250 }],
+            ),
+            other => panic!("expected Start, got {other:?}"),
+        }
+
+        let legacy = serde_json::json!({
+            "type": "start", "match_id": FIXED_MATCH,
+            "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 }
+        });
+        match serde_json::from_value::<GatewayMsg>(legacy).unwrap() {
+            GatewayMsg::Start { pickup_points, .. } => {
+                assert!(pickup_points.is_empty(), "an omitted pickup_points field defaults to empty");
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn agent_msg_wire_shapes_are_stable() {
         // Join — struct variant.
         let join = serde_json::json!({
