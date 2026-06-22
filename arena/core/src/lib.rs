@@ -1420,7 +1420,7 @@ impl Match {
     /// a dash can no more tunnel a wall or leave the arena than a walk can; each
     /// axis-separated retry is a strict single-axis subset of the full step, so it
     /// cannot tunnel either.
-    fn slide(&self, from: Vec2, move_dir: Vec2, magnitude: i32) -> Vec2 {
+    fn slide(&self, from: Vec2, z: i32, move_dir: Vec2, magnitude: i32) -> Vec2 {
         let dx = move_dir.x as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
         let dy = move_dir.y as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
         let bx = self.config.bounds.x as i64;
@@ -1430,7 +1430,7 @@ impl Match {
             y: (from.y as i64 + ddy).clamp(-by, by) as i32,
         };
         let to = target(dx, dy);
-        if !path_hits_blocker(&self.blockers, from, to) {
+        if !path_hits_blocker(&self.blockers, from, z, to, z) {
             return to;
         }
         // The full move is refused. With wall_slide on, a genuinely diagonal step
@@ -1442,11 +1442,11 @@ impl Match {
         // subset of the full step, so it can no more tunnel than the full move can.
         if self.rules.wall_slide && dx != 0 && dy != 0 {
             let slide_x = target(dx, 0);
-            if !path_hits_blocker(&self.blockers, from, slide_x) {
+            if !path_hits_blocker(&self.blockers, from, z, slide_x, z) {
                 return slide_x;
             }
             let slide_y = target(0, dy);
-            if !path_hits_blocker(&self.blockers, from, slide_y) {
+            if !path_hits_blocker(&self.blockers, from, z, slide_y, z) {
                 return slide_y;
             }
         }
@@ -1512,7 +1512,12 @@ impl Match {
             // point. A no-blocker match never reaches the refusal (empty set), so it
             // is byte-identical. Surface-snap and wall-sliding are deferred follow-ups.
             let from = self.pawns[i].pos;
-            let to = self.slide(from, intent.move_dir, self.rules.max_speed);
+            // The pawn's start-of-tick z: the XY slide happens at this elevation, then
+            // the vertical block (below) integrates z. So an airborne pawn (z above a
+            // low wall's height) walks OVER it; a grounded one (z == 0) is stopped by
+            // the footprint exactly as before.
+            let z = self.pawns[i].z;
+            let to = self.slide(from, z, intent.move_dir, self.rules.max_speed);
             self.pawns[i].facing = intent.aim;
 
             // Dash: an ability press bursts the pawn an extra DASH_DISTANCE along
@@ -1530,7 +1535,7 @@ impl Match {
                 && intent.move_dir != Vec2::ZERO;
             let landed = if dashing {
                 self.pawns[i].dash_cooldown = self.rules.dash_cooldown;
-                self.slide(to, intent.move_dir, DASH_DISTANCE)
+                self.slide(to, z, intent.move_dir, DASH_DISTANCE)
             } else {
                 to
             };
@@ -1895,7 +1900,10 @@ impl Match {
             // movement uses so a shot and a pawn agree on what a wall stops. A pawn
             // in front of the wall was already hit above; only a clean step reaching
             // a wall lands here, and a no-blocker match never does.
-            if path_hits_blocker(&self.blockers, from, to) {
+            // The shot flies level at its launch z, so it is absorbed only by a wall
+            // tall enough to stand in its path — a low wall it flies over does not stop
+            // it (the same z-aware rule its sightline check above uses).
+            if path_hits_blocker(&self.blockers, from, proj.z, to, proj.z) {
                 continue; // absorbed by the blocker
             }
             proj.pos = to;
@@ -2553,18 +2561,20 @@ fn has_line_of_sight(blockers: &[Blocker], from: Vec2, from_z: i32, to: Vec2, to
 }
 
 /// `true` if point `p` lies within the closed AABB footprint of `b` (boundary
-/// inclusive). Planar — the movement-collision exemption ([`path_hits_blocker`]) is
-/// z-agnostic, since walls stop movement at full height regardless of a pawn's `z`.
+/// inclusive). Planar — the building block of the z-aware [`blocker_contains_3d`],
+/// which pairs it with the wall's vertical band for the sight + movement exemptions.
 fn blocker_contains(b: &Blocker, p: Vec2) -> bool {
     b.min.x <= p.x && p.x <= b.max.x && b.min.y <= p.y && p.y <= b.max.y
 }
 
 /// `true` if `(p, pz)` lies within the closed 3D box of `b` — its footprint AND, for
 /// a height-bounded wall, the vertical band `0..=height`. An infinitely-tall wall
-/// (`height == 0`) is contained by the footprint alone (any `z`). This is the
-/// sightline endpoint-exemption test: a pawn standing INSIDE the box is neither blind
-/// nor invisible through its own occluder, but a pawn ABOVE a low wall is not "inside"
-/// it (and is not occluded by it either).
+/// (`height == 0`) is contained by the footprint alone (any `z`). The endpoint
+/// exemption for BOTH the sightline ([`occludes`], both ends) and physical travel
+/// ([`path_hits_blocker`], the start only): a pawn standing INSIDE the box is neither
+/// blind/invisible through nor trapped by its own occluder, but a pawn ABOVE a low
+/// wall is not "inside" it (so it is neither occluded by, nor exempt from, that wall —
+/// it simply clears it).
 fn blocker_contains_3d(b: &Blocker, p: Vec2, pz: i32) -> bool {
     blocker_contains(b, p) && (b.height == 0 || (0 <= pz && pz <= b.height))
 }
@@ -2622,22 +2632,35 @@ fn segment_intersects_box_3d(from: Vec2, from_z: i32, to: Vec2, to_z: i32, b: &B
     true
 }
 
-/// `true` if the swept travel `from → to` runs into a physical blocker — the
-/// collision predicate shared by movement and projectile flight, so the two agree
-/// bit-for-bit on "this path crosses a wall". A blocker stops the path unless the
-/// path STARTS inside it: the start-only exemption (vs [`occludes`], which exempts
-/// BOTH endpoints) lets a pawn or shot that begins in or pressed against a wall
-/// leave it — and is the same safety valve that keeps a seat the seed spawned
-/// inside a blocker from being trapped — while any blocker AHEAD still stops it.
-/// Unlike sight, travel is directional: the destination is NOT exempt, so a step
-/// whose endpoint lands inside a wall is blocked rather than walking into it.
-/// Swept (the whole segment, not the endpoints), so a fast mover cannot tunnel a
-/// thin wall in one step; all-integer via [`segment_intersects_aabb`], so it never
-/// panics or divides by zero on a degenerate blocker and is platform-stable.
-fn path_hits_blocker(blockers: &[Blocker], from: Vec2, to: Vec2) -> bool {
-    blockers
-        .iter()
-        .any(|b| !blocker_contains(b, from) && segment_intersects_aabb(from, to, b))
+/// `true` if the swept travel `from → to` (at the constant elevation
+/// `from_z`/`to_z`) runs into a physical blocker — the collision predicate shared by
+/// movement and projectile flight, so the two agree bit-for-bit on "this path
+/// crosses a wall". z-aware via [`segment_intersects_box_3d`]: a height-bounded wall
+/// (`height > 0`) is cleared by a path that travels OVER its top, so a pawn high
+/// enough (mid-jump) walks over low cover and a level shot flies over it — the
+/// physical twin of the z-aware SIGHT rule ([`occludes`]), reusing the SAME
+/// [`Blocker::height`] so what bounds sight also bounds traversal (no see-over /
+/// walk-into split). Both callers pass a CONSTANT z: the sim integrates XY and z
+/// sequentially within a tick (movement slides at the pawn's start-of-tick z, then
+/// the vertical block integrates z) and a projectile flies level at its launch z, so
+/// there is no z-interval to sweep here — though the [`from_z`, `to_z`] form supports
+/// one for free if a future ballistic arc needs it. An infinitely-tall wall
+/// (`height == 0`) and a grounded path (`z == 0`) both reduce to the planar test, so
+/// every 2D match is byte-identical.
+///
+/// A blocker stops the path unless the path STARTS inside its 3D box: the start-only
+/// exemption (vs [`occludes`], which exempts BOTH endpoints) lets a pawn or shot that
+/// begins in or pressed against a wall leave it — the same safety valve that keeps a
+/// seat the seed spawned inside a blocker from being trapped — while any blocker
+/// AHEAD still stops it. Unlike sight, travel is directional: the destination is NOT
+/// exempt, so a step whose endpoint lands inside a wall is blocked rather than walking
+/// into it. Swept (the whole segment, not the endpoints), so a fast mover cannot
+/// tunnel a thin wall in one step; all-integer via [`segment_intersects_box_3d`], so
+/// it never panics or divides by zero on a degenerate blocker and is platform-stable.
+fn path_hits_blocker(blockers: &[Blocker], from: Vec2, from_z: i32, to: Vec2, to_z: i32) -> bool {
+    blockers.iter().any(|b| {
+        !blocker_contains_3d(b, from, from_z) && segment_intersects_box_3d(from, from_z, to, to_z, b)
+    })
 }
 
 /// Integer segment-vs-AABB intersection by the separating-axis theorem. A segment
@@ -4865,20 +4888,20 @@ mod tests {
         // that would END inside a wall is still refused.
         let wall = Blocker { min: Vec2 { x: 5000, y: -2000 }, max: Vec2 { x: 6000, y: 2000 }, height: 0 };
         let o = Vec2::ZERO;
-        assert!(path_hits_blocker(&[wall], o, Vec2 { x: 10_000, y: 0 }), "dead-centre through the wall is blocked");
-        assert!(!path_hits_blocker(&[wall], o, Vec2 { x: 3_000, y: 0 }), "a path short of the wall is clear");
-        assert!(!path_hits_blocker(&[wall], o, Vec2 { x: 0, y: 10_000 }), "a parallel path that never reaches it is clear");
+        assert!(path_hits_blocker(&[wall], o, 0, Vec2 { x: 10_000, y: 0 }, 0), "dead-centre through the wall is blocked");
+        assert!(!path_hits_blocker(&[wall], o, 0, Vec2 { x: 3_000, y: 0 }, 0), "a path short of the wall is clear");
+        assert!(!path_hits_blocker(&[wall], o, 0, Vec2 { x: 0, y: 10_000 }, 0), "a parallel path that never reaches it is clear");
         // Runs along the near (x = 5000) edge — boundary contact counts (conservative).
-        assert!(path_hits_blocker(&[wall], Vec2 { x: 5000, y: -3000 }, Vec2 { x: 5000, y: 3000 }), "a path along the wall edge is blocked");
+        assert!(path_hits_blocker(&[wall], Vec2 { x: 5000, y: -3000 }, 0, Vec2 { x: 5000, y: 3000 }, 0), "a path along the wall edge is blocked");
         // Ends ON a corner — the destination is NOT exempt, so it is refused.
-        assert!(path_hits_blocker(&[wall], Vec2 { x: 0, y: 4000 }, Vec2 { x: 5000, y: 2000 }), "a step ending on the wall is refused");
+        assert!(path_hits_blocker(&[wall], Vec2 { x: 0, y: 4000 }, 0, Vec2 { x: 5000, y: 2000 }, 0), "a step ending on the wall is refused");
         // Starts INSIDE the wall — exempt, so it can leave even toward a point outside.
         let inside = Vec2 { x: 5500, y: 0 };
         assert!(blocker_contains(&wall, inside), "the start point is genuinely inside the wall");
-        assert!(!path_hits_blocker(&[wall], inside, Vec2 { x: 10_000, y: 0 }), "a path starting inside the wall is exempt");
+        assert!(!path_hits_blocker(&[wall], inside, 0, Vec2 { x: 10_000, y: 0 }, 0), "a path starting inside the wall is exempt");
         // ...but a DIFFERENT wall ahead still stops a path that left the first.
         let ahead = Blocker { min: Vec2 { x: 8000, y: -2000 }, max: Vec2 { x: 9000, y: 2000 }, height: 0 };
-        assert!(path_hits_blocker(&[wall, ahead], inside, Vec2 { x: 10_000, y: 0 }), "a wall ahead still stops a path that left another");
+        assert!(path_hits_blocker(&[wall, ahead], inside, 0, Vec2 { x: 10_000, y: 0 }, 0), "a wall ahead still stops a path that left another");
     }
 
     #[test]
