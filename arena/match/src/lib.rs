@@ -38,6 +38,7 @@ use arena_proto::{
     MatchPhase, MatchResult, SeatId, SeatInfo, SpectatorMsg, TeamId, Vec2, POSITION_SCALE,
     PROTOCOL_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Verifies that a ranked seat controls the identity it claims, over the
@@ -351,6 +352,67 @@ impl Queues {
     }
 }
 
+/// Schema version of [`LadderSnapshot`]. Bumped whenever the snapshot's shape or
+/// the meaning of its fields changes, so a snapshot written by an older (or newer)
+/// build is DETECTED and rejected by [`Matchmaker::from_snapshot`] rather than
+/// silently restored into wrong ratings. The ABI-drift-gate analog for the
+/// persisted ladder.
+pub const LADDER_SNAPSHOT_VERSION: u32 = 1;
+
+/// A portable, versioned snapshot of the matchmaker's ranked rating ladder, so the
+/// accumulated ratings survive a process restart — the offline analog of the mesh
+/// coordinator's SQLite crash-recovery. Captured by [`Matchmaker::snapshot`] and
+/// restored by [`Matchmaker::from_snapshot`].
+///
+/// Only the rating ladder is persisted; `pending_ranked` (matches that have FORMED
+/// but not yet settled) is deliberately NOT, because the in-flight match's PLAY is
+/// not persisted either — a fresh process never saw it, so settling it from restored
+/// rating context would commit a result it cannot trust. After a restore, a result
+/// for a pre-restart match settles to the same clean no-op as any unregistered match
+/// ([`Matchmaker::apply_ranked_result`] returns `None`); the durable, authoritative
+/// settled-reputation record is the on-chain `AgentRegistry`/`MatchSettlement`, not
+/// this matchmaking cache.
+///
+/// The ratings are pure `i32`, so a `snapshot → serialize → deserialize → restore`
+/// round-trip reproduces every rating EXACTLY (no float, platform-stable). The type
+/// is `serde`-(de)serializable but format-agnostic: the consumer (operator tooling /
+/// the harness) chooses JSON, bincode, etc., the same library-seam discipline as the
+/// `Settle`/`Spender` transports. A malformed or truncated blob fails at the
+/// consumer's deserialize boundary as a clean `Result` error (serde never panics);
+/// a version mismatch is caught by [`Matchmaker::from_snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LadderSnapshot {
+    /// The schema version this snapshot was written under; checked against
+    /// [`LADDER_SNAPSHOT_VERSION`] on restore.
+    pub version: u32,
+    /// agent identity → integer ranked rating, the ladder verbatim.
+    pub ratings: BTreeMap<String, i32>,
+}
+
+/// Why restoring a [`LadderSnapshot`] failed. Restore never panics and never
+/// silently seeds wrong/zero ratings — a rejected snapshot leaves the caller to
+/// decide (start fresh, or refuse to boot), which is safer than mis-ranking agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The snapshot's `version` is not [`LADDER_SNAPSHOT_VERSION`] — an older or
+    /// newer schema whose fields could mean something different, so it is rejected
+    /// rather than misinterpreted.
+    Version { found: u32, expected: u32 },
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotError::Version { found, expected } => write!(
+                f,
+                "ladder snapshot version mismatch: found {found}, expected {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
 /// All of the matchmaker's mutable state, behind its one lock: the per-mode waiting
 /// queues and the ranked rating ladder. Holding them under a single lock means a
 /// join that pairs by rating reads the book and the queue atomically — there is no
@@ -436,6 +498,32 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             params.team_size
         );
         Self { state: Mutex::new(State::default()), verifier, params }
+    }
+
+    /// Restore a matchmaker whose ranked rating ladder is seeded from a prior
+    /// [`snapshot`](Self::snapshot), so accumulated ratings survive a restart.
+    /// `verifier` and `params` are supplied fresh — they are runtime config, not
+    /// persisted; only the rating ladder is restored. `pending_ranked` starts empty
+    /// by design (see [`LadderSnapshot`]), so a result for a match that formed before
+    /// the restart settles to a clean no-op rather than from stale rating context.
+    ///
+    /// Returns [`SnapshotError::Version`] if the snapshot's schema version is not
+    /// [`LADDER_SNAPSHOT_VERSION`] — never panicking and never silently seeding wrong
+    /// ratings. The same `params` validity asserts as [`new`](Self::new) apply.
+    pub fn from_snapshot(
+        verifier: V,
+        params: MatchParams,
+        snapshot: LadderSnapshot,
+    ) -> Result<Self, SnapshotError> {
+        if snapshot.version != LADDER_SNAPSHOT_VERSION {
+            return Err(SnapshotError::Version {
+                found: snapshot.version,
+                expected: LADDER_SNAPSHOT_VERSION,
+            });
+        }
+        let mm = Self::new(verifier, params);
+        mm.state.lock().expect("matchmaker mutex poisoned").ratings = snapshot.ratings;
+        Ok(mm)
     }
 
     /// Admit `req` to `mode`'s queue, forming a match if it now can. Returns
@@ -576,6 +664,15 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     pub fn waiting(&self, mode: MatchMode) -> usize {
         let mut st = self.state.lock().expect("matchmaker mutex poisoned");
         st.queues.for_mode(mode).len()
+    }
+
+    /// Capture the current ranked rating ladder as a portable, versioned
+    /// [`LadderSnapshot`] for persistence. Only the ratings are captured (see
+    /// [`LadderSnapshot`] for why `pending_ranked` is excluded); a restore with
+    /// [`from_snapshot`](Self::from_snapshot) reproduces every rating exactly.
+    pub fn snapshot(&self) -> LadderSnapshot {
+        let st = self.state.lock().expect("matchmaker mutex poisoned");
+        LadderSnapshot { version: LADDER_SNAPSHOT_VERSION, ratings: st.ratings.clone() }
     }
 
     /// The current ranked rating of `agent_id`, or `None` if it has never joined a

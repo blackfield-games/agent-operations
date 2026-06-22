@@ -32,6 +32,8 @@ dependencies = [
  "arena-proto",
  "hex",
  "k256",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
