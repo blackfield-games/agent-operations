@@ -223,6 +223,13 @@ class Start(_Wire):
     # Mirrors the Rust GatewayMsg::Start field; defaults to empty so a Start without
     # it — an older server, or a match with no occluders — decodes unchanged.
     blockers: list[Blocker] = Field(default_factory=list)
+    # The static pickup spawn POINTS — where world items spawn, the same map layout a
+    # human knows. Deliberately position-only: the pickup kind/amount stays empirical
+    # (an agent learns a pickup's effect by collecting it — the PickupKind posture), so
+    # this is a bare Vec2 list that structurally cannot carry kind/amount. The live
+    # collectible/dormant STATE stays on the per-tick Observation; this is only the
+    # static layout. Mirrors the Rust GatewayMsg::Start field; defaults to empty.
+    pickup_points: list[Vec2] = Field(default_factory=list)
 
 
 GatewayMsg = Challenge | Welcome | Reject | Start | Observation | MatchResult
