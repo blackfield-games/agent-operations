@@ -2815,7 +2815,7 @@ const RATING_DIFF_STEP: i32 = 40;
 /// a twin reproduces it exactly. Strictly increasing, so the expected score is
 /// monotonic in the rating gap.
 const EXPECTED_SCORE_TABLE: [i32; 21] = [
-    5000, 5573, 6131, 6661, 7153, 7597, 7992, 8337, 8632, 8882, 9091, 9264, 9407, 9523, 9617, 9693,
+    5000, 5573, 6131, 6661, 7153, 7597, 7992, 8337, 8632, 8882, 9091, 9264, 9406, 9523, 9617, 9693,
     9755, 9804, 9844, 9876, 9901,
 ];
 
