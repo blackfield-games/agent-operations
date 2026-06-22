@@ -3119,6 +3119,19 @@ mod tests {
         Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), Vec::new(), seed)
     }
 
+    #[test]
+    fn blockers_accessor_returns_the_match_geometry_sent_to_agents() {
+        // The accessor is the source the harness fills GatewayMsg::Start.blockers
+        // from, so it must return EXACTLY the set the match runs under — the FM3
+        // exact-geometry pin (an agent must never path against a phantom map).
+        let wall = Blocker { min: Vec2 { x: 4_000, y: -2_000 }, max: Vec2 { x: 5_000, y: 2_000 } };
+        let m = Match::new(MID.parse().unwrap(), config(2), Rules::default(), two_seats(), vec![wall], 1);
+        assert_eq!(m.blockers(), &[wall]);
+
+        // A no-occluder match surfaces an explicit empty set, never a phantom entry.
+        assert!(new_match(1).blockers().is_empty());
+    }
+
     fn intent(move_dir: Vec2, aim: Bam, fire: bool) -> ActionIntent {
         ActionIntent {
             move_dir,

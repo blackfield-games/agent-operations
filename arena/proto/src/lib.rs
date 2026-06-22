@@ -1720,6 +1720,25 @@ mod tests {
     }
 
     #[test]
+    fn start_without_blockers_defaults_to_empty() {
+        // serde(default): a Start written before the blockers field — or a match with
+        // no occluders that omitted it — deserializes to the no-geometry behavior,
+        // byte-identical to the pre-field Start. Back-compat for the wire-additive
+        // change (the Python mirror defaults the same way).
+        let legacy = serde_json::json!({
+            "type": "start", "match_id": FIXED_MATCH,
+            "config": { "tick_hz": 30, "max_ticks": 3600, "bounds": { "x": 50_000, "y": 50_000 }, "seats": 8 }
+        });
+        match serde_json::from_value::<GatewayMsg>(legacy).unwrap() {
+            GatewayMsg::Start { blockers, config, .. } => {
+                assert!(blockers.is_empty(), "an omitted blockers field defaults to empty");
+                assert_eq!(config.seats, 8);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn agent_msg_wire_shapes_are_stable() {
         // Join — struct variant.
         let join = serde_json::json!({
