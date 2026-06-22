@@ -35,6 +35,7 @@ from .proto import (
     Action,
     ActionButtons,
     ActionIntent,
+    Blocker,
     Challenge,
     MatchConfig,
     MatchResult,
@@ -110,6 +111,9 @@ class ArenaClient:
         self.match_id: str | None = None
         self.seat: int | None = None
         self.config: MatchConfig | None = None
+        # The arena's static cover layout, learned at Start — empty until connect()
+        # and on a match with no occluders. A policy reads it to path around cover.
+        self.blockers: list[Blocker] = []
         self.nonce: str | None = None
         self.result: MatchResult | None = None
         self.done = False
@@ -138,6 +142,7 @@ class ArenaClient:
         if not isinstance(start, Start):
             raise ProtocolError(f"expected start, got {type(start).__name__}")
         self.config = start.config
+        self.blockers = start.blockers
         self.connected = True
         return self
 
