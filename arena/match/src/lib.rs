@@ -409,9 +409,12 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             if mode == MatchMode::Agent {
                 st.ratings.entry(seated.agent_id.clone()).or_insert(DEFAULT_RATING);
             }
+            // Split-borrow the disjoint State fields: the queue is taken mutably to
+            // push + drain the roster, the ladder shared so ranked pairing can read it.
+            let st = &mut *st;
             let queue = st.queues.for_mode(mode);
             queue.push(seated);
-            try_form(mode, queue, self.params.seats_per_match as usize)
+            try_form(mode, queue, &st.ratings, self.params.seats_per_match as usize)
         };
         Ok(match roster {
             Some(roster) => JoinOutcome::Formed(Box::new(self.build(mode, roster))),
@@ -499,14 +502,21 @@ impl<V: IdentityVerifier> Matchmaker<V> {
 /// Pull a full roster from `queue` if `mode`'s composition can be met, removing
 /// exactly those participants; otherwise leave the queue untouched and return
 /// `None`. Called under the matchmaker lock, so selection + removal is atomic.
-fn try_form(mode: MatchMode, queue: &mut Vec<Seated>, seats: usize) -> Option<Vec<Seated>> {
+fn try_form(
+    mode: MatchMode,
+    queue: &mut Vec<Seated>,
+    ratings: &BTreeMap<String, i32>,
+    seats: usize,
+) -> Option<Vec<Seated>> {
     if seats == 0 || queue.len() < seats {
         return None;
     }
     let mut picks = match mode {
-        // Human/Agent queues are single-kind by admission, so the first `seats`
-        // waiting (FIFO) already satisfy the composition.
-        MatchMode::Human | MatchMode::Agent => (0..seats).collect::<Vec<usize>>(),
+        // The Human queue is single-kind by admission, so the first `seats` waiting
+        // (FIFO) already satisfy the composition.
+        MatchMode::Human => (0..seats).collect::<Vec<usize>>(),
+        // The Agent queue is ranked: pair by rating, not arrival order alone.
+        MatchMode::Agent => select_ranked(queue, ratings, seats)?,
         MatchMode::Mixed => select_mixed(queue, seats)?,
     };
     picks.sort_unstable();
@@ -516,6 +526,38 @@ fn try_form(mode: MatchMode, queue: &mut Vec<Seated>, seats: usize) -> Option<Ve
     let mut roster: Vec<Seated> = picks.iter().rev().map(|&i| queue.remove(i)).collect();
     roster.reverse();
     Some(roster)
+}
+
+/// Select `seats` ranked agents from `queue`: anchor on the longest-waiting agent
+/// (the queue head) — so it is matched the instant `seats` agents are present, the
+/// structural anti-starvation guarantee — then fill the remaining seats with the
+/// agents NEAREST it in rating. FIFO decides *who waits least*; rating decides *who
+/// they face*. A rating tie breaks by arrival order (queue index), so selection is a
+/// pure function of `(ratings, queue order)` with no `HashMap` iteration — a
+/// replayed join sequence pairs identically. `None` if fewer than `seats` agents
+/// wait.
+///
+/// Anchoring on the head IS the aging fallback: an isolated rating (a lone very-high
+/// or very-low agent) is never skipped over by tighter-rated pairs forming around
+/// it, because once it reaches the head it is always included in the next match. So
+/// "prefer the nearest-rated opponent" and "no rating is starved" both hold without a
+/// separate wait timer.
+fn select_ranked(
+    queue: &[Seated],
+    ratings: &BTreeMap<String, i32>,
+    seats: usize,
+) -> Option<Vec<usize>> {
+    if seats == 0 || queue.len() < seats {
+        return None;
+    }
+    let rating_of = |i: usize| ratings.get(&queue[i].agent_id).copied().unwrap_or(DEFAULT_RATING);
+    let anchor = rating_of(0);
+    let mut others: Vec<usize> = (1..queue.len()).collect();
+    others.sort_by_key(|&i| (rating_of(i).abs_diff(anchor), i));
+    let mut picks = Vec::with_capacity(seats);
+    picks.push(0);
+    picks.extend(others.into_iter().take(seats - 1));
+    Some(picks)
 }
 
 /// Choose `seats` participants for a Mixed match guaranteed to hold at least one
@@ -938,6 +980,67 @@ mod tests {
         assert!(composition_ok(MatchMode::Mixed, &[human.clone(), agent.clone()]));
         assert!(!composition_ok(MatchMode::Mixed, &[human.clone(), human.clone()]));
         assert!(!composition_ok(MatchMode::Mixed, &[agent.clone(), agent.clone()]));
+    }
+
+    fn ranked_queue(ids: &[&str]) -> Vec<Seated> {
+        ids.iter().map(|id| Seated { agent_id: (*id).into(), kind: ControllerKind::Agent }).collect()
+    }
+
+    fn rating_book(entries: &[(&str, i32)]) -> BTreeMap<String, i32> {
+        entries.iter().map(|(id, r)| (id.to_string(), *r)).collect()
+    }
+
+    #[test]
+    fn ranked_pairing_faces_the_head_with_its_nearest_rated_opponent() {
+        // FM2 (pairing quality): the queue head plays its NEAREST-rated opponent, not
+        // the next arrival. Head A(1500) faces C(1520) over B(1900), though B waited
+        // longer — "prefer the nearest-rated opponent", the point of not-just-FIFO.
+        let queue = ranked_queue(&["A", "B", "C"]);
+        let ratings = rating_book(&[("A", 1500), ("B", 1900), ("C", 1520)]);
+        assert_eq!(
+            select_ranked(&queue, &ratings, 2).unwrap(),
+            vec![0, 2],
+            "the head is paired by rating distance, not arrival order"
+        );
+    }
+
+    #[test]
+    fn ranked_pairing_never_starves_an_isolated_rating() {
+        // FM2 (aging/no-starvation): a lone outlier at the head is ALWAYS in the next
+        // match — tighter-rated pairs cannot form around it and skip it forever.
+        // Head X(3000) is included even though M1/M2 are far closer to each other.
+        let queue = ranked_queue(&["X", "M1", "M2"]);
+        let ratings = rating_book(&[("X", 3000), ("M1", 1500), ("M2", 1500)]);
+        let picks = select_ranked(&queue, &ratings, 2).unwrap();
+        assert!(picks.contains(&0), "the longest-waiting agent (head) is never skipped over");
+        assert_eq!(picks.len(), 2, "exactly a full roster is taken");
+    }
+
+    #[test]
+    fn ranked_pairing_is_deterministic_on_rating_ties() {
+        // FM4 (determinism): equidistant opponents break by arrival order, so the
+        // selection is a pure function of (ratings, queue order) — no HashMap surprise.
+        // All seeded equal ⇒ head A pairs with B (arrived before C), every run.
+        let queue = ranked_queue(&["A", "B", "C"]);
+        let equal = rating_book(&[("A", DEFAULT_RATING), ("B", DEFAULT_RATING), ("C", DEFAULT_RATING)]);
+        assert_eq!(select_ranked(&queue, &equal, 2).unwrap(), vec![0, 1]);
+        // A rating the book has never seen defaults to DEFAULT_RATING in the metric —
+        // the selector must not panic on a miss (the matchmaker seeds before queuing,
+        // but the pure function stays total).
+        assert_eq!(
+            select_ranked(&queue, &BTreeMap::new(), 2).unwrap(),
+            vec![0, 1],
+            "an unseeded rating defaults rather than panicking"
+        );
+    }
+
+    #[test]
+    fn ranked_pairing_needs_a_full_roster() {
+        let queue = ranked_queue(&["A"]);
+        assert!(
+            select_ranked(&queue, &rating_book(&[("A", 1500)]), 2).is_none(),
+            "one waiter cannot form a 2-seat match"
+        );
     }
 
     #[test]
