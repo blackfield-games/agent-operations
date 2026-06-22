@@ -1729,6 +1729,47 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// The dead-lettered, not-yet-settled debits (`dead_lettered_at IS NOT NULL AND
+    /// tx_hash IS NULL`), oldest-first by insert order, as `(job_id, buyer,
+    /// amount_wei, dead_lettered_at)` — the operator's enumeration of stuck charges so
+    /// each can be re-armed by id via [`redrive_dead_lettered_debit`](Self::redrive_dead_lettered_debit)
+    /// after the buyer tops up. Capped at `limit` (the listing twin of
+    /// [`list_jobs`](Self::list_jobs)) so a pathological dead-letter backlog can never
+    /// return an unbounded body; the caller compares the returned length against
+    /// [`dead_lettered_debit_count`](Self::dead_lettered_debit_count) to flag truncation.
+    /// The same state filter as the count: a still-pending row (drainable) and an
+    /// already-settled row (`tx_hash` set, a paid charge) are excluded, so a listed
+    /// row is always genuinely re-armable. `amount_wei` is the decimal-wei string
+    /// verbatim from the row (never re-derived), so an operator sees exactly what is owed.
+    pub fn list_dead_lettered_debits(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(uuid::Uuid, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, buyer, amount_wei, dead_lettered_at
+             FROM pending_debits
+             WHERE dead_lettered_at IS NOT NULL AND tx_hash IS NULL
+             ORDER BY created_at ASC, rowid ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job_id, buyer, amount_wei, dead_lettered_at) = row?;
+            let uuid = uuid::Uuid::parse_str(&job_id)
+                .map_err(|e| anyhow::anyhow!("pending_debits.job_id not a uuid {job_id:?}: {e}"))?;
+            out.push((uuid, buyer, amount_wei, dead_lettered_at));
+        }
+        Ok(out)
+    }
+
     /// The oldest still-pending attestation (`uid IS NULL`), oldest-first by
     /// insert order, as `(job_id, PendingAttestation)` — or `None` when the
     /// backlog is empty. A pure read: it does NOT reserve or mutate the row, so
