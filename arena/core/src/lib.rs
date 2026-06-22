@@ -4160,6 +4160,129 @@ mod tests {
         assert_eq!(ranked_delta(&solo, 1500, 1500, 32), None);
     }
 
+    // Build an N-seat ranked result from `(seat, placement)` pairs — the fixture for the
+    // multi-seat field-delta tests. Only `placement` feeds the delta; score/alive/team do
+    // not, so they are filled with stable placeholders.
+    fn field_result(seats: &[(SeatId, u16)]) -> MatchResult {
+        MatchResult {
+            protocol_version: PROTOCOL_VERSION,
+            match_id: MID.parse().unwrap(),
+            final_tick: 10,
+            outcomes: seats
+                .iter()
+                .map(|&(seat, placement)| SeatOutcome { seat, team: seat as TeamId, placement, score: 0, alive_at_end: placement == 1 })
+                .collect(),
+            replay_hash: "00".into(),
+        }
+    }
+
+    #[test]
+    fn field_delta_is_zero_sum_over_fuzzed_fields() {
+        // FM1: the per-seat deltas sum to EXACTLY 0 across fuzzed seat counts, placements,
+        // ratings, and K — multi-seat reputation conservation (harder than the 1v1 single
+        // negate: N settlements must cancel, not two). A deterministic integer LCG drives
+        // the fuzz, so a failure reproduces.
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..2000 {
+            let n = 2 + (next() % 7) as usize; // 2..=8 seats
+            let seats: Vec<(SeatId, u16)> = (0..n).map(|i| (i as SeatId, (1 + next() % n as u32) as u16)).collect();
+            let ratings: Vec<i32> = (0..n).map(|_| (next() % 4001) as i32 + 300).collect(); // 300..=4300
+            let k = (next() % 65) as i32; // 0..=64
+            let deltas = ranked_field_delta(&field_result(&seats), &ratings, k).expect("a >=2-seat aligned field");
+            let sum: i64 = deltas.iter().map(|d| d.delta as i64).sum();
+            assert_eq!(sum, 0, "field not zero-sum: seats={seats:?} ratings={ratings:?} k={k}");
+        }
+    }
+
+    #[test]
+    fn field_delta_two_seat_agrees_with_ranked_delta_bit_for_bit() {
+        // FM3: a two-seat result routed through the multi-seat path equals ranked_delta
+        // exactly — one pairwise game IS the 1v1 — including the seat->delta mapping
+        // (seat 0 -> a, seat 1 -> b), across win/loss/draw, fuzzed ratings, and K.
+        for (p0, p1) in [(1u16, 2u16), (2, 1), (1, 1)] {
+            let result = field_result(&[(0, p0), (1, p1)]);
+            for (ra, rb) in [(1500, 1500), (1700, 1400), (1400, 1700), (3000, 1000), (300, 4300)] {
+                for k in [0, 1, 16, 32, 64, 1000] {
+                    let field = ranked_field_delta(&result, &[ra, rb], k).unwrap();
+                    let one = ranked_delta(&result, ra, rb, k).unwrap();
+                    assert_eq!(field.len(), 2);
+                    assert_eq!((field[0].seat, field[1].seat), (0, 1), "deltas keep canonical seat order");
+                    assert_eq!(field[0].delta, one.a, "seat 0 != ranked_delta.a at {ra}/{rb} k={k} p={p0}/{p1}");
+                    assert_eq!(field[1].delta, one.b, "seat 1 != ranked_delta.b at {ra}/{rb} k={k} p={p0}/{p1}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn field_delta_maps_each_delta_to_its_canonical_seat() {
+        // FM4: the deltas come back in the result's canonical ascending-seat order, each
+        // carrying its OWN seat, so a caller credits the right agent. Non-contiguous seat
+        // ids prove the mapping is read from the outcome, not the index.
+        let result = field_result(&[(3, 1), (5, 2), (9, 3)]);
+        let deltas = ranked_field_delta(&result, &[1500, 1500, 1500], 24).unwrap();
+        assert_eq!(deltas.iter().map(|d| d.seat).collect::<Vec<_>>(), vec![3, 5, 9], "deltas keep canonical seat order");
+        assert!(deltas[0].delta > 0 && deltas[2].delta < 0, "first place gains, last place loses");
+        assert_eq!(deltas.iter().map(|d| d.delta as i64).sum::<i64>(), 0);
+
+        // Move the winning placement to seat 5: the credit follows the placement, not the
+        // slot — a swap would otherwise reward the wrong agent.
+        let swapped = field_result(&[(3, 2), (5, 1), (9, 3)]);
+        let d = ranked_field_delta(&swapped, &[1500, 1500, 1500], 24).unwrap();
+        assert_eq!(d[1].seat, 5);
+        assert!(d[1].delta > d[0].delta && d[1].delta > d[2].delta, "the new first-place seat is credited most");
+    }
+
+    #[test]
+    fn field_delta_handles_ties_all_equal_and_saturation() {
+        // FM3: degenerate fields settle cleanly — no panic, no divide-by-zero (the design
+        // has no field-size divisor), every field still zero-sum.
+
+        // An all-tie field: equal ratings + one shared placement -> every pairwise game a
+        // draw -> nobody moves.
+        let all_first = field_result(&[(0, 1), (1, 1), (2, 1)]);
+        let d = ranked_field_delta(&all_first, &[1500, 1500, 1500], 32).unwrap();
+        assert!(d.iter().all(|x| x.delta == 0), "an all-tie field moves nobody: {d:?}");
+
+        // A tie for 2nd between unequal ratings: the tied pair scores a draw, so the
+        // favoured of the two moves DOWN toward the underdog (not a mutual win).
+        let tie = field_result(&[(0, 1), (1, 2), (2, 2)]);
+        let d = ranked_field_delta(&tie, &[1500, 1800, 1200], 32).unwrap();
+        assert_eq!(d.iter().map(|x| x.delta as i64).sum::<i64>(), 0);
+        assert!(d[1].delta < d[2].delta, "the favoured tied seat ends below the underdog it only tied");
+
+        // All-equal ratings, strict finish: a placement-symmetric spread (seat i and seat
+        // n-1-i exact opposites) summing to 0.
+        let strict = field_result(&[(0, 1), (1, 2), (2, 3), (3, 4)]);
+        let vals: Vec<i32> = ranked_field_delta(&strict, &[1500; 4], 32).unwrap().iter().map(|x| x.delta).collect();
+        let neg_rev: Vec<i32> = vals.iter().rev().map(|x| -x).collect();
+        assert_eq!(vals, neg_rev, "equal ratings give a placement-symmetric spread: {vals:?}");
+
+        // Saturation: every gap past the ±cap. The favourite winning as expected gains
+        // nothing, and extreme i32 ratings never overflow the expected-score mirror.
+        let capped = field_result(&[(0, 1), (1, 2), (2, 3)]);
+        let d = ranked_field_delta(&capped, &[5000, 1500, 100], 32).unwrap();
+        assert_eq!(d.iter().map(|x| x.delta as i64).sum::<i64>(), 0);
+        assert_eq!(d[0].delta, 0, "a prohibitive favourite winning as expected gains nothing past the cap");
+        let extreme = ranked_field_delta(&capped, &[i32::MAX, 0, i32::MIN], 32).unwrap();
+        assert_eq!(extreme.iter().map(|x| x.delta as i64).sum::<i64>(), 0, "extreme ratings stay zero-sum");
+    }
+
+    #[test]
+    fn field_delta_rejects_a_degenerate_or_misaligned_field() {
+        // A field needs >= 2 seats and ratings aligned 1:1 with the outcomes; anything
+        // else has no well-defined settlement, so it yields None rather than a wrong delta.
+        assert_eq!(ranked_field_delta(&field_result(&[(0, 1)]), &[1500], 32), None, "a one-seat field has no pairwise game");
+        assert_eq!(ranked_field_delta(&field_result(&[]), &[], 32), None, "an empty field settles nothing");
+        let three = field_result(&[(0, 1), (1, 2), (2, 3)]);
+        assert_eq!(ranked_field_delta(&three, &[1500, 1500], 32), None, "too few ratings is rejected");
+        assert_eq!(ranked_field_delta(&three, &[1500, 1500, 1500, 1500], 32), None, "too many ratings is rejected");
+    }
+
     #[test]
     fn blockers_accessor_returns_the_match_geometry_sent_to_agents() {
         // The accessor is the source the harness fills GatewayMsg::Start.blockers
