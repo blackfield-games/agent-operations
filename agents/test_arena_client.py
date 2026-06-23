@@ -289,9 +289,11 @@ def test_move_clamp_matches_rust_golden():
     # bit-for-bit — the machine-checked cross-implementer pin the hand-copied rows
     # could not give. A Rust clamp change (which regenerates the golden) or a Python
     # clamp regression breaks this against the one source of truth, including the
-    # i32::MIN overflow corner and the trunc-toward-zero discriminator.
+    # i32::MIN overflow corner, the trunc-toward-zero discriminator, and the 64
+    # fixed-seed fuzz_NN cases that sweep the full i32 range (every input here is a
+    # valid I32 the field must accept, every output bit-identical to Rust's clamp).
     golden = _clamp_golden()
-    assert golden["domain"] == "blackfield/arena/clamp-parity/v1"
+    assert golden["domain"] == "blackfield/arena/clamp-parity/v2"
     assert golden["move_intent_scale"] == proto.MOVE_INTENT_SCALE
     assert golden["cases"], "golden carries no cases"
     for case in golden["cases"]:

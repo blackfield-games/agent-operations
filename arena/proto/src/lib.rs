@@ -468,7 +468,28 @@ pub struct ClampParityVectors {
 /// Domain tag for [`clamp_parity_vectors`]. Bump only on a deliberate clamp-rule
 /// convention change (a new boundary, a different rounding) — the signal both
 /// implementers re-pin against.
-const CLAMP_PARITY_DOMAIN: &str = "blackfield/arena/clamp-parity/v1";
+const CLAMP_PARITY_DOMAIN: &str = "blackfield/arena/clamp-parity/v2";
+
+/// How many fixed-seed fuzz cases [`clamp_parity_vectors`] appends after the named
+/// discriminators. A wide, deterministic i32 sweep that turns the clamp-parity
+/// review's by-hand equivalence check into a committed, executable cross-impl gate.
+const CLAMP_PARITY_FUZZ_CASES: usize = 64;
+
+/// Fixed seed for the clamp-parity fuzz sweep. Any constant works; this one is
+/// frozen so the golden is byte-stable — change it ONLY with a domain bump + regen.
+const CLAMP_PARITY_FUZZ_SEED: u64 = 0x0017_C1A3_9E37_79B9;
+
+/// SplitMix64 — a fast, well-distributed integer PRNG using only wrapping `u64`
+/// arithmetic (no float, no `rand`), so the fuzz sweep is bit-identical on every
+/// platform and the regenerated golden never flaps. Advances `state` in place and
+/// returns the next draw.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
 
 /// The canonical cross-implementer move-clamp parity vectors: a discriminating
 /// `input → clamped output` set every implementation of the Gateway must
@@ -478,6 +499,12 @@ const CLAMP_PARITY_DOMAIN: &str = "blackfield/arena/clamp-parity/v1";
 /// SAME committed golden, so a clamp change on EITHER side breaks loud against one
 /// source of truth — the cross-implementer pin the hand-duplicated rows could not
 /// give. The arena-core `parity_vectors()` analogue for the proto-layer clamp.
+///
+/// The 12 hand-picked discriminators (trunc-vs-floor, the overflow corners, the
+/// passthrough boundary) are followed by [`CLAMP_PARITY_FUZZ_CASES`] fixed-seed
+/// `fuzz_NN` cases spanning the full i32 range — a committed, executable slice of
+/// the wide equivalence sweep the clamp-parity review ran by hand, so a future
+/// Rust⇄Python divergence on an UNNAMED input also reddens the gate.
 pub fn clamp_parity_vectors() -> ClampParityVectors {
     let case = |label: &str, x: i32, y: i32| {
         let input = Vec2 { x, y };
@@ -488,10 +515,7 @@ pub fn clamp_parity_vectors() -> ClampParityVectors {
         };
         ClampCase { label: label.to_string(), input, output: intent.clamped().move_dir }
     };
-    ClampParityVectors {
-        domain: CLAMP_PARITY_DOMAIN.to_string(),
-        move_intent_scale: MOVE_INTENT_SCALE,
-        cases: vec![
+    let mut cases = vec![
             // Sub-cap and at-cap requests pass through untouched (magnitude ≤ scale,
             // the boundary being magnitude == scale).
             case("zero_is_inert", 0, 0),
@@ -512,7 +536,22 @@ pub fn clamp_parity_vectors() -> ClampParityVectors {
             case("i32_min_overflow_corner", i32::MIN, i32::MIN),
             case("i32_max_overflow_corner", i32::MAX, i32::MAX),
             case("i32_mixed_overflow_corner", i32::MIN, i32::MAX),
-        ],
+    ];
+    // A fixed-seed sweep over the full i32 range, appended after the named cases.
+    // Each draw splits one SplitMix64 output into two i32 components (full range, so
+    // the inputs exercise the same near-overflow squaring the corners pin and the
+    // Python `I32` field must accept verbatim). Outputs come from `clamped()`, so the
+    // golden stays the reference clamp — now machine-cross-checked over 64 more points
+    // than the 12 hand-picked discriminators could reach.
+    let mut seed = CLAMP_PARITY_FUZZ_SEED;
+    for i in 0..CLAMP_PARITY_FUZZ_CASES {
+        let r = splitmix64(&mut seed);
+        cases.push(case(&format!("fuzz_{i:02}"), (r >> 32) as i32, r as i32));
+    }
+    ClampParityVectors {
+        domain: CLAMP_PARITY_DOMAIN.to_string(),
+        move_intent_scale: MOVE_INTENT_SCALE,
+        cases,
     }
 }
 

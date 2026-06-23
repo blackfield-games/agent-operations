@@ -45,7 +45,7 @@ fn clamp_parity_is_byte_identical_across_runs() {
 #[test]
 fn clamp_parity_pins_the_discriminating_conventions() {
     let v = clamp_parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/clamp-parity/v1");
+    assert_eq!(v.domain, "blackfield/arena/clamp-parity/v2");
     assert_eq!(v.move_intent_scale, MOVE_INTENT_SCALE);
     let case = |label: &str| {
         v.cases
