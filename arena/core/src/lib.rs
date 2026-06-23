@@ -558,6 +558,31 @@ pub struct Rules {
     /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
     #[serde(default)]
     pub knockback_horizontal: i32,
+    /// Radius, in position units, of the impassable body disc every OTHER alive pawn
+    /// presents in the slide path — pawn-vs-pawn occupancy. `serde(default)` (`0`)
+    /// DISABLES it: pawns are not obstacles to one another, a move may end on another
+    /// pawn's cell (overlap), and the match plays byte-identically to every
+    /// pre-occupancy record (the default). A positive value turns occupancy on — a
+    /// step whose swept path would bring the mover's centre WITHIN this distance of
+    /// another alive pawn's centre is refused outright (the mover holds at the step
+    /// origin, never overlapping), through the SAME [`slide`](Match::slide) every
+    /// movement uses, so it gates the per-tick walk, the dash burst, AND a directional
+    /// [`knockback_horizontal`](Rules::knockback_horizontal) shove alike — none can push
+    /// a pawn onto or through another. Hard-stop-adjacent: there is NO swap and NO
+    /// push-the-occupant chain (a blocked move is a no-op, the same refuse-at-origin a
+    /// blocker uses — no surface-snap, so the rule stays one integer swept test the UE5
+    /// twin reproduces exactly). The mover's OWN body is never an obstacle to itself,
+    /// and a pawn the mover ALREADY overlaps at the step origin is exempt — mirroring
+    /// the blocker start-containment exemption, so two pawns that begin coincident (a
+    /// tight spawn) separate instead of freezing; the rule is DIRECTIONAL (start-overlap
+    /// exempt, end-overlap refused), exactly like traversal-over-cover. Planar this
+    /// slice: occupancy ignores `z` (a pawn mid-jump still occupies its column),
+    /// consistent with planar-by-default combat — z-coupled occupancy is a follow-up.
+    /// Occupancy is read from integer positions in fixed seat order (the same order the
+    /// move loop mutates), so it is deterministic and replay-stable. Folds into
+    /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
+    #[serde(default)]
+    pub pawn_radius: i32,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -599,6 +624,7 @@ impl Default for Rules {
             vertical_hit_tolerance: 0, // combat planar by default — z ignored in hit resolution
             knockback_velocity: 0, // hits impart no vertical impulse by default — z stays 0
             knockback_horizontal: 0, // hits impart no planar shove by default — pos unchanged
+            pawn_radius: 0, // pawn-vs-pawn occupancy off by default — pawns may overlap
         }
     }
 }
@@ -656,6 +682,7 @@ impl Rules {
         b.extend_from_slice(&self.vertical_hit_tolerance.to_be_bytes());
         b.extend_from_slice(&self.knockback_velocity.to_be_bytes());
         b.extend_from_slice(&self.knockback_horizontal.to_be_bytes());
+        b.extend_from_slice(&self.pawn_radius.to_be_bytes());
         b
     }
 }
@@ -1469,19 +1496,45 @@ impl Match {
         Ok(action.intent.clamped())
     }
 
-    /// Apply a clamped, blocker-respecting displacement from `from`: scale `move_dir`
-    /// (in [`MOVE_INTENT_SCALE`] units) by `magnitude` position units and clamp the
-    /// destination to the arena bounds. If the full swept path crosses a blocker the
-    /// step is refused; with [`Rules::wall_slide`] off (the default) the pawn holds at
-    /// `from`, and with it on the axis-separated components are retried — X-only, then
-    /// Y-only — through the SAME [`path_hits_blocker`] test + clamp, so a pawn grazing a
-    /// wall slides along the unblocked axis while an inside corner (both axes refused)
-    /// still holds. The shared movement-safety primitive for both the per-tick walk
-    /// (`magnitude == max_speed`) and the dash burst (`magnitude == DASH_DISTANCE`), so
-    /// a dash can no more tunnel a wall or leave the arena than a walk can; each
-    /// axis-separated retry is a strict single-axis subset of the full step, so it
-    /// cannot tunnel either.
-    fn slide(&self, from: Vec2, z: i32, move_dir: Vec2, magnitude: i32) -> Vec2 {
+    /// `true` if the swept segment `from → to` (at elevation `z`) is obstructed for the
+    /// pawn in `mover`'s seat — by a static blocker (z-aware, via [`path_hits_blocker`])
+    /// OR, when pawn occupancy is on ([`Rules::pawn_radius`]` > 0`), by any OTHER alive
+    /// pawn whose body disc the segment would enter. The mover's own body is skipped (a
+    /// pawn never blocks its own move — it would freeze every pawn in place), and a pawn
+    /// the mover ALREADY overlaps at `from` is exempt — the same start-containment
+    /// exemption blockers use, so two pawns that begin coincident separate instead of
+    /// freezing. The rule is DIRECTIONAL (start-overlap exempt, end-overlap refused),
+    /// exactly like traversal-over-cover. Occupancy is planar (ignores `z`) this slice
+    /// and is read in fixed seat order — the same order the move loop mutates — so the
+    /// predicate is deterministic and replay-stable, no float anywhere.
+    fn path_obstructed(&self, mover: SeatId, from: Vec2, z: i32, to: Vec2) -> bool {
+        if path_hits_blocker(&self.blockers, from, z, to, z) {
+            return true;
+        }
+        let r = self.rules.pawn_radius;
+        r > 0
+            && self.pawns.iter().any(|p| {
+                p.alive
+                    && p.seat != mover
+                    && !within(from, p.pos, r)
+                    && segment_hits_disc(from, to, p.pos, r)
+            })
+    }
+
+    /// Apply a clamped, obstacle-respecting displacement from `from` for the pawn in
+    /// `mover`'s seat: scale `move_dir` (in [`MOVE_INTENT_SCALE`] units) by `magnitude`
+    /// position units and clamp the destination to the arena bounds. If the full swept
+    /// path is obstructed — by a static blocker OR, under [`Rules::pawn_radius`], by
+    /// another pawn's body — the step is refused; with [`Rules::wall_slide`] off (the
+    /// default) the pawn holds at `from`, and with it on the axis-separated components
+    /// are retried — X-only, then Y-only — through the SAME [`path_obstructed`] test +
+    /// clamp, so a pawn grazing a wall (or a body) slides along the unblocked axis while
+    /// an inside corner (both axes refused) still holds. The shared movement-safety
+    /// primitive for the per-tick walk (`magnitude == max_speed`), the dash burst
+    /// (`magnitude == DASH_DISTANCE`), AND the directional knockback shove, so none can
+    /// tunnel a wall, overlap a pawn, or leave the arena; each axis-separated retry is a
+    /// strict single-axis subset of the full step, so it cannot tunnel either.
+    fn slide(&self, mover: SeatId, from: Vec2, z: i32, move_dir: Vec2, magnitude: i32) -> Vec2 {
         let dx = move_dir.x as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
         let dy = move_dir.y as i64 * magnitude as i64 / MOVE_INTENT_SCALE as i64;
         let bx = self.config.bounds.x as i64;
@@ -1491,7 +1544,7 @@ impl Match {
             y: (from.y as i64 + ddy).clamp(-by, by) as i32,
         };
         let to = target(dx, dy);
-        if !path_hits_blocker(&self.blockers, from, z, to, z) {
+        if !self.path_obstructed(mover, from, z, to) {
             return to;
         }
         // The full move is refused. With wall_slide on, a genuinely diagonal step
@@ -1503,11 +1556,11 @@ impl Match {
         // subset of the full step, so it can no more tunnel than the full move can.
         if self.rules.wall_slide && dx != 0 && dy != 0 {
             let slide_x = target(dx, 0);
-            if !path_hits_blocker(&self.blockers, from, z, slide_x, z) {
+            if !self.path_obstructed(mover, from, z, slide_x) {
                 return slide_x;
             }
             let slide_y = target(0, dy);
-            if !path_hits_blocker(&self.blockers, from, z, slide_y, z) {
+            if !self.path_obstructed(mover, from, z, slide_y) {
                 return slide_y;
             }
         }
@@ -1578,7 +1631,7 @@ impl Match {
             // low wall's height) walks OVER it; a grounded one (z == 0) is stopped by
             // the footprint exactly as before.
             let z = self.pawns[i].z;
-            let to = self.slide(from, z, intent.move_dir, self.rules.max_speed);
+            let to = self.slide(seat, from, z, intent.move_dir, self.rules.max_speed);
             self.pawns[i].facing = intent.aim;
 
             // Dash: an ability press bursts the pawn an extra DASH_DISTANCE along
@@ -1596,7 +1649,7 @@ impl Match {
                 && intent.move_dir != Vec2::ZERO;
             let landed = if dashing {
                 self.pawns[i].dash_cooldown = self.rules.dash_cooldown;
-                self.slide(to, z, intent.move_dir, DASH_DISTANCE)
+                self.slide(seat, to, z, intent.move_dir, DASH_DISTANCE)
             } else {
                 to
             };
@@ -1759,8 +1812,8 @@ impl Match {
         if self.rules.knockback_horizontal <= 0 || !self.pawns[target].alive {
             return;
         }
-        let (pos, z) = (self.pawns[target].pos, self.pawns[target].z);
-        self.pawns[target].pos = self.slide(pos, z, dir, self.rules.knockback_horizontal);
+        let (seat, pos, z) = (self.pawns[target].seat, self.pawns[target].pos, self.pawns[target].z);
+        self.pawns[target].pos = self.slide(seat, pos, z, dir, self.rules.knockback_horizontal);
     }
 
     /// Resolve one beam-hitscan shot from `shooter`: damage the nearest body within
@@ -3296,6 +3349,35 @@ pub struct MoveCase {
     pub blocked: bool,
 }
 
+/// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
+/// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
+/// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
+/// recorded. With `pawn_radius == 0` (occupancy off) the obstacle is no obstacle and a
+/// move may end on its cell (overlap); with it positive, a step whose swept path would
+/// bring the mover's centre within `pawn_radius` of the obstacle is refused (the mover
+/// holds at `start`, hard-stop-adjacent). The geometry isolates the rule: `start`,
+/// `obstacle`, and `move_dir` are chosen so ONLY occupancy can produce a refusal (no
+/// wall, the destination is in bounds), so `blocked` true means the body blocked it. A
+/// twin that lets pawns overlap, that point-tests the destination (and so tunnels
+/// through a body), or that freezes a pawn on its own cell fails the matching case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PawnCollisionCase {
+    pub label: String,
+    pub start: Vec2,
+    pub move_dir: Vec2,
+    pub max_speed: i32,
+    /// The other pawn's position — the body the mover may not move onto/through.
+    pub obstacle: Vec2,
+    /// [`Rules::pawn_radius`] for this case; `0` disables occupancy (the byte-identical
+    /// overlap baseline).
+    pub pawn_radius: i32,
+    /// Seat 0's position after exactly one `step` with this intent.
+    pub end: Vec2,
+    /// `true` when the step produced no displacement — here, an occupancy refusal (the
+    /// geometry rules out any other cause).
+    pub blocked: bool,
+}
+
 /// A pinned z-coupled-combat case: a shot fired DEAD-ON in the plane (the target is
 /// in range, in front, and on a clear sightline) at a target at elevation `target_z`,
 /// under a given weapon `mode` and [`Rules::vertical_hit_tolerance`], and the damage
@@ -3478,6 +3560,11 @@ pub struct ParityVectors {
     /// [`Rules::knockback_velocity`] through the one shared damage sink (so every weapon
     /// mode launches), gated on gravity and knockback both on — the variable-fall source.
     pub knockback: Vec<KnockbackCase>,
+    /// pawn-occupancy cases (domain v11): under a positive [`Rules::pawn_radius`] a move
+    /// whose swept path would enter another alive pawn's body disc is refused (the mover
+    /// holds at its step origin), so pawns are obstacles to one another in the shared
+    /// slide path — walk, dash, and shove alike.
+    pub pawn_collisions: Vec<PawnCollisionCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3504,8 +3591,13 @@ pub struct ParityVectors {
 /// surviving target upward; bumped to v10 for DIRECTIONAL knockback — a gated
 /// [`Rules::knockback_horizontal`] widened `canonical_encoding` again (every committed
 /// match hash moved) and the `knockback` category gained the planar shove that pushes a
-/// surviving target away from the shooter. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v10";
+/// surviving target away from the shooter; bumped to v11 for pawn-body OCCUPANCY — a
+/// gated [`Rules::pawn_radius`] widened `canonical_encoding` once more (every committed
+/// match hash moved) and a new `pawn_collisions` category pins the rule that, under a
+/// positive radius, a move/dash/shove whose swept path would enter another alive pawn's
+/// body is refused (hard-stop-adjacent, no overlap, no swap, no push-chain). Each is a
+/// deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v11";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -3752,6 +3844,26 @@ fn move_case(
     m.step(&intents);
     let end = m.pawns[0].pos;
     MoveCase { label: label.to_string(), start, move_dir, max_speed, bounds, blockers, end, blocked: end == start }
+}
+
+/// Build a pawn-occupancy case: place the mover (seat 0) at `start` and an obstacle
+/// pawn (seat 1) at `obstacle`, set [`Rules::pawn_radius`], step once with `move_dir`,
+/// and record where the mover ends. The arena is large and wall-free, so the ONLY thing
+/// that can refuse the step is the obstacle body — `blocked == (end == start)` therefore
+/// isolates occupancy. Seat 1 has no intent, so it holds at `obstacle` (the move loop
+/// reads its position in fixed seat order); the mover is seat 0, processed first.
+fn pawn_collision_case(label: &str, start: Vec2, move_dir: Vec2, max_speed: i32, obstacle: Vec2, pawn_radius: i32) -> PawnCollisionCase {
+    let rules = Rules { max_speed, pawn_radius, spawn_jitter: 0, ..Default::default() };
+    let config = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), config, rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = start;
+    m.pawns[1].pos = obstacle;
+    let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    intents.insert(0, parity_intent(move_dir, EAST, false));
+    m.step(&intents);
+    let end = m.pawns[0].pos;
+    PawnCollisionCase { label: label.to_string(), start, move_dir, max_speed, obstacle, pawn_radius, end, blocked: end == start }
 }
 
 /// Build a z-coupled-combat case: place shooter (seat 0) at the origin facing east
@@ -4206,6 +4318,33 @@ pub fn parity_vectors() -> ParityVectors {
             // shove pushes it east — a twin that fires only one fails this case.
             knockback_case("pop_and_shove_compose", WeaponMode::Hitscan, 60, 800, 800),
         ],
+        pawn_collisions: {
+            // A 1 m body at x=5 m; movers approach east along the x-axis at 1 m/tick.
+            let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+            let north = Vec2 { x: 0, y: MOVE_INTENT_SCALE };
+            let obstacle = Vec2 { x: 5_000, y: 0 };
+            vec![
+                // A step whose endpoint lands EXACTLY at the 1 m contact distance is refused
+                // (the boundary is inclusive) — the mover holds one step short, never overlapping.
+                pawn_collision_case("into_pawn_blocked", Vec2 { x: 3_000, y: 0 }, east, 1_000, obstacle, 1_000),
+                // The same approach a step earlier clears the contact band, so it proceeds —
+                // a pawn may close right up to the body, just not into it.
+                pawn_collision_case("short_of_pawn_allowed", Vec2 { x: 2_000, y: 0 }, east, 1_000, obstacle, 1_000),
+                // A step NOT toward the body (due north, the body due east) is unobstructed —
+                // occupancy is directional, not a blanket freeze whenever a pawn is near.
+                pawn_collision_case("clear_orthogonal_allowed", Vec2 { x: 3_000, y: 0 }, north, 1_000, obstacle, 1_000),
+                // Occupancy OFF (radius 0, the default): the same step lands directly ON the
+                // body's cell — pawns may overlap, the byte-identical pre-occupancy posture.
+                pawn_collision_case("occupancy_off_overlaps", Vec2 { x: 4_000, y: 0 }, east, 1_000, obstacle, 0),
+                // A 20 m/tick step whose swept path crosses the body but whose ENDPOINT is far
+                // past it is still refused — a point-at-destination test tunnels; the swept test
+                // catches the body, exactly as it does a thin wall.
+                pawn_collision_case("fast_no_tunnel_through_pawn", Vec2::ZERO, east, 20_000, obstacle, 1_000),
+                // A radius set with the body well off the path does NOT impede the mover — only
+                // proximity to a body refuses a step, the radius alone never freezes movement.
+                pawn_collision_case("radius_set_far_obstacle_free", Vec2::ZERO, east, 1_000, Vec2 { x: 40_000, y: 0 }, 2_000),
+            ]
+        },
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
@@ -7367,9 +7506,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 13×i32 + 1×u32 + 10×u16 + 5×u8 = 81 bytes. A new sim field added to the
+        // 14×i32 + 1×u32 + 10×u16 + 5×u8 = 85 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 81, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 85, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -7401,8 +7540,9 @@ mod tests {
             ("vertical_hit_tolerance", Rules { vertical_hit_tolerance: base.vertical_hit_tolerance + 1, ..base }),
             ("knockback_velocity", Rules { knockback_velocity: base.knockback_velocity + 1, ..base }),
             ("knockback_horizontal", Rules { knockback_horizontal: base.knockback_horizontal + 1, ..base }),
+            ("pawn_radius", Rules { pawn_radius: base.pawn_radius + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 29, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 30, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }

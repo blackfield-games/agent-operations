@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v10",
+  "domain": "blackfield/arena/parity-vectors/v11",
   "protocol_version": 1,
   "spawns": [
     {
@@ -43,7 +43,8 @@
         "perception_memory_ticks": 0,
         "vertical_hit_tolerance": 0,
         "knockback_velocity": 0,
-        "knockback_horizontal": 0
+        "knockback_horizontal": 0,
+        "pawn_radius": 0
       },
       "roster": [
         {
@@ -155,7 +156,8 @@
         "perception_memory_ticks": 0,
         "vertical_hit_tolerance": 0,
         "knockback_velocity": 0,
-        "knockback_horizontal": 0
+        "knockback_horizontal": 0,
+        "pawn_radius": 0
       },
       "roster": [
         {
@@ -1363,6 +1365,140 @@
       "target_alive": true
     }
   ],
+  "pawn_collisions": [
+    {
+      "label": "into_pawn_blocked",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1000,
+      "end": {
+        "x": 3000,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "short_of_pawn_allowed",
+      "start": {
+        "x": 2000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1000,
+      "end": {
+        "x": 3000,
+        "y": 0
+      },
+      "blocked": false
+    },
+    {
+      "label": "clear_orthogonal_allowed",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 0,
+        "y": 1000
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1000,
+      "end": {
+        "x": 3000,
+        "y": 1000
+      },
+      "blocked": false
+    },
+    {
+      "label": "occupancy_off_overlaps",
+      "start": {
+        "x": 4000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 0,
+      "end": {
+        "x": 5000,
+        "y": 0
+      },
+      "blocked": false
+    },
+    {
+      "label": "fast_no_tunnel_through_pawn",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 20000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1000,
+      "end": {
+        "x": 0,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "radius_set_far_obstacle_free",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 40000,
+        "y": 0
+      },
+      "pawn_radius": 2000,
+      "end": {
+        "x": 1000,
+        "y": 0
+      },
+      "blocked": false
+    }
+  ],
   "matches": [
     {
       "label": "octant_hitscan",
@@ -1405,7 +1541,8 @@
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
-          "knockback_horizontal": 0
+          "knockback_horizontal": 0,
+          "pawn_radius": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1506,6 +1643,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -1582,7 +1723,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "6a04352fdf66aa97b7c7848864baef548758d1ee62e9114189de3b5626e1f46c"
+          "replay_hash": "e1351623d37af80e33a0caeb65c788a287c63bd7ae775695cdeecc72d94dfc85"
         }
       }
     },
@@ -1627,7 +1768,8 @@
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
-          "knockback_horizontal": 0
+          "knockback_horizontal": 0,
+          "pawn_radius": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1706,6 +1848,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -1804,7 +1950,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "2d7e0e5797db198ab7197b68cd5b64e0df309b71a1e8711bc94cb96e65079840"
+          "replay_hash": "ee4d63e026123525678d6f0673c57ade578423268ab54716d6a85efa68aad90e"
         }
       }
     },
@@ -1849,7 +1995,8 @@
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
-          "knockback_horizontal": 0
+          "knockback_horizontal": 0,
+          "pawn_radius": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1928,6 +2075,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -2030,7 +2181,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "f8ad83267c104c35cc8c04065e4605983ecc9ed0d73de3dec498c69a4f0df576"
+          "replay_hash": "5455981c30cdec13551c45639a966805cc8dbcd44fac393de27e9aa31a65d86f"
         }
       }
     },
@@ -2075,7 +2226,8 @@
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
-          "knockback_horizontal": 0
+          "knockback_horizontal": 0,
+          "pawn_radius": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -2185,6 +2337,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -2261,7 +2417,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "7089fdb62ac87f65a7ff0ab2c405249228a4ecc9f68bdda9a6354d0b4717f9e1"
+          "replay_hash": "c7434443b827707fc22bff380056d807ecc9292034df84ccf031faa988b1ff1c"
         }
       }
     }
