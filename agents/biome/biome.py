@@ -8,6 +8,7 @@ import hashlib
 import re
 from pathlib import Path
 from common.types import WorldBrief, LayerSpec
+from common.usd import usd_str
 
 # Triangles in one scatter instance's low-poly source mesh (a foliage card cluster
 # or debris chunk, pre-LOD). A content-budget knob, not a measured value — the
@@ -71,7 +72,7 @@ async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
 
 def PointInstancer "Scatter"
 {{
-    custom string biome = "{brief.biome}"
+    custom string biome = {usd_str(brief.biome)}
     custom int instanceCount = {count}
     custom string scatterRule = "post_conflict_sparse"
 }}

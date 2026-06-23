@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from common.types import WorldBrief, LayerSpec
+from common.usd import usd_str
 
 
 async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
@@ -24,7 +25,7 @@ def Mesh "Terrain" (
     kind = "component"
 )
 {{
-    custom string biome = "{brief.biome}"
+    custom string biome = {usd_str(brief.biome)}
     custom int gridResolution = 512
     custom string heightfieldSource = "placeholder"
 }}
