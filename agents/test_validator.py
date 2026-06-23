@@ -704,3 +704,160 @@ async def test_run_attributes_malformed_layer_to_its_specialist(tmp_path):
     assert not verdict.accepted
     assert verdict.failing_specialists == ["biome"]
     assert _route_back_target(verdict) == "biome"
+
+
+# ---- director-intent gate (declare → honor → VERIFY) ----
+#
+# The director DECLARES hard intent (intent:must_have, intent:must_not) and prop/biome
+# HONOR it; these pin that the validator — the last gate — VERIFIES they did, reusing
+# prop's/biome's own mapping helpers so it demands ONLY what those specialists would
+# actually emit (no false reject of a correctly-skipped unmappable token), and routes a
+# real violation back to the offending specialist.
+
+
+def _director_body(*, must_have: str | None = None, must_not: str | None = None) -> str:
+    """A well-formed director layer seeding the given intent. An omitted field emits no
+    attribute (the director predates it / seeded nothing) so the gate stays silent."""
+    lines = ["#usda 1.0", "(", '    defaultPrim = "Director"', ")", "", 'def Scope "Director"', "{"]
+    if must_have is not None:
+        lines.append(f'    custom string intent:must_have = "{must_have}"')
+    if must_not is not None:
+        lines.append(f'    custom string intent:must_not = "{must_not}"')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def _prop_body(required_assets: list[str]) -> str:
+    """A prop layer placing one Required prim per asset (the `requiredAsset` marker the
+    gate keys on), beside the fill PointInstancer — mirroring prop._required_block."""
+    prims = "".join(
+        f'\ndef Xform "Required_{i}"\n{{\n    custom string requiredAsset = "{a}"\n}}\n'
+        for i, a in enumerate(required_assets)
+    )
+    return (
+        '#usda 1.0\n(\n    defaultPrim = "Props"\n)\n\n'
+        'def PointInstancer "Props"\n{\n    custom string propAsset = "barricade_01"\n}\n'
+        + prims
+    )
+
+
+def _biome_body(*, capped: bool) -> str:
+    """A biome layer that emits the vegetationCapped marker iff `capped` — mirroring
+    biome.run's cap_line."""
+    cap = "\n    custom bool vegetationCapped = true" if capped else ""
+    return (
+        '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\n'
+        f'def PointInstancer "Scatter"\n{{\n    custom int instanceCount = 100{cap}\n}}\n'
+    )
+
+
+def _set_with_missing(root: Path, bodies: dict[str, str], missing: str) -> list[LayerSpec]:
+    """A full set with `bodies` applied and `missing`'s file left unwritten (its spec
+    still present) — a specialist that failed/timed out, leaving a dangling layer."""
+    return [
+        _layer(root, s, body=None if s == missing else bodies.get(s, VALID_BODY))
+        for s in SPECIALISTS
+    ]
+
+
+async def test_run_accepts_a_world_that_honors_director_intent(tmp_path):
+    # The real pipeline's shape: director seeds both intents, prop places every mapped
+    # must-have, biome caps. The gate finds nothing unmet — accepted, byte-clean.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_have="comms_tower,convoy_wreck", must_not="dense_vegetation"),
+        "prop": _prop_body(["comms_tower_01", "convoy_wreck_01"]),
+        "biome": _biome_body(capped=True),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert verdict.issues == []
+
+
+async def test_run_rejects_a_dropped_must_have_and_routes_to_prop(tmp_path):
+    # FM2 (false accept): prop places comms_tower_01 but DROPS the convoy_wreck_01 the
+    # director marked must_have. The gate must catch the real violation and name prop.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_have="comms_tower,convoy_wreck"),
+        "prop": _prop_body(["comms_tower_01"]),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:must_have" in i and "convoy_wreck_01" in i for i in verdict.issues)
+    assert "prop" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "prop"
+
+
+async def test_run_rejects_an_uncapped_biome_under_a_capping_director(tmp_path):
+    # FM2 (false accept, biome twin): the director's must_not carries the cap token but
+    # biome emits no vegetationCapped marker — rejected and routed back to biome.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="dense_vegetation"),
+        "biome": _biome_body(capped=False),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:must_not" in i and "vegetationCapped" in i for i in verdict.issues)
+    assert "biome" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "biome"
+
+
+async def test_run_does_not_false_reject_an_unmappable_must_have_token(tmp_path):
+    # FM1 (the worst failure — an infinite revision loop): the director names a token
+    # with NO MUST_HAVE_ASSET mapping. prop skips it (places nothing), so the gate must
+    # require only the MAPPED asset — demanding a Required prim for the unmappable token
+    # would route a correctly-built world back forever.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_have="comms_tower,floating_citadel"),
+        "prop": _prop_body(["comms_tower_01"]),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_does_not_require_a_cap_for_non_cap_must_not_tokens(tmp_path):
+    # FM1 (biome twin): a must_not of other specialists' constraints (interior_volumes,
+    # civilians) carries no recognized vegetation-cap token, so biome correctly does NOT
+    # cap. The gate must not demand a vegetationCapped marker — the world stays accepted.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="interior_volumes,civilians"),
+        "biome": _biome_body(capped=False),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_intent_gate_silent_when_director_seeds_no_intent(tmp_path):
+    # FM3 (back-compat): a director with neither must_have nor must_not leaves the gate
+    # dormant — an uncapped biome and a prop with no Required prims still validate.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(),
+        "biome": _biome_body(capped=False),
+        "prop": _prop_body([]),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_intent_gate_degrades_on_a_missing_prop_layer(tmp_path):
+    # FM3 (missing-layer degrade): the director declares a must_have but prop's FILE is
+    # gone (it failed/timed out). The intent gate must skip the unreadable layer, never
+    # crash the final gate; the missing-layer gate rejects and routes back to prop.
+    bodies = {"director": _director_body(must_have="comms_tower,convoy_wreck")}
+    verdict = await validator.run(
+        _brief(), _set_with_missing(tmp_path, bodies, missing="prop"), layers_root=tmp_path
+    )
+    assert not verdict.accepted
+    assert "prop" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "prop"
+
+
+async def test_run_intent_gate_degrades_on_a_missing_biome_layer(tmp_path):
+    # FM3 (missing-layer degrade, biome twin): the director declares a cap token but
+    # biome's FILE is gone. The gate skips it instead of crashing; biome is routed back.
+    bodies = {"director": _director_body(must_not="dense_vegetation")}
+    verdict = await validator.run(
+        _brief(), _set_with_missing(tmp_path, bodies, missing="biome"), layers_root=tmp_path
+    )
+    assert not verdict.accepted
+    assert "biome" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "biome"
