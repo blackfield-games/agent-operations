@@ -1758,18 +1758,21 @@ impl Match {
     /// reaches `0`. Returns the EFFECTIVE damage dealt — shield absorbed plus health
     /// removed, never more than the pawn's effective HP — which the caller credits as
     /// score for an enemy hit. This is the single place the shield/health split lives,
-    /// so every weapon (hitscan, melee, projectile) and the UE5 twin share ONE
-    /// absorption rule.
+    /// so every damage source (hitscan, melee, projectile, AND a hard fall landing) and
+    /// the UE5 twin share ONE absorption rule.
     ///
     /// With no shield (the default `max_shield == 0` ⇒ every pawn's `shield == 0`)
     /// this is exactly `raw.min(health)` removed from health and returned, the clean
     /// generalization of the prior per-site clamp — so a shieldless match is
     /// byte-identical. All saturating/clamped integer math: `absorbed <= raw` and
     /// `to_health <= raw - absorbed`, so the return never overflows `u16`.
-    fn damage_pawn(&mut self, idx: usize, raw: u16) -> u16 {
-        // Read the knockback tuning before borrowing the pawn — disjoint fields, but
-        // taking the copies first keeps the impulse block a clean read of the pawn alone.
-        let (gravity, knockback) = (self.rules.gravity, self.rules.knockback_velocity);
+    ///
+    /// This is the pure HP/shield core with NO side effects beyond the pawn's pools —
+    /// notably it imparts no knockback impulse, so an environmental hit (a fall landing)
+    /// routes through it directly without bouncing the pawn back up the way a weapon hit
+    /// does. A weapon hit goes through [`damage_pawn`](Self::damage_pawn), which adds the
+    /// knockback pop ON TOP of this core.
+    fn apply_hp_damage(&mut self, idx: usize, raw: u16) -> u16 {
         let p = &mut self.pawns[idx];
         let absorbed = raw.min(p.shield);
         p.shield -= absorbed;
@@ -1778,20 +1781,30 @@ impl Match {
         if p.health == 0 {
             p.alive = false;
         }
-        let effective = absorbed + to_health;
-        // Vertical knockback: a hit that DEALT damage to a SURVIVING pawn pops it upward
-        // — the variable-fall-height source. Gated on gravity > 0 (the sole source of any
-        // non-zero z, so a 2D match stays byte-identical) AND knockback_velocity > 0 (off
-        // by default). Saturating, stacking onto any existing z_vel so a mid-air target is
-        // launched higher; the z integration's i64 widening absorbs the larger velocity
-        // without overflow. A downed pawn is skipped — a corpse leaves gravity
-        // integration, so launching it would be dead state churn — and a 0-damage hit
-        // imparts nothing, so a miss (which never reaches here) and a fully-absorbed-by-0
-        // hit are both inert. This is the single sink all three weapon modes funnel
-        // through, so the rule is identical for hitscan, melee, and a projectile, and a
-        // friendly-fire hit that deals damage knocks back too (it dealt real damage).
-        if knockback > 0 && gravity > 0 && effective > 0 && p.alive {
-            p.z_vel = p.z_vel.saturating_add(knockback);
+        absorbed + to_health
+    }
+
+    /// A WEAPON hit on pawn `idx`: apply `raw` through the shared
+    /// [`apply_hp_damage`](Self::apply_hp_damage) core, then pop a SURVIVING target
+    /// upward by [`Rules::knockback_velocity`] — the variable-fall-height source.
+    /// Returns the effective damage the core dealt (the caller credits it as score).
+    ///
+    /// The vertical knockback is gated on `gravity > 0` (the sole source of any non-zero
+    /// z, so a 2D match stays byte-identical) AND `knockback_velocity > 0` (off by
+    /// default). Saturating, stacking onto any existing z_vel so a mid-air target is
+    /// launched higher; the z integration's i64 widening absorbs the larger velocity
+    /// without overflow. A downed pawn is skipped — a corpse leaves gravity integration,
+    /// so launching it would be dead state churn — and a 0-damage hit imparts nothing, so
+    /// a miss (which never reaches here) and a fully-absorbed-by-0 hit are both inert.
+    /// This is the single sink all three weapon modes funnel through, so the rule is
+    /// identical for hitscan, melee, and a projectile, and a friendly-fire hit that deals
+    /// damage knocks back too (it dealt real damage). Fall damage deliberately does NOT
+    /// come through here — a hard landing hurts but never bounces the pawn back upward.
+    fn damage_pawn(&mut self, idx: usize, raw: u16) -> u16 {
+        let (gravity, knockback) = (self.rules.gravity, self.rules.knockback_velocity);
+        let effective = self.apply_hp_damage(idx, raw);
+        if knockback > 0 && gravity > 0 && effective > 0 && self.pawns[idx].alive {
+            self.pawns[idx].z_vel = self.pawns[idx].z_vel.saturating_add(knockback);
         }
         effective
     }
