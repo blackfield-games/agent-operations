@@ -1,0 +1,138 @@
+{
+  "domain": "blackfield/arena/clamp-parity/v1",
+  "move_intent_scale": 1000,
+  "cases": [
+    {
+      "label": "zero_is_inert",
+      "input": {
+        "x": 0,
+        "y": 0
+      },
+      "output": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "label": "short_passthrough",
+      "input": {
+        "x": 300,
+        "y": -400
+      },
+      "output": {
+        "x": 300,
+        "y": -400
+      }
+    },
+    {
+      "label": "at_cap_345_passthrough",
+      "input": {
+        "x": 600,
+        "y": 800
+      },
+      "output": {
+        "x": 600,
+        "y": 800
+      }
+    },
+    {
+      "label": "at_cap_axis_passthrough",
+      "input": {
+        "x": 1000,
+        "y": 0
+      },
+      "output": {
+        "x": 1000,
+        "y": 0
+      }
+    },
+    {
+      "label": "overlong_345_scaled",
+      "input": {
+        "x": 3000,
+        "y": 4000
+      },
+      "output": {
+        "x": 600,
+        "y": 800
+      }
+    },
+    {
+      "label": "just_over_axis_scaled",
+      "input": {
+        "x": 1001,
+        "y": 0
+      },
+      "output": {
+        "x": 1000,
+        "y": 0
+      }
+    },
+    {
+      "label": "overlong_diagonal_scaled",
+      "input": {
+        "x": 1000,
+        "y": 1000
+      },
+      "output": {
+        "x": 707,
+        "y": 707
+      }
+    },
+    {
+      "label": "single_axis_negative_scaled",
+      "input": {
+        "x": -2000,
+        "y": 0
+      },
+      "output": {
+        "x": -1000,
+        "y": 0
+      }
+    },
+    {
+      "label": "negative_axis_trunc_toward_zero",
+      "input": {
+        "x": -5000,
+        "y": 5000
+      },
+      "output": {
+        "x": -707,
+        "y": 707
+      }
+    },
+    {
+      "label": "i32_min_overflow_corner",
+      "input": {
+        "x": -2147483648,
+        "y": -2147483648
+      },
+      "output": {
+        "x": -707,
+        "y": -707
+      }
+    },
+    {
+      "label": "i32_max_overflow_corner",
+      "input": {
+        "x": 2147483647,
+        "y": 2147483647
+      },
+      "output": {
+        "x": 707,
+        "y": 707
+      }
+    },
+    {
+      "label": "i32_mixed_overflow_corner",
+      "input": {
+        "x": -2147483648,
+        "y": 2147483647
+      },
+      "output": {
+        "x": -707,
+        "y": 707
+      }
+    }
+  ]
+}

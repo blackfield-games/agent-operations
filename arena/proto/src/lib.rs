@@ -442,6 +442,80 @@ fn isqrt_u64(n: u64) -> u64 {
     x
 }
 
+/// One move-clamp parity case: the requested `input` `move_dir` and the exact
+/// `output` the canonical [`ActionIntent::clamped`] yields for it. Every Gateway
+/// implementation — the Rust reference here and the Python agent SDK
+/// (`agents/arena_client`) — MUST reproduce `output` from `input` bit-for-bit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClampCase {
+    pub label: String,
+    pub input: Vec2,
+    pub output: Vec2,
+}
+
+/// The versioned, canonical cross-implementer move-clamp parity set. Each
+/// `output` is taken straight from the live [`ActionIntent::clamped`] (never
+/// hand-written), so this set IS the reference clamp serialized — the committed
+/// golden (`tests/clamp_parity.json`) can never silently drift from the clamp it
+/// pins. Pure integer + ordered, so it is byte-stable on every platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClampParityVectors {
+    pub domain: String,
+    pub move_intent_scale: i32,
+    pub cases: Vec<ClampCase>,
+}
+
+/// Domain tag for [`clamp_parity_vectors`]. Bump only on a deliberate clamp-rule
+/// convention change (a new boundary, a different rounding) — the signal both
+/// implementers re-pin against.
+const CLAMP_PARITY_DOMAIN: &str = "blackfield/arena/clamp-parity/v1";
+
+/// The canonical cross-implementer move-clamp parity vectors: a discriminating
+/// `input → clamped output` set every implementation of the Gateway must
+/// reproduce. The outputs come from [`ActionIntent::clamped`] itself, so the set
+/// is the reference clamp in data form. The Rust drift-gate (`tests/clamp_parity.rs`)
+/// and the Python SDK conformance test (`agents/test_arena_client.py`) load the
+/// SAME committed golden, so a clamp change on EITHER side breaks loud against one
+/// source of truth — the cross-implementer pin the hand-duplicated rows could not
+/// give. The arena-core `parity_vectors()` analogue for the proto-layer clamp.
+pub fn clamp_parity_vectors() -> ClampParityVectors {
+    let case = |label: &str, x: i32, y: i32| {
+        let input = Vec2 { x, y };
+        let intent = ActionIntent {
+            move_dir: input,
+            aim: 0,
+            buttons: ActionButtons { fire: false, jump: false, ability: false, reload: false },
+        };
+        ClampCase { label: label.to_string(), input, output: intent.clamped().move_dir }
+    };
+    ClampParityVectors {
+        domain: CLAMP_PARITY_DOMAIN.to_string(),
+        move_intent_scale: MOVE_INTENT_SCALE,
+        cases: vec![
+            // Sub-cap and at-cap requests pass through untouched (magnitude ≤ scale,
+            // the boundary being magnitude == scale).
+            case("zero_is_inert", 0, 0),
+            case("short_passthrough", 300, -400),
+            case("at_cap_345_passthrough", 600, 800),
+            case("at_cap_axis_passthrough", 1000, 0),
+            // Overlong requests scale DOWN to magnitude `scale`, never up.
+            case("overlong_345_scaled", 3000, 4000),
+            case("just_over_axis_scaled", 1001, 0),
+            case("overlong_diagonal_scaled", 1000, 1000),
+            case("single_axis_negative_scaled", -2000, 0),
+            // Truncation is toward zero (Rust `/`), NOT floor: a floor impl yields
+            // (-708, 707) here and fails the golden — the trunc-vs-floor discriminator.
+            case("negative_axis_trunc_toward_zero", -5000, 5000),
+            // The overflow corners: the i64 square-sum overflows without the
+            // u64-widened add, so a refactor dropping the widening would let these
+            // through at god-mode speed and break the golden on BOTH implementers.
+            case("i32_min_overflow_corner", i32::MIN, i32::MIN),
+            case("i32_max_overflow_corner", i32::MAX, i32::MAX),
+            case("i32_mixed_overflow_corner", i32::MIN, i32::MAX),
+        ],
+    }
+}
+
 /// One agent action, bound to the tick it answers.
 ///
 /// `tick` is the [`Observation`] tick this action responds to, so the server can
