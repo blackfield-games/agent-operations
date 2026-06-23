@@ -1672,6 +1672,9 @@ impl Match {
     /// byte-identical. All saturating/clamped integer math: `absorbed <= raw` and
     /// `to_health <= raw - absorbed`, so the return never overflows `u16`.
     fn damage_pawn(&mut self, idx: usize, raw: u16) -> u16 {
+        // Read the knockback tuning before borrowing the pawn — disjoint fields, but
+        // taking the copies first keeps the impulse block a clean read of the pawn alone.
+        let (gravity, knockback) = (self.rules.gravity, self.rules.knockback_velocity);
         let p = &mut self.pawns[idx];
         let absorbed = raw.min(p.shield);
         p.shield -= absorbed;
@@ -1680,7 +1683,22 @@ impl Match {
         if p.health == 0 {
             p.alive = false;
         }
-        absorbed + to_health
+        let effective = absorbed + to_health;
+        // Vertical knockback: a hit that DEALT damage to a SURVIVING pawn pops it upward
+        // — the variable-fall-height source. Gated on gravity > 0 (the sole source of any
+        // non-zero z, so a 2D match stays byte-identical) AND knockback_velocity > 0 (off
+        // by default). Saturating, stacking onto any existing z_vel so a mid-air target is
+        // launched higher; the z integration's i64 widening absorbs the larger velocity
+        // without overflow. A downed pawn is skipped — a corpse leaves gravity
+        // integration, so launching it would be dead state churn — and a 0-damage hit
+        // imparts nothing, so a miss (which never reaches here) and a fully-absorbed-by-0
+        // hit are both inert. This is the single sink all three weapon modes funnel
+        // through, so the rule is identical for hitscan, melee, and a projectile, and a
+        // friendly-fire hit that deals damage knocks back too (it dealt real damage).
+        if knockback > 0 && gravity > 0 && effective > 0 && p.alive {
+            p.z_vel = p.z_vel.saturating_add(knockback);
+        }
+        effective
     }
 
     /// Resolve one beam-hitscan shot from `shooter`: damage the nearest body within
