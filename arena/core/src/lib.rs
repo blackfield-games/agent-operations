@@ -136,6 +136,24 @@ fn bearing_octant(dx: i64, dy: i64) -> usize {
     best
 }
 
+/// The [`MOVE_INTENT_SCALE`] unit vector a knockback shoves a target along, for a
+/// shooter→target bearing `(dx, dy)` — the radial direction classified into the same 8
+/// octants combat uses ([`bearing_octant`]), rescaled from [`OCTANT_SCALE`] to the
+/// [`MOVE_INTENT_SCALE`] [`Match::slide`] expects. A zero bearing (a target exactly on
+/// the shooter) has no direction, so it returns `None` and the caller imparts no shove —
+/// the safe degenerate, never an arbitrary lurch. Integer-only, so the shove direction is
+/// bit-stable for the twin.
+fn knockback_unit(dx: i64, dy: i64) -> Option<Vec2> {
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+    let (ox, oy) = OCTANTS[bearing_octant(dx, dy)];
+    Some(Vec2 {
+        x: (ox as i64 * MOVE_INTENT_SCALE as i64 / OCTANT_SCALE as i64) as i32,
+        y: (oy as i64 * MOVE_INTENT_SCALE as i64 / OCTANT_SCALE as i64) as i32,
+    })
+}
+
 /// Circular distance between two octant indices on the 8-ring, `0..=4`: the min of
 /// the two ways round, so octants adjacent across the `0/7` seam are distance 1,
 /// not 7.
@@ -1723,6 +1741,26 @@ impl Match {
         effective
     }
 
+    /// Apply the planar knockback shove to a SURVIVING target that just took a damaging
+    /// hit: displace it [`Rules::knockback_horizontal`] position units along `dir` (the
+    /// shooter→target octant from [`knockback_unit`]) through the shared
+    /// [`slide`](Self::slide) — the SAME bounds clamp + blocker refusal a walk uses, so
+    /// the shove stops AT a wall and never tunnels or leaves the arena. A no-op when
+    /// knockback is off (`<= 0`) or the target is down (a corpse is not shoved). Gated on
+    /// knockback ALONE — no gravity, a planar shove is meaningful in a 2D match. The
+    /// caller passes `dir` only for a hit that DEALT damage and only when the bearing is
+    /// non-zero, so a miss and a point-blank coincident target both impart nothing. The
+    /// horizontal sibling of the vertical impulse in [`damage_pawn`](Self::damage_pawn) —
+    /// it lives here, not in that sink, because the shove needs the shooter's bearing the
+    /// sink does not carry.
+    fn knock_back_horizontal(&mut self, target: usize, dir: Vec2) {
+        if self.rules.knockback_horizontal <= 0 || !self.pawns[target].alive {
+            return;
+        }
+        let (pos, z) = (self.pawns[target].pos, self.pawns[target].z);
+        self.pawns[target].pos = self.slide(pos, z, dir, self.rules.knockback_horizontal);
+    }
+
     /// Resolve one beam-hitscan shot from `shooter`: damage the nearest body within
     /// the beam (in range, in front, within the lateral `hit_radius`) — an enemy by
     /// default, or an ally too under [`Rules::friendly_fire`], never the shooter.
@@ -1796,6 +1834,16 @@ impl Match {
             if !friendly {
                 self.pawns[shooter].score += dealt as i32;
             }
+            // Planar knockback: a damaging hit shoves the survivor away from the shooter
+            // along their bearing (no-op when knockback_horizontal is off).
+            if dealt > 0 {
+                if let Some(dir) = knockback_unit(
+                    self.pawns[j].pos.x as i64 - s.pos.x as i64,
+                    self.pawns[j].pos.y as i64 - s.pos.y as i64,
+                ) {
+                    self.knock_back_horizontal(j, dir);
+                }
+            }
         }
     }
 
@@ -1844,6 +1892,16 @@ impl Match {
             // scores — mirrors resolve_fire.
             if !friendly {
                 self.pawns[shooter].score += dealt as i32;
+            }
+            // Planar knockback: every cleaved survivor is shoved away from the shooter
+            // along its own bearing (so a cleave fans the struck enemies outward).
+            if dealt > 0 {
+                if let Some(dir) = knockback_unit(
+                    self.pawns[j].pos.x as i64 - s.pos.x as i64,
+                    self.pawns[j].pos.y as i64 - s.pos.y as i64,
+                ) {
+                    self.knock_back_horizontal(j, dir);
+                }
             }
         }
     }
@@ -1950,6 +2008,13 @@ impl Match {
                 if !friendly {
                     if let Some(sp) = self.pawns.iter_mut().find(|p| p.seat == proj.shooter) {
                         sp.score += dealt as i32;
+                    }
+                }
+                // Planar knockback: a projectile shoves the survivor along its TRAVEL
+                // direction (away from the shooter it flew from), not a recomputed bearing.
+                if dealt > 0 {
+                    if let Some(dir) = knockback_unit(proj.vel.x as i64, proj.vel.y as i64) {
+                        self.knock_back_horizontal(j, dir);
                     }
                 }
                 continue; // consumed on hit
