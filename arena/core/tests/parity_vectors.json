@@ -1503,6 +1503,68 @@
       "blocked": false
     }
   ],
+  "fall_damage": [
+    {
+      "label": "self_jump_under_threshold_safe",
+      "gravity": 600,
+      "fall_damage": 30,
+      "fall_damage_threshold": 3000,
+      "launch_z_vel": 1200,
+      "start_health": 100,
+      "impact_speed": 1200,
+      "damage": 0,
+      "landed_alive": true,
+      "ticks_aloft": 5
+    },
+    {
+      "label": "boosted_landing_over_threshold_hurts",
+      "gravity": 600,
+      "fall_damage": 30,
+      "fall_damage_threshold": 3000,
+      "launch_z_vel": 6000,
+      "start_health": 100,
+      "impact_speed": 6000,
+      "damage": 30,
+      "landed_alive": true,
+      "ticks_aloft": 21
+    },
+    {
+      "label": "fall_damage_off_no_harm",
+      "gravity": 600,
+      "fall_damage": 0,
+      "fall_damage_threshold": 0,
+      "launch_z_vel": 6000,
+      "start_health": 100,
+      "impact_speed": 6000,
+      "damage": 0,
+      "landed_alive": true,
+      "ticks_aloft": 21
+    },
+    {
+      "label": "threshold_zero_soft_landing_hurts",
+      "gravity": 600,
+      "fall_damage": 15,
+      "fall_damage_threshold": 0,
+      "launch_z_vel": 1200,
+      "start_health": 100,
+      "impact_speed": 1200,
+      "damage": 15,
+      "landed_alive": true,
+      "ticks_aloft": 5
+    },
+    {
+      "label": "lethal_landing_downs_pawn",
+      "gravity": 600,
+      "fall_damage": 200,
+      "fall_damage_threshold": 3000,
+      "launch_z_vel": 6000,
+      "start_health": 100,
+      "impact_speed": 6000,
+      "damage": 100,
+      "landed_alive": false,
+      "ticks_aloft": 21
+    }
+  ],
   "matches": [
     {
       "label": "octant_hitscan",

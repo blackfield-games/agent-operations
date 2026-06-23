@@ -473,6 +473,54 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(!within(fast_dest, fast.obstacle, fast.pawn_radius), "the would-be destination overshoots the body (a point test tunnels)");
     let far = pc("radius_set_far_obstacle_free");
     assert!(!far.blocked && far.end != far.start && far.pawn_radius > 0, "a set radius with the body off-path never freezes the mover");
+
+    // Fall damage (domain v12): a hard landing hurts, a normal jump does not, the
+    // threshold (not the impact alone) is the gate, and a lethal landing downs the pawn.
+    let fd = |label: &str| v.fall_damage.iter().find(|c| c.label == label).unwrap();
+    let safe = fd("self_jump_under_threshold_safe");
+    let hurts = fd("boosted_landing_over_threshold_hurts");
+    // The NON-DEGENERATE pin: safe and hurts share gravity, threshold, AND fall_damage —
+    // only the launch (fall height) differs, so the threshold alone decides the outcome.
+    assert_eq!(
+        (safe.gravity, safe.fall_damage_threshold, safe.fall_damage),
+        (hurts.gravity, hurts.fall_damage_threshold, hurts.fall_damage),
+        "safe and hurts differ only by launch — the threshold alone decides"
+    );
+    assert!(safe.fall_damage > 0, "fall damage is ON for the safe case (spared by the threshold, not by being off)");
+    assert!(
+        safe.impact_speed <= safe.fall_damage_threshold && safe.damage == 0 && safe.landed_alive,
+        "a fixed-impulse self-jump lands at/below the threshold and is unharmed"
+    );
+    assert!(
+        hurts.impact_speed > hurts.fall_damage_threshold && hurts.impact_speed > safe.impact_speed,
+        "the boosted launch lands harder than the self-jump, above the threshold"
+    );
+    assert_eq!(hurts.damage, hurts.fall_damage, "a hard landing deals exactly fall_damage");
+    assert!(hurts.landed_alive, "a non-lethal hard landing hurts but does not down the pawn");
+    // Off by default: the hardest landing harms nothing when fall_damage is 0.
+    let off = fd("fall_damage_off_no_harm");
+    assert_eq!(off.fall_damage, 0, "the off case has the feature disabled");
+    assert!(
+        off.impact_speed > 0 && off.damage == 0 && off.landed_alive,
+        "with fall_damage 0 even a hard landing deals nothing (byte-identity)"
+    );
+    // The threshold is the gate, not the impact: the SAME soft self-jump that was safe at
+    // threshold 3000 takes damage once the threshold drops to 0.
+    let thr0 = fd("threshold_zero_soft_landing_hurts");
+    assert_eq!(thr0.launch_z_vel, safe.launch_z_vel, "the threshold-0 case reuses the safe case's soft self-jump");
+    assert_eq!(thr0.fall_damage_threshold, 0, "its threshold is 0");
+    assert!(
+        thr0.damage == thr0.fall_damage && thr0.impact_speed > 0,
+        "the once-safe landing now takes damage — the threshold is what spared it"
+    );
+    // Lethal: a landing dealing more than the remaining HP downs the pawn, clamped through
+    // the shared sink (overkill is not negative health).
+    let lethal = fd("lethal_landing_downs_pawn");
+    assert!(!lethal.landed_alive, "a lethal landing downs the pawn");
+    assert!(
+        lethal.fall_damage > lethal.start_health && lethal.damage == lethal.start_health,
+        "overkill is clamped to the pawn's HP through the shared sink"
+    );
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it

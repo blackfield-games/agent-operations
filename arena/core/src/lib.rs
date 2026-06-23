@@ -3440,6 +3440,42 @@ pub struct PawnCollisionCase {
     pub blocked: bool,
 }
 
+/// A pinned fall-damage case (domain v12): a single pawn (seat 0) is launched with
+/// `launch_z_vel` (modelling a jump or a [`Rules::knockback_velocity`]-boosted pop) under
+/// a given [`Rules::gravity`], then integrated by repeated `step`s to its landing, with
+/// [`Rules::fall_damage`] and [`Rules::fall_damage_threshold`] set. Records the downward
+/// `impact_speed` at the landing tick, the `damage` the landing dealt, whether the pawn
+/// `landed_alive`, and `ticks_aloft` (the arc length, a determinism witness). The rule a
+/// twin must reproduce: a landing whose impact STRICTLY exceeds the threshold deals
+/// `fall_damage` through the shared HP sink (shield-first, downs at `0`) — gated on
+/// `fall_damage > 0` so the off default never harms — and the pawn is NOT bounced back
+/// upward (fall damage skips the knockback impulse). A twin that scales the impact wrong,
+/// applies damage at or below the threshold, forgets the gate, or pops the pawn up on a
+/// hard landing fails the matching case. A far, idle bystander (seat 1, a distinct team)
+/// keeps the match Live across the arc but never moves, fires, or self-damages (it lands
+/// at impact `0` every tick). All other tuning is [`Rules::default`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallDamageCase {
+    pub label: String,
+    pub gravity: i32,
+    pub fall_damage: u16,
+    pub fall_damage_threshold: i32,
+    /// The upward velocity imparted at launch — a fixed [`JUMP_VELOCITY`] self-jump or a
+    /// higher knockback-boosted pop; the source of the variable fall height.
+    pub launch_z_vel: i32,
+    pub start_health: u16,
+    /// The downward velocity magnitude at the landing tick (`-z_vel` just before the snap
+    /// to ground) — the quantity the threshold gates.
+    pub impact_speed: i32,
+    /// Health the landing removed: `0` below the threshold or with the feature off,
+    /// `fall_damage` clamped to the pawn's remaining HP for a hard landing.
+    pub damage: u16,
+    /// Whether the pawn survived the landing (`false` iff a lethal landing downed it).
+    pub landed_alive: bool,
+    /// Ticks from launch to landing — pins the integration arc bit-for-bit.
+    pub ticks_aloft: u16,
+}
+
 /// A pinned z-coupled-combat case: a shot fired DEAD-ON in the plane (the target is
 /// in range, in front, and on a clear sightline) at a target at elevation `target_z`,
 /// under a given weapon `mode` and [`Rules::vertical_hit_tolerance`], and the damage
@@ -3627,6 +3663,11 @@ pub struct ParityVectors {
     /// holds at its step origin), so pawns are obstacles to one another in the shared
     /// slide path — walk, dash, and shove alike.
     pub pawn_collisions: Vec<PawnCollisionCase>,
+    /// fall-damage cases (domain v12): a landing whose downward impact speed exceeds
+    /// [`Rules::fall_damage_threshold`] deals [`Rules::fall_damage`] through the shared HP
+    /// sink (no upward bounce), gated on `fall_damage > 0` — the threshold keeps a normal
+    /// self-jump safe while a knockback-boosted launch lands hard enough to hurt.
+    pub fall_damage: Vec<FallDamageCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3930,6 +3971,53 @@ fn pawn_collision_case(label: &str, start: Vec2, move_dir: Vec2, max_speed: i32,
     m.step(&intents);
     let end = m.pawns[0].pos;
     PawnCollisionCase { label: label.to_string(), start, move_dir, max_speed, obstacle, pawn_radius, end, blocked: end == start }
+}
+
+/// Build a fall-damage case: launch seat 0 with `launch_z_vel` under `gravity`, then
+/// `step` (no intents) until it lands, recording the landing impact and what damage it
+/// took. Seat 1 is a far idle bystander on a distinct team so the match stays Live across
+/// the arc (a lone-pawn match would end after one step and freeze the integration).
+fn fall_damage_case(label: &str, gravity: i32, fall_damage: u16, fall_damage_threshold: i32, launch_z_vel: i32, start_health: u16) -> FallDamageCase {
+    let rules = Rules { gravity, fall_damage, fall_damage_threshold, start_health, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[1].pos = Vec2 { x: 30_000, y: 0 }; // far, idle — never perceived, shot, or self-damaged
+    m.pawns[0].z_vel = launch_z_vel; // launch the faller (a jump or a knockback-boosted pop)
+    let before = m.pawns[0].health;
+    let no_intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    let mut impact_speed = 0i32;
+    let mut ticks_aloft = 0u16;
+    // Step until the faller returns to the ground. The impact speed is the downward
+    // velocity it ENTERED the landing tick with (read before `step` snaps it to 0). The
+    // cap is a safety bound far above any real arc (~2·launch/gravity ticks); max_ticks
+    // (3600) would end the match first if a case were ever misparameterized, so this never
+    // spins on a non-landing pawn.
+    while ticks_aloft < 10_000 {
+        let pre_z_vel = m.pawns[0].z_vel;
+        let airborne = m.pawns[0].z != 0 || m.pawns[0].z_vel != 0;
+        m.step(&no_intents);
+        ticks_aloft += 1;
+        if airborne && m.pawns[0].z == 0 {
+            impact_speed = pre_z_vel.saturating_neg();
+            break;
+        }
+        if !airborne {
+            break; // never launched (launch_z_vel <= 0) — defensive; unused by the set
+        }
+    }
+    FallDamageCase {
+        label: label.to_string(),
+        gravity,
+        fall_damage,
+        fall_damage_threshold,
+        launch_z_vel,
+        start_health,
+        impact_speed,
+        damage: before - m.pawns[0].health,
+        landed_alive: m.pawns[0].alive,
+        ticks_aloft,
+    }
 }
 
 /// Build a z-coupled-combat case: place shooter (seat 0) at the origin facing east
@@ -4416,6 +4504,30 @@ pub fn parity_vectors() -> ParityVectors {
                 // A radius set with the body well off the path does NOT impede the mover — only
                 // proximity to a body refuses a step, the radius alone never freezes movement.
                 pawn_collision_case("radius_set_far_obstacle_free", Vec2::ZERO, east, 1_000, Vec2 { x: 40_000, y: 0 }, 2_000),
+            ]
+        },
+        fall_damage: {
+            // gravity 600 gives short, exact arcs: a JUMP_VELOCITY (1200) self-jump lands
+            // at impact 1200 in 5 ticks; a knockback-boosted 6000 launch lands at impact
+            // 6000 in 21 ticks. A threshold of 3000 sits cleanly between them — so the
+            // self-jump is safe and only the boosted fall hurts under the SAME tuning.
+            const G: i32 = 600;
+            vec![
+                // The NON-DEGENERATE guarantee: a fixed-impulse self-jump lands below the
+                // threshold, so a normal hop is never punished though fall damage is ON.
+                fall_damage_case("self_jump_under_threshold_safe", G, 30, 3_000, JUMP_VELOCITY, 100),
+                // Its twin: a knockback-boosted launch lands HARDER (impact 6000 > 3000)
+                // and takes the damage — the variable fall height the threshold reads.
+                fall_damage_case("boosted_landing_over_threshold_hurts", G, 30, 3_000, 6_000, 100),
+                // Off by default: fall_damage 0 harms nothing even on the hardest landing —
+                // the byte-identity gate (a pre-feature match is unchanged).
+                fall_damage_case("fall_damage_off_no_harm", G, 0, 0, 6_000, 100),
+                // Threshold 0: every landing with non-zero impact hurts, so even the soft
+                // self-jump now takes damage — proving the threshold is what spares a hop.
+                fall_damage_case("threshold_zero_soft_landing_hurts", G, 15, 0, JUMP_VELOCITY, 100),
+                // Lethal: a hard landing dealing more than the remaining HP downs the pawn,
+                // clamped through the shared sink — fall damage can kill, not just chip.
+                fall_damage_case("lethal_landing_downs_pawn", G, 200, 3_000, 6_000, 100),
             ]
         },
         matches: vec![
