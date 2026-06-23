@@ -6818,6 +6818,159 @@ mod tests {
         assert_eq!(edge.pawns[0].pos, Vec2 { x: 2500, y: 0 }, "a wall_slide move still clamps to the arena bound");
     }
 
+    /// A 3-seat match wired for an occupancy shove: a shooter (seat 0) at the origin
+    /// facing east, a target (seat 1) point-blank east, and an obstacle (seat 2) exactly
+    /// one shove-length (`knockback_horizontal`) behind the target. No jitter, so the
+    /// geometry is exact — the shove lands the survivor on the obstacle's cell unless
+    /// occupancy refuses it.
+    fn occupancy_shove_match(pawn_radius: i32) -> Match {
+        let rules = Rules { knockback_horizontal: 2000, pawn_radius, spawn_jitter: 0, ..Default::default() };
+        let roster = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
+            SeatInfo { seat: 1, team: 1, controller: "0xbbbb".into() },
+            SeatInfo { seat: 2, team: 1, controller: "0xcccc".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, roster, Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+        m.pawns[2].pos = Vec2 { x: 3500, y: 0 };
+        m
+    }
+
+    #[test]
+    fn occupancy_clamps_the_directional_shove() {
+        // The directional knockback shove goes through slide, so occupancy gates it like
+        // a walk: a hit that would shove the survivor onto another pawn's body is refused
+        // (the survivor holds), where with occupancy off the same shove overlaps the body.
+        // Pins that knock_back_horizontal skips the SHOVED seat (not the shooter) and that
+        // the obstacle body is what blocks it — the FM2 residual this task closes.
+        let mut off = occupancy_shove_match(0);
+        off.resolve_fire(0);
+        assert!(off.pawns[1].alive && off.pawns[1].health < 100, "the shot hits and the target survives to be shoved");
+        assert_eq!(off.pawns[1].pos, Vec2 { x: 3500, y: 0 }, "occupancy off: the survivor is shoved onto the obstacle's cell (overlap)");
+
+        let mut on = occupancy_shove_match(1000);
+        on.resolve_fire(0);
+        assert!(on.pawns[1].alive, "the target still survives with occupancy on");
+        assert_eq!(on.pawns[1].pos, Vec2 { x: 1500, y: 0 }, "occupancy on: the shove into the body is refused — the survivor holds, no overlap");
+        assert_eq!(on.pawns[2].pos, Vec2 { x: 3500, y: 0 }, "the obstacle itself is unmoved (it is not the shoved seat)");
+    }
+
+    #[test]
+    fn occupancy_clamps_the_dash_burst() {
+        // The dash burst also routes through slide, so occupancy stops a dash INTO a body:
+        // seat 0 walks, then its dash sweep into the obstacle is refused (it holds at the
+        // post-walk position), where with occupancy off the dash lands past — onto/through
+        // the body. The swept dash cannot tunnel a pawn any more than it can a wall.
+        let dash = |pawn_radius: i32| {
+            let rules = Rules { dash_cooldown: 5, pawn_radius, spawn_jitter: 0, ..Default::default() };
+            let cfg = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 };
+            let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), Vec::new(), 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[1].pos = Vec2 { x: 3000, y: 0 }; // a body DASH_DISTANCE-ish ahead
+            m
+        };
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+
+        // Off: walk to (200,0), then the dash burst sweeps east past the body and lands.
+        let mut off = dash(0);
+        step_with(&mut off, &[(0, dash_intent(east))]);
+        assert!(off.pawns[0].pos.x > 3000, "occupancy off: the dash sweeps through the body's cell and lands beyond it");
+
+        // On: walk to (200,0), then the dash sweep into the body at 3 m is refused -> hold.
+        let mut on = dash(1000);
+        step_with(&mut on, &[(0, dash_intent(east))]);
+        assert_eq!(on.pawns[0].pos, Vec2 { x: 200, y: 0 }, "occupancy on: the dash into the body is refused — only the walk applied");
+        assert!(on.pawns[0].pos.x < on.pawns[1].pos.x, "the dashing pawn stayed on the near side of the body (no tunnel)");
+    }
+
+    #[test]
+    fn a_set_radius_never_freezes_a_lone_mover() {
+        // FM2 (no self-block): a pawn's OWN body is never an obstacle to its own move, so
+        // even a 10 m radius — with the only other pawn parked far off — leaves the mover
+        // free; it advances tick-for-tick exactly as with occupancy off. A core that
+        // counted the mover's own cell would dead-stop every pawn in place.
+        let lone = |pawn_radius: i32| {
+            let rules = Rules { pawn_radius, spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[1].pos = Vec2 { x: 40 * POSITION_SCALE, y: 0 }; // parked far off the path
+            m
+        };
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+        let mut off = lone(0);
+        let mut on = lone(10_000);
+        for _ in 0..5 {
+            step_with(&mut off, &[(0, intent(east, EAST, false))]);
+            step_with(&mut on, &[(0, intent(east, EAST, false))]);
+        }
+        assert!(on.pawns[0].pos.x > 0, "the mover advanced — it is NOT frozen by its own body");
+        assert_eq!(on.pawns[0].pos, off.pawns[0].pos, "a lone mover with a huge radius advances exactly as with occupancy off");
+    }
+
+    #[test]
+    fn occupancy_is_deterministic_across_runs() {
+        // FM1 (determinism/parity): occupancy reads integer positions in fixed seat order,
+        // so the same occupancy match reproduces bit-for-bit. Two pawns walk toward each
+        // other and hard-stop before contact; a second identical run lands byte-for-byte
+        // the same, and the bodies never coincide.
+        let run = || {
+            let rules = Rules { pawn_radius: 1000, spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            m.pawns[0].pos = Vec2 { x: -3000, y: 0 };
+            m.pawns[1].pos = Vec2 { x: 3000, y: 0 };
+            let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+            let west = Vec2 { x: -MOVE_INTENT_SCALE, y: 0 };
+            for _ in 0..40 {
+                step_with(&mut m, &[(0, intent(east, EAST, false)), (1, intent(west, EAST, false))]);
+            }
+            (m.pawns[0].pos, m.pawns[1].pos)
+        };
+        let (a, b) = (run(), run());
+        assert_eq!(a, b, "the occupancy match reproduces bit-for-bit across runs");
+        assert!(!within(a.0, a.1, 1000), "the two pawns hard-stopped without their bodies overlapping");
+    }
+
+    #[test]
+    fn occupancy_composes_with_a_wall_and_bounds_without_tunneling() {
+        // FM4 (clamp composition): occupancy stacks with the static-blocker clamp without
+        // either masking the other. A long step toward a wall with a pawn in front of it
+        // is refused by the NEARER body and never tunnels past it; a body alone, a wall
+        // alone, and both together each refuse the step, while clearing both lets the same
+        // step land (bounds-clamped). A fully-blocked move is a no-op — the pawn holds.
+        let pawn = Vec2 { x: 3000, y: 0 };
+        let wall = Blocker { min: Vec2 { x: 5000, y: -2000 }, max: Vec2 { x: 5500, y: 2000 }, height: 0 };
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+        let mk = |blockers: Vec<Blocker>, park_obstacle: bool| {
+            let rules = Rules { max_speed: 10_000, pawn_radius: 1000, spawn_jitter: 0, ..Default::default() };
+            let cfg = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 };
+            let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), blockers, 1);
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[1].pos = if park_obstacle { Vec2 { x: 40_000, y: 0 } } else { pawn };
+            m
+        };
+        let step1 = |m: &mut Match| step_with(m, &[(0, intent(east, EAST, false))]);
+
+        // Both a near pawn (3 m) and a far wall (5 m) on a 10 m path -> held at the origin.
+        let mut both = mk(vec![wall], false);
+        step1(&mut both);
+        assert_eq!(both.pawns[0].pos, Vec2::ZERO, "a step into a pawn-in-front-of-a-wall is refused — no tunnel past the nearer body");
+        // The pawn body alone refuses it (the wall is not doing the work).
+        let mut body_only = mk(Vec::new(), false);
+        step1(&mut body_only);
+        assert_eq!(body_only.pawns[0].pos, Vec2::ZERO, "the pawn body alone refuses the step");
+        // The wall alone refuses it (occupancy is not doing the work).
+        let mut wall_only = mk(vec![wall], true);
+        step1(&mut wall_only);
+        assert_eq!(wall_only.pawns[0].pos, Vec2::ZERO, "the wall alone refuses the step");
+        // Neither obstacle: the same 10 m step lands (clamped in-bounds) — composition adds
+        // no spurious block.
+        let mut neither = mk(Vec::new(), true);
+        step1(&mut neither);
+        assert_eq!(neither.pawns[0].pos, Vec2 { x: 10_000, y: 0 }, "with both obstacles gone the 10 m step lands");
+    }
+
     #[test]
     fn ingest_accepts_well_formed_and_clamps_overlong_move() {
         let m = new_match(1);
