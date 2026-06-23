@@ -20,6 +20,12 @@ def _factions_from_usd(text: str) -> list[str]:
     return m.group(1).split(",") if m.group(1) else []
 
 
+def _must_not_from_usd(text: str) -> list[str]:
+    m = re.search(r'intent:must_not\s*=\s*"([^"]*)"', text)
+    assert m, "emitted director USD has no intent:must_not"
+    return m.group(1).split(",") if m.group(1) else []
+
+
 def test_roster_is_deterministic_no_hash_salt():
     # hashlib, not the per-process-salted builtin hash(), so the roster survives a
     # fresh interpreter — a pipeline re-run reproduces the layer byte-for-byte.
@@ -73,6 +79,21 @@ async def test_emitted_layer_carries_the_roster(tmp_path, monkeypatch):
     layer = await director.run(brief, [])
     text = (tmp_path / "layers" / layer.path).read_text()
     assert _factions_from_usd(text) == director._faction_roster(brief.region.region_id)
+
+
+@pytest.mark.asyncio
+async def test_emitted_layer_carries_parse_safe_must_not(tmp_path, monkeypatch):
+    # biome parses intent:must_not with the same quoted-CSV regex npc uses for factions,
+    # so the seeded constraint must be non-empty and parse-safe bare identifiers — a token
+    # carrying a comma/quote/whitespace would be split or truncated on read, silently
+    # corrupting the director->biome cap hand-off. Pin the vocabulary parse-safe at the
+    # source, the sibling of test_factions_are_parse_safe_identifiers.
+    monkeypatch.chdir(tmp_path)
+    brief = WorldBrief(biome="forest", region=RegionCoord(x=3, y=7))
+    layer = await director.run(brief, [])
+    tokens = _must_not_from_usd((tmp_path / "layers" / layer.path).read_text())
+    assert tokens  # a non-empty constraint
+    assert all(re.fullmatch(r"[a-z][a-z_]*", t) for t in tokens)
 
 
 @pytest.mark.asyncio
