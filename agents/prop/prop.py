@@ -136,13 +136,44 @@ def _required_assets(tokens: list[str]) -> list[str]:
     return assets
 
 
+def _required_block(assets: list[str]) -> str:
+    """The guaranteed hero placements as root ``Xform`` prims, or ``""`` when there are
+    none — so a region with no director must_have emits a layer byte-identical to the
+    hash-only fill (the back-compat floor the existing tests pin). Prims are INDEX-named
+    (``Required_0`` …): an asset name is not guaranteed a unique/valid prim identifier,
+    and indexing keeps the layer well-formed even if two tokens resolve to the same
+    asset. Each carries the asset BOTH as a ``references`` arc (real geometry the
+    optimizer budgets) and a parseable ``requiredAsset`` attribute, and sits beside the
+    fill ``PointInstancer`` as a sibling root prim (compose sublayers by path, so extra
+    roots compose cleanly via LIVRPS)."""
+    if not assets:
+        return ""
+    prims = "\n\n".join(
+        f'''def Xform "Required_{idx}" (
+    references = @../../assets/library/props/{asset}.usd@
+)
+{{
+    custom string requiredAsset = {usd_str(asset)}
+    double3 xformOp:translate = (0, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+}}'''
+        for idx, asset in enumerate(assets)
+    )
+    return "\n" + prims + "\n"
+
+
 async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
     rel = f"prop/{brief.region.region_id}.usda"
     full = Path("layers") / rel
     full.parent.mkdir(parents=True, exist_ok=True)
     count = _placement_count(brief.region.region_id)
-    asset = _select_asset(brief.region.region_id)
-    tris = count * _asset_tris(asset)
+    fill_asset = _select_asset(brief.region.region_id)
+    required = _required_assets(_must_have_from_director(prior))
+    # Every placed asset is metered: the hash-selected scatter (count instances) plus
+    # one of each director-required hero. Summing them into the single triangles metric
+    # keeps the optimizer's budget honest — a must-have placed in the USD but unmetered
+    # would hide geometry the validator's budget sum must see.
+    tris = count * _asset_tris(fill_asset) + sum(_asset_tris(asset) for asset in required)
     full.write_text(
         f"""#usda 1.0
 (
@@ -151,23 +182,26 @@ async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
 
 def PointInstancer "Props"
 {{
-    custom string propAsset = {usd_str(asset)}
+    custom string propAsset = {usd_str(fill_asset)}
     custom int placementCount = {count}
 
     def Xform "Prototype" (
-        references = @../../assets/library/props/{asset}.usd@
+        references = @../../assets/library/props/{fill_asset}.usd@
     )
     {{
         double3 xformOp:translate = (0, 0, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }}
 }}
-"""
+{_required_block(required)}"""
     )
+    summary = f"{count} × {fill_asset}"
+    if required:
+        summary += f" + must-have {', '.join(required)}"
     return LayerSpec(
         specialist="prop",
         region_id=brief.region.region_id,
         path=rel,
-        summary=f"{count} × {asset}",
+        summary=summary,
         metrics={"triangles": float(tris)},
     )
