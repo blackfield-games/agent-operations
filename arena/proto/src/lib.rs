@@ -516,6 +516,228 @@ pub fn clamp_parity_vectors() -> ClampParityVectors {
     }
 }
 
+/// Which side of the Gateway emits a [`FrameCase`], so a consumer knows whether to
+/// decode it as a [`GatewayMsg`] (server→agent) or an [`AgentMsg`] (agent→server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameDirection {
+    ServerToAgent,
+    AgentToServer,
+}
+
+/// One canonical Gateway wire FRAME: the exact serde-JSON a real [`GatewayMsg`] /
+/// [`AgentMsg`] value serializes to, tagged with the `direction` that emits it. The
+/// `frame` comes from `serde_json::to_value` of a live message (never hand-written),
+/// so it IS the reference wire shape in data form — the committed golden
+/// (`tests/frame_parity.json`) cannot silently drift from the types it pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameCase {
+    pub label: String,
+    pub direction: FrameDirection,
+    /// `true` when a decode→re-encode reproduces `frame` byte-for-byte. `false` ONLY
+    /// for the back-compat frames that OMIT an optional field (`Start.blockers` /
+    /// `Start.pickup_points`, `Blocker.height`): decoding fills the `serde(default)`,
+    /// so re-encoding adds the field back and cannot reproduce the omitted input. A
+    /// consumer asserts an exact re-encode when `true`, the documented default when
+    /// `false`.
+    pub exact_reencode: bool,
+    pub frame: serde_json::Value,
+}
+
+/// The versioned, canonical cross-implementer Gateway wire-FRAME parity set: one
+/// representative of EACH server→agent [`GatewayMsg`] variant and each agent→server
+/// [`AgentMsg`] frame, plus the back-compat omitted-field Start/Blocker cases. Every
+/// `frame` is `serde_json::to_value` of a real message value (the omit cases then
+/// drop the optional key), so the set is the reference wire in data form. The
+/// sibling of [`ClampParityVectors`] for the OTHER hand-duplicated cross-impl
+/// surface — the wire frames themselves. Pure integer + UUID + fixed strings, so it
+/// is byte-stable on every platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameParityVectors {
+    pub domain: String,
+    pub protocol_version: u32,
+    pub match_id: String,
+    pub frames: Vec<FrameCase>,
+}
+
+/// Domain tag for [`frame_parity_vectors`]. Bump only on a deliberate wire-frame
+/// convention change (a renamed tag, a re-flattened variant, a new required field) —
+/// the signal both implementers re-pin against.
+const FRAME_PARITY_DOMAIN: &str = "blackfield/arena/frame-parity/v1";
+
+/// The fixed match id every parity frame carries, so the golden is byte-stable (no
+/// random UUID); the same value the in-crate wire-shape tests use.
+const PARITY_MATCH_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+/// A fixed placeholder [`MatchResult::replay_hash`] for the `end` frame — a 64-char
+/// lowercase-hex constant, NOT a live [`ReplayRecord::digest`]. This golden pins the
+/// wire SHAPE, not the digest VALUE, so a digest-version bump (which changes the hash
+/// but never the frame layout) must not flap the frame gate.
+const PARITY_REPLAY_HASH: &str =
+    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+/// The canonical cross-implementer Gateway wire-FRAME parity vectors: one
+/// representative of every server→agent [`GatewayMsg`] and agent→server [`AgentMsg`]
+/// frame, each emitted straight from a real message value, so the set is the
+/// reference wire in data form. The Rust drift-gate (`tests/frame_parity.rs`) and the
+/// Python SDK conformance test (`agents/test_arena_client.py`) load the SAME
+/// committed golden, so a wire-shape drift on EITHER side breaks loud against one
+/// source of truth — the cross-implementer pin the hand-duplicated frames could not
+/// give. The [`clamp_parity_vectors`] analogue for the frame layer.
+///
+/// Plan-gate (recorded): ONE representative per variant, NOT an exhaustive
+/// field-value matrix. This golden pins each variant's wire SHAPE — the internal
+/// `type` tag, the newtype flattening (`observe`/`act`/`end`), and the back-compat
+/// field defaults — which is a per-variant property; the discriminating field-VALUE
+/// coverage already lives in [`clamp_parity_vectors`] (the move clamp) and the
+/// per-field `extra=forbid` / hidden-state wire tests on both sides. A full field
+/// matrix here would duplicate those and bloat a golden whose job is shape parity.
+pub fn frame_parity_vectors() -> FrameParityVectors {
+    let mid: MatchId = PARITY_MATCH_ID.parse().expect("PARITY_MATCH_ID is a valid UUID");
+    let config =
+        MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 8 };
+    let observation = Observation {
+        protocol_version: PROTOCOL_VERSION,
+        match_id: mid,
+        seat: 0,
+        tick: 128,
+        phase: MatchPhase::Live,
+        deadline_micros: 50_000,
+        own: SelfState {
+            seat: 0,
+            team: 1,
+            position: Vec2::ZERO,
+            z: 0,
+            facing: 0x4000,
+            velocity: Vec2::ZERO,
+            health: 100,
+            max_health: 100,
+            shield: 40,
+            ammo: 30,
+            cooldown: 5,
+            dash_cooldown: 3,
+            alive: true,
+        },
+        visible: vec![VisibleEntity {
+            entity_id: 7,
+            kind: EntityKind::Player,
+            team: 2,
+            position: Vec2 { x: 1000, y: -2000 },
+            z: 0,
+            facing: 0x4000,
+            in_line_of_sight: true,
+        }],
+    };
+    let action = Action {
+        protocol_version: PROTOCOL_VERSION,
+        match_id: mid,
+        seat: 3,
+        tick: 128,
+        intent: ActionIntent {
+            move_dir: Vec2 { x: 600, y: 800 },
+            aim: 0x4000,
+            buttons: ActionButtons { fire: true, jump: false, ability: false, reload: false },
+        },
+    };
+    let result = MatchResult {
+        protocol_version: PROTOCOL_VERSION,
+        match_id: mid,
+        final_tick: 2,
+        outcomes: vec![
+            SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true },
+            SeatOutcome { seat: 1, team: 2, placement: 2, score: 1, alive_at_end: false },
+        ],
+        replay_hash: PARITY_REPLAY_HASH.to_string(),
+    };
+
+    let sv = |m: &GatewayMsg| serde_json::to_value(m).expect("GatewayMsg serializes to a value");
+    let av = |m: &AgentMsg| serde_json::to_value(m).expect("AgentMsg serializes to a value");
+    let case =
+        |label: &str, direction, exact_reencode, frame| FrameCase { label: label.to_string(), direction, exact_reencode, frame };
+    use FrameDirection::{AgentToServer, ServerToAgent};
+
+    let mut frames = vec![
+        case(
+            "challenge",
+            ServerToAgent,
+            true,
+            sv(&GatewayMsg::Challenge { nonce: "0a1b2c3d4e5f60718293a4b5c6d7e8f9".into() }),
+        ),
+        case(
+            "welcome",
+            ServerToAgent,
+            true,
+            sv(&GatewayMsg::Welcome { protocol_version: PROTOCOL_VERSION, match_id: mid, seat: 2 }),
+        ),
+        case("reject", ServerToAgent, true, sv(&GatewayMsg::Reject { reason: "version mismatch".into() })),
+        case(
+            "start_populated",
+            ServerToAgent,
+            true,
+            sv(&GatewayMsg::Start {
+                match_id: mid,
+                config,
+                blockers: vec![Blocker {
+                    min: Vec2 { x: -1000, y: -2000 },
+                    max: Vec2 { x: 1000, y: 2000 },
+                    height: 2000,
+                }],
+                pickup_points: vec![Vec2 { x: 1500, y: 0 }, Vec2 { x: -1500, y: 0 }],
+            }),
+        ),
+        case("observe", ServerToAgent, true, sv(&GatewayMsg::Observe(observation))),
+        case("end", ServerToAgent, true, sv(&GatewayMsg::End(result))),
+        case(
+            "join",
+            AgentToServer,
+            true,
+            av(&AgentMsg::Join {
+                protocol_version: PROTOCOL_VERSION,
+                agent_id: "0xabcdef1234567890abcdef1234567890abcdef12".into(),
+                signature_hex: "0xcafe".into(),
+            }),
+        ),
+        case("act", AgentToServer, true, av(&AgentMsg::Act(action))),
+        case("leave", AgentToServer, true, av(&AgentMsg::Leave { reason: "forfeit".into() })),
+    ];
+
+    // Back-compat omit frames: a real value serialized, then the optional key
+    // dropped, so an OLDER server's frame (or a no-occluder/no-pickup match) is
+    // pinned. serde(default) fills the gap on decode — and a future required-field
+    // change reddens both implementers' decode of these exact frames.
+    let mut start_legacy = sv(&GatewayMsg::Start {
+        match_id: mid,
+        config,
+        blockers: Vec::new(),
+        pickup_points: Vec::new(),
+    });
+    {
+        let o = start_legacy.as_object_mut().expect("start frame is a json object");
+        o.remove("blockers");
+        o.remove("pickup_points");
+    }
+    frames.push(case("start_legacy_omits_optional_fields", ServerToAgent, false, start_legacy));
+
+    let mut start_no_height = sv(&GatewayMsg::Start {
+        match_id: mid,
+        config,
+        blockers: vec![Blocker { min: Vec2 { x: 0, y: 0 }, max: Vec2 { x: 500, y: 500 }, height: 0 }],
+        pickup_points: vec![Vec2 { x: 1500, y: 0 }],
+    });
+    {
+        let blockers = start_no_height["blockers"].as_array_mut().expect("blockers is a json array");
+        blockers[0].as_object_mut().expect("blocker is a json object").remove("height");
+    }
+    frames.push(case("start_blocker_omits_height", ServerToAgent, false, start_no_height));
+
+    FrameParityVectors {
+        domain: FRAME_PARITY_DOMAIN.to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        match_id: PARITY_MATCH_ID.to_string(),
+        frames,
+    }
+}
+
 /// One agent action, bound to the tick it answers.
 ///
 /// `tick` is the [`Observation`] tick this action responds to, so the server can
