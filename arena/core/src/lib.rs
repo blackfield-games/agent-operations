@@ -1727,12 +1727,15 @@ impl Match {
                     // (shield-first, downs at 0), gated on fall_damage > 0 so the default
                     // match is byte-identical and a self-jump landing under a threshold set
                     // above its speed is unharmed. NOT via damage_pawn: a fall hurts but
-                    // never knocks the pawn back upward. A grounded pawn lands at impact 0,
-                    // never exceeding a >= 0 threshold, so standing still never self-damages.
+                    // never knocks the pawn back upward. Damage requires ACTUAL downward
+                    // motion (impact > 0): a grounded pawn lands at impact 0 every tick and
+                    // is never self-damaged — so even a nonsensical negative threshold can't
+                    // turn standing still into a wound (for a sane threshold >= 0 the
+                    // impact > threshold test already implies impact > 0).
                     let impact = -(self.pawns[i].z_vel as i64);
                     self.pawns[i].z = 0;
                     self.pawns[i].z_vel = 0;
-                    if self.rules.fall_damage > 0 && impact > self.rules.fall_damage_threshold as i64 {
+                    if self.rules.fall_damage > 0 && impact > 0 && impact > self.rules.fall_damage_threshold as i64 {
                         self.apply_hp_damage(i, self.rules.fall_damage);
                     }
                 } else {
@@ -6809,6 +6812,29 @@ mod tests {
         drop_to_landing(&mut m);
         assert_eq!(m.pawns[0].shield, 20, "the 30-damage landing drained the shield pool first (50 -> 20)");
         assert_eq!(m.pawns[0].health, health_before, "health is untouched while the shield absorbs the fall");
+    }
+
+    #[test]
+    fn a_negative_threshold_never_self_damages_a_grounded_pawn() {
+        // Defensive (mirrors negative_gravity_is_inert): fall damage requires actual
+        // downward motion (impact > 0), so even a nonsensical NEGATIVE threshold — which
+        // `impact > threshold` alone would let a standing pawn (impact 0) cross every tick —
+        // never harms a pawn that isn't falling.
+        let mut grounded = fall_match(600, 40, -1, 0);
+        let start = grounded.pawns[0].health;
+        for _ in 0..10 {
+            step_with(&mut grounded, &[]); // stand still on the ground
+        }
+        assert!(
+            grounded.pawns.iter().all(|p| p.health == start && p.alive),
+            "a standing pawn never self-damages, even at a negative threshold"
+        );
+        // ...yet a REAL fall under the same negative threshold still hurts — the gate is
+        // impact > 0, not the threshold being unreachable.
+        let mut falling = fall_match(600, 40, -1, 0);
+        falling.pawns[0].z_vel = 6_000;
+        drop_to_landing(&mut falling);
+        assert!(falling.pawns[0].health < start, "a real fall still takes damage under a negative threshold");
     }
 
     /// A two-seat match with the dash enabled at `dash_cooldown`, no spawn jitter, in
