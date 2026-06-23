@@ -89,6 +89,53 @@ def _select_asset(region_id: str) -> str:
     return assets[idx]
 
 
+def _must_have_from_director(prior: list[LayerSpec]) -> list[str]:
+    """The hero assets the director marked ``intent:must_have`` for this region, parsed
+    off the director layer as bare intent tokens (the [`npc._roster_from_director`]
+    idiom). Empty when the director contributed no layer (it failed/timed out — prop
+    then places only the hash fill) or its layer predates must_have. DEGRADES to empty
+    rather than raising on a missing/unreadable layer: a raise would make the supervisor
+    isolate prop as an empty sublayer, dropping the region's fill AND its hero assets
+    over a director hiccup. The tokens are bare identifiers (no escaped quote the simple
+    capture would miss); prop still never trusts a token it can't place — the caller
+    bridges every one through [`_required_assets`]."""
+    director = next((layer for layer in prior if layer.specialist == "director"), None)
+    if director is None:
+        return []
+    path = Path("layers") / director.path
+    if not path.is_file():
+        return []
+    match = re.search(r'intent:must_have\s*=\s*"([^"]*)"', path.read_text())
+    if not match or not match.group(1):
+        return []
+    return [token for token in match.group(1).split(",") if token]
+
+
+def _required_assets(tokens: list[str]) -> list[str]:
+    """The library assets prop must guarantee for `tokens`, bridged through
+    [`MUST_HAVE_ASSET`] in order. A token with NO mapping is SKIPPED with a warning —
+    not raised, and never silently 0-budgeted: an unknown director token is vocabulary
+    drift prop should survive (placing every asset it CAN, logging the gap) rather than
+    isolating its whole layer as empty (the FM3 degrade-don't-raise posture). A MAPPED
+    asset is always budgetable — [`MUST_HAVE_ASSET`] values are a pinned subset of
+    [`ASSET_TRIS`] — so the caller's [`_asset_tris`] never fires on a must-have; that
+    loud guard is reserved for prop's own table going inconsistent, not director input.
+    Order is preserved (no dedup), mirroring [`_must_have_from_director`]; duplicates
+    become distinct, honestly-counted placements."""
+    assets: list[str] = []
+    for token in tokens:
+        asset = MUST_HAVE_ASSET.get(token)
+        if asset is None:
+            logger.warning(
+                "prop: director intent:must_have token %r has no MUST_HAVE_ASSET "
+                "mapping; skipping (region will not get this hero asset)",
+                token,
+            )
+            continue
+        assets.append(asset)
+    return assets
+
+
 async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
     rel = f"prop/{brief.region.region_id}.usda"
     full = Path("layers") / rel
