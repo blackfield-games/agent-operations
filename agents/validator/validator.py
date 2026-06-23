@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from pathlib import Path
 
 from common.types import WorldBrief, LayerSpec, ValidatorVerdict
+from prop import prop
+from biome import biome
 
 STYLE_SIM_THRESHOLD = 0.72
 
@@ -144,6 +147,18 @@ async def run(
         issues.append(message)
         failing.update(specialists)
 
+    # Director-intent gate — close the loop the rest of the pipeline only half-builds:
+    # the director DECLARES hard intent (must_have, must_not) and prop/biome HONOR it,
+    # but nothing VERIFIED they did. Reject a world where prop dropped a must-have asset
+    # it should have placed, or biome left vegetation uncapped under a capping director,
+    # naming the offending specialist so the supervisor routes the fix back. Runs over
+    # the WELL-FORMED layers only: a missing/malformed director, prop, or biome layer is
+    # already rejected + attributed by the gates above, so the intent check simply skips
+    # it (no double-report, no crash) rather than re-deriving that failure (FM3).
+    for specialist, message in _intent_attributions(wellformed, layers_root):
+        issues.append(message)
+        failing.add(specialist)
+
     # style check: TODO call sidecar with brief.style_anchors + rendered preview
     # for now, accept if no other issues
     accepted = len(issues) == 0
@@ -151,6 +166,94 @@ async def run(
     return ValidatorVerdict(
         accepted=accepted, issues=issues, failing_specialists=sorted(failing), terminal=terminal
     )
+
+
+def _director_intent(layers: list[LayerSpec], layers_root: Path, field: str) -> list[str]:
+    """The director's ``intent:<field>`` tokens (``must_have`` / ``must_not``), parsed
+    off the director layer under `layers_root`, or ``[]`` when no director layer
+    contributed or it seeded no such intent.
+
+    Mirrors ``prop._must_have_from_director`` / ``biome._must_not_from_director`` EXACTLY
+    — same regex, same comma split, same empty-token filter — so the gate reads the same
+    tokens the specialists honored, but off the validator's `layers_root` rather than the
+    ``Path("layers")`` those hardcode (the validator is root-relative for testability).
+    Degrades to ``[]`` on an absent/unreadable director layer: the intent gate then does
+    not fire — a missing director is already rejected by the missing-specialist gate — so
+    a director hiccup never raises through the final gate (FM3).
+    """
+    director = next((layer for layer in layers if layer.specialist == "director"), None)
+    if director is None:
+        return []
+    try:
+        text = (layers_root / director.path).read_text()
+    except OSError:
+        return []
+    match = re.search(rf'intent:{field}\s*=\s*"([^"]*)"', text)
+    if not match or not match.group(1):
+        return []
+    return [token for token in match.group(1).split(",") if token]
+
+
+def _layer_text(layers: list[LayerSpec], specialist: str, layers_root: Path) -> str | None:
+    """`specialist`'s on-disk layer text, or ``None`` when its spec is absent or the file
+    can't be read. The intent gate then defers to the missing-specialist / well-formedness
+    gates (which already reject and attribute the layer) instead of re-reporting it or
+    crashing the final gate with a KeyError/OSError (FM3)."""
+    spec = next((layer for layer in layers if layer.specialist == specialist), None)
+    if spec is None:
+        return None
+    try:
+        return (layers_root / spec.path).read_text()
+    except OSError:
+        return None
+
+
+def _intent_attributions(
+    layers: list[LayerSpec], layers_root: Path
+) -> list[tuple[str, str]]:
+    """Director-intent violations as ``(specialist, message)`` pairs over the well-formed
+    layers — the VERIFY half of declare → honor → verify.
+
+    Reuses prop's and biome's OWN mapping helpers — ``prop._required_assets`` (the
+    ``MUST_HAVE_ASSET`` token→asset bridge, which SKIPS an unmappable token exactly as
+    prop does) and ``biome._caps_vegetation`` (the ``MUST_NOT_VEGETATION_CAP``
+    recognizer) — rather than re-deriving the mapping, so a future vocabulary change in a
+    specialist can't desync the gate from what it emits. The gate therefore requires ONLY
+    the assets prop would actually place and the cap ONLY when biome would actually cap: a
+    token prop legitimately skips is absent from ``required`` and never demanded, so a
+    correctly-built world is never false-rejected (FM1). A real violation — a mapped
+    must-have with no Required prim, or a capping director with no ``vegetationCapped``
+    marker — yields a pair naming the offending specialist so route-back targets it (FM2);
+    the message keys off ``intent:must_have`` / ``intent:must_not`` (not the word
+    "director") so the supervisor's text-scan fallback agrees with the structured
+    attribution. No director intent, or a missing/malformed (hence not-well-formed) prop
+    or biome layer, yields no pairs — the world validates exactly as before (FM3).
+    """
+    out: list[tuple[str, str]] = []
+
+    required = prop._required_assets(_director_intent(layers, layers_root, "must_have"))
+    if required:
+        prop_text = _layer_text(layers, "prop", layers_root)
+        if prop_text is not None:
+            placed = Counter(re.findall(r'requiredAsset\s*=\s*"([^"]+)"', prop_text))
+            dropped = sorted(a for a, n in Counter(required).items() if placed[a] < n)
+            if dropped:
+                out.append((
+                    "prop",
+                    f"intent:must_have unmet: prop must place must-have asset(s) {dropped} "
+                    f"but its layer carries no Required prim referencing them",
+                ))
+
+    if biome._caps_vegetation(_director_intent(layers, layers_root, "must_not")):
+        biome_text = _layer_text(layers, "biome", layers_root)
+        if biome_text is not None and not re.search(r"vegetationCapped\s*=\s*true", biome_text):
+            out.append((
+                "biome",
+                "intent:must_not unmet: biome must cap vegetation density (the director's "
+                "intent:must_not forbids dense vegetation) but its layer carries no "
+                "vegetationCapped marker",
+            ))
+    return out
 
 
 def _is_finite_number(value: object) -> bool:
