@@ -1747,8 +1747,20 @@ impl Match {
                     self.pawns[i].z = 0;
                     self.pawns[i].z_vel = 0;
                     if self.rules.fall_damage > 0 && impact > 0 && impact > self.rules.fall_damage_threshold as i64 {
-                        self.apply_hp_damage(i, self.rules.fall_damage);
+                        let dealt = self.apply_hp_damage(i, self.rules.fall_damage);
+                        // A LETHAL hard landing is a kill: if a knockback launched this
+                        // pawn, credit the launcher the fall damage like a weapon down
+                        // (self/friendly excluded). A self-jump or elevated drop carries no
+                        // tag, so an environmental fall still credits no one.
+                        if !self.pawns[i].alive {
+                            self.credit_fall_kill(i, dealt);
+                        }
                     }
+                    // Grounded again: clear the launch tag so a later self-jump fall (or any
+                    // unprovoked landing) credits no one. Runs every grounded tick — a pawn
+                    // standing still re-enters this branch with impact 0 — a no-op when the
+                    // tag is already clear.
+                    self.pawns[i].launched_by = None;
                 } else {
                     self.pawns[i].z = nz as i32;
                     self.pawns[i].z_vel = self.pawns[i].z_vel.saturating_sub(self.rules.gravity);
@@ -1879,6 +1891,27 @@ impl Match {
             self.pawns[idx].launched_by = Some(attacker);
         }
         effective
+    }
+
+    /// Credit a LETHAL fall to the seat whose knockback launched the victim — the
+    /// fall-death attribution rule. A knockback-into-a-lethal-landing scores for the
+    /// launcher exactly like a weapon down: it adds the effective fall damage `dealt` to
+    /// the launcher's score, with the SAME self/friendly exclusion the weapon paths use —
+    /// a launcher on the victim's team is never rewarded, and a self-launch (trivially
+    /// same-team) is excluded by that one check. A no-op when the victim carries no launch
+    /// tag (a self-jump or elevated drop, so an unprovoked fall still credits no one) or
+    /// the launcher has left the roster. Mirrors resolve_fire / resolve_melee / the
+    /// projectile sink: the same `dealt as i32`, the same team gate.
+    fn credit_fall_kill(&mut self, victim: usize, dealt: u16) {
+        let Some(launcher) = self.pawns[victim].launched_by else {
+            return;
+        };
+        let victim_team = self.pawns[victim].team;
+        if let Some(p) = self.pawns.iter_mut().find(|p| p.seat == launcher) {
+            if p.team != victim_team {
+                p.score += dealt as i32;
+            }
+        }
     }
 
     /// Apply the planar knockback shove to a SURVIVING target that just took a damaging
