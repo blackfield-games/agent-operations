@@ -135,25 +135,70 @@ fn frame_parity_pins_the_wire_conventions() {
         other => panic!("expected Start, got {other:?}"),
     }
 
-    // One representative of EVERY variant is present (per-variant completeness): the
-    // plan-gate guarantee that no server→agent or agent→server frame is unpinned.
-    let tags = |dir: FrameDirection| -> BTreeSet<&str> {
-        v.frames
-            .iter()
-            .filter(|c| c.direction == dir)
-            .map(|c| c.frame["type"].as_str().expect("every frame carries a string type tag"))
-            .collect()
-    };
+    // Every match_id-carrying frame uses the one fixed parity id (byte-stability: no
+    // per-frame UUID can sneak in and flap the golden).
+    for c in &v.frames {
+        if let Some(mid) = c.frame.get("match_id") {
+            assert_eq!(mid, &v.match_id, "frame {} carries a foreign match_id", c.label);
+        }
+    }
+
+    // One representative of EVERY variant is present (per-variant completeness). The
+    // tag of each golden frame is computed by the EXHAUSTIVE gateway_tag/agent_tag
+    // match below — adding a GatewayMsg/AgentMsg variant is a COMPILE error there
+    // until it is tagged, which lands you next to the note to add a representative
+    // frame here. The emitted set is built by DECODING each golden frame to its typed
+    // variant and tagging it, so it can never claim a tag the golden does not carry.
+    let mut emitted_server = BTreeSet::new();
+    let mut emitted_agent = BTreeSet::new();
+    for c in &v.frames {
+        match c.direction {
+            FrameDirection::ServerToAgent => {
+                let m: GatewayMsg = serde_json::from_value(c.frame.clone()).unwrap();
+                emitted_server.insert(gateway_tag(&m));
+            }
+            FrameDirection::AgentToServer => {
+                let m: AgentMsg = serde_json::from_value(c.frame.clone()).unwrap();
+                emitted_agent.insert(agent_tag(&m));
+            }
+        }
+    }
     assert_eq!(
-        tags(FrameDirection::ServerToAgent),
+        emitted_server,
         BTreeSet::from(["challenge", "welcome", "reject", "start", "observe", "end"]),
-        "a server→agent GatewayMsg variant is missing from the golden"
+        "a server→agent GatewayMsg variant has no golden frame"
     );
     assert_eq!(
-        tags(FrameDirection::AgentToServer),
+        emitted_agent,
         BTreeSet::from(["join", "act", "leave"]),
-        "an agent→server AgentMsg variant is missing from the golden"
+        "an agent→server AgentMsg variant has no golden frame"
     );
+}
+
+/// The wire tag for each server→agent variant, via an EXHAUSTIVE match (no `_` arm):
+/// adding a [`GatewayMsg`] variant fails to compile HERE until it is given a tag —
+/// the compile-time half of the per-variant completeness guarantee. When you add the
+/// arm you MUST also add a representative frame to `frame_parity_vectors()` and list
+/// its tag in the completeness assert above (a variant present in the type but not the
+/// golden is the silent gap this guard closes).
+fn gateway_tag(m: &GatewayMsg) -> &'static str {
+    match m {
+        GatewayMsg::Challenge { .. } => "challenge",
+        GatewayMsg::Welcome { .. } => "welcome",
+        GatewayMsg::Reject { .. } => "reject",
+        GatewayMsg::Start { .. } => "start",
+        GatewayMsg::Observe(_) => "observe",
+        GatewayMsg::End(_) => "end",
+    }
+}
+
+/// The agent→server twin of [`gateway_tag`] — same exhaustive-match guard.
+fn agent_tag(m: &AgentMsg) -> &'static str {
+    match m {
+        AgentMsg::Join { .. } => "join",
+        AgentMsg::Act(_) => "act",
+        AgentMsg::Leave { .. } => "leave",
+    }
 }
 
 #[test]
