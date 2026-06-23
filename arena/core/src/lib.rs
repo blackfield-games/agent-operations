@@ -6890,6 +6890,182 @@ mod tests {
         assert!(falling.pawns[0].health < start, "a real fall still takes damage under a negative threshold");
     }
 
+    /// Two seats under gravity with a lethal knockback-fall armed: seat 0 the launcher at
+    /// the origin facing east, seat 1 the victim point-blank dead ahead so a fire lands.
+    /// gravity 600 + knockback 6000 pops the victim to an impact-6000 landing (above the
+    /// 3000 threshold) and fall_damage 200 outright downs it. `victim_team` / `friendly_fire`
+    /// arm the self/friendly cases.
+    fn fall_kill_match(victim_team: TeamId, friendly_fire: bool) -> Match {
+        let rules = Rules {
+            gravity: 600,
+            knockback_velocity: 6_000,
+            fall_damage: 200,
+            fall_damage_threshold: 3_000,
+            friendly_fire,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        // A far idle bystander (seat 2, a distinct team) keeps the match Live across the
+        // arc even when the launcher and victim share a team (the friendly case) — without
+        // it a single-team field would end instantly and freeze the integration.
+        let roster = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
+            SeatInfo { seat: 1, team: victim_team, controller: "0xbbbb".into() },
+            SeatInfo { seat: 2, team: 2, controller: "0xcccc".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, roster, Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+        m.pawns[2].pos = Vec2 { x: 30_000, y: 0 };
+        m
+    }
+
+    /// Step with no intents until pawn `who` returns to the ground (the landing tick, where
+    /// a lethal fall credits the launcher, runs inside the final step). Capped far above any
+    /// real arc.
+    fn step_until_landed(m: &mut Match, who: usize) {
+        for _ in 0..10_000 {
+            let airborne = m.pawns[who].z != 0 || m.pawns[who].z_vel != 0;
+            step_with(m, &[]);
+            if !airborne || m.pawns[who].z == 0 {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn a_knockback_fall_credits_the_launcher() {
+        // The headline rule: a hit that launches an enemy to a lethal landing credits the
+        // launcher the fall damage — on TOP of the launching hit — like a weapon down.
+        let mut m = fall_kill_match(1, false);
+        m.resolve_fire(0);
+        assert_eq!(m.pawns[1].launched_by, Some(0), "the launching hit tagged the victim");
+        assert!(m.pawns[1].z_vel > 0 && m.pawns[1].alive, "the victim was popped airborne and survived the hit");
+        let after_hit = m.pawns[0].score;
+        let victim_hp = m.pawns[1].health;
+        step_until_landed(&mut m, 1);
+        assert!(!m.pawns[1].alive, "the boosted launch fell lethally");
+        assert_eq!(
+            m.pawns[0].score - after_hit,
+            victim_hp as i32,
+            "the lethal fall credits the launcher exactly the fall damage dealt"
+        );
+        assert_eq!(m.pawns[1].launched_by, None, "the tag clears when the victim lands");
+    }
+
+    #[test]
+    fn a_self_jump_fall_credits_no_one() {
+        // A self-jump sets z_vel directly (not through damage_pawn), so it carries no launch
+        // tag — a lethal self-jump fall is an environmental death crediting no one.
+        let rules = Rules { gravity: 600, fall_damage: 200, fall_damage_threshold: 0, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        step_with(&mut m, &[(0, jump_press())]);
+        assert!(m.pawns[0].z_vel > 0 && m.pawns[0].launched_by.is_none(), "a self-jump launches without a tag");
+        step_until_landed(&mut m, 0);
+        assert!(!m.pawns[0].alive, "the self-jump fell lethally (threshold 0)");
+        assert!(m.pawns.iter().all(|p| p.score == 0), "an unprovoked fall credits no one");
+    }
+
+    #[test]
+    fn a_re_launch_overwrites_the_launcher() {
+        // A second knockback overwrites the launch tag — the most recent lifter owns the
+        // fall — so a lethal landing credits the re-launcher, not the original launcher.
+        let rules = Rules { gravity: 600, knockback_velocity: 6_000, fall_damage: 200, fall_damage_threshold: 3_000, spawn_jitter: 0, ..Default::default() };
+        let roster = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xa".into() },
+            SeatInfo { seat: 1, team: 1, controller: "0xb".into() },
+            SeatInfo { seat: 2, team: 2, controller: "0xc".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), rules, roster, Vec::new(), 1);
+        m.damage_pawn(1, 10, 0);
+        assert_eq!(m.pawns[1].launched_by, Some(0), "the first hit tags the original launcher");
+        m.damage_pawn(1, 10, 2);
+        assert_eq!(m.pawns[1].launched_by, Some(2), "a re-launch overwrites with the most recent lifter");
+        let victim_hp = m.pawns[1].health;
+        step_until_landed(&mut m, 1);
+        assert!(!m.pawns[1].alive, "the stacked launch fell lethally");
+        assert_eq!(m.pawns[0].score, 0, "the original launcher is NOT credited after the overwrite");
+        assert_eq!(m.pawns[2].score, victim_hp as i32, "the re-launcher is credited the lethal fall");
+    }
+
+    #[test]
+    fn a_land_then_jump_fall_credits_no_one() {
+        // The tag clears on landing: a pawn that survives a knockback-fall, then self-jumps
+        // to its death, credits no one — the original launcher does not own a later fall.
+        let rules = Rules { gravity: 600, knockback_velocity: 6_000, fall_damage: 60, fall_damage_threshold: 1_000, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        m.damage_pawn(1, 1, 0);
+        assert_eq!(m.pawns[1].launched_by, Some(0), "the knockback tagged the launcher");
+        step_until_landed(&mut m, 1);
+        assert!(m.pawns[1].alive, "the first fall is survivable (60 < remaining HP)");
+        assert_eq!(m.pawns[1].launched_by, None, "landing cleared the launch tag");
+        let launcher_score = m.pawns[0].score;
+        step_with(&mut m, &[(1, jump_press())]);
+        step_until_landed(&mut m, 1);
+        assert!(!m.pawns[1].alive, "the self-jump fall finishes the weakened victim");
+        assert_eq!(m.pawns[0].score, launcher_score, "the original launcher is not credited a later self-jump fall");
+    }
+
+    #[test]
+    fn a_self_launch_fall_credits_no_score() {
+        // Defensive: a launcher can never be the victim's own seat through the weapon paths
+        // (a shooter never targets itself), but the team gate (a pawn shares its own team)
+        // excludes a forced self-tag too — a pawn never scores for downing itself.
+        let rules = Rules { gravity: 600, fall_damage: 200, fall_damage_threshold: 1_000, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].z_vel = 6_000;
+        m.pawns[0].launched_by = Some(0);
+        step_until_landed(&mut m, 0);
+        assert!(!m.pawns[0].alive, "the hard landing downed the pawn");
+        assert_eq!(m.pawns[0].score, 0, "a pawn never scores for its own fall");
+    }
+
+    #[test]
+    fn a_same_team_launcher_gets_no_credit() {
+        // Friendly-fire parity: a same-team launch downs the victim all the same, but the
+        // launcher is never rewarded — the friendly hit scored nothing and neither does the
+        // fall it caused.
+        let mut m = fall_kill_match(0, true);
+        m.resolve_fire(0);
+        assert_eq!(m.pawns[1].launched_by, Some(0), "a friendly hit still launches and tags");
+        assert!(m.pawns[1].z_vel > 0, "the friendly knockback lifted the victim");
+        assert_eq!(m.pawns[0].score, 0, "the friendly launching hit scored nothing");
+        step_until_landed(&mut m, 1);
+        assert!(!m.pawns[1].alive, "the friendly launch fell lethally");
+        assert_eq!(m.pawns[0].score, 0, "a same-team launcher is not credited the fall kill");
+    }
+
+    #[test]
+    fn a_lethal_knockback_fall_is_deterministic() {
+        // The attribution path is pure integer + fixed seat order, so two independent runs of
+        // a lethal knockback-fall produce identical healths, scores, alive flags, and tags.
+        let run = || {
+            let mut m = fall_kill_match(1, false);
+            m.resolve_fire(0);
+            step_until_landed(&mut m, 1);
+            m.pawns.iter().map(|p| (p.seat, p.health, p.score, p.alive, p.launched_by)).collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run(), "a lethal-fall match is bit-identical across runs");
+    }
+
+    #[test]
+    fn fall_damage_off_never_credits_a_fall() {
+        // The gate: with fall_damage 0 (the default) a knockback launch lands harmlessly and
+        // credits no one, so a pre-fall-damage match is byte-identical.
+        let rules = Rules { gravity: 600, knockback_velocity: 6_000, fall_damage: 0, fall_damage_threshold: 0, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+        m.resolve_fire(0);
+        assert_eq!(m.pawns[1].launched_by, Some(0), "the hit launched the victim");
+        let after_hit = m.pawns[0].score;
+        step_until_landed(&mut m, 1);
+        assert!(m.pawns[1].alive, "with fall_damage off the landing is harmless");
+        assert_eq!(m.pawns[0].score, after_hit, "no fall, no fall credit");
+    }
+
     /// A two-seat match with the dash enabled at `dash_cooldown`, no spawn jitter, in
     /// the given `bounds` with the given `blockers` — so seat 0 starts at exactly
     /// (-spawn_radius, 0) and seat 1 at (+spawn_radius, 0), and a dash arc is computed
