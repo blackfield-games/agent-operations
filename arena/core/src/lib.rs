@@ -7767,6 +7767,103 @@ mod tests {
         assert_eq!(neither.pawns[0].pos, Vec2 { x: 10_000, y: 0 }, "with both obstacles gone the 10 m step lands");
     }
 
+    // Step the mover (seat 0) once east INTO the obstacle (seat 1) with both elevations set,
+    // and return whether the body refused it (the mover held). gravity 0, so the set z
+    // persists across the step; the planar geometry ALWAYS overlaps the discs (start 3 m,
+    // obstacle 5 m, radius 1.5 m, a 1 m step), so the result isolates the pawn_height band.
+    fn z_blocked(pawn_radius: i32, pawn_height: i32, mover_z: i32, obstacle_z: i32) -> bool {
+        let rules = Rules { max_speed: 1000, pawn_radius, pawn_height, spawn_jitter: 0, ..Default::default() };
+        let cfg = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 };
+        let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].pos = Vec2 { x: 3000, y: 0 };
+        m.pawns[0].z = mover_z;
+        m.pawns[1].pos = Vec2 { x: 5000, y: 0 };
+        m.pawns[1].z = obstacle_z;
+        let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+        let before = m.pawns[0].pos;
+        step_with(&mut m, &[(0, intent(east, EAST, false))]);
+        m.pawns[0].pos == before
+    }
+
+    #[test]
+    fn pawn_bands_overlap_is_inclusive_symmetric_and_disabled_at_zero() {
+        // height 0 DISABLES the band — any separation "overlaps" (the planar default).
+        assert!(pawn_bands_overlap(0, 1_000_000, 0), "height 0 ignores z (planar)");
+        // Inclusive edge: |dz| == height overlaps, |dz| == height + 1 does not.
+        assert!(pawn_bands_overlap(0, 1000, 1000), "|dz| == height is INCLUSIVE");
+        assert!(!pawn_bands_overlap(0, 1001, 1000), "one unit past the band does not overlap");
+        // Symmetric in its two elevations — A blocks B iff B blocks A.
+        for (a, b, h) in [(0, 500, 1000), (-300, 800, 1000), (i32::MIN, i32::MAX, 5)] {
+            assert_eq!(pawn_bands_overlap(a, b, h), pawn_bands_overlap(b, a, h), "the band is symmetric");
+        }
+        // i64-widened: the widest possible separation is computed, never an i32 overflow.
+        assert!(!pawn_bands_overlap(i32::MIN, i32::MAX, i32::MAX), "even a type-wide band is exceeded by the widest gap (no panic)");
+        assert!(pawn_bands_overlap(i32::MAX - 5, i32::MAX, 5), "a 5-unit gap at the top of the range overlaps a 5-unit band");
+    }
+
+    #[test]
+    fn a_low_pawn_is_blocked_and_a_high_one_vaults() {
+        // The core rule: within the band the body blocks (the mover holds), above it the
+        // mover vaults and the step lands — the FM the planar occupancy left open.
+        assert!(z_blocked(1500, 1000, 500, 0), "a low hop (|dz| 500 <= 1000) is blocked by the body");
+        assert!(!z_blocked(1500, 1000, 5000, 0), "a high jump (|dz| 5000 > 1000) vaults the body");
+    }
+
+    #[test]
+    fn the_z_band_edge_is_inclusive() {
+        // |dz| == pawn_height still collides (inclusive, matching within_vertical_tolerance);
+        // one unit beyond clears — the boundary the UE5 twin must reproduce exactly.
+        assert!(z_blocked(1500, 1000, 1000, 0), "|dz| == pawn_height is INCLUSIVE — blocked");
+        assert!(!z_blocked(1500, 1000, 1001, 0), "one unit past the band clears");
+    }
+
+    #[test]
+    fn z_occupancy_is_symmetric_under_role_swap() {
+        // Elevating the OBSTACLE instead of the mover gives the same verdict — the predicate
+        // reads both seats' z, and |dz| is symmetric.
+        for dz in [0, 500, 1000, 1001, 5000] {
+            assert_eq!(
+                z_blocked(1500, 1000, dz, 0),
+                z_blocked(1500, 1000, 0, dz),
+                "role-swap preserves the verdict at |dz| = {dz}"
+            );
+        }
+    }
+
+    #[test]
+    fn z_band_off_is_planar_regardless_of_elevation() {
+        // pawn_height 0 disables the band: a body blocks regardless of z, byte-identical to
+        // the pre-z-occupancy planar occupancy — even a pawn a kilometre up is still stopped.
+        assert!(z_blocked(1500, 0, 0, 0), "planar occupancy blocks at equal z");
+        assert!(z_blocked(1500, 0, 1_000_000, 0), "planar occupancy STILL blocks a high mover (z ignored)");
+        assert!(z_blocked(1500, 0, 0, 1_000_000), "...and a high obstacle too");
+    }
+
+    #[test]
+    fn z_occupancy_is_deterministic_across_runs() {
+        // The z separation is read from integer elevations in fixed seat order, so a z-band
+        // match reproduces bit-for-bit. Two pawns within the band (gravity off, so the set
+        // elevations persist) walk toward each other and hard-stop; a second identical run
+        // lands byte-for-byte the same, bodies never coincident.
+        let run = || {
+            let rules = Rules { pawn_radius: 1000, pawn_height: 1000, spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            m.pawns[0].pos = Vec2 { x: -3000, y: 0 };
+            m.pawns[0].z = 400; // within the 1 m band of seat 1 -> occupancy engages
+            m.pawns[1].pos = Vec2 { x: 3000, y: 0 };
+            m.pawns[1].z = 0;
+            let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+            let west = Vec2 { x: -MOVE_INTENT_SCALE, y: 0 };
+            for _ in 0..40 {
+                step_with(&mut m, &[(0, intent(east, EAST, false)), (1, intent(west, EAST, false))]);
+            }
+            (m.pawns[0].pos, m.pawns[1].pos)
+        };
+        let (a, b) = (run(), run());
+        assert_eq!(a, b, "the z-band match reproduces bit-for-bit across runs");
+        assert!(!within(a.0, a.1, 1000), "within the band the two pawns hard-stopped without overlapping");
+    }
+
     #[test]
     fn ingest_accepts_well_formed_and_clamps_overlong_move() {
         let m = new_match(1);
