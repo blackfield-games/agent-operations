@@ -78,8 +78,9 @@ def _fog_density(recognized: list[str]) -> float:
     contribution, clamped to [`FOG_DENSITY_MAX`]. Summed in the fixed table order
     [`_recognized_beats`] returns, so the float result is byte-identical across runs
     (a pipeline re-run and a validation-revision re-run reproduce the layer). 0.0 when no
-    recognized beat is present — the base palette stays fog-less."""
-    return min(sum(BEAT_FOG_DENSITY[token] for token in recognized), FOG_DENSITY_MAX)
+    recognized beat is present — the base palette stays fog-less. The 0.0 sum start keeps
+    the return a float for the empty case, not int 0."""
+    return min(sum((BEAT_FOG_DENSITY[token] for token in recognized), 0.0), FOG_DENSITY_MAX)
 
 
 async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
