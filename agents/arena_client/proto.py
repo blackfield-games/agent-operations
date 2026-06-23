@@ -90,7 +90,13 @@ class ActionIntent(_Wire):
         arena-proto exactly (integer `isqrt`, truncate toward zero) so a baseline
         can emit an already-legal move that the server passes through unchanged.
         An in-range request is returned untouched; an overlong one is scaled down
-        to magnitude `MOVE_INTENT_SCALE`, never up."""
+        to magnitude `MOVE_INTENT_SCALE`, never up.
+
+        The bit-for-bit equivalence with the Rust reference clamp is machine-pinned
+        by the shared `arena/proto/tests/clamp_parity.json` golden — emitted by
+        `arena_proto::clamp_parity_vectors()`, diffed by the Rust drift-gate, and
+        replayed through this method by `test_arena_client.py` — so a clamp drift on
+        either side breaks loud against one source of truth."""
         x, y = self.move_dir.x, self.move_dir.y
         mag_sq = x * x + y * y
         max_sq = MOVE_INTENT_SCALE * MOVE_INTENT_SCALE
