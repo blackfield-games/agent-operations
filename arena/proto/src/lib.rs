@@ -540,6 +540,13 @@ pub struct FrameCase {
     /// so re-encoding adds the field back and cannot reproduce the omitted input. A
     /// consumer asserts an exact re-encode when `true`, the documented default when
     /// `false`.
+    ///
+    /// This rests on the wire types serializing EVERY field (no `skip_serializing_if`):
+    /// only then does each field appear in the golden, so the Python `extra=forbid`
+    /// decode rejects a Rust-only field — and every optional field must show up
+    /// NON-default in some frame (`start_populated` carries a populated
+    /// `blockers`/`pickup_points` and a non-zero `Blocker.height`) so a widened or
+    /// renamed optional is caught, not silently defaulted on both sides.
     pub exact_reencode: bool,
     pub frame: serde_json::Value,
 }
@@ -726,7 +733,12 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
     });
     {
         let blockers = start_no_height["blockers"].as_array_mut().expect("blockers is a json array");
-        blockers[0].as_object_mut().expect("blocker is a json object").remove("height");
+        blockers
+            .first_mut()
+            .expect("start_no_height has one blocker")
+            .as_object_mut()
+            .expect("blocker is a json object")
+            .remove("height");
     }
     frames.push(case("start_blocker_omits_height", ServerToAgent, false, start_no_height));
 
