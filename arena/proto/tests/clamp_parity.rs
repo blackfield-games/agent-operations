@@ -88,6 +88,39 @@ fn clamp_parity_pins_the_discriminating_conventions() {
 }
 
 #[test]
+fn clamp_parity_fuzz_sweep_widens_the_executable_cross_check() {
+    // The fixed-seed fuzz cases are what turn the by-hand equivalence review into a
+    // committed gate: pin that they are present, span the overflow-prone i32 range,
+    // and actually exercise the scale-down path (not passthrough), so a future
+    // Rust⇄Python clamp divergence on an unnamed input reddens this golden. The 12
+    // named discriminators MUST survive alongside them (append, never replace).
+    let v = clamp_parity_vectors();
+    for named in ["zero_is_inert", "negative_axis_trunc_toward_zero", "i32_min_overflow_corner"] {
+        assert!(v.cases.iter().any(|c| c.label == named), "named case {named} dropped");
+    }
+    let fuzz: Vec<_> = v.cases.iter().filter(|c| c.label.starts_with("fuzz_")).collect();
+    assert_eq!(fuzz.len(), 64, "expected 64 fuzz cases");
+    assert_eq!(v.cases.len(), 76, "expected 12 named + 64 fuzz = 76 total");
+    // Full-range i32 inputs are all overlong, so every fuzz case must scale DOWN to
+    // the cap — proof the sweep hits the clamp path the cross-check is meant to cover.
+    let max = MOVE_INTENT_SCALE as i64;
+    for c in &fuzz {
+        assert_ne!(c.input, c.output, "fuzz case {} unexpectedly passed through", c.label);
+        let mag_sq = (c.output.x as i64).pow(2) + (c.output.y as i64).pow(2);
+        assert!(mag_sq <= max * max, "fuzz case {} exceeds the cap", c.label);
+    }
+    // At least one draw lands near i32::MIN/MAX (|component| > 2^30), exercising the
+    // u64-widened square-sum the overflow corners guard — full-range coverage, not
+    // just small magnitudes.
+    let reach = fuzz
+        .iter()
+        .map(|c| c.input.x.unsigned_abs().max(c.input.y.unsigned_abs()))
+        .max()
+        .unwrap();
+    assert!(reach > 1 << 30, "fuzz sweep never reached the near-overflow range: {reach}");
+}
+
+#[test]
 #[ignore = "writes the golden fixture; run explicitly to regenerate"]
 fn regenerate_clamp_parity_golden() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/clamp_parity.json");
