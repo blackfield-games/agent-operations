@@ -435,6 +435,44 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         "AND shoves east — both knockback axes fire on one hit"
     );
     assert!(both.target_z_vel > 0 && both.target_pos.x > launched.target_pos.x, "neither axis is dropped when both are armed");
+
+    // Pawn-body occupancy (v11): under a positive pawn_radius a move whose swept path
+    // would enter another alive pawn's body is refused — pawns are obstacles in the
+    // shared slide path. OFF (radius 0) they overlap (the byte-identical default); ON,
+    // the mover hard-stops one step short (never overlapping), a fast step cannot tunnel
+    // a body any more than a thin wall, a step not toward the body is free (directional),
+    // and a set radius with the body off-path never freezes the mover. A twin that lets
+    // pawns overlap, that point-tests the destination (and so tunnels), or that
+    // blanket-freezes a pawn near a body fails one of these.
+    let pc = |label: &str| v.pawn_collisions.iter().find(|c| c.label == label).unwrap();
+    let into = pc("into_pawn_blocked");
+    assert!(into.blocked && into.end == into.start, "a step into a pawn body is refused — the mover holds");
+    assert!(into.pawn_radius > 0, "the into-body case has occupancy ON");
+    // The blocked step's destination sits EXACTLY at the contact distance, so the
+    // inclusive boundary (contact counts as a collision) is the load-bearing pin.
+    let into_dest = Vec2 { x: into.start.x + into.max_speed, y: into.start.y };
+    let into_gap2 = (into_dest.x as i64 - into.obstacle.x as i64).pow(2)
+        + (into_dest.y as i64 - into.obstacle.y as i64).pow(2);
+    assert_eq!(into_gap2, (into.pawn_radius as i64).pow(2), "the refused step ends exactly at the contact radius (inclusive)");
+    let short = pc("short_of_pawn_allowed");
+    assert!(!short.blocked && short.end != short.start, "a step that stops short of contact proceeds");
+    assert!(!within(short.end, short.obstacle, short.pawn_radius), "the allowed step ends OUTSIDE the body — no overlap");
+    // into/short share everything but the start: the contact boundary is exactly one step.
+    assert_eq!((into.obstacle, into.pawn_radius, into.move_dir), (short.obstacle, short.pawn_radius, short.move_dir),
+        "into and short differ only by the start — the boundary is one step wide");
+    let ortho = pc("clear_orthogonal_allowed");
+    assert!(!ortho.blocked && ortho.end != ortho.start, "a step NOT toward the body is free (occupancy is directional)");
+    let off = pc("occupancy_off_overlaps");
+    assert_eq!(off.pawn_radius, 0, "the overlap case has occupancy OFF (the default)");
+    assert!(!off.blocked && off.end == off.obstacle, "with occupancy off the mover ends ON the body's cell (overlap)");
+    let fast = pc("fast_no_tunnel_through_pawn");
+    assert!(fast.blocked && fast.end == fast.start, "a fast step is stopped by a body it would sweep through");
+    // The would-be destination overshoots the body (NOT within the radius), so an
+    // endpoint test reports a clean miss and tunnels — the swept test is load-bearing.
+    let fast_dest = Vec2 { x: fast.start.x + fast.max_speed, y: fast.start.y };
+    assert!(!within(fast_dest, fast.obstacle, fast.pawn_radius), "the would-be destination overshoots the body (a point test tunnels)");
+    let far = pc("radius_set_far_obstacle_free");
+    assert!(!far.blocked && far.end != far.start && far.pawn_radius > 0, "a set radius with the body off-path never freezes the mover");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
