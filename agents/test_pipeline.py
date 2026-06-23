@@ -27,4 +27,4 @@ async def test_smoke(tmp_path, monkeypatch):
     root = compose_world(result["layers"], tmp_path / "out")
     text = root.read_text()
     assert "validator" not in text  # validator doesn't write its own layer
-    assert all(s in text for s in ["director", "terrain", "biome", "lighting"])
+    assert all(s in text for s in ["director", "terrain", "biome", "prop", "lighting"])
