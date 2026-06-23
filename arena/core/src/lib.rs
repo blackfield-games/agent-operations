@@ -6744,6 +6744,73 @@ mod tests {
         );
     }
 
+    fn fall_match(gravity: i32, fall_damage: u16, fall_damage_threshold: i32, max_shield: u16) -> Match {
+        let rules = Rules { gravity, fall_damage, fall_damage_threshold, max_shield, ..Default::default() };
+        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1)
+    }
+
+    /// Step seat 0 to its landing (no intents), returning the tick count. The faller is
+    /// launched by the caller (z_vel set directly); seat 1 stays a grounded bystander.
+    fn drop_to_landing(m: &mut Match) -> u16 {
+        let mut ticks = 0u16;
+        while m.pawns[0].z != 0 || m.pawns[0].z_vel != 0 {
+            step_with(m, &[]);
+            ticks += 1;
+            if ticks > 1_000 {
+                break; // safety bound; every real arc is far shorter
+            }
+        }
+        ticks
+    }
+
+    #[test]
+    fn fall_damage_saturates_at_extreme_impact_without_panic() {
+        // FM3: the impact read widens to i64 before negation, so even an i32::MIN falling
+        // velocity (the worst case) yields a finite impact with no overflow/panic — and a
+        // landing that hard, above the threshold, downs the pawn through the CLAMPED sink
+        // (overkill is capped to HP, never wrapped).
+        let mut m = fall_match(100, 200, 1_000, 0);
+        // Drop seat 0 from just above the ground at the most extreme falling velocity an
+        // i32 holds: nz = 10 + i32::MIN <= 0 lands THIS step.
+        m.pawns[0].z = 10;
+        m.pawns[0].z_vel = i32::MIN;
+        let before = m.pawns[0].health;
+        step_with(&mut m, &[]); // must not panic on the extreme negation
+        assert_eq!(m.pawns[0].z, 0, "the pawn snaps to the ground");
+        assert!(!m.pawns[0].alive && m.pawns[0].health == 0, "an extreme landing above the threshold downs the pawn");
+        assert_eq!(before - m.pawns[0].health, before, "overkill is clamped to HP, not wrapped");
+    }
+
+    #[test]
+    fn fall_damage_landing_is_deterministic() {
+        // FM3: identical inputs produce byte-identical fall outcomes — pure integer, no
+        // ordering nondeterminism. Two matches launched the same way reach the same health,
+        // alive flag, and landing tick.
+        let run = || {
+            let mut m = fall_match(600, 30, 3_000, 0);
+            m.pawns[0].z_vel = 6_000; // a knockback-boosted launch
+            let ticks = drop_to_landing(&mut m);
+            (m.pawns[0].health, m.pawns[0].alive, ticks)
+        };
+        assert_eq!(run(), run(), "the fall outcome is deterministic across identical runs");
+        let (health, alive, _) = run();
+        assert!(alive && health < Rules::default().start_health, "the boosted landing hurt but did not kill");
+    }
+
+    #[test]
+    fn a_hard_landing_drains_shield_before_health() {
+        // The shared sink: fall damage routes through apply_hp_damage, so it spends shield
+        // FIRST exactly like a weapon hit — a hard landing under a shield pool costs the
+        // pool, not health, until the pool is gone.
+        let mut m = fall_match(600, 30, 3_000, 50);
+        m.pawns[0].shield = 50; // earned shield (spawn shield is 0)
+        m.pawns[0].z_vel = 6_000; // a hard, above-threshold launch
+        let health_before = m.pawns[0].health;
+        drop_to_landing(&mut m);
+        assert_eq!(m.pawns[0].shield, 20, "the 30-damage landing drained the shield pool first (50 -> 20)");
+        assert_eq!(m.pawns[0].health, health_before, "health is untouched while the shield absorbs the fall");
+    }
+
     /// A two-seat match with the dash enabled at `dash_cooldown`, no spawn jitter, in
     /// the given `bounds` with the given `blockers` — so seat 0 starts at exactly
     /// (-spawn_radius, 0) and seat 1 at (+spawn_radius, 0), and a dash arc is computed
