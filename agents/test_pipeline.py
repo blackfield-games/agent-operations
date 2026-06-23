@@ -13,6 +13,7 @@ import pytest
 from common.types import WorldBrief, RegionCoord
 from common.compose import compose_world
 from director import director
+from prop import prop
 from runtime.supervisor import build_graph
 
 
@@ -47,3 +48,23 @@ async def test_npc_archetype_comes_from_the_director_roster_through_the_graph(tm
     text = (tmp_path / "layers" / npc_layer.path).read_text()
     archetype = re.search(r'archetype\s*=\s*"([^"]*)"', text).group(1)
     assert archetype in director._faction_roster(brief.region.region_id)
+
+
+@pytest.mark.asyncio
+async def test_prop_places_director_must_have_through_the_graph(tmp_path, monkeypatch):
+    # The director→prop intent hand-off survives the REAL supervisor edges (not a
+    # hand-built prior): the prop layer the graph emits carries a Required placement for
+    # every asset the director marked intent:must_have for the region, in order.
+    monkeypatch.chdir(tmp_path)
+    brief = WorldBrief(biome="scorched_grassland", region=RegionCoord(x=42, y=-17))
+
+    result = await build_graph().ainvoke({"brief": brief, "layers": [], "rounds": 0})
+
+    director_layer = next(layer for layer in result["layers"] if layer.specialist == "director")
+    required = prop._required_assets(prop._must_have_from_director([director_layer]))
+    assert required  # the director seeds a non-empty must_have
+
+    prop_layer = next(layer for layer in result["layers"] if layer.specialist == "prop")
+    text = (tmp_path / "layers" / prop_layer.path).read_text()
+    placed = re.findall(r'requiredAsset\s*=\s*"([^"]+)"', text)
+    assert placed == required
