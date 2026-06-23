@@ -441,7 +441,8 @@ pub struct Rules {
     /// outcome — `z` enters HIT resolution only when
     /// [`vertical_hit_tolerance`](Rules::vertical_hit_tolerance)` > 0` (otherwise combat
     /// stays planar, byte-identical to a 2D match). Fall damage remains a deferred
-    /// follow-up (it needs variable fall heights to be a non-degenerate mechanic).
+    /// follow-up, but its prerequisite — variable fall heights — is now supplied by
+    /// [`knockback_velocity`](Rules::knockback_velocity).
     #[serde(default)]
     pub gravity: i32,
     /// Ticks between dashes — the rate gate for the
@@ -494,11 +495,13 @@ pub struct Rules {
     /// evasive tool. Only meaningful with [`gravity`](Rules::gravity)` > 0` (the sole
     /// source of any non-zero `z`); with gravity off every pawn's `z` stays `0`, the
     /// bound never triggers, and the match is byte-identical even with a tolerance set.
-    /// Couples HIT resolution only — vision and blocker line-of-sight stay planar (a
-    /// jumping pawn is still SEEN, since a player plainly sees someone jump, and
-    /// occluders are still infinitely tall), so z-aware occlusion and fall damage are
-    /// deferred follow-ups. Folds into
-    /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
+    /// Couples HIT resolution only — detection stays planar (a jumping pawn is still
+    /// SEEN: perception range and the FOV cone ignore `z`, since a player plainly sees
+    /// someone jump). Line-of-sight occlusion is independently z-aware via a
+    /// height-bounded [`Blocker`], but that is a separate rule, not this field. Fall
+    /// damage is the remaining deferred follow-up — its variable-fall-height
+    /// prerequisite is now supplied by [`knockback_velocity`](Rules::knockback_velocity).
+    /// Folds into [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
     #[serde(default)]
     pub vertical_hit_tolerance: i32,
     /// Upward `z` velocity, in position units per tick, that a landed DAMAGING hit
