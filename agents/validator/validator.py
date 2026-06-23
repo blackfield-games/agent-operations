@@ -28,17 +28,18 @@ STYLE_SIM_THRESHOLD = 0.72
 # with a real downstream consumer are listed: the optimizer's budget verdict
 # (read by run() below) and the triangle count the optimizer sums across prior
 # layers. A role with no entry imposes NO requirement, so the specialists that
-# legitimately emit no metrics (director, prop, lighting, npc) are
+# legitimately emit no metrics (director, lighting, npc) are
 # unaffected — keeping the schema to what a role genuinely always emits.
 #
-# NOTE: the optimizer sums `triangles` across ALL prior layers; terrain and biome
-# both emit geometry, so both are contracted emitters. If a further stub
-# (prop/…) starts contributing geometry, add `triangles` to its contract here so a
-# mis-spelled key there can't silently under-count the budget.
+# NOTE: the optimizer sums `triangles` across ALL prior layers; terrain, biome, and
+# prop all emit geometry, so all three are contracted emitters — a mis-spelled key
+# in any of them can't silently under-count the budget. If a further stub
+# (lighting/npc) starts contributing geometry, add `triangles` to its contract here.
 ROLE_METRICS: dict[str, set[str]] = {
     "optimization": {"over_budget"},
     "terrain": {"triangles"},
     "biome": {"triangles"},
+    "prop": {"triangles"},
 }
 
 # USD text layers must begin with this cookie; pxr refuses to open a file without
