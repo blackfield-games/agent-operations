@@ -244,3 +244,91 @@ async def test_resolved_layer_composes_and_validates(tmp_path, monkeypatch):
     compose_world(layers, tmp_path / "world")
     verdict = await validator.run(brief, layers)
     assert verdict.accepted, verdict.issues
+
+
+def test_unset_env_resolves_to_module_defaults(monkeypatch):
+    # FM1 (default back-compat): with no override the resolvers return the module
+    # constants verbatim, so the unconfigured pipeline is byte-identical to before the
+    # override existed (and the existing monkeypatch.setattr(TRIANGLE_BUDGET) tests still
+    # bind, since the resolver falls back to the module global).
+    monkeypatch.delenv("BLACKFIELD_TRIANGLE_BUDGET", raising=False)
+    monkeypatch.delenv("BLACKFIELD_GEOMETRY_FLOOR", raising=False)
+    assert optimization._resolve_budget() == optimization.TRIANGLE_BUDGET == 1_500_000
+    assert optimization._resolve_floor() == optimization.GEOMETRY_FLOOR == {"terrain"}
+
+
+@pytest.mark.asyncio
+async def test_unset_env_run_emits_default_budget(tmp_path, monkeypatch):
+    # FM1: a run with no override emits the module-default budget into the layer.
+    monkeypatch.delenv("BLACKFIELD_TRIANGLE_BUDGET", raising=False)
+    _, text = await _run([_layer("terrain", 262144), _layer("biome", 400000)], tmp_path, monkeypatch)
+    assert int(_scalar(text, "triangleBudget")) == optimization.TRIANGLE_BUDGET
+
+
+@pytest.mark.asyncio
+async def test_tighter_budget_override_now_sheds_a_world_that_fit(tmp_path, monkeypatch):
+    # FM2: a world that fit untouched under the default budget is driven over (and shed)
+    # by a tighter override — the env value, not the constant, gates the resolve.
+    prior = [_layer("terrain", 262144), _layer("biome", 400000, path="biome/r0.usda")]
+    monkeypatch.delenv("BLACKFIELD_TRIANGLE_BUDGET", raising=False)
+    _, text_default = await _run(prior, tmp_path / "d", monkeypatch)
+    assert _scalar(text_default, "forcedLodCollapse") == "false"  # fits under the default
+    monkeypatch.setenv("BLACKFIELD_TRIANGLE_BUDGET", "500000")
+    layer, text = await _run(prior, tmp_path / "t", monkeypatch)
+    assert int(_scalar(text, "triangleBudget")) == 500000
+    assert _scalar(text, "forcedLodCollapse") == "true"  # the tighter budget sheds it
+    assert float(_scalar(text, "observedTriangles")) <= 500000
+    assert layer.metrics["over_budget"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_looser_budget_override_now_fits_a_world_that_shed(tmp_path, monkeypatch):
+    # FM2 (other direction): a world the default budget could only shed now fits
+    # untouched under a looser override, observed == authored (no reduction).
+    prior = [_layer("terrain", 262144), _layer("biome", 3_000_000, path="biome/r0.usda")]
+    monkeypatch.delenv("BLACKFIELD_TRIANGLE_BUDGET", raising=False)
+    _, text_default = await _run(prior, tmp_path / "d", monkeypatch)
+    assert _scalar(text_default, "forcedLodCollapse") == "true"  # default must shed it
+    monkeypatch.setenv("BLACKFIELD_TRIANGLE_BUDGET", "100000000")
+    layer, text = await _run(prior, tmp_path / "l", monkeypatch)
+    assert int(_scalar(text, "triangleBudget")) == 100000000
+    assert _scalar(text, "forcedLodCollapse") == "false"  # fits untouched
+    assert float(_scalar(text, "observedTriangles")) == 262144 + 3_000_000
+    assert layer.metrics["over_budget"] == 0.0
+
+
+@pytest.mark.parametrize("bad", ["abc", "0", "-5", "1.5", "   "])
+def test_malformed_budget_override_falls_back_to_default(bad, monkeypatch):
+    # FM3: a non-numeric/zero/negative/blank override is rejected back to the default
+    # (warned, not raised) — never a 0 that sheds everything or an inf that sheds nothing.
+    monkeypatch.setenv("BLACKFIELD_TRIANGLE_BUDGET", bad)
+    assert optimization._resolve_budget() == optimization.TRIANGLE_BUDGET
+
+
+def test_floor_override_is_honored_and_always_includes_terrain(monkeypatch):
+    # FM4: an explicit floor set is honored, and terrain is ALWAYS in it even when the
+    # override omits it (the walkable base is never decimable).
+    monkeypatch.setenv("BLACKFIELD_GEOMETRY_FLOOR", "prop,biome")
+    assert optimization._resolve_floor() == {"terrain", "prop", "biome"}
+    monkeypatch.setenv("BLACKFIELD_GEOMETRY_FLOOR", "prop")  # omits terrain
+    assert "terrain" in optimization._resolve_floor()
+
+
+def test_floor_override_drops_unknown_specialists(monkeypatch):
+    # FM4: a name not in the known specialist set is dropped (warned), not silently
+    # admitted as a phantom floor entry that could never match a layer.
+    monkeypatch.setenv("BLACKFIELD_GEOMETRY_FLOOR", "terrain,bogus_xyz")
+    assert optimization._resolve_floor() == {"terrain"}
+
+
+@pytest.mark.asyncio
+async def test_floored_specialist_is_not_shed(tmp_path, monkeypatch):
+    # FM4 (integration): a specialist named in the floor override is load-bearing — never
+    # decimated — even when flooring it makes the world terminal. Proves the floor
+    # override actually moves a layer out of the shed-able set.
+    monkeypatch.setenv("BLACKFIELD_TRIANGLE_BUDGET", "500000")
+    monkeypatch.setenv("BLACKFIELD_GEOMETRY_FLOOR", "terrain,biome")
+    prior = [_layer("terrain", 262144), _layer("biome", 1_000_000, path="biome/r0.usda")]
+    layer, text = await _run(prior, tmp_path, monkeypatch)
+    assert "biome" not in {d["specialist"] for d in _directives(text)}  # floored, never shed
+    assert layer.metrics["over_budget"] == 1.0  # floor alone over budget -> terminal
