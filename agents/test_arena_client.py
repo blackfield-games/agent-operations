@@ -33,13 +33,10 @@ from arena_client.proto import (
     ActionButtons,
     ActionIntent,
     Blocker,
-    Challenge,
     MatchResult,
     Observation,
-    Reject,
     Start,
     Vec2,
-    Welcome,
     act_frame,
     decode_gateway,
     join_frame,
@@ -49,30 +46,98 @@ from arena_client.proto import (
 FIXED_MATCH = "550e8400-e29b-41d4-a716-446655440000"
 
 
-def test_observation_wire_shape_matches_rust():
-    # The exact canonical frame from arena/proto observation_wire_shape_is_stable.
-    canonical = {
-        "protocol_version": proto.PROTOCOL_VERSION,
-        "match_id": FIXED_MATCH,
-        "seat": 0,
-        "tick": 128,
-        "phase": "live",
-        "deadline_micros": 50_000,
-        "own": {
-            "seat": 0, "team": 1,
-            "position": {"x": 0, "y": 0}, "z": 0,
-            "facing": 16384,
-            "velocity": {"x": 0, "y": 0},
-            "health": 100, "max_health": 100, "shield": 40, "ammo": 30, "cooldown": 5, "dash_cooldown": 0, "alive": True,
-        },
-        "visible": [{
-            "entity_id": 7, "kind": "player", "team": 2,
-            "position": {"x": 1000, "y": -2000}, "z": 0,
-            "facing": 16384, "in_line_of_sight": True,
-        }],
-    }
-    obs = Observation.model_validate(canonical)
-    assert obs.model_dump(mode="json") == canonical
+def _frame_golden() -> dict:
+    """The SAME committed Gateway wire-frame parity golden the Rust arena-proto
+    drift-gate pins (arena/proto/tests/frame_parity.json), resolved by repo-relative
+    path from THIS file (never the CWD), so it holds under validate.sh's agents-dir
+    pytest run. A missing golden fails LOUD — it is the single source of truth for the
+    Rust<->Python frame contract and must never be silently skipped (which would let a
+    wire drift through). Regenerate after an intentional wire change with
+    `cargo test -p arena-proto --test frame_parity regenerate_frame_parity_golden -- --ignored`."""
+    path = Path(__file__).resolve().parents[1] / "arena" / "proto" / "tests" / "frame_parity.json"
+    assert path.is_file(), f"shared frame-parity golden not found at {path}"
+    return json.loads(path.read_text())
+
+
+def _golden_frames(direction: str) -> list[dict]:
+    return [c for c in _frame_golden()["frames"] if c["direction"] == direction]
+
+
+def test_frame_golden_header_matches_proto():
+    golden = _frame_golden()
+    assert golden["domain"] == "blackfield/arena/frame-parity/v1"
+    assert golden["protocol_version"] == proto.PROTOCOL_VERSION
+    assert golden["match_id"] == FIXED_MATCH  # the fixed, byte-stable parity match id
+
+
+def test_gateway_frames_decode_and_reencode_against_rust_golden():
+    # Every server->agent frame in the SHARED golden (emitted by Rust
+    # frame_parity_vectors, diffed by the Rust drift-gate) decodes via decode_gateway
+    # into the typed model and re-encodes to the SAME wire body — the machine-checked
+    # cross-implementer pin the hand-copied frames could not give. A Rust wire change
+    # (which regenerates the golden) or a Python model drift breaks this against the one
+    # source of truth, including the observe/end newtype flattening next to "type".
+    server = _golden_frames("server_to_agent")
+    assert server, "golden carries no server->agent frames"
+    seen = set()
+    for case in server:
+        frame = case["frame"]
+        msg = decode_gateway(frame)
+        seen.add(frame["type"])
+        body = {k: v for k, v in frame.items() if k != "type"}
+        if case["exact_reencode"]:
+            assert msg.model_dump(mode="json") == body, (
+                f"{case['label']} did not decode/re-encode to the golden body"
+            )
+    assert {"challenge", "welcome", "reject", "start", "observe", "end"} <= seen, (
+        "a server->agent GatewayMsg variant is missing from the golden"
+    )
+
+
+def test_gateway_golden_backcompat_frames_fill_defaults():
+    # The omit frames pin the serde(default) back-compat both implementers must keep:
+    # an older server's Start (or a no-occluder / no-pickup match) decodes unchanged.
+    # These frames OMIT the optional key entirely, so a re-encode can't reproduce them
+    # (the default is filled back) — the wire-shape pin is the decode-to-default here.
+    by_label = {c["label"]: c["frame"] for c in _frame_golden()["frames"]}
+    legacy = decode_gateway(by_label["start_legacy_omits_optional_fields"])
+    assert isinstance(legacy, Start)
+    assert legacy.blockers == [] and legacy.pickup_points == []
+
+    no_height = decode_gateway(by_label["start_blocker_omits_height"])
+    assert isinstance(no_height, Start)
+    assert no_height.blockers and no_height.blockers[0].height == 0
+
+
+def test_match_config_wire_shape_matches_rust_golden():
+    # MatchConfig rides the Start frame; pin it from the SAME golden (the hand-copy is
+    # gone) by validating the populated Start's config and re-dumping it unchanged.
+    start = {c["label"]: c["frame"] for c in _frame_golden()["frames"]}["start_populated"]
+    cfg = proto.MatchConfig.model_validate(start["config"])
+    assert cfg.model_dump(mode="json") == start["config"]
+
+
+def test_agent_frames_encode_to_rust_golden():
+    # Agent->server frames pin the Python ENCODERS against the golden: join_frame /
+    # act_frame / leave_frame must produce the exact bytes the Rust serde emits. And
+    # decode_gateway REFUSES an agent->server frame — the one-directional boundary (a
+    # join/act/leave is not a valid server->agent message).
+    agent = {c["frame"]["type"]: c["frame"] for c in _golden_frames("agent_to_server")}
+    assert set(agent) == {"join", "act", "leave"}, "an agent->server AgentMsg variant is missing"
+
+    join = agent["join"]
+    assert join_frame(join["agent_id"], join["signature_hex"]) == join
+
+    act = agent["act"]
+    action = Action.model_validate({k: v for k, v in act.items() if k != "type"})
+    assert act_frame(action) == act
+
+    leave = agent["leave"]
+    assert leave_frame(leave["reason"]) == leave
+
+    for frame in agent.values():
+        with pytest.raises(proto.ProtocolError):
+            decode_gateway(frame)
 
 
 def test_self_state_carries_cooldown_but_visible_entity_does_not():
@@ -142,43 +207,6 @@ def test_self_state_carries_dash_cooldown_but_visible_entity_does_not():
         })
 
 
-def test_action_wire_shape_matches_rust():
-    canonical = {
-        "protocol_version": proto.PROTOCOL_VERSION,
-        "match_id": FIXED_MATCH,
-        "seat": 3,
-        "tick": 128,
-        "intent": {
-            "move_dir": {"x": 600, "y": 800},
-            "aim": 16384,
-            "buttons": {"fire": True, "jump": False, "ability": False, "reload": False},
-        },
-    }
-    action = Action.model_validate(canonical)
-    assert action.model_dump(mode="json") == canonical
-
-
-def test_match_result_wire_shape_matches_rust():
-    canonical = {
-        "protocol_version": proto.PROTOCOL_VERSION,
-        "match_id": FIXED_MATCH,
-        "final_tick": 2,
-        "outcomes": [
-            {"seat": 0, "team": 1, "placement": 1, "score": 3, "alive_at_end": True},
-            {"seat": 1, "team": 2, "placement": 2, "score": 1, "alive_at_end": False},
-        ],
-        "replay_hash": "deadbeef",
-    }
-    result = MatchResult.model_validate(canonical)
-    assert result.model_dump(mode="json") == canonical
-
-
-def test_match_config_wire_shape_matches_rust():
-    canonical = {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 8}
-    cfg = proto.MatchConfig.model_validate(canonical)
-    assert cfg.model_dump(mode="json") == canonical
-
-
 def test_unknown_field_is_rejected():
     # extra=forbid: a field the Python type does not know is a decode error, not a
     # silent drop — the same wire-shape discipline the Rust crate enforces.
@@ -211,37 +239,6 @@ def test_out_of_domain_fields_are_rejected():
         )
 
 
-def test_gateway_envelopes_decode():
-    nonce = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
-    assert decode_gateway({"type": "challenge", "nonce": nonce}) == Challenge(nonce=nonce)
-    assert decode_gateway(
-        {"type": "welcome", "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 2}
-    ) == Welcome(protocol_version=proto.PROTOCOL_VERSION, match_id=FIXED_MATCH, seat=2)
-    assert decode_gateway({"type": "reject", "reason": "nope"}) == Reject(reason="nope")
-
-    start = decode_gateway({
-        "type": "start", "match_id": FIXED_MATCH,
-        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 8},
-    })
-    assert isinstance(start, Start) and start.config.seats == 8
-
-    # observe / end flatten the inner struct next to "type".
-    obs_frame = {"type": "observe", **Observation.model_validate({
-        "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 1,
-        "phase": "live", "deadline_micros": 50_000,
-        "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
-                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": True},
-        "visible": [],
-    }).model_dump(mode="json")}
-    assert isinstance(decode_gateway(obs_frame), Observation)
-
-    end_frame = {"type": "end", **MatchResult.model_validate({
-        "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "final_tick": 9,
-        "outcomes": [], "replay_hash": "00",
-    }).model_dump(mode="json")}
-    assert isinstance(decode_gateway(end_frame), MatchResult)
-
-
 def test_unknown_gateway_tag_raises():
     with pytest.raises(proto.ProtocolError):
         decode_gateway({"type": "teleport"})
@@ -249,19 +246,13 @@ def test_unknown_gateway_tag_raises():
         decode_gateway({"no_type": 1})
 
 
-def test_agent_frames_encode():
+def test_unranked_join_frame_carries_an_empty_signature():
+    # The golden's join frame is a ranked-ish placeholder ("0xcafe"); the SDK's own
+    # default path is an UNRANKED seat — an empty signature_hex — so pin that too.
     assert join_frame("0xabc") == {
         "type": "join", "protocol_version": proto.PROTOCOL_VERSION,
         "agent_id": "0xabc", "signature_hex": "",
     }
-    action = Action.model_validate({
-        "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 1, "tick": 4,
-        "intent": {"move_dir": {"x": 1, "y": 2}, "aim": 3,
-                   "buttons": {"fire": False, "jump": False, "ability": False, "reload": False}},
-    })
-    af = act_frame(action)
-    assert af["type"] == "act" and af["seat"] == 1 and af["tick"] == 4
-    assert leave_frame("forfeit") == {"type": "leave", "reason": "forfeit"}
 
 
 def _intent(x: int, y: int) -> ActionIntent:
