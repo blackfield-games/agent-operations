@@ -15,6 +15,7 @@ from biome import biome
 from common.types import RegionCoord, WorldBrief
 from optimization import optimization
 from terrain import terrain
+from validator import validator
 
 
 def _instance_count_from_usd(text: str) -> int:
@@ -98,3 +99,22 @@ async def test_sparse_biome_stays_under_budget(tmp_path, monkeypatch):
         bio = await biome.run(brief, [terr])
         opt = await optimization.run(brief, [terr, bio])
         assert opt.metrics["over_budget"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_hostile_biome_string_injects_no_prim(tmp_path, monkeypatch):
+    # brief.biome is CLI-supplied free-form text interpolated into the layer. A
+    # value carrying a USD quote/newline must not close the string literal and
+    # forge a prim — the validator's structural scan (the prod gate ships without
+    # usd-core) would otherwise read the injected prim and misattribute it to biome
+    # or, via a fabricated path collision, to an innocent specialist.
+    monkeypatch.chdir(tmp_path)
+    hostile = 'forest"\n}\ndef Mesh "Injected"\n{\n  custom int n = 1'
+    brief = WorldBrief(biome=hostile, region=RegionCoord(x=1, y=2))
+    layer = await biome.run(brief, [])
+    text = (tmp_path / "layers" / layer.path).read_text()
+    prims = {path for _, _, path in validator._prim_specs(text)}
+    assert prims == {"/Scatter"}  # only the intended PointInstancer, no /Injected
+    # the no-phantom-geometry invariant still holds for a hostile input
+    count = _instance_count_from_usd(text)
+    assert layer.metrics["triangles"] == float(count * biome.TRIS_PER_INSTANCE)
