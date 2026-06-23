@@ -1,0 +1,253 @@
+{
+  "domain": "blackfield/arena/frame-parity/v1",
+  "protocol_version": 1,
+  "match_id": "550e8400-e29b-41d4-a716-446655440000",
+  "frames": [
+    {
+      "label": "challenge",
+      "direction": "server_to_agent",
+      "exact_reencode": true,
+      "frame": {
+        "nonce": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "type": "challenge"
+      }
+    },
+    {
+      "label": "welcome",
+      "direction": "server_to_agent",
+      "exact_reencode": true,
+      "frame": {
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "protocol_version": 1,
+        "seat": 2,
+        "type": "welcome"
+      }
+    },
+    {
+      "label": "reject",
+      "direction": "server_to_agent",
+      "exact_reencode": true,
+      "frame": {
+        "reason": "version mismatch",
+        "type": "reject"
+      }
+    },
+    {
+      "label": "start_populated",
+      "direction": "server_to_agent",
+      "exact_reencode": true,
+      "frame": {
+        "blockers": [
+          {
+            "height": 2000,
+            "max": {
+              "x": 1000,
+              "y": 2000
+            },
+            "min": {
+              "x": -1000,
+              "y": -2000
+            }
+          }
+        ],
+        "config": {
+          "bounds": {
+            "x": 50000,
+            "y": 50000
+          },
+          "max_ticks": 3600,
+          "seats": 8,
+          "tick_hz": 30
+        },
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "pickup_points": [
+          {
+            "x": 1500,
+            "y": 0
+          },
+          {
+            "x": -1500,
+            "y": 0
+          }
+        ],
+        "type": "start"
+      }
+    },
+    {
+      "label": "observe",
+      "direction": "server_to_agent",
+      "exact_reencode": true,
+      "frame": {
+        "deadline_micros": 50000,
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "own": {
+          "alive": true,
+          "ammo": 30,
+          "cooldown": 5,
+          "dash_cooldown": 3,
+          "facing": 16384,
+          "health": 100,
+          "max_health": 100,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "seat": 0,
+          "shield": 40,
+          "team": 1,
+          "velocity": {
+            "x": 0,
+            "y": 0
+          },
+          "z": 0
+        },
+        "phase": "live",
+        "protocol_version": 1,
+        "seat": 0,
+        "tick": 128,
+        "type": "observe",
+        "visible": [
+          {
+            "entity_id": 7,
+            "facing": 16384,
+            "in_line_of_sight": true,
+            "kind": "player",
+            "position": {
+              "x": 1000,
+              "y": -2000
+            },
+            "team": 2,
+            "z": 0
+          }
+        ]
+      }
+    },
+    {
+      "label": "end",
+      "direction": "server_to_agent",
+      "exact_reencode": true,
+      "frame": {
+        "final_tick": 2,
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "outcomes": [
+          {
+            "alive_at_end": true,
+            "placement": 1,
+            "score": 3,
+            "seat": 0,
+            "team": 1
+          },
+          {
+            "alive_at_end": false,
+            "placement": 2,
+            "score": 1,
+            "seat": 1,
+            "team": 2
+          }
+        ],
+        "protocol_version": 1,
+        "replay_hash": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        "type": "end"
+      }
+    },
+    {
+      "label": "join",
+      "direction": "agent_to_server",
+      "exact_reencode": true,
+      "frame": {
+        "agent_id": "0xabcdef1234567890abcdef1234567890abcdef12",
+        "protocol_version": 1,
+        "signature_hex": "0xcafe",
+        "type": "join"
+      }
+    },
+    {
+      "label": "act",
+      "direction": "agent_to_server",
+      "exact_reencode": true,
+      "frame": {
+        "intent": {
+          "aim": 16384,
+          "buttons": {
+            "ability": false,
+            "fire": true,
+            "jump": false,
+            "reload": false
+          },
+          "move_dir": {
+            "x": 600,
+            "y": 800
+          }
+        },
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "protocol_version": 1,
+        "seat": 3,
+        "tick": 128,
+        "type": "act"
+      }
+    },
+    {
+      "label": "leave",
+      "direction": "agent_to_server",
+      "exact_reencode": true,
+      "frame": {
+        "reason": "forfeit",
+        "type": "leave"
+      }
+    },
+    {
+      "label": "start_legacy_omits_optional_fields",
+      "direction": "server_to_agent",
+      "exact_reencode": false,
+      "frame": {
+        "config": {
+          "bounds": {
+            "x": 50000,
+            "y": 50000
+          },
+          "max_ticks": 3600,
+          "seats": 8,
+          "tick_hz": 30
+        },
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "type": "start"
+      }
+    },
+    {
+      "label": "start_blocker_omits_height",
+      "direction": "server_to_agent",
+      "exact_reencode": false,
+      "frame": {
+        "blockers": [
+          {
+            "max": {
+              "x": 500,
+              "y": 500
+            },
+            "min": {
+              "x": 0,
+              "y": 0
+            }
+          }
+        ],
+        "config": {
+          "bounds": {
+            "x": 50000,
+            "y": 50000
+          },
+          "max_ticks": 3600,
+          "seats": 8,
+          "tick_hz": 30
+        },
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "pickup_points": [
+          {
+            "x": 1500,
+            "y": 0
+          }
+        ],
+        "type": "start"
+      }
+    }
+  ]
+}
