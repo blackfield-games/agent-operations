@@ -7191,6 +7191,29 @@ mod tests {
         assert_eq!(m.pawns[0].score, after_hit, "no fall, no fall credit");
     }
 
+    #[test]
+    fn a_dead_launcher_still_earns_the_fall_kill() {
+        // Score permanence mirrors a weapon down: a launcher that dies before its victim lands
+        // still earns the kill posthumously — credit_fall_kill resolves the launcher by seat,
+        // not by its alive flag. Intentional (standard shooter env-kill semantics); pinned so a
+        // future living-launchers-only guard is a deliberate change, not a silent regression.
+        let mut m = fall_kill_match(1, false);
+        m.resolve_fire(0);
+        assert_eq!(m.pawns[1].launched_by, Some(0), "the launching hit tagged the victim");
+        let after_hit = m.pawns[0].score;
+        let victim_hp = m.pawns[1].health;
+        m.pawns[0].health = 0;
+        m.pawns[0].alive = false; // the launcher dies while its victim is still airborne
+        step_until_landed(&mut m, 1);
+        assert!(!m.pawns[1].alive, "the launched victim fell lethally");
+        assert!(!m.pawns[0].alive, "the launcher is dead before the victim lands");
+        assert_eq!(
+            m.pawns[0].score - after_hit,
+            victim_hp as i32,
+            "a dead launcher is still credited the lethal fall it set up"
+        );
+    }
+
     /// A two-seat match with the dash enabled at `dash_cooldown`, no spawn jitter, in
     /// the given `bounds` with the given `blockers` — so seat 0 starts at exactly
     /// (-spawn_radius, 0) and seat 1 at (+spawn_radius, 0), and a dash arc is computed
