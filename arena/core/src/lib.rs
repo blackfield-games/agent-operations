@@ -575,9 +575,10 @@ pub struct Rules {
     /// and a pawn the mover ALREADY overlaps at the step origin is exempt — mirroring
     /// the blocker start-containment exemption, so two pawns that begin coincident (a
     /// tight spawn) separate instead of freezing; the rule is DIRECTIONAL (start-overlap
-    /// exempt, end-overlap refused), exactly like traversal-over-cover. Planar this
-    /// slice: occupancy ignores `z` (a pawn mid-jump still occupies its column),
-    /// consistent with planar-by-default combat — z-coupled occupancy is a follow-up.
+    /// exempt, end-overlap refused), exactly like traversal-over-cover. Planar by default
+    /// (`z` ignored, a pawn mid-jump still occupies its column, consistent with
+    /// planar-by-default combat); a positive [`pawn_height`](Rules::pawn_height) z-COUPLES
+    /// the refusal so a pawn that has jumped higher than the band vaults a body.
     /// Occupancy is read from integer positions in fixed seat order (the same order the
     /// move loop mutates), so it is deterministic and replay-stable. Folds into
     /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
@@ -1573,20 +1574,29 @@ impl Match {
     /// the mover ALREADY overlaps at `from` is exempt — the same start-containment
     /// exemption blockers use, so two pawns that begin coincident separate instead of
     /// freezing. The rule is DIRECTIONAL (start-overlap exempt, end-overlap refused),
-    /// exactly like traversal-over-cover. Occupancy is planar (ignores `z`) this slice
-    /// and is read in fixed seat order — the same order the move loop mutates — so the
-    /// predicate is deterministic and replay-stable, no float anywhere.
+    /// exactly like traversal-over-cover. Under [`Rules::pawn_height`]` > 0` the refusal is
+    /// z-COUPLED: a swept disc entry is an obstacle only when the mover's and the obstacle's
+    /// feet are also within the band ([`pawn_bands_overlap`]), so a pawn that has jumped
+    /// higher than the band vaults the body instead of freezing; at the default
+    /// `pawn_height == 0` the band is disabled and occupancy is planar (`z` ignored),
+    /// byte-identical to the pre-z-occupancy slice. The z gate refines the END-overlap
+    /// refusal only — the start-overlap exemption short-circuits first, so two coincident
+    /// pawns still separate regardless of elevation. Both positions and elevations are read
+    /// in fixed seat order — the same order the move loop mutates — so the predicate is
+    /// deterministic and replay-stable, no float anywhere.
     fn path_obstructed(&self, mover: SeatId, from: Vec2, z: i32, to: Vec2) -> bool {
         if path_hits_blocker(&self.blockers, from, z, to, z) {
             return true;
         }
         let r = self.rules.pawn_radius;
+        let h = self.rules.pawn_height;
         r > 0
             && self.pawns.iter().any(|p| {
                 p.alive
                     && p.seat != mover
                     && !within(from, p.pos, r)
                     && segment_hits_disc(from, to, p.pos, r)
+                    && pawn_bands_overlap(z, p.z, h)
             })
     }
 
@@ -2846,6 +2856,22 @@ fn within(a: Vec2, b: Vec2, range: i32) -> bool {
 /// mode (hitscan, melee, projectile) so the vertical rule lives in ONE place.
 fn within_vertical_tolerance(shooter_z: i32, target_z: i32, tolerance: i32) -> bool {
     tolerance == 0 || (shooter_z as i64 - target_z as i64).abs() <= tolerance as i64
+}
+
+/// `true` if two pawn bodies — each a vertical cylinder of [`Rules::pawn_height`] rising
+/// from its feet `z` — overlap in elevation, the z-coupling of pawn-vs-pawn occupancy.
+/// `height == 0` DISABLES the band: occupancy is planar, `z` is ignored (a grounded pawn
+/// and one mid-jump still collide), byte-identical to every pre-z-occupancy match — so a
+/// planar match short-circuits to `true` before touching `z`. A positive height collides
+/// the two only when their feet are within `height` units (INCLUSIVE: equal-height
+/// cylinders `[z_a, z_a + h]`/`[z_b, z_b + h]` overlap iff `|z_a - z_b| <= h`), so a pawn
+/// that has jumped higher than the band vaults the body instead of freezing — the
+/// occupancy twin of [`within_vertical_tolerance`] (HITS) and a height-bounded [`Blocker`]
+/// (walls). Symmetric by the `abs`, so A blocks B iff B blocks A. The difference widens to
+/// `i64` so it never overflows at any operator-set `z`, and the rule is one integer
+/// compare a UE5 twin reproduces exactly.
+fn pawn_bands_overlap(z_a: i32, z_b: i32, height: i32) -> bool {
+    height == 0 || (z_a as i64 - z_b as i64).abs() <= height as i64
 }
 
 /// `true` if `to` lies within the observer's forward field-of-view cone. The cone
