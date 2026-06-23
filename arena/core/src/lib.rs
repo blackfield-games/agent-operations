@@ -501,6 +501,23 @@ pub struct Rules {
     /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
     #[serde(default)]
     pub vertical_hit_tolerance: i32,
+    /// Upward `z` velocity, in position units per tick, that a landed DAMAGING hit
+    /// imparts to the SURVIVING target — the variable-fall-height source. `serde(default)`
+    /// (`0`) DISABLES knockback: a hit imparts no vertical impulse and the match plays
+    /// byte-identically to every pre-knockback record (the default). A positive value
+    /// pops a hit pawn upward: the impulse is added (saturating, stacking onto any
+    /// existing `z_vel`, so a mid-air target is launched higher) in the shared
+    /// [`damage_pawn`](Match::damage_pawn) sink every weapon mode funnels through, so a
+    /// landing's impact velocity now VARIES with the hit it took — a launched pawn can
+    /// land harder than a self-jump. Only meaningful with [`gravity`](Rules::gravity)` > 0`
+    /// (the sole source of any non-zero `z`); with gravity off the impulse is suppressed
+    /// and every pawn's `z` stays `0`, so a 2D match is byte-identical even with knockback
+    /// set. Never fires on a miss, on a killed pawn (a corpse is not launched), or on the
+    /// shooter. This is VERTICAL-ONLY (a pop-up); directional (horizontal) knockback is a
+    /// deferred follow-up. Makes fall damage a non-degenerate, revivable mechanic. Folds
+    /// into [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
+    #[serde(default)]
+    pub knockback_velocity: i32,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -540,6 +557,7 @@ impl Default for Rules {
             wall_slide: false, // a grazing step stops at its origin (no slide) by default
             perception_memory_ticks: 0, // perception memory off — a lost entity vanishes at once
             vertical_hit_tolerance: 0, // combat planar by default — z ignored in hit resolution
+            knockback_velocity: 0, // hits impart no vertical impulse by default — z stays 0
         }
     }
 }
@@ -595,6 +613,7 @@ impl Rules {
         b.push(self.wall_slide as u8);
         b.extend_from_slice(&self.perception_memory_ticks.to_be_bytes());
         b.extend_from_slice(&self.vertical_hit_tolerance.to_be_bytes());
+        b.extend_from_slice(&self.knockback_velocity.to_be_bytes());
         b
     }
 }
@@ -3332,8 +3351,11 @@ pub struct ParityVectors {
 /// bumped to v8 for the multi-seat ranked-rating delta (a new `field_deltas` category
 /// pinning the zero-sum per-seat reputation a settled FFA / 3+ match applies, the
 /// multi-player generalization of v7) — also settlement-layer, so no replay-digest tag
-/// move. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v8";
+/// move; bumped to v9 for the vertical knockback impulse — a gated
+/// [`Rules::knockback_velocity`] widened `canonical_encoding` (so every committed match
+/// hash moved) and a new `knockback` category pins the rule that a damaging hit pops a
+/// surviving target upward. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v9";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -3771,7 +3793,7 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// stream yet hash differently because their aim_mode differs — while the rules also
 /// bind the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v8`: the digest binds the combat `rules` and the
+/// Set domain is `parity-vectors/v9`: the digest binds the combat `rules` and the
 /// `config` determinants (arena bounds + tick cap); v4 added the z-coupled-combat rule
 /// ([`Rules::vertical_hit_tolerance`] widened the rules encoding and the `vertical_hits`
 /// cases pin it); v5 adds blocker `height` — the digest folds it at replay tag v6
@@ -3780,8 +3802,11 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// bounds physical traversal); v7 adds the `rating_deltas` cases (the settlement-layer
 /// zero-sum Elo reputation curve); v8 adds the `field_deltas` cases (the multi-seat
 /// generalization of that curve) — v6, v7, and v8 are pure-logic, so none moves the
-/// replay-digest tag. A twin must fold the wider encodings into its match digest and
-/// reproduce every rule or it diverges; the v2 blockers-as-physical-cover convention
+/// replay-digest tag; v9 adds the vertical knockback impulse ([`Rules::knockback_velocity`]
+/// widened the rules encoding, moving every committed match hash again, and the
+/// `knockback` cases pin that a damaging hit pops a surviving target upward). A twin must
+/// fold the wider encodings into its match digest and reproduce every rule or it diverges;
+/// the v2 blockers-as-physical-cover convention
 /// still holds. These are deliberate conventions every twin must follow.
 ///
 /// The generator is pure integer, ordered, and float/map-free, so the set is
@@ -7119,9 +7144,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 11×i32 + 1×u32 + 10×u16 + 5×u8 = 73 bytes. A new sim field added to the
+        // 12×i32 + 1×u32 + 10×u16 + 5×u8 = 77 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 73, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 77, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -7151,8 +7176,9 @@ mod tests {
             ("wall_slide", Rules { wall_slide: !base.wall_slide, ..base }),
             ("perception_memory_ticks", Rules { perception_memory_ticks: base.perception_memory_ticks + 1, ..base }),
             ("vertical_hit_tolerance", Rules { vertical_hit_tolerance: base.vertical_hit_tolerance + 1, ..base }),
+            ("knockback_velocity", Rules { knockback_velocity: base.knockback_velocity + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 27, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 28, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
