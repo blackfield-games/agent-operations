@@ -24,6 +24,12 @@ def _placement_count_from_usd(text: str) -> int:
     return int(m.group(1))
 
 
+def _asset_from_usd(text: str) -> str:
+    m = re.search(r'propAsset\s*=\s*"([^"]+)"', text)
+    assert m, "emitted prop USD has no propAsset"
+    return m.group(1)
+
+
 def _authored_from_usd(text: str) -> float:
     m = re.search(r"authoredTriangles\s*=\s*([\d.]+)", text)
     assert m, "optimization USD has no authoredTriangles"
@@ -32,15 +38,17 @@ def _authored_from_usd(text: str) -> float:
 
 @pytest.mark.asyncio
 async def test_triangles_metric_matches_declared_placement_count(tmp_path, monkeypatch):
-    # FM1 (phantom geometry): the metric must equal the placementCount actually written
-    # into the PointInstancer times the PER-ASSET table value — never an independent
-    # magic number, and scaled by which asset is placed (the table), not a flat constant.
+    # FM1 (phantom geometry): the metric must equal the placementCount times the table
+    # value for the asset ACTUALLY written into the USD — never an independent magic
+    # number, and never a pick that diverges between the propAsset field and the math.
     monkeypatch.chdir(tmp_path)
     brief = WorldBrief(biome="forest", region=RegionCoord(x=3, y=7))
     layer = await prop.run(brief, [])
-    count = _placement_count_from_usd((tmp_path / "layers" / layer.path).read_text())
+    text = (tmp_path / "layers" / layer.path).read_text()
+    count = _placement_count_from_usd(text)
+    asset = _asset_from_usd(text)
     assert count > 0  # a real, non-empty placement
-    assert layer.metrics["triangles"] == float(count * prop.ASSET_TRIS[prop.PROP_ASSET])
+    assert layer.metrics["triangles"] == float(count * prop.ASSET_TRIS[asset])
 
 
 @pytest.mark.asyncio
@@ -76,9 +84,8 @@ def test_unknown_asset_raises_not_silent_zero():
     # default to 0 triangles — a silent 0 would hide its geometry from the budget.
     with pytest.raises(KeyError):
         prop._asset_tris("no_such_asset_99")
-    # every shipped asset has a positive budget, and the default asset is in the table.
+    # every shipped asset has a positive budget.
     assert all(prop._asset_tris(a) > 0 for a in prop.ASSET_TRIS)
-    assert prop._asset_tris(prop.PROP_ASSET) == prop.ASSET_TRIS[prop.PROP_ASSET]
 
 
 @pytest.mark.asyncio
@@ -109,6 +116,9 @@ async def test_prop_is_a_sheddable_non_floor_layer(tmp_path, monkeypatch):
     # shed-able layer above the terrain floor and prove it gets collapsed.
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(optimization, "TRIANGLE_BUDGET", 500_000)
+    # force the heaviest asset so the scenario exceeds budget regardless of the
+    # per-region asset pick — the test isolates shed-ability, not the selection hash.
+    monkeypatch.setattr(prop, "_select_asset", lambda rid: "comms_tower_01")
     assert "prop" not in optimization.GEOMETRY_FLOOR
     brief = WorldBrief(biome="scorched", region=RegionCoord(x=5, y=9))
     terr = await terrain.run(brief, [])

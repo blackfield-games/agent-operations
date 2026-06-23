@@ -26,10 +26,6 @@ ASSET_TRIS: dict[str, int] = {
     "ammo_crate_01": 600,
 }
 
-# The library asset prop instances across a region. One asset for the deterministic
-# placeholder; the real impl picks per-brief from the asset agent's library.
-PROP_ASSET = "comms_tower_01"
-
 # Base prop placements per region before the per-region jitter. Props are discrete
 # artifacts — far sparser than scatter vegetation — but a heavy hero asset
 # (comms_tower_01 at 12k tris) still makes prop a real shed-able budget contributor,
@@ -61,12 +57,26 @@ def _placement_count(region_id: str) -> int:
     return BASE_PLACEMENTS * jitter_milli // 1000
 
 
+def _select_asset(region_id: str) -> str:
+    """Which library asset prop places in this region — deterministic, drawn from the
+    [`ASSET_TRIS`] keys so the pick is ALWAYS budget-known (a selection can never
+    produce an unknown-asset 0-tri layer). A STABLE hash of the region id over the
+    SORTED keys (a fixed, reproducible order), salted distinctly from
+    [`_placement_count`] so the asset and the count vary independently — two regions
+    can place different props (a region dense with barricades, another with comms
+    towers) while the same region is byte-identical on every run."""
+    assets = sorted(ASSET_TRIS)
+    idx = int.from_bytes(hashlib.sha256(("asset:" + region_id).encode("utf-8")).digest()[:4], "big") % len(assets)
+    return assets[idx]
+
+
 async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
     rel = f"prop/{brief.region.region_id}.usda"
     full = Path("layers") / rel
     full.parent.mkdir(parents=True, exist_ok=True)
     count = _placement_count(brief.region.region_id)
-    tris = count * _asset_tris(PROP_ASSET)
+    asset = _select_asset(brief.region.region_id)
+    tris = count * _asset_tris(asset)
     full.write_text(
         f"""#usda 1.0
 (
@@ -75,11 +85,11 @@ async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
 
 def PointInstancer "Props"
 {{
-    custom string propAsset = {usd_str(PROP_ASSET)}
+    custom string propAsset = {usd_str(asset)}
     custom int placementCount = {count}
 
     def Xform "Prototype" (
-        references = @../../assets/library/props/{PROP_ASSET}.usd@
+        references = @../../assets/library/props/{asset}.usd@
     )
     {{
         double3 xformOp:translate = (0, 0, 0)
@@ -92,6 +102,6 @@ def PointInstancer "Props"
         specialist="prop",
         region_id=brief.region.region_id,
         path=rel,
-        summary=f"{count} × {PROP_ASSET}",
+        summary=f"{count} × {asset}",
         metrics={"triangles": float(tris)},
     )
