@@ -2786,6 +2786,94 @@ mod tests {
         assert!(spec.recv().is_none(), "nothing follows the terminal End");
     }
 
+    #[test]
+    fn replay_to_feed_streams_the_exact_replay_frames_then_one_terminal_end() {
+        // FM1 + FM2: a spectator whose ring holds the whole match receives EXACTLY the
+        // Broadcast sequence replay_frames returns, in order, then a SINGLE terminal End
+        // carrying the match's MatchResult -- and nothing after. The publisher itself
+        // drops/reorders/duplicates nothing (distinct from the feed's slow-consumer
+        // lossiness, exercised below).
+        let record = finished_record();
+        let expected = replay_frames(&record).expect("a valid record replays");
+        let result = record.verify().expect("a finished record verifies to its terminal result");
+
+        // Ring sized for every frame + the End, so a non-reading spectator sheds nothing.
+        let feed = SpectatorFeed::new(expected.len() + 1, 2);
+        let spec = feed.subscribe().unwrap();
+        let published = replay_to_feed(&record, &feed).expect("the record streams to the feed");
+        assert_eq!(published, expected.len(), "one publish per replay_frames frame");
+
+        let mut streamed = Vec::new();
+        let mut ended: Option<MatchResult> = None;
+        let mut ends = 0u32;
+        while let Some(msg) = spec.recv() {
+            match msg {
+                SpectatorMsg::Frame(b) => {
+                    assert_eq!(ends, 0, "every frame precedes the terminal End");
+                    streamed.push(b);
+                }
+                SpectatorMsg::End(r) => {
+                    ends += 1;
+                    ended = Some(r);
+                }
+            }
+        }
+        assert_eq!(streamed, expected, "the feed carries the exact replay_frames sequence, in order");
+        assert_eq!(ends, 1, "publish_end fires exactly once");
+        assert_eq!(ended, Some(result), "the terminal End carries the match's MatchResult");
+        assert_eq!(spec.dropped(), 0, "a spectator sized for the match drops nothing");
+    }
+
+    #[test]
+    fn replay_to_feed_completes_past_a_slow_spectator_that_sheds_overflow() {
+        // FM3: the feed is lossy + non-blocking, so a slow consumer must NEVER stall the
+        // publisher. With a ring far smaller than the match, a spectator that never reads
+        // sheds its overflow (counted), yet replay_to_feed still RUNS TO COMPLETION and
+        // streams every frame -- consumer speed is decoupled from the replay.
+        let record = finished_record();
+        let frame_count = replay_frames(&record).unwrap().len();
+        assert!(frame_count >= 3, "the match must outlast the slow ring of 2");
+        let total_msgs = frame_count + 1; // every frame plus the terminal End
+
+        let feed = SpectatorFeed::new(2, 4);
+        let slow = feed.subscribe().unwrap(); // never reads
+        let published = replay_to_feed(&record, &feed).expect("completes despite the stalled consumer");
+
+        assert_eq!(published, frame_count, "the publisher streamed every frame to completion");
+        assert_eq!(slow.buffered(), 2, "the slow ring stays bounded to its capacity");
+        assert_eq!(
+            slow.dropped(),
+            (total_msgs - 2) as u64,
+            "the slow consumer shed its overflow instead of backpressuring the publisher"
+        );
+    }
+
+    #[test]
+    fn replay_to_feed_streams_only_simulated_frames_for_a_padded_record() {
+        // FM4 (inherited from replay_frames): a record padded with canonical
+        // post-terminal ticks passes verify() (they are scanned but never simulated), so
+        // replay_to_feed must stream ONLY the real frames -- the padding can't turn the
+        // feed into an unbounded publish loop.
+        let mut padded = finished_record();
+        let real_frames = replay_frames(&padded).unwrap().len();
+        let next = padded.replay.ticks.len() as u64;
+        for k in 0..20_000u64 {
+            padded.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new() });
+        }
+
+        // Ring sized for the REAL frames + End: an extra padding publish would overflow it.
+        let feed = SpectatorFeed::new(real_frames + 1, 2);
+        let spec = feed.subscribe().unwrap();
+        let published = replay_to_feed(&padded, &feed).expect("a padded record still verifies + streams");
+
+        assert_eq!(published, real_frames, "only the simulated frames are published, not the 20k padding");
+        let frames = std::iter::from_fn(|| spec.recv())
+            .filter(|m| matches!(m, SpectatorMsg::Frame(_)))
+            .count();
+        assert_eq!(frames, real_frames, "the spectator sees only the real frames");
+        assert_eq!(spec.dropped(), 0, "no padding frame was ever published, so nothing was shed");
+    }
+
     /// Form a 2-seat Human match on `arena` and hand back the built [`Match`].
     fn form_on(arena: &'static str) -> Match {
         let mm = Matchmaker::new(StubIdentityVerifier::new(), MatchParams { arena, ..MatchParams::default() });
