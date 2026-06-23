@@ -88,3 +88,24 @@ async def test_biome_vegetation_capped_through_the_graph(tmp_path, monkeypatch):
     biome_layer = next(layer for layer in result["layers"] if layer.specialist == "biome")
     text = (tmp_path / "layers" / biome_layer.path).read_text()
     assert "custom bool vegetationCapped = true" in text
+
+
+@pytest.mark.asyncio
+async def test_validator_intent_gate_passes_for_the_real_pipeline_world(tmp_path, monkeypatch):
+    # The closing of declare → honor → VERIFY, end to end: the validator's director-intent
+    # gate (run as the graph's final node) ACCEPTS the world the real pipeline emits. The
+    # director seeds a mapped must_have AND a recognized must_not cap token, prop/biome
+    # honor them, and the gate finds nothing unmet — so a future false-reject regression
+    # (the worst failure mode) breaks here, not silently in production. Asserting the gate
+    # had real intent to check (non-empty mapped must_have + an active cap) distinguishes a
+    # genuine pass from a director that accidentally stopped seeding intent.
+    monkeypatch.chdir(tmp_path)
+    brief = WorldBrief(biome="jungle", region=RegionCoord(x=11, y=-4))
+
+    result = await build_graph().ainvoke({"brief": brief, "layers": [], "rounds": 0})
+
+    director_layer = next(layer for layer in result["layers"] if layer.specialist == "director")
+    assert prop._required_assets(prop._must_have_from_director([director_layer]))
+    assert biome._caps_vegetation(biome._must_not_from_director([director_layer]))
+
+    assert result["verdict"].accepted, result["verdict"].issues
