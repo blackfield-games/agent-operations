@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v9",
+  "domain": "blackfield/arena/parity-vectors/v10",
   "protocol_version": 1,
   "spawns": [
     {
@@ -42,7 +42,8 @@
         "wall_slide": false,
         "perception_memory_ticks": 0,
         "vertical_hit_tolerance": 0,
-        "knockback_velocity": 0
+        "knockback_velocity": 0,
+        "knockback_horizontal": 0
       },
       "roster": [
         {
@@ -153,7 +154,8 @@
         "wall_slide": false,
         "perception_memory_ticks": 0,
         "vertical_hit_tolerance": 0,
-        "knockback_velocity": 0
+        "knockback_velocity": 0,
+        "knockback_horizontal": 0
       },
       "roster": [
         {
@@ -1290,7 +1292,8 @@
           "wall_slide": false,
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
-          "knockback_velocity": 0
+          "knockback_velocity": 0,
+          "knockback_horizontal": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1387,6 +1390,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -1463,7 +1470,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "18e6b829d01f77fcd4da740c7db1684af1249f1c80597ebf1d3a19ebc1d62d6a"
+          "replay_hash": "6a04352fdf66aa97b7c7848864baef548758d1ee62e9114189de3b5626e1f46c"
         }
       }
     },
@@ -1507,7 +1514,8 @@
           "wall_slide": false,
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
-          "knockback_velocity": 0
+          "knockback_velocity": 0,
+          "knockback_horizontal": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1586,6 +1594,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -1680,7 +1692,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "c4c90d010a5e83339fc348a44cca5675d4e8ed981d1e0108df4dfa218e5a272c"
+          "replay_hash": "2d7e0e5797db198ab7197b68cd5b64e0df309b71a1e8711bc94cb96e65079840"
         }
       }
     },
@@ -1724,7 +1736,8 @@
           "wall_slide": false,
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
-          "knockback_velocity": 0
+          "knockback_velocity": 0,
+          "knockback_horizontal": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1803,6 +1816,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -1901,7 +1918,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "5a6e639e88429a47866f95d4fec9f01a4d51ca6039c4f27da8b6737a7d8a9700"
+          "replay_hash": "f8ad83267c104c35cc8c04065e4605983ecc9ed0d73de3dec498c69a4f0df576"
         }
       }
     },
@@ -1945,7 +1962,8 @@
           "wall_slide": false,
           "perception_memory_ticks": 0,
           "vertical_hit_tolerance": 0,
-          "knockback_velocity": 0
+          "knockback_velocity": 0,
+          "knockback_horizontal": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -2051,6 +2069,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -2127,7 +2149,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "c9098989b3e0115be8cae714521e6be7b4659d3422188ad60991580ea2d6aaa9"
+          "replay_hash": "7089fdb62ac87f65a7ff0ab2c405249228a4ecc9f68bdda9a6354d0b4717f9e1"
         }
       }
     }
