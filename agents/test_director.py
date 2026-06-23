@@ -38,6 +38,15 @@ def test_roster_size_and_membership():
         assert roster == sorted(roster)
 
 
+def test_factions_are_parse_safe_identifiers():
+    # npc parses intent:factions with a simple quoted-CSV regex that only round-trips
+    # bare identifiers: a name carrying a comma, quote, backslash, or whitespace would
+    # be split or truncated on read (usd_str escapes a quote to \" and the capture stops
+    # there). Pin the vocabulary parse-safe so a future faction can't silently corrupt
+    # the director→npc hand-off — the assumption the regex relies on, enforced.
+    assert all(re.fullmatch(r"[a-z][a-z_]*", f) for f in director.FACTION_ARCHETYPES)
+
+
 def test_distinct_regions_can_field_distinct_rosters():
     # A constant roster would leave npc one effective choice everywhere; the director's
     # intent must actually vary region to region.
