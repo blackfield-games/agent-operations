@@ -784,6 +784,8 @@ async def test_run_rejects_a_dropped_must_have_and_routes_to_prop(tmp_path):
     assert not verdict.accepted
     assert any("intent:must_have" in i and "convoy_wreck_01" in i for i in verdict.issues)
     assert "prop" in verdict.failing_specialists
+    # the message names no other specialist, so even the text-scan fallback routes right.
+    assert _failing_specialist(verdict.issues) == "prop"
     assert _route_back_target(verdict) == "prop"
 
 
@@ -798,6 +800,9 @@ async def test_run_rejects_an_uncapped_biome_under_a_capping_director(tmp_path):
     assert not verdict.accepted
     assert any("intent:must_not" in i and "vegetationCapped" in i for i in verdict.issues)
     assert "biome" in verdict.failing_specialists
+    # the message keys off intent:must_not, not the word "director", so the text-scan
+    # fallback agrees with the structured attribution (no misroute to director).
+    assert _failing_specialist(verdict.issues) == "biome"
     assert _route_back_target(verdict) == "biome"
 
 

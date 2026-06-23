@@ -249,8 +249,8 @@ def _intent_attributions(
         if biome_text is not None and not re.search(r"vegetationCapped\s*=\s*true", biome_text):
             out.append((
                 "biome",
-                "intent:must_not unmet: biome must cap vegetation density (the director's "
-                "intent:must_not forbids dense vegetation) but its layer carries no "
+                "intent:must_not unmet: biome must cap vegetation density "
+                "(intent:must_not forbids dense vegetation) but its layer carries no "
                 "vegetationCapped marker",
             ))
     return out
