@@ -4,8 +4,12 @@ These are the exact serde-JSON shapes the Rust Gateway emits and accepts, so a
 Python agent built on this SDK is wire-compatible with the headless reference
 arena (and, later, the UE5 server) without a second protocol definition. The
 field names, the `snake_case` enums, and the internally-tagged `type` envelopes
-match `arena/proto/src/lib.rs` byte-for-byte; `test_arena_client.py` pins the
-same canonical frames the Rust crate pins, so a drift on either side breaks loud.
+match `arena/proto/src/lib.rs` byte-for-byte. The exact canonical frames are no
+longer hand-copied on both sides: `arena_proto::frame_parity_vectors()` emits the
+shared golden `arena/proto/tests/frame_parity.json` (one representative of every
+GatewayMsg + AgentMsg frame, diffed by a Rust drift-gate), and `test_arena_client.py`
+decodes/re-encodes each frame in that SAME file — so a wire-shape drift on either
+side breaks loud against one source of truth, the sibling of the clamp-parity golden.
 
 Like the Rust side, every spatial quantity is integer fixed-point — no floats on
 the wire — so the same match hashes identically on every platform. Integer fields
@@ -256,7 +260,10 @@ def decode_gateway(frame: dict) -> GatewayMsg:
     """Decode one server→agent frame. Envelopes are internally tagged on `type`
     (`snake_case`), and the two newtype variants — `observe` / `end` — carry the
     `Observation` / `MatchResult` fields flattened next to `type`, exactly as the
-    Rust `GatewayMsg` serializes them."""
+    Rust `GatewayMsg` serializes them. This reconstruction is machine-pinned against
+    the shared `arena/proto/tests/frame_parity.json` golden (one representative of
+    every GatewayMsg + AgentMsg frame, emitted by `arena_proto::frame_parity_vectors()`
+    and diffed by the Rust drift-gate) — see `test_arena_client.py`."""
     if not isinstance(frame, dict) or "type" not in frame:
         raise ProtocolError(f"frame is not a tagged gateway message: {frame!r}")
     tag = frame["type"]
