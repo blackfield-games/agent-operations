@@ -1074,23 +1074,28 @@ impl SpectatorFeed {
     }
 }
 
-/// Re-run a finished [`MatchRecord`] (arena-05) into the sequence of [`Broadcast`]
-/// frames a spectator would have seen — the "watch a finished match" path, the
-/// replay counterpart to the live [`SpectatorFeed`].
+/// Re-run a verified [`MatchRecord`] from its determinants, invoking `on_frame` with
+/// each [`Broadcast`] in order — the opening tick plus one after every SIMULATED tick,
+/// the last carrying `phase == Ended`. The shared spine behind both [`replay_frames`]
+/// (which collects the frames) and [`replay_to_feed`] (which streams them to
+/// spectators), so the two can never diverge on what a replay produces.
 ///
-/// The record is VERIFIED first ([`MatchRecord::verify`]), so a truncated, tampered,
-/// or non-reproducing record is rejected as a typed [`ReplayError`] and NEVER panics
-/// the playback — the same anti-DoS guarantee arena-05 gives a settlement verifier,
-/// reused here because a spectator/replay feed parses untrusted records too. On
-/// success the verified record is re-run from its determinants, capturing the
-/// broadcast at the opening tick and after every simulated tick — `ticks.len() + 1`
-/// frames, the last carrying the terminal `phase == Ended`.
-pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError> {
-    record.verify()?;
-    // new_with_pickups, not new: a recorded match's world pickups are a
-    // determinant of its broadcasts, so rebuilding without them would diverge the
-    // spectator feed from the real match (the core verify() re-run already loads
-    // them).
+/// VERIFIES first ([`MatchRecord::verify`]), so a truncated, tampered, or
+/// non-reproducing record is rejected as a typed [`ReplayError`] and NEVER panics the
+/// playback — the same anti-DoS guarantee arena-05 gives a settlement verifier, reused
+/// because a replay/spectator path parses untrusted records too. `verify` bounds cost
+/// AND proves the record reaches a terminal result, which it RETURNS — so a caller that
+/// needs the outcome (the feed's terminal `publish_end`) takes it from here rather than
+/// re-deriving it, and `publish_end` can never fire on a rejected record (the `?`
+/// returns first).
+fn replay_into(
+    record: &MatchRecord,
+    mut on_frame: impl FnMut(Broadcast),
+) -> Result<MatchResult, ReplayError> {
+    let result = record.verify()?;
+    // new_with_pickups, not new: a recorded match's world pickups are a determinant of
+    // its broadcasts, so rebuilding without them would diverge the spectator feed from
+    // the real match (the core verify() re-run already loads them).
     let mut m = Match::new_with_pickups(
         record.replay.match_id,
         record.config,
@@ -1100,15 +1105,12 @@ pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError
         record.replay.pickups.clone(),
         record.replay.seed,
     );
-    // Do NOT pre-size from `record.replay.ticks.len()`: `verify` accepts a record
-    // padded with canonical post-terminal ticks (they are scanned but never
-    // simulated — `replay_match` breaks at the terminal phase), so an adversarial
-    // record can inflate that length to millions while the match really ran a
-    // handful of ticks. The loop below breaks at the terminal phase too, so it
-    // pushes only the frames actually simulated; let the Vec grow to that real
-    // count instead of eagerly reserving memory for attacker-controlled padding.
-    let mut frames = Vec::new();
-    frames.push(m.broadcast());
+    // The opening-tick broadcast, then one after every SIMULATED tick. The loop breaks
+    // at the terminal phase, so a record `verify` accepts with canonical post-terminal
+    // tick padding (scanned but never simulated — `replay_match` breaks there too)
+    // streams ONLY the frames actually played: an adversarial record claiming millions
+    // of ticks can't turn this into an unbounded publish loop.
+    on_frame(m.broadcast());
     for tr in &record.replay.ticks {
         if m.phase() != MatchPhase::Live {
             break;
@@ -1116,9 +1118,44 @@ pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError
         let intents: BTreeMap<SeatId, ActionIntent> =
             tr.actions.iter().map(|a| (a.seat, a.intent)).collect();
         m.step(&intents);
-        frames.push(m.broadcast());
+        on_frame(m.broadcast());
     }
+    Ok(result)
+}
+
+/// Re-run a finished [`MatchRecord`] (arena-05) into the sequence of [`Broadcast`]
+/// frames a spectator would have seen — the "watch a finished match" path, the replay
+/// counterpart to the live [`SpectatorFeed`]. At most `ticks.len() + 1` frames: the
+/// broadcast at the opening tick plus one after every simulated tick, the last carrying
+/// the terminal `phase == Ended`. A non-verifying record is a typed [`ReplayError`],
+/// never a panic (see [`replay_into`]).
+pub fn replay_frames(record: &MatchRecord) -> Result<Vec<Broadcast>, ReplayError> {
+    let mut frames = Vec::new();
+    replay_into(record, |frame| frames.push(frame))?;
     Ok(frames)
+}
+
+/// Stream a finished [`MatchRecord`] to a live [`SpectatorFeed`] — the producer the
+/// feed was built for. Re-runs the verified record and
+/// [`publish_frame`](SpectatorFeed::publish_frame)s each [`Broadcast`] in the exact
+/// order [`replay_frames`] returns, then [`publish_end`](SpectatorFeed::publish_end)s
+/// the terminal [`MatchResult`] EXACTLY ONCE, after the final frame — so a subscribed
+/// spectator streams the match frame-by-frame and learns who won. Returns the number of
+/// frames published (`== replay_frames(record)?.len()`).
+///
+/// Publishing is non-blocking and lossy by the feed's design: a slow spectator drops
+/// its oldest frames (counted) rather than stalling the replay, so a stalled consumer
+/// can never backpressure the publisher. The terminal result comes from
+/// [`verify`](MatchRecord::verify) (which a verified record guarantees is terminal), so
+/// `publish_end` always fires once with the real outcome and never on a rejected record.
+pub fn replay_to_feed(record: &MatchRecord, feed: &SpectatorFeed) -> Result<usize, ReplayError> {
+    let mut published = 0usize;
+    let result = replay_into(record, |frame| {
+        feed.publish_frame(frame);
+        published += 1;
+    })?;
+    feed.publish_end(result);
+    Ok(published)
 }
 
 #[cfg(test)]
