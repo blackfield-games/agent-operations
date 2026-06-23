@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v13",
+  "domain": "blackfield/arena/parity-vectors/v14",
   "protocol_version": 1,
   "spawns": [
     {
@@ -46,7 +46,8 @@
         "knockback_horizontal": 0,
         "pawn_radius": 0,
         "fall_damage": 0,
-        "fall_damage_threshold": 0
+        "fall_damage_threshold": 0,
+        "pawn_height": 0
       },
       "roster": [
         {
@@ -161,7 +162,8 @@
         "knockback_horizontal": 0,
         "pawn_radius": 0,
         "fall_damage": 0,
-        "fall_damage_threshold": 0
+        "fall_damage_threshold": 0,
+        "pawn_height": 0
       },
       "roster": [
         {
@@ -1644,7 +1646,8 @@
           "knockback_horizontal": 0,
           "pawn_radius": 0,
           "fall_damage": 0,
-          "fall_damage_threshold": 0
+          "fall_damage_threshold": 0,
+          "pawn_height": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1755,6 +1758,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -1831,7 +1838,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "0cc9b89622f9727591c6db2c579b3a525c45b90919cf7cbc8affc2b00e98bf9d"
+          "replay_hash": "1c0f295e877a544f9d658220c40adc743ae422fad9e75893332be3645643de4f"
         }
       }
     },
@@ -1879,7 +1886,8 @@
           "knockback_horizontal": 0,
           "pawn_radius": 0,
           "fall_damage": 0,
-          "fall_damage_threshold": 0
+          "fall_damage_threshold": 0,
+          "pawn_height": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1958,6 +1966,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -2066,7 +2078,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "be1046ad2fd3996fcb88971f1cc05a02db7a31affd174404754ff127560cd17b"
+          "replay_hash": "d2a415ff0bbd6fba31acd55acaad4e61a5c959590a7663484a2b13ebb5cc6e2e"
         }
       }
     },
@@ -2114,7 +2126,8 @@
           "knockback_horizontal": 0,
           "pawn_radius": 0,
           "fall_damage": 0,
-          "fall_damage_threshold": 0
+          "fall_damage_threshold": 0,
+          "pawn_height": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -2193,6 +2206,10 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -2305,7 +2322,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "1dc33fbe8b4cdb30dd1b2404fd547d38d8c5165676f85373af9fc75cfe3dad45"
+          "replay_hash": "73de50a02c1e24e8d663578ebd2ff1b4b9a9a78f5e315814fa530d10f9f596ea"
         }
       }
     },
@@ -2353,7 +2370,8 @@
           "knockback_horizontal": 0,
           "pawn_radius": 0,
           "fall_damage": 0,
-          "fall_damage_threshold": 0
+          "fall_damage_threshold": 0,
+          "pawn_height": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -2473,6 +2491,10 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -2549,7 +2571,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "8672e13527adbc84515c1c901e180267947e2e82a0f234565ac272442f518f56"
+          "replay_hash": "3165d03fa53398ba41ec92cfbd102e47bdbbb4c83f480a789bf11ac762dc4323"
         }
       }
     }

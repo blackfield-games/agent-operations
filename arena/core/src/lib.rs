@@ -614,6 +614,27 @@ pub struct Rules {
     /// binds it.
     #[serde(default)]
     pub fall_damage_threshold: i32,
+    /// Vertical body height, in position units, of the cylinder every pawn presents to
+    /// pawn-vs-pawn occupancy — the z-coupling of [`pawn_radius`](Rules::pawn_radius).
+    /// `serde(default)` (`0`) DISABLES the band: occupancy is PLANAR, a pawn's elevation
+    /// is ignored, and a match plays byte-identically to every pre-z-occupancy record (the
+    /// default) — a pawn mid-jump still occupies its ground column. A positive value
+    /// couples `z` into the refusal: a step is blocked by another alive pawn's body only
+    /// when their XY discs overlap AND their feet are within `pawn_height` units
+    /// (INCLUSIVE) — equivalently, each pawn is a vertical cylinder of this height rising
+    /// from its feet and the two collide only when the cylinders overlap (`|z_a - z_b| <=
+    /// pawn_height`) — so a pawn that has jumped higher than the band vaults the body
+    /// instead of freezing. The occupancy analogue of
+    /// [`vertical_hit_tolerance`](Rules::vertical_hit_tolerance) (which couples `z` into HIT
+    /// resolution) and a height-bounded [`Blocker`] (which a high-enough path clears). Only
+    /// meaningful with [`pawn_radius`](Rules::pawn_radius)` > 0` (no occupancy at all
+    /// otherwise) and [`gravity`](Rules::gravity)` > 0` (the sole source of any non-zero
+    /// `z`); with either off the band never changes an outcome. The z separation is read
+    /// from integer elevations in fixed seat order like the planar occupancy, so it stays
+    /// deterministic and replay-stable. Folds into
+    /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
+    #[serde(default)]
+    pub pawn_height: i32,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -658,6 +679,7 @@ impl Default for Rules {
             pawn_radius: 0, // pawn-vs-pawn occupancy off by default — pawns may overlap
             fall_damage: 0, // a hard landing deals no damage by default — every landing safe
             fall_damage_threshold: 0, // inert while fall_damage is 0 (the feature's off default)
+            pawn_height: 0, // pawn occupancy is planar by default — z ignored, bodies are columns
         }
     }
 }
@@ -718,6 +740,7 @@ impl Rules {
         b.extend_from_slice(&self.pawn_radius.to_be_bytes());
         b.extend_from_slice(&self.fall_damage.to_be_bytes());
         b.extend_from_slice(&self.fall_damage_threshold.to_be_bytes());
+        b.extend_from_slice(&self.pawn_height.to_be_bytes());
         b
     }
 }
@@ -3808,9 +3831,15 @@ pub struct ParityVectors {
 /// exceeds the threshold deals damage through the shared HP sink (no upward bounce);
 /// bumped to v13 for FALL-KILL ATTRIBUTION — a new `fall_kills` category pins that a
 /// knockback-into-a-lethal-fall credits the LAUNCHER like a weapon down (self/friendly
-/// excluded), riding a DERIVED launch tag (never recorded), so no replay-digest tag move.
+/// excluded), riding a DERIVED launch tag (never recorded), so no replay-digest tag move;
+/// bumped to v14 for z-COUPLED OCCUPANCY — a gated [`Rules::pawn_height`] widened
+/// `canonical_encoding` once more (every committed match hash moved) and a new
+/// `z_occupancy` category pins the rule that, under a positive height, a pawn-body refusal
+/// also requires the mover's and obstacle's feet within the band (`|dz| <= pawn_height`),
+/// so a pawn that jumped high enough vaults the body instead of freezing — the occupancy
+/// twin of v4's `vertical_hit_tolerance` (hits) and v5's `Blocker.height` (walls).
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v13";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v14";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -8314,9 +8343,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 15×i32 + 1×u32 + 11×u16 + 5×u8 = 91 bytes. A new sim field added to the
+        // 16×i32 + 1×u32 + 11×u16 + 5×u8 = 95 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 91, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 95, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -8351,8 +8380,9 @@ mod tests {
             ("pawn_radius", Rules { pawn_radius: base.pawn_radius + 1, ..base }),
             ("fall_damage", Rules { fall_damage: base.fall_damage + 1, ..base }),
             ("fall_damage_threshold", Rules { fall_damage_threshold: base.fall_damage_threshold + 1, ..base }),
+            ("pawn_height", Rules { pawn_height: base.pawn_height + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 32, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 33, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
