@@ -12,6 +12,7 @@ import pytest
 
 from common.types import WorldBrief, RegionCoord
 from common.compose import compose_world
+from biome import biome
 from director import director
 from prop import prop
 from runtime.supervisor import build_graph
@@ -68,3 +69,22 @@ async def test_prop_places_director_must_have_through_the_graph(tmp_path, monkey
     text = (tmp_path / "layers" / prop_layer.path).read_text()
     placed = re.findall(r'requiredAsset\s*=\s*"([^"]+)"', text)
     assert placed == required
+
+
+@pytest.mark.asyncio
+async def test_biome_vegetation_capped_through_the_graph(tmp_path, monkeypatch):
+    # The director→biome must_not hand-off survives the REAL supervisor edges (not a
+    # hand-built prior): the biome layer the graph emits records vegetationCapped because
+    # the director seeded the cap token (dense_vegetation) for the region — the constraint
+    # hand-off proven through the real director→biome edge, mirroring the npc + prop proofs.
+    monkeypatch.chdir(tmp_path)
+    brief = WorldBrief(biome="jungle", region=RegionCoord(x=11, y=-4))
+
+    result = await build_graph().ainvoke({"brief": brief, "layers": [], "rounds": 0})
+
+    director_layer = next(layer for layer in result["layers"] if layer.specialist == "director")
+    assert biome._caps_vegetation(biome._must_not_from_director([director_layer]))  # director seeded the cap
+
+    biome_layer = next(layer for layer in result["layers"] if layer.specialist == "biome")
+    text = (tmp_path / "layers" / biome_layer.path).read_text()
+    assert "custom bool vegetationCapped = true" in text
