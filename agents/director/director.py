@@ -4,7 +4,8 @@ Writes a sparse USD layer that establishes:
   - region bounds + grid coords
   - faction control / story beats present in this region
   - "must-haves": comms tower, downed convoy, civilian extraction point
-  - "must-nots": vegetation density caps, no enclosed interiors (frontier rule)
+  - "must-nots": vegetation density caps (`dense_vegetation` — biome clamps its
+    scatter density when present), no enclosed interiors (frontier rule)
 
 Other specialists override; validator has final say.
 """
@@ -69,7 +70,7 @@ def Scope "Director"
 {{
     custom string intent:beats = "scorched. abandoned. recent conflict."
     custom string intent:must_have = "comms_tower,convoy_wreck"
-    custom string intent:must_not = "interior_volumes,civilians"
+    custom string intent:must_not = "dense_vegetation,interior_volumes,civilians"
     custom string intent:factions = {usd_str(",".join(roster))}
 }}
 """
