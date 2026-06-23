@@ -21,10 +21,21 @@ always yield the same LOD assignment and a byte-identical layer.
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 from common.types import WorldBrief, LayerSpec
+from common.compose import STRENGTH_ORDER
 from common.usd import usd_str
 
+logger = logging.getLogger(__name__)
+
+# Default triangle budget when no target override is configured. The real budget is
+# platform- and LOD-tier-dependent (a phone and a workstation can't carry the same
+# geometry), so an operator overrides it per target via BLACKFIELD_TRIANGLE_BUDGET
+# (see _resolve_budget); this constant is the conservative default and stays the
+# value the module emits when nothing is set, so the unconfigured pipeline is
+# byte-identical to before the override existed.
 TRIANGLE_BUDGET = 1_500_000
 
 # Deepest LOD a shed-able layer may collapse to: scale 0.5**3 = 1/8 of its authored
@@ -43,9 +54,64 @@ MAX_RESOLVE_PASSES = 256
 # Specialists whose geometry is load-bearing and must never be decimated: the base
 # terrain heightfield is the walkable surface, and collapsing it would punch holes
 # in the world. Every other triangle contributor is instanced scatter (biome
-# vegetation/debris) the optimizer may thin. A layer in this set still counts
-# against the budget but is never reduced — the do-not-shed floor.
+# vegetation/debris, prop placements, npc characters) the optimizer may thin. A layer
+# in this set still counts against the budget but is never reduced — the do-not-shed
+# floor. Default set; an operator widens it (e.g. once structures become load-bearing
+# geometry) via BLACKFIELD_GEOMETRY_FLOOR (see _resolve_floor). terrain is always
+# floored regardless of the override.
 GEOMETRY_FLOOR = {"terrain"}
+
+
+def _resolve_budget() -> int:
+    """The effective triangle budget: BLACKFIELD_TRIANGLE_BUDGET when set to a valid
+    positive integer, else the module default [`TRIANGLE_BUDGET`].
+
+    A malformed override (non-numeric, zero, negative) is REJECTED back to the default
+    with a loud warning rather than raising — a typo'd target must not crash every
+    region's optimization, and the default is a real conservative budget (not a 0 that
+    sheds everything or an inf that sheds nothing). Reading the module global as the
+    fallback keeps the existing ``monkeypatch.setattr(optimization, 'TRIANGLE_BUDGET')``
+    tests authoritative when no env is set."""
+    raw = os.environ.get("BLACKFIELD_TRIANGLE_BUDGET")
+    if raw is None or raw.strip() == "":
+        return TRIANGLE_BUDGET
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "BLACKFIELD_TRIANGLE_BUDGET=%r is not an integer; using default %d",
+            raw, TRIANGLE_BUDGET,
+        )
+        return TRIANGLE_BUDGET
+    if value <= 0:
+        logger.warning(
+            "BLACKFIELD_TRIANGLE_BUDGET=%d must be positive; using default %d",
+            value, TRIANGLE_BUDGET,
+        )
+        return TRIANGLE_BUDGET
+    return value
+
+
+def _resolve_floor() -> set[str]:
+    """The effective do-not-shed floor set: BLACKFIELD_GEOMETRY_FLOOR (a comma list of
+    specialist names) when set, else the module default [`GEOMETRY_FLOOR`].
+
+    `terrain` is ALWAYS in the floor (the walkable base is never decimable) even if the
+    override omits it. Names not in the known specialist set ([`STRENGTH_ORDER`]) are
+    dropped with a warning — a typo can't silently move a real layer in or out of the
+    floor, and an unknown name can't quietly become a phantom floor entry."""
+    raw = os.environ.get("BLACKFIELD_GEOMETRY_FLOOR")
+    if raw is None or raw.strip() == "":
+        return GEOMETRY_FLOOR
+    names = {part.strip() for part in raw.split(",") if part.strip()}
+    unknown = names - set(STRENGTH_ORDER)
+    if unknown:
+        logger.warning(
+            "BLACKFIELD_GEOMETRY_FLOOR names unknown specialists %s; ignoring them",
+            sorted(unknown),
+        )
+        names -= unknown
+    return names | GEOMETRY_FLOOR
 
 
 def _lod_scale(level: int) -> float:
@@ -57,6 +123,8 @@ def _lod_scale(level: int) -> float:
 
 def _resolve(
     prior: list[LayerSpec],
+    budget: int | None = None,
+    floor: set[str] | None = None,
 ) -> tuple[float, float, int, list[tuple[str, str, float, int]]]:
     """Resolve the prior layers' geometry toward TRIANGLE_BUDGET.
 
@@ -74,16 +142,20 @@ def _resolve(
     stops at under-budget (resolved) or when every shed-able layer sits at MAX_LOD
     (terminal). Floor-set layers are summed but never enter the candidate set.
     """
+    if budget is None:
+        budget = TRIANGLE_BUDGET
+    if floor is None:
+        floor = GEOMETRY_FLOOR
     floor_total = sum(
         float(layer.metrics.get("triangles", 0.0))
         for layer in prior
-        if layer.specialist in GEOMETRY_FLOOR
+        if layer.specialist in floor
     )
     sheddable = sorted(
         (
             (layer.specialist, layer.path, float(layer.metrics.get("triangles", 0.0)))
             for layer in prior
-            if layer.specialist not in GEOMETRY_FLOOR
+            if layer.specialist not in floor
             and float(layer.metrics.get("triangles", 0.0)) > 0.0
         ),
         key=lambda s: (-s[2], s[1]),  # heaviest authored first, then path — a stable order
@@ -97,7 +169,7 @@ def _resolve(
         )
 
     passes = 0
-    while effective() > TRIANGLE_BUDGET and passes < MAX_RESOLVE_PASSES:
+    while effective() > budget and passes < MAX_RESOLVE_PASSES:
         candidates = [i for i in range(len(sheddable)) if lods[i] < MAX_LOD]
         if not candidates:
             break  # every shed-able layer is at the floor LOD — nothing left to reduce
@@ -148,8 +220,10 @@ def _directives_block(directives: list[tuple[str, str, float, int]]) -> str:
 
 
 async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
-    authored_total, effective_total, passes, directives = _resolve(prior)
-    over_budget = effective_total > TRIANGLE_BUDGET
+    budget = _resolve_budget()
+    floor = _resolve_floor()
+    authored_total, effective_total, passes, directives = _resolve(prior, budget, floor)
+    over_budget = effective_total > budget
 
     rel = f"optimization/{brief.region.region_id}.usda"
     full = Path("layers") / rel
@@ -162,7 +236,7 @@ async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
 
 def Scope "Optimization"
 {{
-    custom int triangleBudget = {TRIANGLE_BUDGET}
+    custom int triangleBudget = {budget}
     custom double authoredTriangles = {authored_total}
     custom double observedTriangles = {effective_total}
     custom bool forcedLodCollapse = {str(bool(directives)).lower()}
@@ -177,6 +251,6 @@ def Scope "Optimization"
         specialist="optimization",
         region_id=brief.region.region_id,
         path=rel,
-        summary=f"budget {effective_total:.0f}/{TRIANGLE_BUDGET}{shed}",
+        summary=f"budget {effective_total:.0f}/{budget}{shed}",
         metrics={"over_budget": float(over_budget)},
     )
