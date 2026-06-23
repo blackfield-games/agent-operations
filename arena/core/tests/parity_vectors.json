@@ -1207,6 +1207,48 @@
       ]
     }
   ],
+  "knockback": [
+    {
+      "label": "hitscan_launches_grounded_target",
+      "weapon_mode": "hitscan",
+      "gravity": 60,
+      "knockback_velocity": 800,
+      "damage": 25,
+      "target_z_vel": 800,
+      "shooter_z_vel": 0,
+      "target_alive": true
+    },
+    {
+      "label": "melee_shares_the_knockback_sink",
+      "weapon_mode": "melee",
+      "gravity": 60,
+      "knockback_velocity": 800,
+      "damage": 50,
+      "target_z_vel": 800,
+      "shooter_z_vel": 0,
+      "target_alive": true
+    },
+    {
+      "label": "knockback_off_no_launch",
+      "weapon_mode": "hitscan",
+      "gravity": 60,
+      "knockback_velocity": 0,
+      "damage": 25,
+      "target_z_vel": 0,
+      "shooter_z_vel": 0,
+      "target_alive": true
+    },
+    {
+      "label": "gravity_off_no_launch",
+      "weapon_mode": "hitscan",
+      "gravity": 0,
+      "knockback_velocity": 800,
+      "damage": 25,
+      "target_z_vel": 0,
+      "shooter_z_vel": 0,
+      "target_alive": true
+    }
+  ],
   "matches": [
     {
       "label": "octant_hitscan",

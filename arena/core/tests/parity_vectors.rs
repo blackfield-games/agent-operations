@@ -368,6 +368,33 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(sat.deltas[0].delta < 0, "the upset favourite loses despite its rating");
     assert!(sat.deltas[0].delta.abs() >= sat.k - 2, "the capped upset sheds nearly a full K");
     assert_eq!(sat.deltas[2].delta, 0, "the expected wins over the weakest, past the cap, move nothing");
+
+    // Knockback (v9): a damaging hit pops a grounded survivor UPWARD by exactly
+    // knockback_velocity — the variable-fall source — through the one shared damage sink
+    // (so every weapon mode launches), and never recoils the shooter. Gated on gravity>0
+    // AND knockback>0, so a 2D or knockback-off match is byte-identical. A twin that drops
+    // the impulse, signs it downward, recoils the shooter, or ignores the gate fails one.
+    let kb = |label: &str| v.knockback.iter().find(|c| c.label == label).unwrap();
+    let launched = kb("hitscan_launches_grounded_target");
+    assert!(launched.damage > 0 && launched.target_alive, "the launching hit damages a survivor");
+    assert_eq!(
+        launched.target_z_vel, launched.knockback_velocity,
+        "a grounded survivor is popped up by exactly knockback_velocity"
+    );
+    assert!(launched.target_z_vel > 0, "the impulse is UPWARD — a dropped or downward one fails here");
+    assert_eq!(launched.shooter_z_vel, 0, "the shooter never recoils (the impulse hits the target)");
+    // The shared sink: melee launches identically, so the rule is mode-agnostic.
+    let melee = kb("melee_shares_the_knockback_sink");
+    assert_eq!(melee.target_z_vel, launched.target_z_vel, "every weapon mode funnels through one knockback sink");
+    assert!(melee.damage > 0 && melee.target_alive);
+    // The gate: knockback off and gravity off each suppress the impulse while the hit
+    // still lands — so the launch is driven by the rule, not the planar setup.
+    let kb_off = kb("knockback_off_no_launch");
+    assert_eq!(kb_off.target_z_vel, 0, "knockback_velocity 0 (the default) leaves the target grounded");
+    assert!(kb_off.damage > 0, "knockback-off still lands the hit — only the launch is suppressed");
+    let grav_off = kb("gravity_off_no_launch");
+    assert_eq!(grav_off.target_z_vel, 0, "gravity off suppresses the impulse even with knockback set");
+    assert!(grav_off.damage > 0, "gravity-off still lands the planar hit");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it

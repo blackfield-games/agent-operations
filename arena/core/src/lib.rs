@@ -3231,6 +3231,33 @@ pub struct VerticalHitCase {
     pub damage: u16,
 }
 
+/// A pinned knockback case (domain v9): a point-blank DAMAGING hit on a GROUNDED target
+/// under a given weapon `mode`, with [`Rules::gravity`] and [`Rules::knockback_velocity`]
+/// set, and the upward `z_vel` the hit imparts to the target. The planar geometry is the
+/// same point-blank shot [`VerticalHitCase`] uses (it lands in every weapon mode under
+/// [`Rules::default`] tuning), so the only thing that moves the target's `z_vel` is the
+/// knockback rule: a damaging hit on a surviving pawn adds exactly `knockback_velocity`
+/// (the shooter never recoils), gated on `gravity > 0` AND `knockback_velocity > 0` —
+/// with either off the impulse is suppressed and `z_vel` stays `0`. A twin that drops the
+/// impulse, signs it downward, applies it to the shooter, or ignores the gate fails the
+/// matching case. All other tuning is [`Rules::default`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnockbackCase {
+    pub label: String,
+    pub weapon_mode: WeaponMode,
+    pub gravity: i32,
+    pub knockback_velocity: i32,
+    /// Damage the one shot deals — `> 0` confirms the hit landed (knockback rides a real hit).
+    pub damage: u16,
+    /// The target's `z_vel` immediately after the hit: `knockback_velocity` for a grounded
+    /// survivor, `0` if the impulse was suppressed (gravity/knockback off) or dropped.
+    pub target_z_vel: i32,
+    /// The shooter's `z_vel` after the hit — always `0` (knockback never recoils the shooter).
+    pub shooter_z_vel: i32,
+    /// Whether the target survived the hit (a corpse is never launched).
+    pub target_alive: bool,
+}
+
 /// A pinned z-aware-occlusion case: a sightline from `(from, from_z)` to `(to, to_z)`
 /// against a single height-bounded [`Blocker`], and whether that wall occludes it. The
 /// rule a twin must reproduce: a wall with `height > 0` blocks a ground-level look but
@@ -3349,6 +3376,10 @@ pub struct ParityVectors {
     /// delta a settled FFA / 3+ ranked match applies — the multi-player generalization
     /// of `rating_deltas`, also a settlement-layer rule.
     pub field_deltas: Vec<FieldDeltaCase>,
+    /// knockback cases (domain v9): a damaging hit pops a surviving target upward by
+    /// [`Rules::knockback_velocity`] through the one shared damage sink (so every weapon
+    /// mode launches), gated on gravity and knockback both on — the variable-fall source.
+    pub knockback: Vec<KnockbackCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3662,6 +3693,46 @@ fn vertical_hit_case(label: &str, mode: WeaponMode, shooter_z: i32, target_z: i3
         target_z,
         vertical_hit_tolerance: tolerance,
         damage: before - m.pawns[1].health,
+    }
+}
+
+/// Build a knockback case: fire one point-blank shot at a grounded target with
+/// `gravity`/`knockback_velocity` set and record the target's post-hit upward z_vel (the
+/// variable-fall source), the shooter's (always 0 — never recoils), and whether the
+/// target survived. Mirrors `vertical_hit_case`'s one-geometry-all-modes point-blank
+/// setup; both pawns sit at `z == 0`, so the planar shot lands in every mode and the only
+/// z motion is the knockback itself.
+fn knockback_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocity: i32) -> KnockbackCase {
+    let rules = Rules { weapon_mode: mode, gravity, knockback_velocity, spawn_jitter: 0, ..Default::default() };
+    let shooter = Vec2::ZERO;
+    let target = Vec2 { x: 1500, y: 0 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = shooter;
+    m.pawns[0].facing = EAST;
+    m.pawns[1].pos = target;
+    let before = m.pawns[1].health;
+    match mode {
+        WeaponMode::Hitscan => m.resolve_fire(0),
+        WeaponMode::Melee => m.resolve_melee(0),
+        WeaponMode::Projectile => {
+            m.spawn_projectile(0);
+            let mut age = 0u16;
+            while !m.projectiles.is_empty() && age < MAX_PROJECTILE_LIFETIME {
+                m.advance_projectiles();
+                age += 1;
+            }
+        }
+    }
+    KnockbackCase {
+        label: label.to_string(),
+        weapon_mode: mode,
+        gravity,
+        knockback_velocity,
+        damage: before - m.pawns[1].health,
+        target_z_vel: m.pawns[1].z_vel,
+        shooter_z_vel: m.pawns[0].z_vel,
+        target_alive: m.pawns[1].alive,
     }
 }
 
@@ -4000,6 +4071,20 @@ pub fn parity_vectors() -> ParityVectors {
             // upset costs it ~a full K while both expected wins over the 200 seat 2 round to
             // nothing. Pins the cap in the multi-seat path.
             field_delta_case("saturated_gap_upset", &[(0, 2, 3000), (1, 1, 1500), (2, 3, 200)], 32),
+        ],
+        knockback: vec![
+            // The impulse: a damaging hitscan hit pops the grounded survivor upward by
+            // exactly knockback_velocity, and the shooter never recoils.
+            knockback_case("hitscan_launches_grounded_target", WeaponMode::Hitscan, 60, 800),
+            // The one shared damage sink: a melee swing launches identically — every
+            // weapon mode funnels through it, so the rule is mode-agnostic.
+            knockback_case("melee_shares_the_knockback_sink", WeaponMode::Melee, 60, 800),
+            // Off by default: knockback_velocity 0 leaves the target grounded though the
+            // hit still lands — the byte-identity (no-launch) case.
+            knockback_case("knockback_off_no_launch", WeaponMode::Hitscan, 60, 0),
+            // Gravity gates it: with vertical physics off the impulse is suppressed even
+            // with a knockback velocity set, so a 2D match is unchanged.
+            knockback_case("gravity_off_no_launch", WeaponMode::Hitscan, 0, 800),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
