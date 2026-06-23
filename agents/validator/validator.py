@@ -31,15 +31,16 @@ STYLE_SIM_THRESHOLD = 0.72
 # legitimately emit no metrics (director, lighting, npc) are
 # unaffected — keeping the schema to what a role genuinely always emits.
 #
-# NOTE: the optimizer sums `triangles` across ALL prior layers; terrain, biome, and
-# prop all emit geometry, so all three are contracted emitters — a mis-spelled key
-# in any of them can't silently under-count the budget. If a further stub
-# (lighting/npc) starts contributing geometry, add `triangles` to its contract here.
+# NOTE: the optimizer sums `triangles` across ALL prior layers; terrain, biome, prop,
+# and npc all emit geometry, so all four are contracted emitters — a mis-spelled key
+# in any of them can't silently under-count the budget. If a further stub (lighting)
+# starts contributing geometry, add `triangles` to its contract here.
 ROLE_METRICS: dict[str, set[str]] = {
     "optimization": {"over_budget"},
     "terrain": {"triangles"},
     "biome": {"triangles"},
     "prop": {"triangles"},
+    "npc": {"triangles"},
 }
 
 # USD text layers must begin with this cookie; pxr refuses to open a file without

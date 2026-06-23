@@ -42,6 +42,7 @@ _ROLE_METRICS = {
     "terrain": {"triangles": 262144.0},
     "biome": {"triangles": 100000.0},
     "prop": {"triangles": 96000.0},
+    "npc": {"triangles": 144000.0},
     "optimization": {"over_budget": 0.0},
 }
 
