@@ -800,6 +800,16 @@ struct Pawn {
     /// disabled). Never recorded (derived from the action stream like `cooldown`/`vel`),
     /// so replay rebuilds it bit-for-bit; always `0` when `dash_cooldown == 0`.
     dash_cooldown: u16,
+    /// The seat whose knockback impulse last lifted this pawn off the ground — the
+    /// fall-death attribution tag. Set in [`damage_pawn`](Match::damage_pawn) the moment a
+    /// hit's knockback launches a SURVIVING pawn (the same gate that imparts the upward
+    /// `z_vel`), overwritten by a later re-launch, and cleared the tick the pawn is
+    /// grounded again. On a LETHAL hard landing the launcher is credited the fall damage
+    /// like a weapon down (self/friendly excluded); a self-jump or elevated drop carries
+    /// no tag, so an unprovoked fall still credits no one. Never recorded (derived like
+    /// `z_vel`/`dash_cooldown`), so it adds no `canonical_encoding`/digest surface and a
+    /// fall-damage-off match is byte-identical.
+    launched_by: Option<SeatId>,
     /// Cumulative damage this pawn has dealt to enemies — the match score.
     score: i32,
     alive: bool,
@@ -1162,6 +1172,7 @@ impl Match {
                     ammo: rules.mag_size,
                     cooldown: 0,
                     dash_cooldown: 0,
+                    launched_by: None,
                     score: 0,
                     alive: true,
                 }
@@ -1852,11 +1863,20 @@ impl Match {
     /// identical for hitscan, melee, and a projectile, and a friendly-fire hit that deals
     /// damage knocks back too (it dealt real damage). Fall damage deliberately does NOT
     /// come through here — a hard landing hurts but never bounces the pawn back upward.
-    fn damage_pawn(&mut self, idx: usize, raw: u16) -> u16 {
+    ///
+    /// `attacker` is the seat that landed the hit. When the knockback actually lifts a
+    /// surviving pawn it is tagged as that pawn's [`launched_by`](Pawn::launched_by), so a
+    /// later lethal fall credits it like a weapon down — the same gate that imparts the
+    /// impulse, so the tag and the launch are inseparable.
+    fn damage_pawn(&mut self, idx: usize, raw: u16, attacker: SeatId) -> u16 {
         let (gravity, knockback) = (self.rules.gravity, self.rules.knockback_velocity);
         let effective = self.apply_hp_damage(idx, raw);
         if knockback > 0 && gravity > 0 && effective > 0 && self.pawns[idx].alive {
             self.pawns[idx].z_vel = self.pawns[idx].z_vel.saturating_add(knockback);
+            // This hit lifted a surviving pawn: tag the launcher so a later lethal
+            // landing credits it. A re-launch overwrites with the most recent lifter; the
+            // tag clears the tick the pawn is grounded again.
+            self.pawns[idx].launched_by = Some(attacker);
         }
         effective
     }
@@ -1948,7 +1968,7 @@ impl Match {
         if let Some((j, _)) = best {
             let friendly = self.pawns[j].team == s.team;
             let raw = self.rules.damage;
-            let dealt = self.damage_pawn(j, raw);
+            let dealt = self.damage_pawn(j, raw, s.seat);
             // A friendly hit (only reachable under `friendly_fire`) deals damage but
             // never scores — a team hit is never rewarded.
             if !friendly {
@@ -2007,7 +2027,7 @@ impl Match {
         for j in hits {
             let friendly = self.pawns[j].team == s.team;
             let raw = self.rules.melee_damage;
-            let dealt = self.damage_pawn(j, raw);
+            let dealt = self.damage_pawn(j, raw, s.seat);
             // A friendly hit (only under `friendly_fire`) deals damage but never
             // scores — mirrors resolve_fire.
             if !friendly {
@@ -2123,7 +2143,7 @@ impl Match {
             if let Some(j) = hit {
                 let friendly = self.pawns[j].team == proj.team;
                 let raw = self.rules.damage;
-                let dealt = self.damage_pawn(j, raw);
+                let dealt = self.damage_pawn(j, raw, proj.shooter);
                 // A friendly hit deals damage but never scores — mirrors resolve_fire.
                 if !friendly {
                     if let Some(sp) = self.pawns.iter_mut().find(|p| p.seat == proj.shooter) {
@@ -8513,27 +8533,27 @@ mod tests {
         // Overflow spill: shield 10 vs 25 dmg → 10 absorbed, 15 to health, 25 effective.
         m.pawns[1].shield = 10;
         m.pawns[1].health = 100;
-        assert_eq!(m.damage_pawn(1, 25), 25, "effective = shield absorbed + health spill");
+        assert_eq!(m.damage_pawn(1, 25, 0), 25, "effective = shield absorbed + health spill");
         assert_eq!(m.pawns[1].shield, 0, "shield fully drained");
         assert_eq!(m.pawns[1].health, 85, "the 15 overflow spilled to health");
         assert!(m.pawns[1].alive);
         // Under-shield: a hit smaller than the pool costs no health.
         m.pawns[1].shield = 50;
         m.pawns[1].health = 100;
-        assert_eq!(m.damage_pawn(1, 25), 25);
+        assert_eq!(m.damage_pawn(1, 25, 0), 25);
         assert_eq!(m.pawns[1].shield, 25, "only the shield drained");
         assert_eq!(m.pawns[1].health, 100, "no health lost under the shield");
         // Exact-deplete: a hit equal to the pool zeroes shield, leaves health intact.
         m.pawns[1].shield = 25;
         m.pawns[1].health = 100;
-        assert_eq!(m.damage_pawn(1, 25), 25);
+        assert_eq!(m.damage_pawn(1, 25, 0), 25);
         assert_eq!(m.pawns[1].shield, 0);
         assert_eq!(m.pawns[1].health, 100, "an exactly-depleting hit costs no health");
         // Lethal spill: shield 10 + health 5 vs 25 → downed; overkill (10) not in the
         // effective return, mirroring the prior damage.min(health) clamp.
         m.pawns[1].shield = 10;
         m.pawns[1].health = 5;
-        assert_eq!(m.damage_pawn(1, 25), 15, "effective HP removed caps at what the pawn had");
+        assert_eq!(m.damage_pawn(1, 25, 0), 15, "effective HP removed caps at what the pawn had");
         assert_eq!(m.pawns[1].shield, 0);
         assert_eq!(m.pawns[1].health, 0);
         assert!(!m.pawns[1].alive, "health reached 0 → downed");
@@ -8551,7 +8571,7 @@ mod tests {
         // the shooter's z_vel.
         let mut m = knockback_match(60, 800);
         assert_eq!(m.pawns[1].z_vel, 0, "the target starts grounded");
-        assert_eq!(m.damage_pawn(1, 25), 25, "the hit dealt damage");
+        assert_eq!(m.damage_pawn(1, 25, 0), 25, "the hit dealt damage");
         assert!(m.pawns[1].alive, "the target survived");
         assert_eq!(m.pawns[1].z_vel, 800, "a survivor is popped up by exactly knockback_velocity");
         assert_eq!(m.pawns[0].z_vel, 0, "the shooter never recoils");
@@ -8562,7 +8582,7 @@ mod tests {
         // FM1: with the default rules (gravity 0, knockback 0) a hit imparts no impulse —
         // the 2D match is byte-identical, the z stays 0.
         let mut m = new_match(1);
-        m.damage_pawn(1, 25);
+        m.damage_pawn(1, 25, 0);
         assert_eq!(m.pawns[1].z_vel, 0, "no knockback by default");
     }
 
@@ -8572,7 +8592,7 @@ mod tests {
         // down), so gravity 0 suppresses it even with a knockback velocity set — keeping a
         // gravity-off match byte-identical to 2D.
         let mut m = knockback_match(0, 800);
-        m.damage_pawn(1, 25);
+        m.damage_pawn(1, 25, 0);
         assert_eq!(m.pawns[1].z_vel, 0, "gravity off → no launch even with knockback set");
     }
 
@@ -8580,7 +8600,7 @@ mod tests {
     fn knockback_requires_a_positive_velocity() {
         // The complement: gravity on but knockback 0 (the off switch) imparts nothing.
         let mut m = knockback_match(60, 0);
-        m.damage_pawn(1, 25);
+        m.damage_pawn(1, 25, 0);
         assert_eq!(m.pawns[1].z_vel, 0, "knockback 0 → no launch even under gravity");
     }
 
@@ -8591,7 +8611,7 @@ mod tests {
         // a phantom flying body).
         let mut m = knockback_match(60, 800);
         m.pawns[1].health = 10; // a 25-damage hit is lethal
-        assert_eq!(m.damage_pawn(1, 25), 10, "effective caps at the 10 HP it had");
+        assert_eq!(m.damage_pawn(1, 25, 0), 10, "effective caps at the 10 HP it had");
         assert!(!m.pawns[1].alive, "the hit downed it");
         assert_eq!(m.pawns[1].z_vel, 0, "a corpse is never launched");
     }
@@ -8601,7 +8621,7 @@ mod tests {
         // FM-gating: the impulse rides REAL damage — a 0-effective hit (the value a miss
         // would carry, though a miss never reaches the sink) leaves z_vel untouched.
         let mut m = knockback_match(60, 800);
-        assert_eq!(m.damage_pawn(1, 0), 0, "no damage dealt");
+        assert_eq!(m.damage_pawn(1, 0, 0), 0, "no damage dealt");
         assert_eq!(m.pawns[1].z_vel, 0, "no damage → no knockback");
     }
 
@@ -8613,7 +8633,7 @@ mod tests {
         let mut m = knockback_match(60, 800);
         m.pawns[1].z = 500;
         m.pawns[1].z_vel = 1200; // already ascending from a jump
-        m.damage_pawn(1, 25);
+        m.damage_pawn(1, 25, 0);
         assert_eq!(m.pawns[1].z_vel, 2000, "knockback stacks onto the existing ascent");
     }
 
@@ -8624,7 +8644,7 @@ mod tests {
         let mut m = knockback_match(60, i32::MAX);
         m.pawns[1].z_vel = i32::MAX;
         m.pawns[1].health = 100; // survives the small hit
-        m.damage_pawn(1, 10);
+        m.damage_pawn(1, 10, 0);
         assert_eq!(m.pawns[1].z_vel, i32::MAX, "saturates at the ceiling, no wrap, no panic");
     }
 
@@ -8635,7 +8655,7 @@ mod tests {
         // through the shared sink, where the team distinction has already been resolved.
         let mut m = knockback_match(60, 800);
         m.pawns[1].team = m.pawns[0].team; // same team — a friendly hit
-        m.damage_pawn(1, 25);
+        m.damage_pawn(1, 25, 0);
         assert_eq!(m.pawns[1].z_vel, 800, "a friendly-fire hit still imparts knockback");
     }
 
