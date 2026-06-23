@@ -3318,22 +3318,26 @@ pub struct VerticalHitCase {
     pub damage: u16,
 }
 
-/// A pinned knockback case (domain v9): a point-blank DAMAGING hit on a GROUNDED target
-/// under a given weapon `mode`, with [`Rules::gravity`] and [`Rules::knockback_velocity`]
-/// set, and the upward `z_vel` the hit imparts to the target. The planar geometry is the
-/// same point-blank shot [`VerticalHitCase`] uses (it lands in every weapon mode under
-/// [`Rules::default`] tuning), so the only thing that moves the target's `z_vel` is the
-/// knockback rule: a damaging hit on a surviving pawn adds exactly `knockback_velocity`
-/// (the shooter never recoils), gated on `gravity > 0` AND `knockback_velocity > 0` —
-/// with either off the impulse is suppressed and `z_vel` stays `0`. A twin that drops the
-/// impulse, signs it downward, applies it to the shooter, or ignores the gate fails the
-/// matching case. All other tuning is [`Rules::default`].
+/// A pinned knockback case (domain v9; v10 adds the planar shove): a point-blank DAMAGING
+/// hit on a GROUNDED target under a given weapon `mode`, recording the FULL post-hit
+/// kinematics — the upward `z_vel` the hit imparts AND the position it shoves the target
+/// to — with [`Rules::gravity`], [`Rules::knockback_velocity`], and
+/// [`Rules::knockback_horizontal`] set. The planar geometry is the same point-blank shot
+/// [`VerticalHitCase`] uses (it lands in every weapon mode under [`Rules::default`]
+/// tuning), so the only thing that moves the target is the knockback rule: a damaging hit
+/// on a surviving pawn adds exactly `knockback_velocity` to `z_vel` (gated on `gravity > 0`
+/// AND `knockback_velocity > 0`) and shoves it exactly one `knockback_horizontal` step AWAY
+/// from the shooter (gated on `knockback_horizontal > 0` ALONE — no gravity); the shooter
+/// never recoils or moves. A twin that drops either impulse, signs it the wrong way, applies
+/// it to the shooter, or ignores a gate fails the matching case. All other tuning is
+/// [`Rules::default`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnockbackCase {
     pub label: String,
     pub weapon_mode: WeaponMode,
     pub gravity: i32,
     pub knockback_velocity: i32,
+    pub knockback_horizontal: i32,
     /// Damage the one shot deals — `> 0` confirms the hit landed (knockback rides a real hit).
     pub damage: u16,
     /// The target's `z_vel` immediately after the hit: `knockback_velocity` for a grounded
@@ -3341,7 +3345,12 @@ pub struct KnockbackCase {
     pub target_z_vel: i32,
     /// The shooter's `z_vel` after the hit — always `0` (knockback never recoils the shooter).
     pub shooter_z_vel: i32,
-    /// Whether the target survived the hit (a corpse is never launched).
+    /// The target's position after the hit: shoved `knockback_horizontal` units AWAY from
+    /// the shooter (so `x` grows for a due-east hit), or unmoved if the shove was off/gated.
+    pub target_pos: Vec2,
+    /// The shooter's position after the hit — unchanged (the shove never moves the shooter).
+    pub shooter_pos: Vec2,
+    /// Whether the target survived the hit (a corpse is never launched or shoved).
     pub target_alive: bool,
 }
 
@@ -3787,13 +3796,14 @@ fn vertical_hit_case(label: &str, mode: WeaponMode, shooter_z: i32, target_z: i3
 }
 
 /// Build a knockback case: fire one point-blank shot at a grounded target with
-/// `gravity`/`knockback_velocity` set and record the target's post-hit upward z_vel (the
-/// variable-fall source), the shooter's (always 0 — never recoils), and whether the
-/// target survived. Mirrors `vertical_hit_case`'s one-geometry-all-modes point-blank
-/// setup; both pawns sit at `z == 0`, so the planar shot lands in every mode and the only
-/// z motion is the knockback itself.
-fn knockback_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocity: i32) -> KnockbackCase {
-    let rules = Rules { weapon_mode: mode, gravity, knockback_velocity, spawn_jitter: 0, ..Default::default() };
+/// `gravity`/`knockback_velocity`/`knockback_horizontal` set and record the target's
+/// post-hit upward z_vel (the variable-fall source) AND its shoved position, the shooter's
+/// (z_vel always 0 — never recoils; pos unchanged — never shoved), and whether the target
+/// survived. Mirrors `vertical_hit_case`'s one-geometry-all-modes point-blank setup; both
+/// pawns sit at `z == 0`, the target due east of the shooter, so the planar shot lands in
+/// every mode and a positive `knockback_horizontal` shoves the target further east.
+fn knockback_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocity: i32, knockback_horizontal: i32) -> KnockbackCase {
+    let rules = Rules { weapon_mode: mode, gravity, knockback_velocity, knockback_horizontal, spawn_jitter: 0, ..Default::default() };
     let shooter = Vec2::ZERO;
     let target = Vec2 { x: 1500, y: 0 };
     let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
@@ -3819,9 +3829,12 @@ fn knockback_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocit
         weapon_mode: mode,
         gravity,
         knockback_velocity,
+        knockback_horizontal,
         damage: before - m.pawns[1].health,
         target_z_vel: m.pawns[1].z_vel,
         shooter_z_vel: m.pawns[0].z_vel,
+        target_pos: m.pawns[1].pos,
+        shooter_pos: m.pawns[0].pos,
         target_alive: m.pawns[1].alive,
     }
 }
@@ -4166,18 +4179,30 @@ pub fn parity_vectors() -> ParityVectors {
             field_delta_case("saturated_gap_upset", &[(0, 2, 3000), (1, 1, 1500), (2, 3, 200)], 32),
         ],
         knockback: vec![
-            // The impulse: a damaging hitscan hit pops the grounded survivor upward by
-            // exactly knockback_velocity, and the shooter never recoils.
-            knockback_case("hitscan_launches_grounded_target", WeaponMode::Hitscan, 60, 800),
+            // The vertical impulse: a damaging hitscan hit pops the grounded survivor upward
+            // by exactly knockback_velocity, and the shooter never recoils.
+            knockback_case("hitscan_launches_grounded_target", WeaponMode::Hitscan, 60, 800, 0),
             // The one shared damage sink: a melee swing launches identically — every
             // weapon mode funnels through it, so the rule is mode-agnostic.
-            knockback_case("melee_shares_the_knockback_sink", WeaponMode::Melee, 60, 800),
+            knockback_case("melee_shares_the_knockback_sink", WeaponMode::Melee, 60, 800, 0),
             // Off by default: knockback_velocity 0 leaves the target grounded though the
             // hit still lands — the byte-identity (no-launch) case.
-            knockback_case("knockback_off_no_launch", WeaponMode::Hitscan, 60, 0),
+            knockback_case("knockback_off_no_launch", WeaponMode::Hitscan, 60, 0, 0),
             // Gravity gates it: with vertical physics off the impulse is suppressed even
             // with a knockback velocity set, so a 2D match is unchanged.
-            knockback_case("gravity_off_no_launch", WeaponMode::Hitscan, 0, 800),
+            knockback_case("gravity_off_no_launch", WeaponMode::Hitscan, 0, 800, 0),
+            // The planar shove (v10): a damaging hitscan hit displaces the survivor one
+            // knockback_horizontal step AWAY from the shooter (east here) — and, UNLIKE the
+            // vertical pop, needs NO gravity. The shooter never moves.
+            knockback_case("hitscan_shoves_grounded_target", WeaponMode::Hitscan, 0, 0, 800),
+            // The same shared sink: a melee cleave shoves identically (mode-agnostic).
+            knockback_case("melee_shares_the_shove_sink", WeaponMode::Melee, 0, 0, 800),
+            // The projectile shoves along its TRAVEL direction (away from the shooter it
+            // flew from) — the same eastward displacement.
+            knockback_case("projectile_shoves_along_travel", WeaponMode::Projectile, 0, 0, 800),
+            // Both axes compose on ONE hit: gravity+knockback pop it up AND the horizontal
+            // shove pushes it east — a twin that fires only one fails this case.
+            knockback_case("pop_and_shove_compose", WeaponMode::Hitscan, 60, 800, 800),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

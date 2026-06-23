@@ -395,6 +395,46 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let grav_off = kb("gravity_off_no_launch");
     assert_eq!(grav_off.target_z_vel, 0, "gravity off suppresses the impulse even with knockback set");
     assert!(grav_off.damage > 0, "gravity-off still lands the planar hit");
+
+    // Directional knockback (v10): a damaging hit ALSO shoves a surviving target one
+    // knockback_horizontal step AWAY from the shooter, through the same shared sink (every
+    // weapon mode shoves), gated on knockback_horizontal>0 ALONE — no gravity — and never
+    // moves the shooter. The vertical cases above all run knockback_horizontal 0, so their
+    // target_pos is the unshoved baseline. A twin that drops the shove, signs it toward the
+    // shooter, shoves the shooter, or demands gravity fails one.
+    assert_eq!(launched.target_pos.x, 1500, "the vertical-only cases leave the target at its start x (kh 0)");
+    let shoved = kb("hitscan_shoves_grounded_target");
+    assert!(shoved.damage > 0 && shoved.target_alive, "the shoving hit damages a survivor");
+    assert_eq!(shoved.gravity, 0, "the planar shove needs NO gravity — it fires in a 2D match");
+    assert!(
+        shoved.target_pos.x > launched.target_pos.x,
+        "the survivor is shoved EAST, away from the shooter at the origin — a dropped or toward-shooter shove fails here"
+    );
+    assert_eq!(
+        shoved.target_pos.x,
+        launched.target_pos.x + shoved.knockback_horizontal,
+        "shoved by exactly knockback_horizontal along the bearing"
+    );
+    assert_eq!(shoved.target_pos.y, 0, "a due-east bearing moves only x");
+    assert_eq!(shoved.shooter_pos, launched.shooter_pos, "the shooter never moves (the shove hits the target)");
+    // The shared sink shoves in every weapon mode: a melee cleave and a projectile land the
+    // identical displacement (the projectile along its travel direction).
+    assert_eq!(kb("melee_shares_the_shove_sink").target_pos, shoved.target_pos, "a melee cleave shoves identically");
+    assert_eq!(kb("projectile_shoves_along_travel").target_pos, shoved.target_pos, "a projectile shoves along its travel, the same step");
+    // The gate complement: the vertical-only cases (knockback_horizontal 0) are NOT shoved,
+    // so the displacement is rule-driven, not the planar setup.
+    assert_eq!(grav_off.target_pos.x, launched.target_pos.x, "knockback_horizontal 0 leaves the target unshoved");
+    assert_eq!(kb_off.target_pos, launched.target_pos, "the no-launch case is un-shoved too (kh 0)");
+    // Both axes compose on ONE hit: a pop AND a shove from the same damage — a twin that
+    // fires only one is caught.
+    let both = kb("pop_and_shove_compose");
+    assert_eq!(both.target_z_vel, both.knockback_velocity, "the compose case still pops up");
+    assert_eq!(
+        both.target_pos.x,
+        launched.target_pos.x + both.knockback_horizontal,
+        "AND shoves east — both knockback axes fire on one hit"
+    );
+    assert!(both.target_z_vel > 0 && both.target_pos.x > launched.target_pos.x, "neither axis is dropped when both are armed");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
