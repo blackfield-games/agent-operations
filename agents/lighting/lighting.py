@@ -93,12 +93,13 @@ async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
     # back-compat floor the pipeline/compose tests pin). drivenBy lists the recognized
     # vocabulary tokens — never the raw free-form beats — so the layer carries no
     # injectable director text. The Sky/Sun palette below is untouched per DECISIONS.md.
+    driven = ",".join(recognized)
     fog_block = (
         f"""
     def Volume "Atmosphere"
     {{
         float inputs:density = {density:.2f}
-        custom string drivenBy = "{",".join(recognized)}"
+        custom string drivenBy = "{driven}"
         custom string mood = "haze"
     }}"""
         if recognized
