@@ -77,6 +77,10 @@ def test_gateway_frames_decode_and_reencode_against_rust_golden():
     # cross-implementer pin the hand-copied frames could not give. A Rust wire change
     # (which regenerates the golden) or a Python model drift breaks this against the one
     # source of truth, including the observe/end newtype flattening next to "type".
+    expected_type = {
+        "challenge": proto.Challenge, "welcome": proto.Welcome, "reject": proto.Reject,
+        "start": Start, "observe": Observation, "end": MatchResult,
+    }
     server = _golden_frames("server_to_agent")
     assert server, "golden carries no server->agent frames"
     seen = set()
@@ -84,6 +88,11 @@ def test_gateway_frames_decode_and_reencode_against_rust_golden():
         frame = case["frame"]
         msg = decode_gateway(frame)
         seen.add(frame["type"])
+        # decode_gateway must route each tag to the RIGHT concrete model — a mis-wired
+        # tag->type mapping is caught here, not only by field shape.
+        assert isinstance(msg, expected_type[frame["type"]]), (
+            f"{case['label']} decoded to {type(msg).__name__}"
+        )
         body = {k: v for k, v in frame.items() if k != "type"}
         if case["exact_reencode"]:
             assert msg.model_dump(mode="json") == body, (
