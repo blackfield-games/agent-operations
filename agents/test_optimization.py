@@ -233,10 +233,14 @@ async def test_resolved_layer_composes_and_validates(tmp_path, monkeypatch):
     # force an over-budget world so the optimizer actually sheds, then validate
     layers = [ly for ly in layers if ly.specialist != "biome"]
     layers.append(_layer("biome", 4_000_000, rid=brief.region.region_id, path=f"biome/{brief.region.region_id}.usda"))
-    # write the heavy biome layer to disk so well-formedness/composition can open it
+    # write the heavy biome layer to disk so well-formedness/composition can open it.
+    # It carries vegetationCapped because the real director seeds intent:must_not
+    # (dense_vegetation) for this region, so the real biome would cap — the synthetic
+    # stand-in must honor that too or the validator's director-intent gate rejects it.
     (tmp_path / "layers" / "biome").mkdir(parents=True, exist_ok=True)
     (tmp_path / "layers" / f"biome/{brief.region.region_id}.usda").write_text(
-        '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\ndef PointInstancer "Scatter"\n{\n    custom int instanceCount = 16667\n}\n'
+        '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\ndef PointInstancer "Scatter"\n{\n'
+        "    custom int instanceCount = 16667\n    custom bool vegetationCapped = true\n}\n"
     )
     opt = await optimization.run(brief, layers)
     layers.append(opt)
