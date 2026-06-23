@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v11",
+  "domain": "blackfield/arena/parity-vectors/v12",
   "protocol_version": 1,
   "spawns": [
     {
@@ -44,7 +44,9 @@
         "vertical_hit_tolerance": 0,
         "knockback_velocity": 0,
         "knockback_horizontal": 0,
-        "pawn_radius": 0
+        "pawn_radius": 0,
+        "fall_damage": 0,
+        "fall_damage_threshold": 0
       },
       "roster": [
         {
@@ -157,7 +159,9 @@
         "vertical_hit_tolerance": 0,
         "knockback_velocity": 0,
         "knockback_horizontal": 0,
-        "pawn_radius": 0
+        "pawn_radius": 0,
+        "fall_damage": 0,
+        "fall_damage_threshold": 0
       },
       "roster": [
         {
@@ -1542,7 +1546,9 @@
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
           "knockback_horizontal": 0,
-          "pawn_radius": 0
+          "pawn_radius": 0,
+          "fall_damage": 0,
+          "fall_damage_threshold": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1647,6 +1653,12 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -1723,7 +1735,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "e1351623d37af80e33a0caeb65c788a287c63bd7ae775695cdeecc72d94dfc85"
+          "replay_hash": "0cc9b89622f9727591c6db2c579b3a525c45b90919cf7cbc8affc2b00e98bf9d"
         }
       }
     },
@@ -1769,7 +1781,9 @@
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
           "knockback_horizontal": 0,
-          "pawn_radius": 0
+          "pawn_radius": 0,
+          "fall_damage": 0,
+          "fall_damage_threshold": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -1848,6 +1862,12 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -1950,7 +1970,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "ee4d63e026123525678d6f0673c57ade578423268ab54716d6a85efa68aad90e"
+          "replay_hash": "be1046ad2fd3996fcb88971f1cc05a02db7a31affd174404754ff127560cd17b"
         }
       }
     },
@@ -1996,7 +2016,9 @@
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
           "knockback_horizontal": 0,
-          "pawn_radius": 0
+          "pawn_radius": 0,
+          "fall_damage": 0,
+          "fall_damage_threshold": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -2075,6 +2097,12 @@
             50,
             0,
             15,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -2181,7 +2209,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "5455981c30cdec13551c45639a966805cc8dbcd44fac393de27e9aa31a65d86f"
+          "replay_hash": "1dc33fbe8b4cdb30dd1b2404fd547d38d8c5165676f85373af9fc75cfe3dad45"
         }
       }
     },
@@ -2227,7 +2255,9 @@
           "vertical_hit_tolerance": 0,
           "knockback_velocity": 0,
           "knockback_horizontal": 0,
-          "pawn_radius": 0
+          "pawn_radius": 0,
+          "fall_damage": 0,
+          "fall_damage_threshold": 0
         },
         "replay": {
           "protocol_version": 1,
@@ -2341,6 +2371,12 @@
             0,
             0,
             0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             0
           ],
           "config": {
@@ -2417,7 +2453,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "c7434443b827707fc22bff380056d807ecc9292034df84ccf031faa988b1ff1c"
+          "replay_hash": "8672e13527adbc84515c1c901e180267947e2e82a0f234565ac272442f518f56"
         }
       }
     }

@@ -583,6 +583,37 @@ pub struct Rules {
     /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
     #[serde(default)]
     pub pawn_radius: i32,
+    /// HP a HARD LANDING deals to the pawn that lands — fall damage. `serde(default)`
+    /// (`0`) DISABLES it: no landing ever damages and the match plays byte-identically to
+    /// every pre-fall-damage record (the default). A positive value is the flat damage a
+    /// landing whose downward impact speed EXCEEDS [`fall_damage_threshold`] deals,
+    /// applied through the shared [`apply_hp_damage`](Match::apply_hp_damage) sink at the
+    /// landing tick (so it drains shield first and downs the pawn at `0` like any damage)
+    /// but NOT through [`damage_pawn`](Match::damage_pawn) — a hard landing hurts and can
+    /// kill, yet never bounces the pawn back upward. Only meaningful with
+    /// [`gravity`](Rules::gravity)` > 0` (the sole source of any non-zero `z`, hence of
+    /// any landing impact); with gravity off no pawn leaves the ground and the knob is
+    /// inert. The threshold makes it NON-DEGENERATE: a fixed-impulse self-jump lands at
+    /// ~[`JUMP_VELOCITY`] and a threshold above that never punishes a normal hop, while a
+    /// [`knockback_velocity`](Rules::knockback_velocity)-boosted launch lands harder and
+    /// crosses it. Folds into [`canonical_encoding`](Rules::canonical_encoding) so the
+    /// digest binds it.
+    ///
+    /// [`fall_damage_threshold`]: Rules::fall_damage_threshold
+    #[serde(default)]
+    pub fall_damage: u16,
+    /// Downward impact SPEED (position units per tick) a landing must EXCEED for
+    /// [`fall_damage`](Rules::fall_damage) to apply — the gate that keeps a normal jump
+    /// safe. `serde(default)` (`0`) means "any landing with non-zero downward speed is a
+    /// hard landing"; paired with the default `fall_damage == 0` the whole feature is off
+    /// and byte-identical. A grounded pawn standing still lands at impact `0`, which never
+    /// exceeds a `>= 0` threshold, so it is never self-damaged. Set it just above a
+    /// self-jump's landing speed so only an externally boosted fall (a
+    /// [`knockback_velocity`](Rules::knockback_velocity) pop, or a future elevated drop)
+    /// hurts. Folds into [`canonical_encoding`](Rules::canonical_encoding) so the digest
+    /// binds it.
+    #[serde(default)]
+    pub fall_damage_threshold: i32,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -625,6 +656,8 @@ impl Default for Rules {
             knockback_velocity: 0, // hits impart no vertical impulse by default — z stays 0
             knockback_horizontal: 0, // hits impart no planar shove by default — pos unchanged
             pawn_radius: 0, // pawn-vs-pawn occupancy off by default — pawns may overlap
+            fall_damage: 0, // a hard landing deals no damage by default — every landing safe
+            fall_damage_threshold: 0, // inert while fall_damage is 0 (the feature's off default)
         }
     }
 }
@@ -683,6 +716,8 @@ impl Rules {
         b.extend_from_slice(&self.knockback_velocity.to_be_bytes());
         b.extend_from_slice(&self.knockback_horizontal.to_be_bytes());
         b.extend_from_slice(&self.pawn_radius.to_be_bytes());
+        b.extend_from_slice(&self.fall_damage.to_be_bytes());
+        b.extend_from_slice(&self.fall_damage_threshold.to_be_bytes());
         b
     }
 }
@@ -1684,8 +1719,22 @@ impl Match {
                 // on the ground with no drift and never tunnels to negative z.
                 let nz = self.pawns[i].z as i64 + self.pawns[i].z_vel as i64;
                 if nz <= 0 {
+                    // Landing this tick. The impact speed is the downward velocity that
+                    // carried the pawn to the ground (z_vel < 0 while falling), read
+                    // BEFORE the snap zeroes it and widened to i64 so an extreme launch
+                    // can't overflow the negation. A HARD landing — impact strictly above
+                    // fall_damage_threshold — deals fall_damage through the shared HP sink
+                    // (shield-first, downs at 0), gated on fall_damage > 0 so the default
+                    // match is byte-identical and a self-jump landing under a threshold set
+                    // above its speed is unharmed. NOT via damage_pawn: a fall hurts but
+                    // never knocks the pawn back upward. A grounded pawn lands at impact 0,
+                    // never exceeding a >= 0 threshold, so standing still never self-damages.
+                    let impact = -(self.pawns[i].z_vel as i64);
                     self.pawns[i].z = 0;
                     self.pawns[i].z_vel = 0;
+                    if self.rules.fall_damage > 0 && impact > self.rules.fall_damage_threshold as i64 {
+                        self.apply_hp_damage(i, self.rules.fall_damage);
+                    }
                 } else {
                     self.pawns[i].z = nz as i32;
                     self.pawns[i].z_vel = self.pawns[i].z_vel.saturating_sub(self.rules.gravity);
@@ -3608,9 +3657,13 @@ pub struct ParityVectors {
 /// gated [`Rules::pawn_radius`] widened `canonical_encoding` once more (every committed
 /// match hash moved) and a new `pawn_collisions` category pins the rule that, under a
 /// positive radius, a move/dash/shove whose swept path would enter another alive pawn's
-/// body is refused (hard-stop-adjacent, no overlap, no swap, no push-chain). Each is a
-/// deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v11";
+/// body is refused (hard-stop-adjacent, no overlap, no swap, no push-chain); bumped to
+/// v12 for FALL DAMAGE — gated [`Rules::fall_damage`]/[`Rules::fall_damage_threshold`]
+/// widened `canonical_encoding` again (every committed match hash moved) and a new
+/// `fall_damage` category pins the rule that a landing whose downward impact speed
+/// exceeds the threshold deals damage through the shared HP sink (no upward bounce).
+/// Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v12";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4112,7 +4165,7 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// stream yet hash differently because their aim_mode differs — while the rules also
 /// bind the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v11`: the digest binds the combat `rules` and the
+/// Set domain is `parity-vectors/v12`: the digest binds the combat `rules` and the
 /// `config` determinants (arena bounds + tick cap); v4 added the z-coupled-combat rule
 /// ([`Rules::vertical_hit_tolerance`] widened the rules encoding and the `vertical_hits`
 /// cases pin it); v5 adds blocker `height` — the digest folds it at replay tag v6
@@ -4130,7 +4183,10 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// OCCUPANCY ([`Rules::pawn_radius`] widened the rules encoding once more, moving every
 /// committed match hash, and a new `pawn_collisions` category pins that a move/dash/shove
 /// whose swept path would enter another alive pawn's body disc is refused — pawns are
-/// obstacles to one another). A twin must
+/// obstacles to one another); v12 adds FALL DAMAGE ([`Rules::fall_damage`] and
+/// [`Rules::fall_damage_threshold`] widened the rules encoding once more, moving every
+/// committed match hash, and a new `fall_damage` category pins that a landing whose
+/// downward impact speed exceeds the threshold deals damage — and never bounces). A twin must
 /// fold the wider encodings into its match digest and reproduce every rule or it diverges;
 /// the v2 blockers-as-physical-cover convention
 /// still holds. These are deliberate conventions every twin must follow.
@@ -7676,9 +7732,9 @@ mod tests {
         // closes. Flip EACH field and assert the bytes move.
         let base = Rules::default();
         assert_eq!(base.canonical_encoding(), base.canonical_encoding(), "encoding is not a pure function");
-        // 14×i32 + 1×u32 + 10×u16 + 5×u8 = 85 bytes. A new sim field added to the
+        // 15×i32 + 1×u32 + 11×u16 + 5×u8 = 91 bytes. A new sim field added to the
         // encoding moves this pin, forcing the field-flip set below to grow with it.
-        assert_eq!(base.canonical_encoding().len(), 85, "the encoding width pins the covered field set");
+        assert_eq!(base.canonical_encoding().len(), 91, "the encoding width pins the covered field set");
 
         let cases: Vec<(&str, Rules)> = vec![
             ("max_speed", Rules { max_speed: base.max_speed + 1, ..base }),
@@ -7711,8 +7767,10 @@ mod tests {
             ("knockback_velocity", Rules { knockback_velocity: base.knockback_velocity + 1, ..base }),
             ("knockback_horizontal", Rules { knockback_horizontal: base.knockback_horizontal + 1, ..base }),
             ("pawn_radius", Rules { pawn_radius: base.pawn_radius + 1, ..base }),
+            ("fall_damage", Rules { fall_damage: base.fall_damage + 1, ..base }),
+            ("fall_damage_threshold", Rules { fall_damage_threshold: base.fall_damage_threshold + 1, ..base }),
         ];
-        assert_eq!(cases.len(), 30, "every Rules field needs a flip case");
+        assert_eq!(cases.len(), 32, "every Rules field needs a flip case");
         for (field, mutated) in &cases {
             assert_ne!(base.canonical_encoding(), mutated.canonical_encoding(), "{field} must bind the encoding");
         }
