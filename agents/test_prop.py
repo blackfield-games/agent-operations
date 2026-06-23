@@ -129,3 +129,23 @@ async def test_prop_is_a_sheddable_non_floor_layer(tmp_path, monkeypatch):
     assert "forcedLodCollapse = true" in usd  # a real shed happened
     assert prp.path in usd  # and prop is the layer that was LOD-collapsed
     assert opt.metrics["over_budget"] == 0.0  # resolved by shedding prop, not terminal
+
+
+def test_asset_selection_is_deterministic_and_region_variable():
+    # FM2: the per-region asset pick is a stable function of the region id (two calls
+    # agree) and DIFFERS across regions — a constant pick would defeat region-variable
+    # composition. Distinct regions select more than one distinct asset.
+    rid = RegionCoord(x=3, y=7).region_id
+    assert prop._select_asset(rid) == prop._select_asset(rid)
+    assets = {prop._select_asset(RegionCoord(x=x, y=0).region_id) for x in range(20)}
+    assert len(assets) > 1
+
+
+def test_selected_asset_is_always_a_table_key():
+    # FM3: the pick is drawn from ASSET_TRIS keys, so it can NEVER be an unknown asset
+    # that would slip past _asset_tris as a 0-tri phantom layer — every region's pick is
+    # budget-known, and the count and asset are independently salted (a region's pick is
+    # not just a function of its count).
+    for x in range(20):
+        for y in range(-5, 5):
+            assert prop._select_asset(RegionCoord(x=x, y=y).region_id) in prop.ASSET_TRIS
