@@ -65,10 +65,12 @@ def test_distinct_regions_yield_distinct_geometry():
 
 
 @pytest.mark.asyncio
-async def test_dense_biome_can_exceed_budget_via_the_optimizer(tmp_path, monkeypatch):
+async def test_dense_biome_is_lod_resolved_by_the_optimizer(tmp_path, monkeypatch):
     # FM4 (optimizer integration / the unblock): biome triangles flow into
-    # optimization.run's sum, so a dense biome region CAN trip over_budget — the
-    # thing terrain alone never could, which is why the LOD-resolve task was blocked.
+    # optimization.run's sum, so a dense biome region's RAW geometry exceeds the
+    # budget — the thing terrain alone never could. The optimizer (now budget-
+    # resolving) LOD-sheds that scatter back under budget rather than fast-failing,
+    # which is exactly the contributor the LOD-resolve task needed to do real work.
     monkeypatch.chdir(tmp_path)
     terrain_tris = (await terrain.run(WorldBrief(biome="forest", region=RegionCoord(x=0, y=0)), [])).metrics[
         "triangles"
@@ -85,13 +87,17 @@ async def test_dense_biome_can_exceed_budget_via_the_optimizer(tmp_path, monkeyp
     terr = await terrain.run(brief, [])
     bio = await biome.run(brief, [terr])
     opt = await optimization.run(brief, [terr, bio])
-    assert opt.metrics["over_budget"] == 1.0
+    assert opt.metrics["over_budget"] == 0.0  # resolved by shedding, not a terminal fail
+    opt_usd = (tmp_path / "layers" / opt.path).read_text()
+    assert "forcedLodCollapse = true" in opt_usd  # a real shed happened
+    assert bio.path in opt_usd  # the biome scatter is the layer that was LOD-collapsed
 
 
 @pytest.mark.asyncio
-async def test_sparse_biome_stays_under_budget(tmp_path, monkeypatch):
-    # The complement: a sparse post-conflict biome never trips the budget, so the
-    # over_budget signal stays meaningful (not always-on regardless of geometry).
+async def test_sparse_biome_needs_no_shedding(tmp_path, monkeypatch):
+    # The complement to the dense case: a sparse post-conflict biome fits under budget
+    # on its own, so the optimizer resolves it WITHOUT shedding (no forced collapse) —
+    # the shed signal stays meaningful (driven by geometry, not always-on).
     monkeypatch.chdir(tmp_path)
     for x in range(20):
         brief = WorldBrief(biome="scorched", region=RegionCoord(x=x, y=0))
@@ -99,6 +105,7 @@ async def test_sparse_biome_stays_under_budget(tmp_path, monkeypatch):
         bio = await biome.run(brief, [terr])
         opt = await optimization.run(brief, [terr, bio])
         assert opt.metrics["over_budget"] == 0.0
+        assert "forcedLodCollapse = false" in (tmp_path / "layers" / opt.path).read_text()
 
 
 @pytest.mark.asyncio
