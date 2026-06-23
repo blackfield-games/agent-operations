@@ -15,6 +15,7 @@ A2A path can never pass CI by silently skipping.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -270,11 +271,36 @@ def _intent(x: int, y: int) -> ActionIntent:
     )
 
 
-def test_move_clamp_matches_rust():
-    # The exact rows from arena/proto move_clamp_caps_overlong_and_leaves_inrange.
-    assert _intent(3000, 4000).clamped().move_dir == Vec2(x=600, y=800)
-    assert _intent(600, 800).clamped().move_dir == Vec2(x=600, y=800)
-    assert _intent(300, -400).clamped().move_dir == Vec2(x=300, y=-400)
+def _clamp_golden() -> dict:
+    """The SAME committed clamp-parity golden the Rust arena-proto drift-gate pins
+    (arena/proto/tests/clamp_parity.json), resolved by repo-relative path from THIS
+    file (never the CWD), so it holds under validate.sh's agents-dir pytest run. A
+    missing golden fails LOUD — it is the single source of truth for the Rust⇄Python
+    move-clamp contract and must never be silently skipped (which would let drift
+    through). Regenerate after an intentional clamp change with
+    `cargo test -p arena-proto --test clamp_parity regenerate_clamp_parity_golden -- --ignored`."""
+    path = Path(__file__).resolve().parents[1] / "arena" / "proto" / "tests" / "clamp_parity.json"
+    assert path.is_file(), f"shared clamp-parity golden not found at {path}"
+    return json.loads(path.read_text())
+
+
+def test_move_clamp_matches_rust_golden():
+    # Python ActionIntent.clamped() must reproduce EVERY case in the Rust golden
+    # bit-for-bit — the machine-checked cross-implementer pin the hand-copied rows
+    # could not give. A Rust clamp change (which regenerates the golden) or a Python
+    # clamp regression breaks this against the one source of truth, including the
+    # i32::MIN overflow corner and the trunc-toward-zero discriminator.
+    golden = _clamp_golden()
+    assert golden["domain"] == "blackfield/arena/clamp-parity/v1"
+    assert golden["move_intent_scale"] == proto.MOVE_INTENT_SCALE
+    assert golden["cases"], "golden carries no cases"
+    for case in golden["cases"]:
+        inp, exp = case["input"], case["output"]
+        got = _intent(inp["x"], inp["y"]).clamped().move_dir
+        assert got == Vec2(x=exp["x"], y=exp["y"]), (
+            f"clamp parity drift on {case['label']!r}: input {inp} -> "
+            f"Python ({got.x}, {got.y}) vs Rust golden ({exp['x']}, {exp['y']})"
+        )
 
 
 def test_move_clamp_truncates_toward_zero_not_floor():
