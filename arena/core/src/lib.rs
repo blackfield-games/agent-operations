@@ -534,9 +534,11 @@ pub struct Rules {
     /// (the sole source of any non-zero `z`); with gravity off the impulse is suppressed
     /// and every pawn's `z` stays `0`, so a 2D match is byte-identical even with knockback
     /// set. Never fires on a miss, on a killed pawn (a corpse is not launched), or on the
-    /// shooter. This is VERTICAL-ONLY (a pop-up); directional (horizontal) knockback is a
-    /// deferred follow-up. Makes fall damage a non-degenerate, revivable mechanic. Folds
-    /// into [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
+    /// shooter. This is the VERTICAL pop-up; its planar sibling
+    /// [`knockback_horizontal`](Rules::knockback_horizontal) shoves the target away from the
+    /// shooter (independently gated, no gravity needed). Makes fall damage a non-degenerate,
+    /// revivable mechanic. Folds into
+    /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
     #[serde(default)]
     pub knockback_velocity: i32,
     /// Horizontal distance, in position units, a landed DAMAGING hit shoves the
