@@ -8057,6 +8057,149 @@ mod tests {
         assert!(m.pawns[1].z > 0, "the knocked-back pawn is now airborne");
     }
 
+    /// Two seats with directional knockback armed: the shooter at the origin facing EAST,
+    /// the target due east at x=1500 (in both fire and melee range under default tuning),
+    /// no jitter — so the post-hit shove lands at an exact, predictable position.
+    fn directional_match(knockback_horizontal: i32) -> Match {
+        let rules = Rules { knockback_horizontal, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+        m
+    }
+
+    #[test]
+    fn directional_unit_is_the_away_octant_or_none() {
+        // FM3: the push direction is the shooter→target bearing snapped to an octant and
+        // rescaled to MOVE_INTENT_SCALE; a zero bearing (coincident) has NO direction.
+        assert_eq!(knockback_unit(1500, 0), Some(Vec2 { x: 1000, y: 0 }), "due east → the east unit at move scale");
+        assert_eq!(knockback_unit(-1500, 0), Some(Vec2 { x: -1000, y: 0 }), "due west → the mirrored west unit (away, not toward)");
+        assert_eq!(knockback_unit(0, 0), None, "a target on the shooter has no bearing → no shove");
+        let ne = knockback_unit(1000, 1000).expect("a NE bearing has a direction");
+        assert!(ne.x > 0 && ne.y > 0, "a NE bearing pushes NE — both axes away from the shooter");
+    }
+
+    #[test]
+    fn directional_shoves_the_survivor_away_from_the_shooter() {
+        // FM3: a damaging hitscan shot displaces the surviving target AWAY from the shooter
+        // by exactly knockback_horizontal along the bearing, and never moves the shooter.
+        // gravity is 0 here, so this ALSO pins that the planar shove needs no gravity.
+        let mut m = directional_match(800);
+        assert_eq!(m.rules.gravity, 0, "no gravity — a planar shove must still fire");
+        let before = m.pawns[1].pos;
+        m.resolve_fire(0);
+        assert!(m.pawns[1].alive, "one shot does not down a full-health pawn");
+        assert_eq!(m.pawns[1].pos.x, before.x + 800, "shoved east by exactly knockback_horizontal");
+        assert_eq!(m.pawns[1].pos.y, before.y, "a pure-east bearing moves only x");
+        assert_eq!(m.pawns[0].pos, Vec2::ZERO, "the shooter never recoils");
+    }
+
+    #[test]
+    fn directional_is_off_by_default() {
+        // FM1: knockback_horizontal 0 (the default) → a hit imparts no shove; the position
+        // is byte-identical to a pre-directional match.
+        let mut m = directional_match(0);
+        let before = m.pawns[1].pos;
+        m.resolve_fire(0);
+        assert!(m.pawns[1].alive);
+        assert_eq!(m.pawns[1].pos, before, "no shove by default");
+    }
+
+    #[test]
+    fn directional_does_not_shove_a_corpse() {
+        // FM3: a lethal hit downs the target — a corpse is not shoved; it stays where it died.
+        let mut m = directional_match(800);
+        m.pawns[1].health = 10; // a 25-damage shot is lethal
+        let before = m.pawns[1].pos;
+        m.resolve_fire(0);
+        assert!(!m.pawns[1].alive, "the shot downed it");
+        assert_eq!(m.pawns[1].pos, before, "a corpse is never shoved");
+    }
+
+    #[test]
+    fn directional_does_not_shove_a_coincident_melee_target() {
+        // FM3: a melee swing strikes a point-blank target ON the shooter (in_fov admits a
+        // zero offset), but with no bearing there is no shove — the safe degenerate guarded
+        // at the call site, on a hit that really dealt damage.
+        let mut m = directional_match(800);
+        m.rules.weapon_mode = WeaponMode::Melee;
+        m.pawns[1].pos = m.pawns[0].pos; // coincident
+        let before = m.pawns[1].pos;
+        m.resolve_melee(0);
+        assert!(m.pawns[1].health < Rules::default().start_health, "the point-blank cleave landed");
+        assert_eq!(m.pawns[1].pos, before, "no bearing → no shove, even on a real hit");
+    }
+
+    #[test]
+    fn directional_shove_stops_at_a_wall_no_tunnel() {
+        // FM2: the shove runs through slide's blocker refusal — a wall in the shove path
+        // stops it (it holds, like a walk into a wall), never tunneling to the far side.
+        let wall = Blocker { min: Vec2 { x: 1800, y: -500 }, max: Vec2 { x: 2000, y: 500 }, height: 0 };
+        let rules = Rules { knockback_horizontal: 800, spawn_jitter: 0, ..Default::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), vec![wall], 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: 1500, y: 0 }; // hit lands (wall is past the target), shove crosses the wall
+        m.resolve_fire(0);
+        assert!(m.pawns[1].alive, "the shot landed — the wall is beyond the target, not on the sightline");
+        assert_eq!(m.pawns[1].pos, Vec2 { x: 1500, y: 0 }, "the shove into the wall holds — never tunnels past x=1800");
+    }
+
+    #[test]
+    fn directional_shove_clamps_to_the_arena_bound() {
+        // FM2: a shove toward the edge clamps at the arena bound (the same clamp a walk
+        // uses), never leaving the arena — even with an enormous knockback.
+        let mut m = directional_match(1_000_000);
+        let bound = m.config.bounds.x;
+        m.pawns[0].pos = Vec2 { x: bound - 1600, y: 0 };
+        m.pawns[1].pos = Vec2 { x: bound - 100, y: 0 }; // gap 1500, in range; just inside the east edge
+        m.resolve_fire(0);
+        assert!(m.pawns[1].alive);
+        assert_eq!(m.pawns[1].pos.x, bound, "the shove clamps exactly at the east bound");
+    }
+
+    #[test]
+    fn directional_shoves_through_a_melee_cleave() {
+        // The shove rides the shared post-hit path in EVERY weapon mode — a melee cleave
+        // shoves its struck survivor away too, not just a hitscan beam.
+        let mut m = directional_match(800);
+        m.rules.weapon_mode = WeaponMode::Melee;
+        let before = m.pawns[1].pos;
+        m.resolve_melee(0);
+        assert!(m.pawns[1].alive, "one swing does not down a full-health pawn");
+        assert_eq!(m.pawns[1].pos.x, before.x + 800, "the melee survivor is shoved east too");
+    }
+
+    #[test]
+    fn directional_shoves_through_a_projectile_hit() {
+        // And the projectile path shoves along the shot's TRAVEL direction. Fire a level
+        // projectile east into the target; the survivor is shoved east by the same step.
+        let mut m = directional_match(800);
+        m.rules.weapon_mode = WeaponMode::Projectile;
+        let before = m.pawns[1].pos;
+        m.spawn_projectile(0);
+        let mut guard = 0u16;
+        while !m.projectiles.is_empty() && guard < MAX_PROJECTILE_LIFETIME {
+            m.advance_projectiles();
+            guard += 1;
+        }
+        assert!(m.pawns[1].alive, "one projectile does not down a full-health pawn");
+        assert_eq!(m.pawns[1].pos.x, before.x + 800, "the projectile shoved the survivor east along its travel");
+    }
+
+    #[test]
+    fn directional_shove_is_deterministic() {
+        // FM2: the integer shove is bit-stable — two identical setups give the identical
+        // post-shove position.
+        let run = || {
+            let mut m = directional_match(800);
+            m.resolve_fire(0);
+            m.pawns[1].pos
+        };
+        assert_eq!(run(), run(), "the shove is deterministic across runs");
+    }
+
     #[test]
     fn a_shield_absorbs_a_real_shot_and_can_save_a_pawn() {
         // FM1: end-to-end through a real fire. Control: a low-health pawn with no shield
