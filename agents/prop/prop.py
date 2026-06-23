@@ -6,9 +6,13 @@ draft → validate → retopo → UV → texture → LOD → import).
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 from pathlib import Path
 from common.types import WorldBrief, LayerSpec
 from common.usd import usd_str
+
+logger = logging.getLogger(__name__)
 
 # Triangles in one placed prop's source mesh (pre-LOD), keyed by the library asset.
 # A content-budget TABLE, not a single per-layer constant — different props carry
@@ -24,6 +28,21 @@ ASSET_TRIS: dict[str, int] = {
     "convoy_wreck_01": 8000,
     "barricade_01": 1500,
     "ammo_crate_01": 600,
+}
+
+# The director's intent:must_have names INTENT tokens ("comms_tower"), not the library
+# assets ("comms_tower_01") prop actually places — this dict is the deterministic bridge
+# that lets prop honor that intent. Each token a region MUST have maps to the concrete
+# library asset prop guarantees for it. Every value MUST be a key of ASSET_TRIS (pinned
+# by test_must_have_asset_values_are_a_subset_of_asset_tris) so a guaranteed placement is
+# ALWAYS budget-known and _asset_tris can never fire on a must-have. An art-director
+# confirms the real token->asset map alongside the geometry tables (operator-reviewable,
+# like ASSET_TRIS — see the agents-prop-geometry-metrics escalation in BLOCKERS); a
+# director token absent here is skipped with a warning (see _required_assets), never
+# silently dropped as a 0-tri phantom.
+MUST_HAVE_ASSET: dict[str, str] = {
+    "comms_tower": "comms_tower_01",
+    "convoy_wreck": "convoy_wreck_01",
 }
 
 # Base prop placements per region before the per-region jitter. Props are discrete
