@@ -65,7 +65,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v12");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v13");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -521,6 +521,41 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         lethal.fall_damage > lethal.start_health && lethal.damage == lethal.start_health,
         "overkill is clamped to the pawn's HP through the shared sink"
     );
+
+    // Fall-kill attribution (domain v13): a knockback-into-a-lethal-fall credits the
+    // LAUNCHER's score like a weapon down (the effective fall damage), with the same
+    // self/friendly exclusion — a team launch downs the victim all the same but credits no
+    // one. The enemy and friendly cases share every tuning and differ ONLY by team, so the
+    // credit divergence is the team rule, not the setup.
+    let fk = |label: &str| v.fall_kills.iter().find(|c| c.label == label).unwrap();
+    let enemy_fk = fk("enemy_launch_credits_launcher");
+    let friendly_fk = fk("friendly_launch_credits_no_one");
+    // Both lethal falls down the victim and both launches lifted it — only the CREDIT
+    // differs by team (a friendly hit launches and kills just the same).
+    assert!(!enemy_fk.victim_alive && !friendly_fk.victim_alive, "a lethal knockback-fall downs the victim regardless of team");
+    assert!(enemy_fk.victim_launch_z_vel > 0 && friendly_fk.victim_launch_z_vel > 0, "the knockback lifted the victim in both cases");
+    assert!(enemy_fk.impact_speed > enemy_fk.fall_damage_threshold, "the boosted fall lands above the threshold (a hard, lethal landing)");
+    assert!(enemy_fk.fall_damage_dealt > 0, "the lethal fall removed real HP");
+    // The enemy launch credits the launcher EXACTLY the fall damage, on top of its hit.
+    assert_eq!(enemy_fk.credited_seat, Some(0), "an enemy launch credits the launcher");
+    assert_eq!(
+        enemy_fk.launcher_score_after_fall - enemy_fk.launcher_score_before_fall,
+        enemy_fk.fall_damage_dealt as i32,
+        "the lethal fall adds exactly its damage to the launcher's score"
+    );
+    // The friendly launch downs the victim identically but credits NO ONE — and the friendly
+    // hit itself scored nothing, so the launcher's score never moved at all.
+    assert_eq!(friendly_fk.credited_seat, None, "a same-team launch credits no one");
+    assert_eq!(friendly_fk.launcher_score_after_fall, friendly_fk.launcher_score_before_fall, "the friendly fall adds no score");
+    assert_eq!(friendly_fk.launcher_score_before_fall, 0, "the friendly launching hit scored nothing either");
+    // Non-degenerate: enemy and friendly differ ONLY by team — same gravity, knockback, fall
+    // damage, and threshold — so the credit divergence is the team rule alone.
+    assert_eq!(
+        (enemy_fk.gravity, enemy_fk.knockback_velocity, enemy_fk.fall_damage, enemy_fk.fall_damage_threshold),
+        (friendly_fk.gravity, friendly_fk.knockback_velocity, friendly_fk.fall_damage, friendly_fk.fall_damage_threshold),
+        "enemy and friendly share all tuning"
+    );
+    assert!(!enemy_fk.friendly && friendly_fk.friendly, "the two cases differ by the team flag");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it

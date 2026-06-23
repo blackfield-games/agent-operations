@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v12",
+  "domain": "blackfield/arena/parity-vectors/v13",
   "protocol_version": 1,
   "spawns": [
     {
@@ -1563,6 +1563,40 @@
       "damage": 100,
       "landed_alive": false,
       "ticks_aloft": 21
+    }
+  ],
+  "fall_kills": [
+    {
+      "label": "enemy_launch_credits_launcher",
+      "gravity": 600,
+      "knockback_velocity": 6000,
+      "fall_damage": 200,
+      "fall_damage_threshold": 3000,
+      "start_health": 100,
+      "friendly": false,
+      "victim_launch_z_vel": 6000,
+      "impact_speed": 6000,
+      "fall_damage_dealt": 75,
+      "victim_alive": false,
+      "launcher_score_before_fall": 25,
+      "launcher_score_after_fall": 100,
+      "credited_seat": 0
+    },
+    {
+      "label": "friendly_launch_credits_no_one",
+      "gravity": 600,
+      "knockback_velocity": 6000,
+      "fall_damage": 200,
+      "fall_damage_threshold": 3000,
+      "start_health": 100,
+      "friendly": true,
+      "victim_launch_z_vel": 6000,
+      "impact_speed": 6000,
+      "fall_damage_dealt": 75,
+      "victim_alive": false,
+      "launcher_score_before_fall": 0,
+      "launcher_score_after_fall": 0,
+      "credited_seat": null
     }
   ],
   "matches": [

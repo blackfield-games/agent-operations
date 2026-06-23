@@ -3532,6 +3532,49 @@ pub struct FallDamageCase {
     pub ticks_aloft: u16,
 }
 
+/// A pinned fall-KILL attribution case (domain v13): seat 0 (the launcher) lands a
+/// point-blank DAMAGING hit on seat 1 (the victim) under a knockback that pops it airborne,
+/// then the match is stepped (no intents) to the victim's LETHAL landing. Pins the scoring
+/// contract a twin must reproduce: a knockback-into-a-lethal-fall credits the LAUNCHER's
+/// score exactly like a weapon down — the effective `fall_damage_dealt`, added on TOP of the
+/// launching hit — with the SAME self/friendly exclusion (a launcher on the victim's team is
+/// never rewarded, so a `friendly` launch credits no one though it downs the victim all the
+/// same). A far idle bystander (seat 2, a distinct team) keeps the match Live across the arc.
+/// The enemy and friendly cases share every tuning and differ ONLY by team, so the credit
+/// divergence is the team rule, not the setup. A twin that drops the fall credit, rewards a
+/// friendly launcher, or mis-scopes the amount fails the matching case. All other tuning is
+/// [`Rules::default`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallKillCase {
+    pub label: String,
+    pub gravity: i32,
+    pub knockback_velocity: i32,
+    pub fall_damage: u16,
+    pub fall_damage_threshold: i32,
+    pub start_health: u16,
+    /// Whether the launcher and victim share a team — a friendly launch credits nothing.
+    pub friendly: bool,
+    /// The victim's upward `z_vel` right after the launching hit — `> 0` confirms the
+    /// knockback lifted it off the ground (so the later landing can be lethal).
+    pub victim_launch_z_vel: i32,
+    /// The downward impact speed at the lethal landing tick — exceeds the threshold.
+    pub impact_speed: i32,
+    /// The lethal fall's effective damage (clamped to the victim's remaining HP).
+    pub fall_damage_dealt: u16,
+    /// `false` — the landing downed the victim, true in BOTH the enemy and friendly cases
+    /// (only the credit differs by team).
+    pub victim_alive: bool,
+    /// The launcher's score after the launching hit, BEFORE the fall resolves — the weapon
+    /// hit's own credit (`damage` for an enemy hit, `0` for a friendly one).
+    pub launcher_score_before_fall: i32,
+    /// The launcher's score after the lethal landing — the before plus the fall credit for
+    /// an enemy launch, unchanged for a friendly one.
+    pub launcher_score_after_fall: i32,
+    /// The seat the lethal fall credited: the launcher (seat 0) for an enemy launch, NONE
+    /// for a friendly/self launch.
+    pub credited_seat: Option<SeatId>,
+}
+
 /// A pinned z-coupled-combat case: a shot fired DEAD-ON in the plane (the target is
 /// in range, in front, and on a clear sightline) at a target at elevation `target_z`,
 /// under a given weapon `mode` and [`Rules::vertical_hit_tolerance`], and the damage
@@ -3724,6 +3767,10 @@ pub struct ParityVectors {
     /// sink (no upward bounce), gated on `fall_damage > 0` — the threshold keeps a normal
     /// self-jump safe while a knockback-boosted launch lands hard enough to hurt.
     pub fall_damage: Vec<FallDamageCase>,
+    /// fall-kill attribution cases (domain v13): a knockback-into-a-lethal-fall credits the
+    /// LAUNCHER's score like a weapon down (the effective fall damage), self/friendly
+    /// excluded — the scoring sibling of the `fall_damage` category.
+    pub fall_kills: Vec<FallKillCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3758,9 +3805,12 @@ pub struct ParityVectors {
 /// v12 for FALL DAMAGE — gated [`Rules::fall_damage`]/[`Rules::fall_damage_threshold`]
 /// widened `canonical_encoding` again (every committed match hash moved) and a new
 /// `fall_damage` category pins the rule that a landing whose downward impact speed
-/// exceeds the threshold deals damage through the shared HP sink (no upward bounce).
+/// exceeds the threshold deals damage through the shared HP sink (no upward bounce);
+/// bumped to v13 for FALL-KILL ATTRIBUTION — a new `fall_kills` category pins that a
+/// knockback-into-a-lethal-fall credits the LAUNCHER like a weapon down (self/friendly
+/// excluded), riding a DERIVED launch tag (never recorded), so no replay-digest tag move.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v12";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v13";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4073,6 +4123,68 @@ fn fall_damage_case(label: &str, gravity: i32, fall_damage: u16, fall_damage_thr
         damage: before - m.pawns[0].health,
         landed_alive: m.pawns[0].alive,
         ticks_aloft,
+    }
+}
+
+/// Build a fall-kill attribution case: seat 0 (launcher) fires one point-blank hitscan shot
+/// at seat 1 (victim) under gravity + a knockback that launches it, then steps (no intents)
+/// to the victim's lethal landing, recording the launch, the lethal impact, and the
+/// launcher's score across the fall. `friendly` puts the victim on the launcher's team (with
+/// friendly_fire on so the hit still lands and launches) — the case that downs the victim yet
+/// credits no one. Seat 2 is a far idle bystander on a distinct team so the match stays Live
+/// across the arc even when launcher and victim share a team.
+fn fall_kill_case(label: &str, gravity: i32, knockback_velocity: i32, fall_damage: u16, fall_damage_threshold: i32, start_health: u16, friendly: bool) -> FallKillCase {
+    let rules = Rules { gravity, knockback_velocity, fall_damage, fall_damage_threshold, start_health, friendly_fire: friendly, spawn_jitter: 0, ..Default::default() };
+    let victim_team = if friendly { 0 } else { 1 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, victim_team), parity_seat(2, 2)];
+    let mut m = Match::new(parity_match_id(), parity_config(3), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    m.pawns[1].pos = Vec2 { x: 1500, y: 0 }; // point-blank, dead ahead — the hit lands
+    m.pawns[2].pos = Vec2 { x: 30_000, y: 0 }; // far, idle — keeps the match Live, never hit
+    m.resolve_fire(0); // the launcher pops the victim airborne — launched_by[1] = 0
+    let victim_launch_z_vel = m.pawns[1].z_vel;
+    let launcher_score_before_fall = m.pawns[0].score;
+    let no_intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    let mut impact_speed = 0i32;
+    let mut fall_damage_dealt = 0u16;
+    let mut ticks = 0u16;
+    // Step until the victim lands. The impact speed is the downward velocity it ENTERED the
+    // landing tick with (read before the snap to 0); the fall damage is the HP it lost on
+    // that tick — the credit the launcher earns. The launching hit already dealt the weapon
+    // damage above, so this isolates the FALL's contribution.
+    while ticks < 10_000 {
+        let pre_z_vel = m.pawns[1].z_vel;
+        let pre_health = m.pawns[1].health;
+        let airborne = m.pawns[1].z != 0 || m.pawns[1].z_vel != 0;
+        m.step(&no_intents);
+        ticks += 1;
+        if airborne && m.pawns[1].z == 0 {
+            impact_speed = pre_z_vel.saturating_neg();
+            fall_damage_dealt = pre_health - m.pawns[1].health;
+            break;
+        }
+        if !airborne {
+            break;
+        }
+    }
+    let launcher_score_after_fall = m.pawns[0].score;
+    let credited_seat = if launcher_score_after_fall > launcher_score_before_fall { Some(0) } else { None };
+    FallKillCase {
+        label: label.to_string(),
+        gravity,
+        knockback_velocity,
+        fall_damage,
+        fall_damage_threshold,
+        start_health,
+        friendly,
+        victim_launch_z_vel,
+        impact_speed,
+        fall_damage_dealt,
+        victim_alive: m.pawns[1].alive,
+        launcher_score_before_fall,
+        launcher_score_after_fall,
+        credited_seat,
     }
 }
 
@@ -4584,6 +4696,19 @@ pub fn parity_vectors() -> ParityVectors {
                 // Lethal: a hard landing dealing more than the remaining HP downs the pawn,
                 // clamped through the shared sink — fall damage can kill, not just chip.
                 fall_damage_case("lethal_landing_downs_pawn", G, 200, 3_000, 6_000, 100),
+            ]
+        },
+        fall_kills: {
+            // gravity 600 + a 6000 knockback launch lands the victim at impact 6000 (above
+            // the 3000 threshold); fall_damage 200 outright downs it. The enemy and friendly
+            // cases share ALL tuning and differ only by team — so the credit divergence is
+            // the team rule, not the setup.
+            const G: i32 = 600;
+            vec![
+                // Enemy launch: the launcher is credited the lethal fall on top of its hit.
+                fall_kill_case("enemy_launch_credits_launcher", G, 6_000, 200, 3_000, 100, false),
+                // Friendly launch: the same lethal fall, but a same-team launcher scores nothing.
+                fall_kill_case("friendly_launch_credits_no_one", G, 6_000, 200, 3_000, 100, true),
             ]
         },
         matches: vec![
