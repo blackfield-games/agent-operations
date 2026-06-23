@@ -1601,6 +1601,158 @@
       "credited_seat": null
     }
   ],
+  "z_occupancy": [
+    {
+      "label": "within_band_blocked",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1500,
+      "mover_z": 500,
+      "obstacle_z": 0,
+      "pawn_height": 1000,
+      "end": {
+        "x": 3000,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "high_jump_clears",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1500,
+      "mover_z": 5000,
+      "obstacle_z": 0,
+      "pawn_height": 1000,
+      "end": {
+        "x": 4000,
+        "y": 0
+      },
+      "blocked": false
+    },
+    {
+      "label": "band_edge_inclusive_blocks",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1500,
+      "mover_z": 1000,
+      "obstacle_z": 0,
+      "pawn_height": 1000,
+      "end": {
+        "x": 3000,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "just_past_band_clears",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1500,
+      "mover_z": 1001,
+      "obstacle_z": 0,
+      "pawn_height": 1000,
+      "end": {
+        "x": 4000,
+        "y": 0
+      },
+      "blocked": false
+    },
+    {
+      "label": "swap_obstacle_high_blocks",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1500,
+      "mover_z": 0,
+      "obstacle_z": 500,
+      "pawn_height": 1000,
+      "end": {
+        "x": 3000,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "swap_obstacle_high_clears",
+      "start": {
+        "x": 3000,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 1000,
+      "obstacle": {
+        "x": 5000,
+        "y": 0
+      },
+      "pawn_radius": 1500,
+      "mover_z": 0,
+      "obstacle_z": 5000,
+      "pawn_height": 1000,
+      "end": {
+        "x": 4000,
+        "y": 0
+      },
+      "blocked": false
+    }
+  ],
   "matches": [
     {
       "label": "octant_hitscan",

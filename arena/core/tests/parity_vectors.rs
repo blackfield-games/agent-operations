@@ -556,6 +556,51 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         "enemy and friendly share all tuning"
     );
     assert!(!enemy_fk.friendly && friendly_fk.friendly, "the two cases differ by the team flag");
+
+    // z-coupled occupancy (domain v14): under a positive pawn_height a body refusal also
+    // requires the two pawns' feet within the band (|dz| <= pawn_height), so a pawn that
+    // jumped high enough vaults the body. Every case shares ONE planar geometry (the discs
+    // always overlap), so each verdict isolates the z band — not the XY collision.
+    let zo = |label: &str| v.z_occupancy.iter().find(|c| c.label == label).unwrap();
+    let within = zo("within_band_blocked");
+    let high = zo("high_jump_clears");
+    // The block/clear pair shares start, obstacle, radius, max_speed, AND pawn_height —
+    // only mover_z differs, and that alone flips the verdict: z, nothing else, decides.
+    assert_eq!(
+        (within.start, within.obstacle, within.pawn_radius, within.pawn_height, within.max_speed),
+        (high.start, high.obstacle, high.pawn_radius, high.pawn_height, high.max_speed),
+        "the block/clear pair isolates z (identical XY geometry + band)"
+    );
+    assert_ne!(within.mover_z, high.mover_z, "the pair differs only in the mover's elevation");
+    assert!(within.blocked && within.end == within.start, "a pawn within the band is held by the body");
+    assert!(!high.blocked && high.end != high.start, "a pawn jumped above the band vaults and moves");
+    // The band edge is INCLUSIVE: |dz| == pawn_height blocks, |dz| == pawn_height + 1 clears.
+    let edge = zo("band_edge_inclusive_blocks");
+    let past = zo("just_past_band_clears");
+    assert_eq!((edge.mover_z - edge.obstacle_z).abs(), edge.pawn_height, "the edge case sits EXACTLY at the band");
+    assert_eq!((past.mover_z - past.obstacle_z).abs(), past.pawn_height + 1, "the past case sits one unit beyond the band");
+    assert!(edge.blocked, "|dz| == pawn_height is INCLUSIVE — still blocked");
+    assert!(!past.blocked, "one unit past the band clears");
+    // Symmetry: swapping which pawn is elevated (mover-high vs obstacle-high) preserves the
+    // verdict, since |dz| is symmetric — A blocks B iff B blocks A.
+    let swap_block = zo("swap_obstacle_high_blocks");
+    let swap_clear = zo("swap_obstacle_high_clears");
+    assert_eq!(
+        (swap_block.mover_z - swap_block.obstacle_z).abs(),
+        (within.mover_z - within.obstacle_z).abs(),
+        "the swap mirrors the block case's |dz|"
+    );
+    assert_eq!(
+        (swap_clear.mover_z - swap_clear.obstacle_z).abs(),
+        (high.mover_z - high.obstacle_z).abs(),
+        "the swap mirrors the clear case's |dz|"
+    );
+    assert_eq!(swap_block.blocked, within.blocked, "role-swap preserves the BLOCK verdict");
+    assert_eq!(swap_clear.blocked, high.blocked, "role-swap preserves the CLEAR verdict");
+    // The swapped cases elevate the OTHER pawn (mover grounded, obstacle high) — proving the
+    // predicate reads both seats' z, not just the mover's.
+    assert!(swap_block.mover_z == 0 && swap_block.obstacle_z > 0, "the block-swap elevates the obstacle, not the mover");
+    assert!(swap_clear.mover_z == 0 && swap_clear.obstacle_z > 0, "the clear-swap elevates the obstacle, not the mover");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it

@@ -3545,6 +3545,38 @@ pub struct PawnCollisionCase {
     pub blocked: bool,
 }
 
+/// A pinned z-coupled-occupancy case (domain v14): the [`PawnCollisionCase`] setup with
+/// both pawns' elevations set and a positive [`Rules::pawn_height`]. A single mover (seat
+/// 0) at `start`, elevation `mover_z`, takes one `step` toward an obstacle pawn (seat 1) at
+/// `obstacle`, elevation `obstacle_z`, with [`Rules::pawn_radius`] and `pawn_height` set,
+/// and the mover's resulting position is recorded. The XY geometry is chosen so the swept
+/// discs ALWAYS overlap (a planar refusal), so `blocked` is decided purely by the z band:
+/// within the band (`|mover_z - obstacle_z| <= pawn_height`) the body blocks and the mover
+/// holds at `start`; beyond it the mover vaults and ends past the body. `gravity` is `0`,
+/// so the set elevations persist across the step — the case isolates the z predicate, not a
+/// jump arc. A twin that ignores `z` (blocks regardless of elevation), inverts the band
+/// edge, or reads a boundary other than `|dz| <= pawn_height` fails the matching case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZOccupancyCase {
+    pub label: String,
+    pub start: Vec2,
+    pub move_dir: Vec2,
+    pub max_speed: i32,
+    /// The other pawn's position — the body the mover may not enter when their z-bands overlap.
+    pub obstacle: Vec2,
+    pub pawn_radius: i32,
+    /// The mover's (seat 0) elevation during the slide.
+    pub mover_z: i32,
+    /// The obstacle pawn's (seat 1) elevation.
+    pub obstacle_z: i32,
+    /// [`Rules::pawn_height`] for this case — the vertical band (`0` would disable it, planar).
+    pub pawn_height: i32,
+    /// Seat 0's position after exactly one `step`.
+    pub end: Vec2,
+    /// `true` when the step produced no displacement — here, a z-coupled occupancy refusal.
+    pub blocked: bool,
+}
+
 /// A pinned fall-damage case (domain v12): a single pawn (seat 0) is launched with
 /// `launch_z_vel` (modelling a jump or a [`Rules::knockback_velocity`]-boosted pop) under
 /// a given [`Rules::gravity`], then integrated by repeated `step`s to its landing, with
@@ -3820,6 +3852,11 @@ pub struct ParityVectors {
     /// LAUNCHER's score like a weapon down (the effective fall damage), self/friendly
     /// excluded — the scoring sibling of the `fall_damage` category.
     pub fall_kills: Vec<FallKillCase>,
+    /// z-coupled occupancy cases (domain v14): under a positive [`Rules::pawn_height`] a
+    /// pawn-body refusal also requires the mover's and obstacle's feet within the band
+    /// (`|dz| <= pawn_height`), so a pawn that jumped high enough vaults the body — the
+    /// z-coupling sibling of the planar `pawn_collisions` category.
+    pub z_occupancy: Vec<ZOccupancyCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4132,6 +4169,31 @@ fn pawn_collision_case(label: &str, start: Vec2, move_dir: Vec2, max_speed: i32,
     m.step(&intents);
     let end = m.pawns[0].pos;
     PawnCollisionCase { label: label.to_string(), start, move_dir, max_speed, obstacle, pawn_radius, end, blocked: end == start }
+}
+
+/// Build a z-coupled-occupancy case: place the mover (seat 0) at `start`, elevation
+/// `mover_z`, and an obstacle pawn (seat 1) at `obstacle`, elevation `obstacle_z`, set
+/// [`Rules::pawn_radius`] + [`Rules::pawn_height`], step once toward the obstacle, and
+/// record where the mover ends. `gravity` is `0` (the default), so the vertical integrator
+/// never runs and the set elevations persist through the step — the case isolates the z
+/// band: the XY discs always overlap, so `blocked == (end == start)` is decided purely by
+/// whether `|mover_z - obstacle_z| <= pawn_height`. Mirrors `pawn_collision_case`'s
+/// wall-free arena so only the body — within the band — can refuse the step.
+#[allow(clippy::too_many_arguments)]
+fn z_occupancy_case(label: &str, start: Vec2, move_dir: Vec2, max_speed: i32, obstacle: Vec2, pawn_radius: i32, mover_z: i32, obstacle_z: i32, pawn_height: i32) -> ZOccupancyCase {
+    let rules = Rules { max_speed, pawn_radius, pawn_height, spawn_jitter: 0, ..Default::default() };
+    let config = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds: Vec2 { x: 50_000, y: 50_000 }, seats: 2 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), config, rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = start;
+    m.pawns[0].z = mover_z;
+    m.pawns[1].pos = obstacle;
+    m.pawns[1].z = obstacle_z;
+    let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    intents.insert(0, parity_intent(move_dir, EAST, false));
+    m.step(&intents);
+    let end = m.pawns[0].pos;
+    ZOccupancyCase { label: label.to_string(), start, move_dir, max_speed, obstacle, pawn_radius, mover_z, obstacle_z, pawn_height, end, blocked: end == start }
 }
 
 /// Build a fall-damage case: launch seat 0 with `launch_z_vel` under `gravity`, then
@@ -4764,6 +4826,30 @@ pub fn parity_vectors() -> ParityVectors {
                 fall_kill_case("enemy_launch_credits_launcher", G, 6_000, 200, 3_000, 100, false),
                 // Friendly launch: the same lethal fall, but a same-team launcher scores nothing.
                 fall_kill_case("friendly_launch_credits_no_one", G, 6_000, 200, 3_000, 100, true),
+            ]
+        },
+        z_occupancy: {
+            // Every case shares ONE planar geometry — a 1.5 m body at x=5 m, the mover one
+            // step (1 m) short at x=3 m moving east INTO it — so the swept XY discs always
+            // overlap and only the pawn_height band (1 m here) decides each verdict.
+            let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+            let start = Vec2 { x: 3_000, y: 0 };
+            let obstacle = Vec2 { x: 5_000, y: 0 };
+            const R: i32 = 1_500;
+            const H: i32 = 1_000;
+            vec![
+                // Within the band: a low hop (|dz| 500 <= 1000) is blocked by the body.
+                z_occupancy_case("within_band_blocked", start, east, 1_000, obstacle, R, 500, 0, H),
+                // Above the band: a high jump (|dz| 5000 > 1000) vaults the body and moves.
+                z_occupancy_case("high_jump_clears", start, east, 1_000, obstacle, R, 5_000, 0, H),
+                // The band edge is INCLUSIVE: |dz| == pawn_height (1000) still blocks.
+                z_occupancy_case("band_edge_inclusive_blocks", start, east, 1_000, obstacle, R, 1_000, 0, H),
+                // One unit past the edge clears: |dz| == pawn_height + 1 (1001) vaults.
+                z_occupancy_case("just_past_band_clears", start, east, 1_000, obstacle, R, 1_001, 0, H),
+                // Symmetry: swapping which pawn is elevated preserves the BLOCK (|dz| 500).
+                z_occupancy_case("swap_obstacle_high_blocks", start, east, 1_000, obstacle, R, 0, 500, H),
+                // Symmetry: swapping which pawn is elevated preserves the CLEAR (|dz| 5000).
+                z_occupancy_case("swap_obstacle_high_clears", start, east, 1_000, obstacle, R, 0, 5_000, H),
             ]
         },
         matches: vec![
