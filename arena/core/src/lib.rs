@@ -4099,7 +4099,7 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// stream yet hash differently because their aim_mode differs — while the rules also
 /// bind the outcomes a re-run reproduces.
 ///
-/// Set domain is `parity-vectors/v10`: the digest binds the combat `rules` and the
+/// Set domain is `parity-vectors/v11`: the digest binds the combat `rules` and the
 /// `config` determinants (arena bounds + tick cap); v4 added the z-coupled-combat rule
 /// ([`Rules::vertical_hit_tolerance`] widened the rules encoding and the `vertical_hits`
 /// cases pin it); v5 adds blocker `height` — the digest folds it at replay tag v6
@@ -4113,7 +4113,11 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// `knockback` cases pin that a damaging hit pops a surviving target upward); v10 adds
 /// DIRECTIONAL knockback ([`Rules::knockback_horizontal`] widened the rules encoding once
 /// more, moving every committed match hash, and the `knockback` cases gain the planar
-/// shove that pushes a surviving target away from the shooter). A twin must
+/// shove that pushes a surviving target away from the shooter); v11 adds pawn-body
+/// OCCUPANCY ([`Rules::pawn_radius`] widened the rules encoding once more, moving every
+/// committed match hash, and a new `pawn_collisions` category pins that a move/dash/shove
+/// whose swept path would enter another alive pawn's body disc is refused — pawns are
+/// obstacles to one another). A twin must
 /// fold the wider encodings into its match digest and reproduce every rule or it diverges;
 /// the v2 blockers-as-physical-cover convention
 /// still holds. These are deliberate conventions every twin must follow.
