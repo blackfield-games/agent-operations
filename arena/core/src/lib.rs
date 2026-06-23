@@ -7760,6 +7760,124 @@ mod tests {
         assert!(!m.pawns[1].alive, "health reached 0 → downed");
     }
 
+    fn knockback_match(gravity: i32, knockback_velocity: i32) -> Match {
+        let rules = Rules { gravity, knockback_velocity, ..Default::default() };
+        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1)
+    }
+
+    #[test]
+    fn knockback_pops_a_grounded_survivor_upward() {
+        // FM-gating: a damaging hit on a surviving, grounded pawn adds exactly
+        // knockback_velocity to its z_vel — the variable-fall source — and never touches
+        // the shooter's z_vel.
+        let mut m = knockback_match(60, 800);
+        assert_eq!(m.pawns[1].z_vel, 0, "the target starts grounded");
+        assert_eq!(m.damage_pawn(1, 25), 25, "the hit dealt damage");
+        assert!(m.pawns[1].alive, "the target survived");
+        assert_eq!(m.pawns[1].z_vel, 800, "a survivor is popped up by exactly knockback_velocity");
+        assert_eq!(m.pawns[0].z_vel, 0, "the shooter never recoils");
+    }
+
+    #[test]
+    fn knockback_is_off_by_default() {
+        // FM1: with the default rules (gravity 0, knockback 0) a hit imparts no impulse —
+        // the 2D match is byte-identical, the z stays 0.
+        let mut m = new_match(1);
+        m.damage_pawn(1, 25);
+        assert_eq!(m.pawns[1].z_vel, 0, "no knockback by default");
+    }
+
+    #[test]
+    fn knockback_requires_gravity_on() {
+        // FM-gating: knockback is meaningless without gravity (z would never come back
+        // down), so gravity 0 suppresses it even with a knockback velocity set — keeping a
+        // gravity-off match byte-identical to 2D.
+        let mut m = knockback_match(0, 800);
+        m.damage_pawn(1, 25);
+        assert_eq!(m.pawns[1].z_vel, 0, "gravity off → no launch even with knockback set");
+    }
+
+    #[test]
+    fn knockback_requires_a_positive_velocity() {
+        // The complement: gravity on but knockback 0 (the off switch) imparts nothing.
+        let mut m = knockback_match(60, 0);
+        m.damage_pawn(1, 25);
+        assert_eq!(m.pawns[1].z_vel, 0, "knockback 0 → no launch even under gravity");
+    }
+
+    #[test]
+    fn knockback_does_not_launch_a_downed_target() {
+        // FM-gating: a hit that DOWNS the pawn must not launch the corpse — gravity
+        // integration skips a dead pawn, so a non-zero z_vel on it would be dead churn (and
+        // a phantom flying body).
+        let mut m = knockback_match(60, 800);
+        m.pawns[1].health = 10; // a 25-damage hit is lethal
+        assert_eq!(m.damage_pawn(1, 25), 10, "effective caps at the 10 HP it had");
+        assert!(!m.pawns[1].alive, "the hit downed it");
+        assert_eq!(m.pawns[1].z_vel, 0, "a corpse is never launched");
+    }
+
+    #[test]
+    fn knockback_imparts_nothing_on_a_zero_damage_hit() {
+        // FM-gating: the impulse rides REAL damage — a 0-effective hit (the value a miss
+        // would carry, though a miss never reaches the sink) leaves z_vel untouched.
+        let mut m = knockback_match(60, 800);
+        assert_eq!(m.damage_pawn(1, 0), 0, "no damage dealt");
+        assert_eq!(m.pawns[1].z_vel, 0, "no damage → no knockback");
+    }
+
+    #[test]
+    fn knockback_stacks_onto_an_airborne_target() {
+        // FM2: a target already rising (mid-jump) takes the impulse ON TOP of its current
+        // z_vel, so a hit launches it higher than a self-jump — the mechanic that makes a
+        // landing harder than a jump.
+        let mut m = knockback_match(60, 800);
+        m.pawns[1].z = 500;
+        m.pawns[1].z_vel = 1200; // already ascending from a jump
+        m.damage_pawn(1, 25);
+        assert_eq!(m.pawns[1].z_vel, 2000, "knockback stacks onto the existing ascent");
+    }
+
+    #[test]
+    fn knockback_saturates_without_overflow() {
+        // FM2: a max knockback added to a max-stacked z_vel must not panic — the impulse
+        // is saturating, capping at i32::MAX rather than wrapping to a downward velocity.
+        let mut m = knockback_match(60, i32::MAX);
+        m.pawns[1].z_vel = i32::MAX;
+        m.pawns[1].health = 100; // survives the small hit
+        m.damage_pawn(1, 10);
+        assert_eq!(m.pawns[1].z_vel, i32::MAX, "saturates at the ceiling, no wrap, no panic");
+    }
+
+    #[test]
+    fn knockback_launches_a_friendly_fire_target() {
+        // FM-gating: knockback follows DAMAGE, not team — a friendly-fire hit deals real
+        // damage, so it knocks the ally back too (it scores nothing, but it hurts). Pinned
+        // through the shared sink, where the team distinction has already been resolved.
+        let mut m = knockback_match(60, 800);
+        m.pawns[1].team = m.pawns[0].team; // same team — a friendly hit
+        m.damage_pawn(1, 25);
+        assert_eq!(m.pawns[1].z_vel, 800, "a friendly-fire hit still imparts knockback");
+    }
+
+    #[test]
+    fn knockback_through_a_real_fire_launches_then_falls() {
+        // End-to-end: a real hitscan shot launches the grounded target, which then rides
+        // the gravity arc up and back down — the full author→launch→fall path, not just the
+        // sink in isolation. The z integration runs BEFORE the fire each tick, so the
+        // impulse lands this tick and integrates into altitude on the next.
+        let mut m = close_match(1);
+        m.rules.gravity = 60;
+        m.rules.knockback_velocity = 800;
+        assert_eq!((m.pawns[1].z, m.pawns[1].z_vel), (0, 0), "the target starts grounded");
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]); // seat 0 fires at seat 1
+        assert!(m.pawns[1].alive, "one shot does not down a full-health pawn");
+        assert_eq!(m.pawns[1].z_vel, 800, "the hit imparted the upward impulse");
+        assert_eq!(m.pawns[1].z, 0, "z integrates next tick — gravity ran before the fire this tick");
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]); // ride the arc
+        assert!(m.pawns[1].z > 0, "the knocked-back pawn is now airborne");
+    }
+
     #[test]
     fn a_shield_absorbs_a_real_shot_and_can_save_a_pawn() {
         // FM1: end-to-end through a real fire. Control: a low-health pawn with no shield
