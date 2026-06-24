@@ -11485,6 +11485,101 @@ mod tests {
         );
     }
 
+    /// FM1: the dead-letter age anchors on the OLDEST `dead_lettered_at` (`MIN`), not the
+    /// newest. Two quarantined rows stamped with distinct times must yield the older stamp
+    /// for both the attestation and debit backlogs (a store-level test with explicit
+    /// stamps, since real dead-letters in a test all land within the same second).
+    #[tokio::test]
+    async fn oldest_dead_lettered_age_is_min_not_newest() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let older = seed_job();
+        let newer = seed_job();
+        settle_one_metered(&state, &older).await; // pending attestation + pending debit
+        settle_one_metered(&state, &newer).await;
+
+        let store = state.store.lock().await;
+        // Quarantine each with an explicit, distinct stamp (older = 1000, newer = 2000).
+        assert!(store.mark_attestation_dead_lettered(&older.id, 1000).unwrap());
+        assert!(store.mark_attestation_dead_lettered(&newer.id, 2000).unwrap());
+        assert!(store.mark_debit_dead_lettered(&older.id, 1000).unwrap());
+        assert!(store.mark_debit_dead_lettered(&newer.id, 2000).unwrap());
+
+        assert_eq!(
+            store.oldest_dead_lettered_attestation_at().unwrap(),
+            Some(1000),
+            "MIN stamp, not the newer 2000"
+        );
+        assert_eq!(
+            store.oldest_dead_lettered_debit_at().unwrap(),
+            Some(1000),
+            "MIN stamp, not the newer 2000"
+        );
+    }
+
+    /// FM2: `/stats` reports `null` for both dead-letter ages on a clean mesh (no row
+    /// quarantined), and a small positive numeric age once a row is dead-lettered — proving
+    /// None → Some and that the field is the AGE, not the count. FM4: the new fields are
+    /// additive — the existing `oldest_in_flight_secs` and the dead-letter DEPTH counts are
+    /// unchanged in the same response.
+    #[tokio::test]
+    async fn stats_reports_oldest_dead_lettered_age() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+
+        // Clean mesh → both ages null (present-but-null, the additive shape).
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert!(json["oldest_dead_lettered_attestation_secs"].is_null(), "clean → null");
+        assert!(json["oldest_dead_lettered_debit_secs"].is_null(), "clean → null");
+        // Additive shape: the pre-existing key is still serialized (present, value
+        // irrelevant — seeded jobs left in_flight by the drain make it a number here).
+        assert!(json.get("oldest_in_flight_secs").is_some(), "existing field still present");
+        assert_eq!(json["dead_lettered_attestations"], 0);
+        assert_eq!(json["dead_lettered_debits"], 0);
+
+        // Quarantine one metered job's receipt AND its debit.
+        let job = seed_job();
+        settle_one_metered(&state, &job).await;
+        drain_debits(&state, &MockSpender::permanent()).await; // dead-letters the debit
+        let poison = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&job.id));
+        drain_attestations(&state, &poison, TEST_BATCH).await; // dead-letters the receipt
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        let att_age = json["oldest_dead_lettered_attestation_secs"]
+            .as_u64()
+            .expect("dead-lettered → numeric age");
+        let debit_age = json["oldest_dead_lettered_debit_secs"]
+            .as_u64()
+            .expect("dead-lettered → numeric age");
+        assert!(att_age < 5, "freshly quarantined receipt age ~0, got {att_age}");
+        assert!(debit_age < 5, "freshly quarantined debit age ~0, got {debit_age}");
+        // Depth and age agree that exactly one of each is stuck.
+        assert_eq!(json["dead_lettered_attestations"], 1);
+        assert_eq!(json["dead_lettered_debits"], 1);
+    }
+
+    /// FM3: a `dead_lettered_at` ahead of `now` (clock skew) must floor the age at 0, never
+    /// a negative value wrapped into a huge u64.
+    #[tokio::test]
+    async fn stats_dead_lettered_age_floors_at_zero_on_future_stamp() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        settle_one(&state, &job).await; // pending attestation
+        {
+            let store = state.store.lock().await;
+            // A stamp far in the future (skew); the age must clamp to 0, not wrap.
+            assert!(store
+                .mark_attestation_dead_lettered(&job.id, now_secs() + 100_000)
+                .unwrap());
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(
+            json["oldest_dead_lettered_attestation_secs"].as_u64().unwrap(),
+            0,
+            "a future stamp floors to 0, never a wrapped u64"
+        );
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight_progress_pct_avg() {
         // Build state with a truly-empty store (test_state_empty drains seeds via
