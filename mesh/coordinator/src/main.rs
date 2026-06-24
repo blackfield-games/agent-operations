@@ -54,7 +54,7 @@ mod validate;
 mod verify;
 
 use meter::{SpendError, Spender};
-use relay::{Relay, RelayError};
+use relay::{Relay, RelayError, ALREADY_ISSUED_UID};
 use store::Store;
 
 #[derive(Parser)]
@@ -1617,12 +1617,6 @@ async fn prune_terminal_history(state: &Arc<AppState>) -> usize {
     }
     total
 }
-
-/// Marker `uid` stored when the contract reports the receipt is already on-chain
-/// (`DuplicateReceipt`): the receipt exists but the relay didn't capture its real
-/// UID (a crash recovered between a prior `issueReceipt` and its local mark). The
-/// row is settled — it just carries this sentinel instead of the on-chain UID.
-const ALREADY_ISSUED_UID: &str = "already-issued";
 
 /// Spawn the attestation relayer: every `interval_secs`, drain the pending-receipt
 /// backlog through `relay`. Mirrors `spawn_reaper`; only the real binary spawns it.

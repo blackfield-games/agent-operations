@@ -37,14 +37,72 @@ pub enum RelayError {
     Permanent(String),
 }
 
-/// Submits a pending attestation as a `RenderReceipts.issueReceipt` call,
-/// returning the EAS attestation UID on success. The future is `Send` so the
-/// drain loop can run on the multi-threaded runtime; implementors must not block.
+/// Marker UID recorded when the contract reports a receipt is already on-chain
+/// (`AlreadyIssued`): the attestation landed but the relay didn't capture its real
+/// UID (a crash recovered between a prior `issueReceipt` and its local mark). The
+/// row is settled — it just carries this sentinel instead of an EAS UID.
+pub const ALREADY_ISSUED_UID: &str = "already-issued";
+
+/// Why a *batch* submission (`issueReceipts`) failed — the drain reacts to each
+/// differently, mirroring the single-submit reactions but at batch granularity.
+#[derive(Debug)]
+pub enum BatchRelayError {
+    /// The batch reverted atomically on-chain — `issueReceipts` is all-or-nothing,
+    /// so ONE element's `DuplicateReceipt` fence or one bad arg rolls the whole
+    /// batch back. The revert names no single offender, so the drain falls back to
+    /// per-receipt [`Relay::submit`] to isolate it: the already-issued/bad element
+    /// self-identifies while the rest still drain.
+    Reverted(String),
+    /// A transient transport fault for the whole batch (RPC timeout, nonce
+    /// contention, a reorg). Nothing landed; the drain backs off to the next tick
+    /// with every row still pending — single submits would hit the same fault, so
+    /// the fallback is skipped.
+    Transient(String),
+    /// A non-retryable fault for the whole batch (the signer is not an authorized
+    /// coordinator). The drain stops loudly; every row stays pending.
+    Permanent(String),
+}
+
+/// Submits validated render receipts as `RenderReceipts` calls, returning the EAS
+/// attestation UID(s) on success. [`submit`](Relay::submit) is one
+/// `issueReceipt`; [`submit_batch`](Relay::submit_batch) is one
+/// `issueReceipts(ReceiptRequest[])` (one `EAS.multiAttest`). The futures are
+/// `Send` so the drain loop can run on the multi-threaded runtime; implementors
+/// must not block.
 pub trait Relay: Send + Sync {
     fn submit(
         &self,
         att: &PendingAttestation,
     ) -> impl Future<Output = Result<String, RelayError>> + Send;
+
+    /// Submit a whole chunk as ONE `issueReceipts` call, returning the UIDs in
+    /// submission order — `uids[i]` is `atts[i]`'s, so the caller maps each job to
+    /// its own UID by a positional zip. Atomic on-chain: any element reverting
+    /// rolls the whole batch back ([`BatchRelayError::Reverted`]).
+    ///
+    /// The default submits each element sequentially via [`submit`](Relay::submit)
+    /// — correct, just un-amortized — so a transport that can't batch works
+    /// unchanged; the live Base impl overrides it with a real `multiAttest`. An
+    /// already-issued element resolves to the [`ALREADY_ISSUED_UID`] sentinel (an
+    /// idempotent success), and the first `Transient`/`Permanent` short-circuits to
+    /// the matching batch error.
+    fn submit_batch(
+        &self,
+        atts: &[PendingAttestation],
+    ) -> impl Future<Output = Result<Vec<String>, BatchRelayError>> + Send {
+        async move {
+            let mut uids = Vec::with_capacity(atts.len());
+            for att in atts {
+                match self.submit(att).await {
+                    Ok(uid) => uids.push(uid),
+                    Err(RelayError::AlreadyIssued) => uids.push(ALREADY_ISSUED_UID.to_string()),
+                    Err(RelayError::Transient(m)) => return Err(BatchRelayError::Transient(m)),
+                    Err(RelayError::Permanent(m)) => return Err(BatchRelayError::Permanent(m)),
+                }
+            }
+            Ok(uids)
+        }
+    }
 }
 
 /// In-process [`Relay`] for tests and the `--relay-dev-mock` local path. Never
@@ -62,16 +120,33 @@ pub struct MockRelay {
 }
 
 struct MockInner {
-    /// Fail this many calls with `Transient` before succeeding.
+    /// Fail this many single `submit` calls with `Transient` before succeeding.
     transient_remaining: usize,
-    /// Always fail with `Permanent`.
+    /// Always fail single `submit` with `Permanent`.
     permanent: bool,
-    /// Always fail with `AlreadyIssued` (models a receipt already on-chain).
+    /// Always fail single `submit` with `AlreadyIssued` (models a receipt already
+    /// on-chain).
     already_issued: bool,
-    /// Total `submit` calls (successful or not).
+    /// Specific `job_id`s whose single `submit` returns `AlreadyIssued` (the rest
+    /// succeed) — models ONE already-on-chain receipt inside a reverted batch, so
+    /// the fallback isolates it. Empty on the production dev path.
+    already_issued_jobs: Vec<String>,
+    /// Fail `submit_batch` with `Reverted` (models the contract's atomic batch
+    /// revert — one bad/duplicate element rolls the whole call back).
+    batch_reverts: bool,
+    /// Fail `submit_batch` with `Transient` (a whole-batch transport fault).
+    batch_transient: bool,
+    /// Fail `submit_batch` with `Permanent` (a whole-batch non-retryable fault).
+    batch_permanent: bool,
+    /// Total single `submit` calls (successful or not).
     calls: usize,
-    /// `job_id` (bytes32 hex) of every attestation that returned a fresh UID.
+    /// Total `submit_batch` calls — distinct from `calls`, so a test proves the
+    /// happy path does ONE `multiAttest`, not N single submits.
+    batch_calls: usize,
+    /// `job_id` (bytes32 hex) of every attestation that returned a fresh single UID.
     submitted: Vec<String>,
+    /// `job_id`s included in a successful batch, in submission order.
+    batch_submitted: Vec<String>,
 }
 
 impl MockRelay {
@@ -83,8 +158,14 @@ impl MockRelay {
                 transient_remaining: 0,
                 permanent: false,
                 already_issued: false,
+                already_issued_jobs: Vec::new(),
+                batch_reverts: false,
+                batch_transient: false,
+                batch_permanent: false,
                 calls: 0,
+                batch_calls: 0,
                 submitted: Vec::new(),
+                batch_submitted: Vec::new(),
             }),
             started: None,
             release: None,
@@ -126,6 +207,37 @@ impl MockRelay {
         m
     }
 
+    /// Make `submit_batch` revert atomically (the contract's all-or-nothing batch
+    /// fence). Composed with a single-submit outcome, it drives the drain's
+    /// per-receipt fallback path.
+    #[cfg(test)]
+    pub fn with_batch_reverts(mut self) -> Self {
+        self.inner.get_mut().unwrap().batch_reverts = true;
+        self
+    }
+
+    /// Make `submit_batch` fail `Transient` (a whole-batch transport fault).
+    #[cfg(test)]
+    pub fn with_batch_transient(mut self) -> Self {
+        self.inner.get_mut().unwrap().batch_transient = true;
+        self
+    }
+
+    /// Make `submit_batch` fail `Permanent` (a whole-batch non-retryable fault).
+    #[cfg(test)]
+    pub fn with_batch_permanent(mut self) -> Self {
+        self.inner.get_mut().unwrap().batch_permanent = true;
+        self
+    }
+
+    /// Make this specific `job_id`'s single `submit` return `AlreadyIssued` (the
+    /// rest succeed) — one already-on-chain receipt for the fallback to isolate.
+    #[cfg(test)]
+    pub fn with_already_issued_job(mut self, job_id: String) -> Self {
+        self.inner.get_mut().unwrap().already_issued_jobs.push(job_id);
+        self
+    }
+
     /// Total `submit` calls so far.
     #[cfg(test)]
     pub fn calls(&self) -> usize {
@@ -138,12 +250,31 @@ impl MockRelay {
     pub fn submitted(&self) -> Vec<String> {
         self.inner.lock().unwrap().submitted.clone()
     }
+
+    /// Total `submit_batch` calls so far (the multiAttest count).
+    #[cfg(test)]
+    pub fn batch_calls(&self) -> usize {
+        self.inner.lock().unwrap().batch_calls
+    }
+
+    /// `job_id`s included in a successful batch, in submission order.
+    #[cfg(test)]
+    pub fn batch_submitted(&self) -> Vec<String> {
+        self.inner.lock().unwrap().batch_submitted.clone()
+    }
 }
 
-/// Deterministic mock UID for a given attestation, so a test can assert the
-/// drain stored exactly what the relay returned.
+/// Deterministic mock UID for a single `submit`, so a test can assert the drain
+/// stored exactly what the relay returned.
 fn mock_uid(att: &PendingAttestation) -> String {
     format!("0xmock-{}", att.job_id)
+}
+
+/// Deterministic mock UID for a batched element — a distinct prefix from
+/// [`mock_uid`] so a test can tell a batch UID from a single-submit one and prove
+/// the happy path went through `multiAttest`.
+fn batch_uid(att: &PendingAttestation) -> String {
+    format!("0xmockbatch-{}", att.job_id)
 }
 
 impl Relay for MockRelay {
@@ -159,7 +290,7 @@ impl Relay for MockRelay {
         if inner.permanent {
             return Err(RelayError::Permanent("mock permanent".into()));
         }
-        if inner.already_issued {
+        if inner.already_issued || inner.already_issued_jobs.iter().any(|j| *j == att.job_id) {
             return Err(RelayError::AlreadyIssued);
         }
         if inner.transient_remaining > 0 {
@@ -168,6 +299,34 @@ impl Relay for MockRelay {
         }
         inner.submitted.push(att.job_id.clone());
         Ok(mock_uid(att))
+    }
+
+    async fn submit_batch(
+        &self,
+        atts: &[PendingAttestation],
+    ) -> Result<Vec<String>, BatchRelayError> {
+        if let Some(s) = &self.started {
+            s.notify_one();
+        }
+        if let Some(r) = &self.release {
+            r.notified().await;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.batch_calls += 1;
+        if inner.batch_permanent {
+            return Err(BatchRelayError::Permanent("mock batch permanent".into()));
+        }
+        if inner.batch_reverts {
+            return Err(BatchRelayError::Reverted("mock batch revert".into()));
+        }
+        if inner.batch_transient {
+            return Err(BatchRelayError::Transient("mock batch transient".into()));
+        }
+        let uids: Vec<String> = atts.iter().map(batch_uid).collect();
+        for a in atts {
+            inner.batch_submitted.push(a.job_id.clone());
+        }
+        Ok(uids)
     }
 }
 
@@ -221,5 +380,119 @@ mod tests {
         assert!(matches!(r.submit(&att()).await, Err(RelayError::AlreadyIssued)));
         assert_eq!(r.calls(), 1);
         assert!(r.submitted().is_empty());
+    }
+
+    fn atts(tags: &[&str]) -> Vec<PendingAttestation> {
+        tags.iter()
+            .map(|t| PendingAttestation {
+                job_id: t.to_string(),
+                ..att()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn submit_batch_returns_uids_in_submission_order_via_one_call() {
+        let r = MockRelay::succeeding();
+        let batch = atts(&["a", "b", "c"]);
+        let uids = r.submit_batch(&batch).await.expect("batch succeeds");
+        assert_eq!(uids, batch.iter().map(batch_uid).collect::<Vec<_>>());
+        assert_eq!(r.batch_calls(), 1, "one multiAttest");
+        assert_eq!(r.calls(), 0, "no single submits on the batch path");
+        assert_eq!(r.batch_submitted(), vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn submit_batch_reverts_when_scripted() {
+        let r = MockRelay::succeeding().with_batch_reverts();
+        assert!(matches!(
+            r.submit_batch(&atts(&["a", "b"])).await,
+            Err(BatchRelayError::Reverted(_))
+        ));
+        assert_eq!(r.batch_calls(), 1);
+        assert!(r.batch_submitted().is_empty(), "a revert records nothing");
+    }
+
+    #[tokio::test]
+    async fn submit_batch_transient_and_permanent_when_scripted() {
+        let t = MockRelay::succeeding().with_batch_transient();
+        assert!(matches!(
+            t.submit_batch(&atts(&["a"])).await,
+            Err(BatchRelayError::Transient(_))
+        ));
+        let p = MockRelay::succeeding().with_batch_permanent();
+        assert!(matches!(
+            p.submit_batch(&atts(&["a"])).await,
+            Err(BatchRelayError::Permanent(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_isolates_an_already_issued_job() {
+        let r = MockRelay::succeeding().with_already_issued_job("a".into());
+        let batch = atts(&["a", "b"]);
+        assert!(matches!(
+            r.submit(&batch[0]).await,
+            Err(RelayError::AlreadyIssued)
+        ));
+        assert!(r.submit(&batch[1]).await.is_ok(), "the rest still submit");
+        assert_eq!(r.submitted(), vec!["b"]);
+    }
+
+    /// A `Relay` that implements only `submit` gets `submit_batch` from the trait
+    /// default — sequential single submits, no amortization.
+    enum SeqMode {
+        Ok,
+        AlreadyIssued,
+        Transient,
+    }
+    struct SeqRelay {
+        mode: SeqMode,
+        calls: Mutex<usize>,
+    }
+    impl Relay for SeqRelay {
+        async fn submit(&self, att: &PendingAttestation) -> Result<String, RelayError> {
+            *self.calls.lock().unwrap() += 1;
+            match self.mode {
+                SeqMode::Ok => Ok(format!("0xseq-{}", att.job_id)),
+                SeqMode::AlreadyIssued => Err(RelayError::AlreadyIssued),
+                SeqMode::Transient => Err(RelayError::Transient("seq transient".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_submit_batch_does_sequential_single_submits() {
+        let r = SeqRelay {
+            mode: SeqMode::Ok,
+            calls: Mutex::new(0),
+        };
+        let batch = atts(&["a", "b", "c"]);
+        let uids = r.submit_batch(&batch).await.expect("succeeds");
+        assert_eq!(uids, vec!["0xseq-a", "0xseq-b", "0xseq-c"]);
+        assert_eq!(*r.calls.lock().unwrap(), 3, "one submit per element");
+    }
+
+    #[tokio::test]
+    async fn default_submit_batch_maps_already_issued_to_the_sentinel() {
+        let r = SeqRelay {
+            mode: SeqMode::AlreadyIssued,
+            calls: Mutex::new(0),
+        };
+        let uids = r.submit_batch(&atts(&["a"])).await.expect("idempotent");
+        assert_eq!(uids, vec![ALREADY_ISSUED_UID]);
+    }
+
+    #[tokio::test]
+    async fn default_submit_batch_short_circuits_on_transient() {
+        let r = SeqRelay {
+            mode: SeqMode::Transient,
+            calls: Mutex::new(0),
+        };
+        assert!(matches!(
+            r.submit_batch(&atts(&["a", "b"])).await,
+            Err(BatchRelayError::Transient(_))
+        ));
+        assert_eq!(*r.calls.lock().unwrap(), 1, "stops at the first failure");
     }
 }
