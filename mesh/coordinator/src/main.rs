@@ -1067,6 +1067,29 @@ fn prune_stale_earners(
 ///   earner is never displaced; when every entry is live (a genuinely full fleet),
 ///   the registration is rejected (`false`). The at-cap scan is O(n) but only runs
 ///   when the backstop engages, and `n` is bounded by `max_earners`.
+/// The outcome of an [`admit_earner`] call. The three admitting variants are kept
+/// distinct so a caller can meter registry-cap CHURN — only [`Evicted`](Admission::Evicted)
+/// reclaimed a slot by displacing a stale past-TTL entry — separately from the all-live
+/// [`Rejected`](Admission::Rejected) it complements: an at-cap fleet that constantly
+/// rotates evicts-and-readmits (churn) where a genuinely full one of live earners
+/// rejects. A below-cap [`Inserted`](Admission::Inserted) had free room and an
+/// [`Upserted`](Admission::Upserted) refreshed a known earner in place — neither
+/// consumed a new slot, so neither is churn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Inserted,
+    Upserted,
+    Evicted,
+    Rejected,
+}
+
+impl Admission {
+    /// Whether the earner now occupies a registry slot — every outcome but [`Rejected`](Admission::Rejected).
+    fn admitted(self) -> bool {
+        !matches!(self, Admission::Rejected)
+    }
+}
+
 fn admit_earner(
     earners: &mut std::collections::HashMap<String, EarnerInfo>,
     address: String,
@@ -1074,10 +1097,14 @@ fn admit_earner(
     max_earners: usize,
     now: i64,
     ttl_secs: i64,
-) -> bool {
-    if earners.contains_key(&address) || earners.len() < max_earners {
+) -> Admission {
+    if earners.contains_key(&address) {
         earners.insert(address, info);
-        return true;
+        return Admission::Upserted;
+    }
+    if earners.len() < max_earners {
+        earners.insert(address, info);
+        return Admission::Inserted;
     }
     let stalest = earners
         .iter()
@@ -1088,9 +1115,9 @@ fn admit_earner(
         Some(key) => {
             earners.remove(&key);
             earners.insert(address, info);
-            true
+            Admission::Evicted
         }
-        None => false,
+        None => Admission::Rejected,
     }
 }
 
@@ -2310,7 +2337,7 @@ async fn register(
     let earner_address = verify::canonical_earner_address(&earner_address);
 
     let now = now_secs();
-    let admitted = admit_earner(
+    let admission = admit_earner(
         &mut *state.earners.lock().await,
         earner_address.clone(),
         EarnerInfo {
@@ -2323,7 +2350,7 @@ async fn register(
         now,
         state.earner_ttl_secs,
     );
-    if !admitted {
+    if !admission.admitted() {
         // Registry full of LIVE earners: shed with a retryable 503 (matches the
         // queue-cap backpressure). A stale earner aging past its TTL frees a slot.
         state.earners_shed.fetch_add(1, Ordering::Relaxed);
@@ -3705,7 +3732,7 @@ async fn recv_hello_inner(
         // session, so they all derive from one case-invariant form.
         let earner_address = verify::canonical_earner_address(&earner_address);
         let now = now_secs();
-        let admitted = admit_earner(
+        let admission = admit_earner(
             &mut *state.earners.lock().await,
             earner_address.clone(),
             EarnerInfo {
@@ -3718,7 +3745,7 @@ async fn recv_hello_inner(
             now,
             state.earner_ttl_secs,
         );
-        if !admitted {
+        if !admission.admitted() {
             // Same admission policy as HTTP /register (FM4 parity): a registry full
             // of live earners can't make room, so close the socket instead of
             // admitting (no live earner is ever displaced).
@@ -8944,8 +8971,8 @@ mod tests {
     #[test]
     fn admit_earner_inserts_below_cap() {
         let mut earners = HashMap::new();
-        assert!(admit_earner(&mut earners, "a".into(), earner_info(100), 3, 100, 60));
-        assert!(admit_earner(&mut earners, "b".into(), earner_info(100), 3, 100, 60));
+        assert_eq!(admit_earner(&mut earners, "a".into(), earner_info(100), 3, 100, 60), Admission::Inserted);
+        assert_eq!(admit_earner(&mut earners, "b".into(), earner_info(100), 3, 100, 60), Admission::Inserted);
         assert_eq!(earners.len(), 2);
     }
 
@@ -8958,7 +8985,7 @@ mod tests {
         earners.insert("a".to_string(), earner_info(100));
         earners.insert("b".to_string(), earner_info(100));
         // At cap (2), all live: re-Hello from "a" still succeeds and updates it.
-        assert!(admit_earner(&mut earners, "a".into(), earner_info(150), 2, 200, 60));
+        assert_eq!(admit_earner(&mut earners, "a".into(), earner_info(150), 2, 200, 60), Admission::Upserted);
         assert_eq!(earners.len(), 2);
         assert_eq!(earners["a"].last_seen, 150, "the upsert refreshed the existing entry");
     }
@@ -8971,7 +8998,7 @@ mod tests {
         let mut earners = HashMap::new();
         earners.insert("a".to_string(), earner_info(100));
         earners.insert("b".to_string(), earner_info(100));
-        assert!(!admit_earner(&mut earners, "c".into(), earner_info(100), 2, 100, 60));
+        assert_eq!(admit_earner(&mut earners, "c".into(), earner_info(100), 2, 100, 60), Admission::Rejected);
         assert_eq!(earners.len(), 2);
         assert!(earners.contains_key("a") && earners.contains_key("b"));
         assert!(!earners.contains_key("c"), "no live earner displaced for the newcomer");
@@ -8984,7 +9011,7 @@ mod tests {
         let mut earners = HashMap::new();
         earners.insert("stale".to_string(), earner_info(10)); // now-10=90 > ttl 60 → not live
         earners.insert("live".to_string(), earner_info(100)); // now-100=0 → live
-        assert!(admit_earner(&mut earners, "new".into(), earner_info(100), 2, 100, 60));
+        assert_eq!(admit_earner(&mut earners, "new".into(), earner_info(100), 2, 100, 60), Admission::Evicted);
         assert_eq!(earners.len(), 2);
         assert!(!earners.contains_key("stale"), "the past-TTL entry was evicted");
         assert!(earners.contains_key("live"), "the live entry was kept");
@@ -9000,7 +9027,7 @@ mod tests {
         earners.insert("b".to_string(), earner_info(5)); // the stalest
         earners.insert("c".to_string(), earner_info(20));
         // now=100, ttl=60 → all three are past TTL; cap=3 is full.
-        assert!(admit_earner(&mut earners, "d".into(), earner_info(100), 3, 100, 60));
+        assert_eq!(admit_earner(&mut earners, "d".into(), earner_info(100), 3, 100, 60), Admission::Evicted);
         assert_eq!(earners.len(), 3);
         assert!(!earners.contains_key("b"), "the stalest (last_seen=5) was evicted");
         assert!(earners.contains_key("a") && earners.contains_key("c") && earners.contains_key("d"));
