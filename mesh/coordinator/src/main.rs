@@ -119,6 +119,18 @@ struct Args {
     /// replies in milliseconds, so the default is generous; must be >= 1.
     #[arg(long, env = "COORDINATOR_HANDSHAKE_TIMEOUT_SECS", default_value_t = DEFAULT_HANDSHAKE_TIMEOUT.as_secs())]
     handshake_timeout_secs: u64,
+    /// Seconds of read-idle (no inbound ws frame — including the pong to the
+    /// coordinator's keepalive ping) tolerated on an ESTABLISHED earner session
+    /// before the socket is closed. The post-Hello twin of `--handshake-timeout-secs`:
+    /// that bounds the pre-Hello handshake; this bounds a session that completed
+    /// Hello then went silent (a half-open/vanished peer that would otherwise hold a
+    /// `ws_session` task + FD until ~2h OS TCP keepalive or a max-connections
+    /// eviction). The coordinator pings at half this bound, so a live earner — even
+    /// idle between jobs, which sends no application frames — auto-pongs and is never
+    /// closed; an in-flight job's heartbeats reset it too. Only a peer that stops
+    /// responding trips it. Must be >= 1; generous by default.
+    #[arg(long, env = "COORDINATOR_SESSION_IDLE_TIMEOUT_SECS", default_value_t = DEFAULT_SESSION_IDLE_TIMEOUT.as_secs())]
+    session_idle_timeout_secs: u64,
     /// Seconds the coordinator waits for a connection to send its complete HTTP
     /// request headers before closing it. Bounds a pre-routing slow-headers
     /// slowloris that parks an FD before any handler runs (one layer below the ws
@@ -281,6 +293,12 @@ struct AppState {
     /// gate that closes a slowloris connection; read by `recv_hello`. Mirrors
     /// `--handshake-timeout-secs` / `COORDINATOR_HANDSHAKE_TIMEOUT_SECS`.
     handshake_timeout: Duration,
+    /// Read-idle bound on an ESTABLISHED post-Hello ws session: the socket is
+    /// closed if no inbound frame (including the pong to the keepalive ping) lands
+    /// within this window. The post-Hello twin of `handshake_timeout`; read by
+    /// `ws_session`. Validated > 0 in `with_store`. Mirrors
+    /// `--session-idle-timeout-secs` / `COORDINATOR_SESSION_IDLE_TIMEOUT_SECS`.
+    session_idle_timeout: Duration,
     /// Optional shared-secret bearer token gating `POST /jobs`. `Some` → ingestion
     /// requires `Authorization: Bearer <token>` (constant-time compared in
     /// `create_job`); `None` → the endpoint is open (dev), warned at startup.
@@ -323,6 +341,7 @@ struct StoreConfig {
     ttl_deadline_multiple: u32,
     retention_secs: i64,
     handshake_timeout: Duration,
+    session_idle_timeout: Duration,
     ingest_token: Option<String>,
     max_queued_jobs: usize,
     max_earners: usize,
@@ -353,6 +372,10 @@ impl StoreConfig {
         anyhow::ensure!(
             !self.handshake_timeout.is_zero(),
             "handshake_timeout must be > 0 (0 would reject every registration before its Hello)"
+        );
+        anyhow::ensure!(
+            !self.session_idle_timeout.is_zero(),
+            "session_idle_timeout must be > 0 (0 would close every established session on its first idle check)"
         );
         if let Some(token) = self.ingest_token.as_deref() {
             anyhow::ensure!(
@@ -403,6 +426,7 @@ impl AppState {
             ttl_deadline_multiple: cfg.ttl_deadline_multiple,
             retention_secs: cfg.retention_secs,
             handshake_timeout: cfg.handshake_timeout,
+            session_idle_timeout: cfg.session_idle_timeout,
             ingest_token: cfg.ingest_token,
             max_queued_jobs: cfg.max_queued_jobs,
             max_earners: cfg.max_earners,
@@ -641,6 +665,7 @@ async fn main() -> Result<()> {
             ttl_deadline_multiple: args.ttl_deadline_multiple,
             retention_secs: args.retention_secs as i64,
             handshake_timeout: Duration::from_secs(args.handshake_timeout_secs),
+            session_idle_timeout: Duration::from_secs(args.session_idle_timeout_secs),
             ingest_token: args.ingest_token,
             max_queued_jobs: args.max_queued_jobs,
             max_earners: args.max_earners,
@@ -1322,6 +1347,17 @@ const DEFAULT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 /// `AppState::handshake_timeout` at runtime, so a test can shrink it to a
 /// sub-second value without a slow suite.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default read-idle bound on an ESTABLISHED post-Hello ws session. The
+/// coordinator pings at half this bound; a live earner — even idle between jobs,
+/// which emits no application frames — auto-pongs in milliseconds, so 90s only
+/// ever closes a genuinely silent/vanished session. Larger than the 60s
+/// `earner_ttl` so the socket outlives a brief registry-liveness gap, and far
+/// under the ~2h OS TCP keepalive it replaces. Backs `Args::session_idle_timeout_secs`
+/// (`--session-idle-timeout-secs` / `COORDINATOR_SESSION_IDLE_TIMEOUT_SECS`);
+/// `ws_session` reads the configured `AppState::session_idle_timeout` at runtime,
+/// so a test can shrink it to a sub-second value without a slow suite.
+const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Default wall-clock bound on the pre-routing HTTP request-header read: the
 /// coordinator closes a connection that hasn't sent its complete request headers
@@ -2888,6 +2924,21 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, source: IpAddr)
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut last_liveness_bump = now_secs();
 
+    // Read-idle keepalive. `handshake_timeout` bounds only the pre-Hello handshake;
+    // once a session is established its `socket.recv()` has no deadline, so a peer
+    // that completes Hello then goes silent (a half-open/vanished earner) would hold
+    // this task + FD until ~2h OS TCP keepalive or a max-connections eviction — and
+    // the `tick` arm below SELF-bumps the registry `last_seen` every second while
+    // idle, so the `earner_ttl` prune can't even surface it as stale. We probe with a
+    // ws Ping at half the idle bound: a live earner — even idle between jobs, which
+    // sends no application frames — auto-pongs, refreshing `last_inbound` on the recv
+    // arm, so only a peer that stops responding trips the deadline. An in-flight job's
+    // heartbeats reset it the same way (never reap a live render).
+    let idle_timeout = state.session_idle_timeout;
+    let mut idle_probe = tokio::time::interval((idle_timeout / 2).max(Duration::from_millis(1)));
+    idle_probe.tick().await; // consume the immediate first tick so the first probe is one interval in
+    let mut last_inbound = tokio::time::Instant::now();
+
     loop {
         // If we have no outstanding offer, try to grab a supported job.
         if offered.is_none() {
@@ -2917,6 +2968,24 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, source: IpAddr)
                 }
                 continue;
             }
+            // Read-idle deadline + keepalive probe. Driven by last-inbound-frame time
+            // (NOT the self-bumped `last_seen`, and NOT last-job-offer), so it fires
+            // for a silent/vanished session even while the job-poll tick keeps running.
+            _ = idle_probe.tick() => {
+                if last_inbound.elapsed() >= idle_timeout {
+                    tracing::info!(
+                        earner = %earner_address,
+                        idle_secs = idle_timeout.as_secs(),
+                        "ws session idle past the read deadline (no inbound frame, incl. keepalive pong); closing",
+                    );
+                    break;
+                }
+                // A live earner — even idle between jobs — auto-pongs this, resetting
+                // `last_inbound` on the recv arm; a vanished peer never pongs and trips
+                // the deadline on a later tick. Best-effort: a failed send means the
+                // socket is already gone, so the next `recv()` ends the session.
+                let _ = socket.send(Message::Ping(Vec::new().into())).await;
+            }
             incoming = socket.recv() => {
                 let Some(frame) = incoming else { break }; // socket closed
                 let frame = match frame {
@@ -2926,6 +2995,10 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, source: IpAddr)
                         break;
                     }
                 };
+                // Any received frame — Text/Binary/Ping/Pong (incl. the pong to our
+                // keepalive ping) — is a sign the peer is still responding; reset the
+                // read-idle deadline before we filter by frame type.
+                last_inbound = tokio::time::Instant::now();
                 let text = match frame {
                     Message::Text(t) => t,
                     Message::Close(_) => break,
@@ -3482,6 +3555,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -3507,6 +3581,7 @@ mod tests {
                 ttl_deadline_multiple: 4,
                 retention_secs: 222,
                 handshake_timeout: Duration::from_secs(11),
+                session_idle_timeout: Duration::from_secs(13),
                 ingest_token: Some("map-probe-token".to_string()),
                 max_queued_jobs: 123,
                 max_earners: 456,
@@ -3521,6 +3596,7 @@ mod tests {
         assert_eq!(state.ttl_deadline_multiple, 4);
         assert_eq!(state.retention_secs, 222);
         assert_eq!(state.handshake_timeout, Duration::from_secs(11));
+        assert_eq!(state.session_idle_timeout, Duration::from_secs(13));
         assert_eq!(state.ingest_token.as_deref(), Some("map-probe-token"));
         assert_eq!(state.max_queued_jobs, 123);
         assert_eq!(state.max_earners, 456);
@@ -10000,6 +10076,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -10045,6 +10122,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -11263,6 +11341,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12067,6 +12146,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12123,6 +12203,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12184,6 +12265,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12208,6 +12290,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12305,6 +12388,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12418,6 +12502,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12469,6 +12554,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12533,6 +12619,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12591,6 +12678,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12640,6 +12728,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12702,6 +12791,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12770,6 +12860,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
@@ -12837,6 +12928,7 @@ mod tests {
             ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
             retention_secs: DEFAULT_RETENTION_SECS as i64,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             ingest_token: None,
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
