@@ -11979,6 +11979,29 @@ mod tests {
         );
     }
 
+    /// FM3 (plan half): the `/stats` in-flight progress mean is a hot poll query, so
+    /// its `status =` filter must be SEARCHed via `idx_jobs_status_created_at`'s
+    /// leading column over the bounded live set — never a full `SCAN jobs` that drags
+    /// every terminal row's inline `spec_json` through the unbounded history on every
+    /// poll. Guards the `in_flight_progress_pct_avg` doc-comment claim against an index
+    /// drop or a query change that silently regresses it to a table scan.
+    #[test]
+    fn in_flight_progress_pct_avg_query_plan_uses_the_index() {
+        let store = Store::open_in_memory().unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+        store.enqueue(&job_with_deadline(60)).unwrap();
+
+        let plan = store.in_flight_progress_pct_avg_query_plan().unwrap();
+        assert!(
+            plan.contains("idx_jobs_status_created_at"),
+            "the in-flight progress mean must use the index, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN jobs"),
+            "the in-flight progress mean must not full-scan jobs, got plan: {plan}"
+        );
+    }
+
     /// A legacy ROW-shaped earner_faults (one row per fault, pre-counter) migrates
     /// to the counter on open: each earner's row COUNT rolls into `fault_count`,
     /// preserving every lifetime total EXACTLY, and the table collapses to one row

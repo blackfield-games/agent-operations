@@ -250,6 +250,25 @@ impl Store {
         Ok(plan)
     }
 
+    /// Test-only: the EXPLAIN QUERY PLAN for the ACTUAL `in_flight_progress_pct_avg`
+    /// statement (byte-for-byte), so a test can assert the `/stats` in-flight mean is
+    /// SEARCHed via `idx_jobs_status_created_at`'s leading `status` column over only the
+    /// live set — never a full `SCAN jobs` over the unbounded terminal history this
+    /// hot poll query must not drag through (FM1: creation alone doesn't imply use).
+    #[cfg(test)]
+    pub fn in_flight_progress_pct_avg_query_plan(&self) -> Result<String> {
+        let mut stmt = self
+            .conn
+            .prepare("EXPLAIN QUERY PLAN SELECT AVG(progress_pct) FROM jobs WHERE status = ?1")?;
+        let rows = stmt.query_map([STATUS_IN_FLIGHT], |r| r.get::<_, String>(3))?;
+        let mut plan = String::new();
+        for row in rows {
+            plan.push_str(&row?);
+            plan.push('\n');
+        }
+        Ok(plan)
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
