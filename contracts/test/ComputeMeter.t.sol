@@ -213,6 +213,116 @@ contract ComputeMeterTest is Test {
         assertEq(meter.totalSpent(), 105 ether);
     }
 
+    // --- depositFor: sponsor-funded credit ---
+
+    function test_depositFor_sponsorCreditsBuyerNotSelf() public {
+        // FM1: a sponsor (neither owner nor authorized spender) pre-funds buyer's meter.
+        // The credit must land on buyer and the tokens burn from the SPONSOR — a
+        // copy-paste of deposit would strand the credit on the caller.
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 500 ether));
+
+        vm.startPrank(sponsor);
+        token.approve(address(meter), 200 ether);
+        meter.depositFor(buyer, 200 ether);
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 200 ether, "credit lands on buyer");
+        assertEq(meter.credit(sponsor), 0, "caller is not credited");
+        assertEq(token.balanceOf(sponsor), 300 ether, "sponsor paid");
+        assertEq(token.balanceOf(buyer), 1000 ether, "buyer's own tokens untouched");
+        assertEq(token.balanceOf(meter.BURN_ADDRESS()), 200 ether, "tokens burned");
+        assertEq(meter.totalBurned(), 200 ether);
+    }
+
+    function test_depositFor_buyerCanSpendSponsoredCredit() public {
+        // The feature's point: sponsored credit is real, spendable credit.
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 500 ether));
+
+        vm.startPrank(sponsor);
+        token.approve(address(meter), 200 ether);
+        meter.depositFor(buyer, 200 ether);
+        vm.stopPrank();
+
+        vm.prank(spender);
+        meter.spend(buyer, 150 ether, keccak256("sponsored-job"));
+
+        assertEq(meter.credit(buyer), 50 ether);
+        assertEq(meter.spentByBuyer(buyer), 150 ether);
+    }
+
+    function test_depositFor_emitsDepositedNamingBuyer() public {
+        // FM3: the Deposited event's indexed buyer is the BUYER, not the sponsor — a
+        // per-buyer credit indexer keys on it, so naming the sponsor would mis-attribute.
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 500 ether));
+
+        vm.startPrank(sponsor);
+        token.approve(address(meter), 200 ether);
+        vm.expectEmit(true, false, false, true);
+        emit Deposited(buyer, 200 ether, 200 ether);
+        meter.depositFor(buyer, 200 ether);
+        vm.stopPrank();
+    }
+
+    function test_depositFor_revertsForZeroAddressBuyer() public {
+        // FM4: crediting address(0) would burn the sponsor's tokens into unspendable
+        // credit. depositFor rejects it before any token moves.
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 500 ether));
+
+        vm.startPrank(sponsor);
+        token.approve(address(meter), 200 ether);
+        vm.expectRevert(ComputeMeter.ZeroAddressBuyer.selector);
+        meter.depositFor(address(0), 200 ether);
+        vm.stopPrank();
+
+        assertEq(meter.totalBurned(), 0, "no tokens burned on the rejected deposit");
+        assertEq(token.balanceOf(sponsor), 500 ether, "sponsor's tokens untouched");
+        assertEq(meter.credit(address(0)), 0);
+    }
+
+    function test_depositFor_accumulatesWithSelfDeposit() public {
+        // FM2: deposit and depositFor share ONE accounting core, so a self-deposit and a
+        // sponsor-deposit to the same buyer accumulate without drift — credit,
+        // totalBurned, and the burn balance all sum across both entry points.
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 500 ether));
+
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        vm.startPrank(sponsor);
+        token.approve(address(meter), 250 ether);
+        meter.depositFor(buyer, 250 ether);
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 350 ether, "self + sponsor credit sum");
+        assertEq(meter.totalBurned(), 350 ether, "totalBurned spans both entry points");
+        assertEq(token.balanceOf(meter.BURN_ADDRESS()), 350 ether);
+    }
+
+    function test_depositFor_zeroAmount_isNoOpButEmits() public {
+        // Mirrors deposit(0): a zero-amount sponsor deposit to a valid buyer moves no
+        // tokens and credits nothing, but still emits the event (no ZeroAmount guard).
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 500 ether));
+
+        vm.startPrank(sponsor);
+        token.approve(address(meter), 1 ether);
+        vm.expectEmit(true, false, false, true);
+        emit Deposited(buyer, 0, 0);
+        meter.depositFor(buyer, 0);
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 0);
+        assertEq(meter.totalBurned(), 0);
+        assertEq(token.balanceOf(sponsor), 500 ether, "no tokens moved");
+    }
+
     // --- spendOnce per-job idempotency fence ---
 
     function test_spendOnce_debitsAndEmitsLikeSpend() public {

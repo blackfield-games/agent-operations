@@ -49,6 +49,23 @@ contract ComputeMeterHandler is Test {
         ghost_totalDeposited += amount;
     }
 
+    /// @notice Sponsor-deposit: one actor burns its tokens to credit another actor's
+    ///         meter. The burn is a deposit like any other, so the conservation
+    ///         invariants must hold identically whether credit was self- or
+    ///         sponsor-funded (FM2 — the two entry points share one accounting core).
+    function depositFor(uint256 sponsorSeed, uint256 buyerSeed, uint256 amount) external {
+        address sponsor = actors[sponsorSeed % actors.length];
+        address buyer = actors[buyerSeed % actors.length];
+        uint256 bal = token.balanceOf(sponsor);
+        if (bal == 0) return;
+        amount = bound(amount, 0, bal);
+        if (amount == 0) return;
+
+        vm.prank(sponsor);
+        meter.depositFor(buyer, amount);
+        ghost_totalDeposited += amount;
+    }
+
     function spend(uint256 buyerSeed, uint256 amount) external {
         address buyer = actors[buyerSeed % actors.length];
         uint256 c = meter.credit(buyer);
@@ -211,6 +228,30 @@ contract ComputeMeterFuzzTest is Test {
         assertEq(meter.credit(buyer), amount);
         assertEq(token.balanceOf(meter.BURN_ADDRESS()), burnBefore + amount);
         assertEq(token.balanceOf(buyer), buyerBefore - amount);
+    }
+
+    function testFuzz_depositFor_creditsBuyerBurnsFromSponsor(uint256 amount) public {
+        // FM1 + FM2 fuzzed: the sponsor pays, the buyer is credited, and the buyer's own
+        // tokens never move — the sponsor-deposit twin of testFuzz_deposit_creditsAndBurns.
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 1000 ether));
+        vm.prank(sponsor);
+        token.approve(address(meter), type(uint256).max);
+
+        amount = bound(amount, 0, token.balanceOf(sponsor));
+
+        uint256 burnBefore = token.balanceOf(meter.BURN_ADDRESS());
+        uint256 sponsorBefore = token.balanceOf(sponsor);
+        uint256 buyerBefore = token.balanceOf(buyer);
+
+        vm.prank(sponsor);
+        meter.depositFor(buyer, amount);
+
+        assertEq(meter.credit(buyer), amount, "credit lands on buyer");
+        assertEq(meter.credit(sponsor), 0, "sponsor not credited");
+        assertEq(token.balanceOf(meter.BURN_ADDRESS()), burnBefore + amount);
+        assertEq(token.balanceOf(sponsor), sponsorBefore - amount, "burned from sponsor");
+        assertEq(token.balanceOf(buyer), buyerBefore, "buyer's own tokens untouched");
     }
 
     function testFuzz_spend_debitsExactly(uint256 dep, uint256 spendAmt) public {
