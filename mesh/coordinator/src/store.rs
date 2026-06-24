@@ -1983,6 +1983,75 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Re-arm a dead-lettered attestation so the next `drain_attestations` tick
+    /// re-attempts it — the operator recovery a quarantined receipt needs after the
+    /// underlying `Permanent` cause is fixed (e.g. the coordinator funds the region
+    /// fee whose unpayability reverted `issueReceipt`, or the operator authorizes the
+    /// signer). Clears `dead_lettered_at` back to NULL ONLY where the row is
+    /// dead-lettered AND not yet attested (`dead_lettered_at IS NOT NULL AND uid IS
+    /// NULL`); returns whether a row was re-armed. A dead-lettered row is NEVER
+    /// auto-re-claimed (`claim_oldest_pending_batch` skips `dead_lettered_at IS NOT
+    /// NULL`), so this explicit, operator-gated call is the only way one re-enters the
+    /// drainable backlog. The attestation twin of
+    /// [`redrive_dead_lettered_debit`](Self::redrive_dead_lettered_debit), `tx_hash`
+    /// (the debit settled-marker) substituted by `uid`.
+    ///
+    /// The double guard is the safety boundary, `mark_attestation_dead_lettered`
+    /// inverted:
+    /// * a still-pending row (`dead_lettered_at IS NULL`) is not re-armed — it is
+    ///   already in the drainable backlog, so re-arming is meaningless (returns false);
+    /// * an already-attested row (`uid` set) is NEVER re-armed — clearing the mark on a
+    ///   landed attestation would resurrect it into the backlog and re-submit it; the
+    ///   only thing then standing between it and a double-attest is `RenderReceipts`'s
+    ///   on-chain `DuplicateReceipt` jobId fence, so this guard refuses it off-chain too
+    ///   (defense in depth).
+    ///
+    /// Re-arming is idempotent + safe under a concurrent drain: a re-armed row re-enters
+    /// the oldest-first drain (it keeps its original insert order, so it is re-attempted
+    /// ahead of newer receipts) and, if the `Permanent` cause is STILL present, simply
+    /// re-dead-letters on the next error — one more attempt per re-drive, never an
+    /// infinite auto-retry. A second re-drive of the same row once it has attested is a
+    /// no-op (`uid` set), so an operator double-call can't double-attest.
+    pub fn redrive_dead_lettered_attestation(&self, job_id: &uuid::Uuid) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET dead_lettered_at = NULL
+             WHERE job_id = ?1 AND dead_lettered_at IS NOT NULL AND uid IS NULL",
+            (job_id.to_string(),),
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Re-arm EVERY dead-lettered, not-yet-attested receipt in one statement; returns
+    /// the count re-armed. The bulk twin of
+    /// [`redrive_dead_lettered_attestation`](Self::redrive_dead_lettered_attestation),
+    /// for the recovery after a BROAD `Permanent` cause is fixed (the coordinator signer
+    /// re-authorized via `setCoordinator`, or a whole class of region fees funded) —
+    /// instead of issuing N single re-drives, the operator re-arms the lot.
+    ///
+    /// Identical `WHERE dead_lettered_at IS NOT NULL AND uid IS NULL` guard as the single
+    /// re-drive, just without the `job_id` filter, so the same safety boundary holds
+    /// set-wide: a still-pending row (already drainable) is untouched and an
+    /// already-attested row (`uid` set) is NEVER cleared — mass-clearing attested marks
+    /// would resurrect landed attestations into the drain, fenced only by
+    /// `RenderReceipts`'s on-chain `DuplicateReceipt` jobId guard, so this refuses them
+    /// off-chain too (defense in depth). Re-armed rows keep their insert order, so they
+    /// re-enter the oldest-first drain ahead of newer receipts.
+    ///
+    /// Idempotent + safe under a concurrent drain, like the single re-drive but over the
+    /// whole set: each re-armed row gets exactly one more attempt and, if the broad cause
+    /// is NOT actually fixed, simply re-dead-letters on the next error (one attempt per
+    /// re-drive, never a hot loop). A second bulk call once the set has attested re-arms
+    /// nothing (every row now `uid`-set), so an operator double-call can't double-attest.
+    /// `0` is returned when there is nothing to re-arm — a clean no-op, not an error.
+    pub fn redrive_all_dead_lettered_attestations(&self) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET dead_lettered_at = NULL
+             WHERE dead_lettered_at IS NOT NULL AND uid IS NULL",
+            (),
+        )?;
+        Ok(updated)
+    }
+
     /// Test-only: read back the pending attestation recorded for a job, rebuilt
     /// as an `eas::PendingAttestation` so a test can assert the settle-time
     /// mapping round-trips. `None` when no pending row exists for the job.

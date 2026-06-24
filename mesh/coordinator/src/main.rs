@@ -2036,6 +2036,8 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/debits/dead-lettered", get(dead_lettered_debits))
         .route("/debits/{id}/redrive", post(redrive_debit))
         .route("/debits/redrive-all", post(redrive_all_debits))
+        .route("/receipts/{id}/redrive", post(redrive_receipt))
+        .route("/receipts/redrive-all", post(redrive_all_receipts))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -2399,6 +2401,95 @@ async fn redrive_all_debits(
         }
         Err(e) => {
             tracing::error!(?e, "bulk re-drive: redrive_all_dead_lettered_debits failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// `POST /receipts/{id}/redrive` — operator recovery: re-arm the dead-lettered EAS
+/// render receipt for job `{id}` so the next drain re-attempts it, used after the
+/// `Permanent` cause is fixed (e.g. the coordinator funds the region fee whose
+/// unpayability reverted `issueReceipt`, or the operator authorizes the signer). A
+/// dead-lettered receipt is never auto-re-claimed (`claim_oldest_pending_batch` skips
+/// it), so this is the only path back into the drainable backlog. The attestation
+/// twin of [`redrive_debit`].
+///
+/// A privileged recovery action, so it carries the SAME bearer-token gate as
+/// `POST /jobs` (`--ingest-token` / `COORDINATOR_INGEST_TOKEN`): when a token is
+/// configured, a request without `Authorization: Bearer <token>` is rejected `401`
+/// before any store work — nothing is re-armed for an unauthorized caller. With no
+/// token configured the endpoint is open (the same dev posture as ingestion).
+///
+/// Returns `200` with `{"rearmed": bool}`: `true` when a dead-lettered, not-yet-attested
+/// receipt was re-armed; `false` for the idempotent no-op cases (the row was not
+/// dead-lettered, was already attested — re-arming would resurrect a landed attestation,
+/// so the store refuses it — or no such receipt exists). A re-armed receipt re-enters
+/// the oldest-first batch drain and, if the cause is still unfixed, simply re-dead-letters
+/// on the next `Permanent` error — one attempt per re-drive, never an auto-retry.
+async fn redrive_receipt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<RedriveResponse>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!(%id, "rejected: POST /receipts/{{id}}/redrive missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    match store.redrive_dead_lettered_attestation(&id) {
+        Ok(rearmed) => {
+            if rearmed {
+                tracing::info!(%id, "re-drive: dead-lettered attestation re-armed for the next drain");
+            } else {
+                tracing::info!(%id, "re-drive: no dead-lettered, unattested receipt to re-arm (no-op)");
+            }
+            Ok(Json(RedriveResponse { rearmed }))
+        }
+        Err(e) => {
+            tracing::error!(%id, ?e, "re-drive: redrive_dead_lettered_attestation failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// `POST /receipts/redrive-all` — operator bulk recovery: re-arm EVERY dead-lettered
+/// EAS render receipt in one call, used after a BROAD `Permanent` cause is fixed (the
+/// coordinator signer re-authorized via `setCoordinator`, or a whole class of region
+/// fees funded) — the bulk twin of `POST /receipts/{id}/redrive`, the attestation twin
+/// of [`redrive_all_debits`].
+///
+/// A privileged MASS-recovery action, so it carries the SAME bearer-token gate as
+/// `POST /jobs` and the single re-drive: when a token is configured, a request without
+/// `Authorization: Bearer <token>` is rejected `401` before any store work — nothing is
+/// re-armed for an unauthorized caller. Open when no token is configured (the dev
+/// posture). The store clears only `dead_lettered_at IS NOT NULL AND uid IS NULL` rows,
+/// so a pending (drainable) or attested (landed) receipt is never touched.
+///
+/// Returns `200` with `{"rearmed": count}` — the number re-armed, `0` for the
+/// idempotent no-op (nothing dead-lettered). Each re-armed receipt re-enters the
+/// oldest-first batch drain and, if the broad cause is NOT actually fixed, simply
+/// re-dead-letters on the next `Permanent` error — one attempt per re-drive, never an
+/// auto-retry loop.
+async fn redrive_all_receipts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<BulkRedriveResponse>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!("rejected: POST /receipts/redrive-all missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    match store.redrive_all_dead_lettered_attestations() {
+        Ok(rearmed) => {
+            tracing::info!(rearmed, "bulk re-drive: dead-lettered attestations re-armed for the next drain");
+            Ok(Json(BulkRedriveResponse { rearmed }))
+        }
+        Err(e) => {
+            tracing::error!(?e, "bulk re-drive: redrive_all_dead_lettered_attestations failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
