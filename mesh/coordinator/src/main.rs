@@ -353,6 +353,14 @@ struct AppState {
     /// the ingest-backpressure signal (the twin of the flood `registrations_shed`).
     /// `Relaxed` for the same reason: a pure observability counter, no happens-before.
     jobs_shed: AtomicU64,
+    /// Cumulative count of registrations shed by the earner-registry cap — the shared
+    /// `admit_earner` seam rejecting a NEW earner because the registry is full of LIVE
+    /// earners (`--max-earners` reached, nothing stale to evict), on EITHER path (`503`
+    /// on HTTP `/register`, socket close on the WS `Hello`). Bumped only on that
+    /// cap-full reject — never on a successful register, an in-place upsert of a known
+    /// earner, a rate-limit shed, or a validation failure. The registry-cap third of
+    /// the shed trio, surfaced on `/stats`. `Relaxed`: a pure observability counter.
+    earners_shed: AtomicU64,
 }
 
 /// The non-store construction knobs for [`AppState::with_store`], named so a long
@@ -461,6 +469,7 @@ impl AppState {
             trusted_proxies: cfg.trusted_proxies,
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         }))
     }
 }
@@ -709,6 +718,13 @@ struct Stats {
     /// value means producers are outrunning drain, not that jobs are malformed. 0 on a
     /// healthy mesh. Additive and optional.
     jobs_shed: usize,
+    /// Cumulative registrations shed by the earner-registry cap (`--max-earners` full of
+    /// LIVE earners) since boot, across both the HTTP `/register` `503` and WS `Hello`
+    /// close paths — the registry-saturation signal completing the shed trio. Counts
+    /// only the cap-full reject, never a successful register, an upsert of a known
+    /// earner, a rate-limit shed, or a validation failure. 0 on a healthy mesh. Additive
+    /// and optional.
+    earners_shed: usize,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -2310,6 +2326,7 @@ async fn register(
     if !admitted {
         // Registry full of LIVE earners: shed with a retryable 503 (matches the
         // queue-cap backpressure). A stale earner aging past its TTL frees a slot.
+        state.earners_shed.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             address = %earner_address,
             cap = state.max_earners,
@@ -2864,6 +2881,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
     // lock). u64→usize is lossless on the 64-bit targets the coordinator runs on.
     let registrations_shed = state.registrations_shed.load(Ordering::Relaxed) as usize;
     let jobs_shed = state.jobs_shed.load(Ordering::Relaxed) as usize;
+    let earners_shed = state.earners_shed.load(Ordering::Relaxed) as usize;
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -2891,6 +2909,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         oldest_dead_lettered_debit_secs,
         registrations_shed,
         jobs_shed,
+        earners_shed,
     }))
 }
 
@@ -3703,6 +3722,7 @@ async fn recv_hello_inner(
             // Same admission policy as HTTP /register (FM4 parity): a registry full
             // of live earners can't make room, so close the socket instead of
             // admitting (no live earner is ever displaced).
+            state.earners_shed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 address = %earner_address,
                 cap = state.max_earners,
@@ -11967,6 +11987,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -12110,6 +12131,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -13367,6 +13389,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         let job = seed_job();
         let job_id = job.id;
@@ -14174,6 +14197,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -14233,6 +14257,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
 
         let terrain_job = JobSpec {
@@ -14297,6 +14322,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -14324,6 +14350,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
 
         let mut ids = Vec::new();
@@ -14424,6 +14451,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
 
         let queued = job_with_deadline(60);
@@ -14540,6 +14568,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14594,6 +14623,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14661,6 +14691,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14722,6 +14753,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -14774,6 +14806,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -14839,6 +14872,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -14910,6 +14944,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -14980,6 +15015,7 @@ mod tests {
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
+            earners_shed: AtomicU64::new(0),
         });
         let pay = test_address("pay");
         let resp = post_json(
