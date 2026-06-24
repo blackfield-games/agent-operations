@@ -664,6 +664,17 @@ struct Stats {
     /// cannot block the backlog. Nonzero here means a stuck charge needs operator
     /// attention (top-up + replay). 0 on a healthy mesh. Additive and optional.
     dead_lettered_debits: usize,
+    /// Age in seconds of the OLDEST quarantined attestation (`now - MIN(dead_lettered_at)`
+    /// over the dead-lettered, not-yet-attested rows), or `null` when none are stuck. The
+    /// dead-letter-age twin of `oldest_in_flight_secs`: `dead_lettered_attestations` is the
+    /// DEPTH, this is how LONG the oldest owed proof has been stuck — so an operator can
+    /// alarm on a single long-quarantined receipt a low depth would hide. Additive and
+    /// optional.
+    oldest_dead_lettered_attestation_secs: Option<u64>,
+    /// Age in seconds of the OLDEST quarantined debit (`now - MIN(dead_lettered_at)` over
+    /// the dead-lettered, not-yet-settled rows), or `null` when none are stuck — the debit
+    /// twin of `oldest_dead_lettered_attestation_secs`. Additive and optional.
+    oldest_dead_lettered_debit_secs: Option<u64>,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -2790,6 +2801,25 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    // Age (now - MIN stamp) of the oldest stuck row in each dead-letter backlog, the
+    // age twin of `oldest_in_flight_secs`. `.max(0)` floors a future stamp (clock skew)
+    // at 0 rather than wrapping to a huge u64; `None` when nothing is quarantined.
+    let oldest_dead_lettered_attestation_secs = match store.oldest_dead_lettered_attestation_at() {
+        Ok(Some(ts)) => Some(now.saturating_sub(ts).max(0) as u64),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(?e, "stats: oldest_dead_lettered_attestation_at failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let oldest_dead_lettered_debit_secs = match store.oldest_dead_lettered_debit_at() {
+        Ok(Some(ts)) => Some(now.saturating_sub(ts).max(0) as u64),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(?e, "stats: oldest_dead_lettered_debit_at failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -2813,6 +2843,8 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         dead_lettered_attestations,
         pending_debits,
         dead_lettered_debits,
+        oldest_dead_lettered_attestation_secs,
+        oldest_dead_lettered_debit_secs,
     }))
 }
 

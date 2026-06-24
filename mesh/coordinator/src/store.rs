@@ -1579,6 +1579,42 @@ impl Store {
         Ok(oldest)
     }
 
+    /// Epoch-seconds `dead_lettered_at` of the OLDEST quarantined, not-yet-attested
+    /// receipt (`MIN` over the listable dead-letter predicate), or `None` when none are
+    /// stuck. The `/stats` handler turns this into an `oldest_dead_lettered_attestation_secs`
+    /// age (`now - this`) — the dead-letter-age twin of
+    /// [`oldest_in_flight_started_at`](Self::oldest_in_flight_started_at), so an operator
+    /// can alarm on HOW LONG owed proof has been stuck, not just the
+    /// [`dead_lettered_attestation_count`](Self::dead_lettered_attestation_count) depth (a
+    /// single long-quarantined receipt a low depth would hide). Same listable predicate as
+    /// the count + listing (`uid IS NULL`), so a settled row never contributes; `MIN` over
+    /// zero matching rows is SQL NULL → `None`.
+    pub fn oldest_dead_lettered_attestation_at(&self) -> Result<Option<i64>> {
+        let oldest: Option<i64> = self.conn.query_row(
+            "SELECT MIN(dead_lettered_at) FROM pending_attestations
+             WHERE dead_lettered_at IS NOT NULL AND uid IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(oldest)
+    }
+
+    /// Epoch-seconds `dead_lettered_at` of the OLDEST quarantined, not-yet-settled debit
+    /// (`MIN` over the listable dead-letter predicate), or `None` when none are stuck — the
+    /// debit twin of
+    /// [`oldest_dead_lettered_attestation_at`](Self::oldest_dead_lettered_attestation_at).
+    /// Same listable predicate as the count + listing (`tx_hash IS NULL`), so a settled
+    /// charge never contributes; `MIN` over zero matching rows is SQL NULL → `None`.
+    pub fn oldest_dead_lettered_debit_at(&self) -> Result<Option<i64>> {
+        let oldest: Option<i64> = self.conn.query_row(
+            "SELECT MIN(dead_lettered_at) FROM pending_debits
+             WHERE dead_lettered_at IS NOT NULL AND tx_hash IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(oldest)
+    }
+
     /// Mean `progress_pct` across every `in_flight` job (rounded to a whole percent),
     /// or `None` when nothing is in flight — the `/stats` in-flight progress signal.
     /// Only `in_flight` rows are aggregated, so a queued/terminal job's last-known
