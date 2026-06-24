@@ -54,7 +54,7 @@ mod validate;
 mod verify;
 
 use meter::{SpendError, Spender};
-use relay::{Relay, RelayError, ALREADY_ISSUED_UID};
+use relay::{BatchRelayError, Relay, RelayError, ALREADY_ISSUED_UID};
 use store::Store;
 
 #[derive(Parser)]
@@ -167,6 +167,17 @@ struct Args {
     /// `/stats pending_attestations`.
     #[arg(long, env = "COORDINATOR_RELAY_DEV_MOCK", default_value = "false")]
     relay_dev_mock: bool,
+    /// Max receipts the attestation relayer batches into one `issueReceipts`
+    /// (`EAS.multiAttest`) call per drain step. `issueReceipts` is atomic — every
+    /// element runs in one tx — so the cap keeps a batch under the block gas limit:
+    /// each element costs the per-receipt work plus its region fee-route, so an
+    /// unbounded batch eventually exceeds the block gas and always reverts. The
+    /// drain claims at most this many, submits one batch, and on a revert falls
+    /// back to per-receipt single submits; the remaining backlog drains over the
+    /// next steps/ticks. 32 leaves wide headroom under Base's block gas; raise it to
+    /// amortize a deeper backlog, lower it if per-element cost grows. Must be >= 1.
+    #[arg(long, env = "COORDINATOR_RELAY_BATCH_SIZE", default_value_t = DEFAULT_RELAY_BATCH_SIZE)]
+    relay_batch_size: usize,
     /// How often (seconds) the debit relayer drains pending ComputeMeter debits to
     /// the chain. Only runs when a spender is configured (see `--spender-dev-mock`).
     #[arg(long, env = "COORDINATOR_SPENDER_INTERVAL_SECS", default_value = "10")]
@@ -653,6 +664,10 @@ async fn main() -> Result<()> {
         .with_env_filter("coordinator=info,tower_http=info")
         .init();
     let args = Args::parse();
+    anyhow::ensure!(
+        args.relay_batch_size > 0,
+        "relay_batch_size must be >= 1 (0 would claim an empty batch every tick and never drain the receipt backlog)"
+    );
     let store = Store::open(&args.db)?.with_compute_rate_wei(args.compute_rate_wei);
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
     // `with_store` also reclaims jobs left in_flight by a previous crash.
@@ -718,6 +733,7 @@ async fn main() -> Result<()> {
             state.clone(),
             relay::MockRelay::succeeding(),
             args.relay_interval_secs,
+            args.relay_batch_size,
         );
     } else {
         tracing::info!(
@@ -1412,6 +1428,14 @@ const MAX_REQUEST_BODY_BYTES: usize = 2 * validate::MAX_INPUTS_BYTES;
 /// `Args::max_connections` (`--max-connections` / `COORDINATOR_MAX_CONNECTIONS`).
 const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
+/// Default cap on receipts per `issueReceipts` batch. 32 keeps the atomic batch
+/// well under Base's block gas limit (each element pays the per-receipt fence +
+/// counters + attestation + region fee-route) while still amortizing the base tx
+/// cost across a settle wave. Backs `Args::relay_batch_size`
+/// (`--relay-batch-size` / `COORDINATOR_RELAY_BATCH_SIZE`); a deeper backlog can
+/// raise it, a heavier per-element cost lower it.
+const DEFAULT_RELAY_BATCH_SIZE: usize = 32;
+
 /// Default cap on the number of `queued` jobs the runtime ingestion endpoint
 /// (`POST /jobs`) will admit. Sized far above any legitimate early backlog (the
 /// boot-time seed is a handful of jobs, exempt anyway) so it never bites honest
@@ -1619,43 +1643,136 @@ async fn prune_terminal_history(state: &Arc<AppState>) -> usize {
 }
 
 /// Spawn the attestation relayer: every `interval_secs`, drain the pending-receipt
-/// backlog through `relay`. Mirrors `spawn_reaper`; only the real binary spawns it.
-fn spawn_relayer<R: Relay + 'static>(state: Arc<AppState>, relay: R, interval_secs: u64) {
+/// backlog through `relay` in `batch_size`-capped chunks. Mirrors `spawn_reaper`;
+/// only the real binary spawns it.
+fn spawn_relayer<R: Relay + 'static>(
+    state: Arc<AppState>,
+    relay: R,
+    interval_secs: u64,
+    batch_size: usize,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             tick.tick().await;
-            drain_attestations(&state, &relay).await;
+            drain_attestations(&state, &relay, batch_size).await;
         }
     });
 }
 
 /// Drain pending EAS receipts oldest-first through `relay`, settling each to its
-/// on-chain attestation UID. Stops the batch at the first transient/permanent
-/// error so a flaky or misconfigured RPC backs off to the next tick instead of
-/// hot-looping; successful receipts drain within the tick.
+/// on-chain attestation UID. Each step claims a `batch_size`-capped chunk and
+/// submits it as ONE `issueReceipts` (`multiAttest`) call, marking each row with
+/// its submission-order uid; the loop then claims the next chunk until the backlog
+/// is drained.
 ///
-/// The store lock is NEVER held across the submit await: each receipt is claimed
-/// under the lock, the lock is dropped for the (slow) on-chain call, and only
-/// re-acquired to mark the result. So settles and `/stats` never stall behind
-/// network latency. `AlreadyIssued` is an idempotent success — the receipt is on
-/// chain (a recovered crash), so it is marked and the drain continues.
-async fn drain_attestations<R: Relay>(state: &Arc<AppState>, relay: &R) {
+/// `issueReceipts` is atomic — any element reverting (one already on-chain, or one
+/// bad arg) rolls the WHOLE batch back. So a batch revert falls back to
+/// per-receipt single `submit`s ([`drain_singly`]) to isolate the offender: the
+/// already-issued/bad element self-identifies (`AlreadyIssued` → marked, Permanent
+/// → stop) while the rest still drain. A whole-batch Transient backs off to the
+/// next tick; a whole-batch Permanent stops loudly. Either leaves every row in the
+/// chunk pending (nothing partial-marked), so the atomic revert reconciles to
+/// all-pending and is retried.
+///
+/// The store lock is NEVER held across a submit await: a chunk is claimed under
+/// the lock, the lock is dropped for the (slow) on-chain call, and only
+/// re-acquired to mark each result. So settles and `/stats` never stall behind
+/// network latency.
+async fn drain_attestations<R: Relay>(state: &Arc<AppState>, relay: &R, batch_size: usize) {
     loop {
         let claimed = {
             let store = state.store.lock().await;
-            store.claim_oldest_pending()
+            store.claim_oldest_pending_batch(batch_size)
         }; // lock dropped before the on-chain submit below
         let claimed = match claimed {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(?e, "relay: claim_oldest_pending failed");
+                tracing::error!(?e, "relay: claim_oldest_pending_batch failed");
                 return;
             }
         };
-        let Some((job_id, att)) = claimed else { return }; // backlog drained
+        if claimed.is_empty() {
+            return; // backlog drained
+        }
 
-        let uid = match relay.submit(&att).await {
+        let atts: Vec<crate::eas::PendingAttestation> =
+            claimed.iter().map(|(_, att)| att.clone()).collect();
+        match relay.submit_batch(&atts).await {
+            Ok(uids) => {
+                // The contract returns exactly `n` uids in submission order; a short
+                // return would mis-map a job to the wrong/stale uid (the contract
+                // itself reverts on an indexed read past the end). Mark nothing and
+                // back off rather than corrupt the mapping.
+                if uids.len() != claimed.len() {
+                    tracing::error!(
+                        got = uids.len(),
+                        want = claimed.len(),
+                        "relay: issueReceipts returned the wrong uid count; marking nothing"
+                    );
+                    return;
+                }
+                for ((job_id, _), uid) in claimed.iter().zip(uids.iter()) {
+                    if !mark_relayed(state, job_id, uid).await {
+                        return;
+                    }
+                }
+            }
+            Err(BatchRelayError::Reverted(msg)) => {
+                tracing::warn!(%msg, n = claimed.len(), "relay: batch reverted; isolating via single submits");
+                if !drain_singly(state, relay, &claimed).await {
+                    return;
+                }
+            }
+            Err(BatchRelayError::Transient(msg)) => {
+                tracing::warn!(%msg, "relay: transient batch failure; retrying next tick");
+                return; // back off; the whole chunk stays pending
+            }
+            Err(BatchRelayError::Permanent(msg)) => {
+                tracing::error!(%msg, "relay: permanent batch failure; draining paused (check coordinator authorization)");
+                return; // whole chunk stays pending
+            }
+        }
+    }
+}
+
+/// Mark one relayed receipt under the lock. Returns `false` only on a store error
+/// (the caller stops the drain); a no-op re-mark (the row was already marked by a
+/// recovered/duplicate drain) is logged and treated as success so the rest of the
+/// backlog keeps draining.
+async fn mark_relayed(state: &Arc<AppState>, job_id: &uuid::Uuid, uid: &str) -> bool {
+    let marked = {
+        let store = state.store.lock().await;
+        store.mark_submitted(job_id, uid, now_secs())
+    };
+    match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(%job_id, "relay: receipt already marked submitted");
+            true
+        }
+        Err(e) => {
+            tracing::error!(%job_id, ?e, "relay: mark_submitted failed");
+            false
+        }
+    }
+}
+
+/// Isolate a reverted batch: re-submit each claimed receipt singly so the one
+/// offending element (already on-chain, or bad) self-identifies while the rest
+/// still drain. Mirrors the single-submit semantics — `AlreadyIssued` is an
+/// idempotent success (marked with the sentinel), `Transient` backs off, and
+/// `Permanent` stops the drain loudly. Returns `true` only if every receipt was
+/// handled (so the outer loop claims the next chunk); a Transient/Permanent single
+/// — or a store error — returns `false` to stop this tick, leaving the unhandled
+/// rows pending.
+async fn drain_singly<R: Relay>(
+    state: &Arc<AppState>,
+    relay: &R,
+    claimed: &[(uuid::Uuid, crate::eas::PendingAttestation)],
+) -> bool {
+    for (job_id, att) in claimed {
+        let uid = match relay.submit(att).await {
             Ok(uid) => uid,
             Err(RelayError::AlreadyIssued) => {
                 tracing::info!(%job_id, "relay: receipt already on-chain; marking submitted");
@@ -1663,29 +1780,18 @@ async fn drain_attestations<R: Relay>(state: &Arc<AppState>, relay: &R) {
             }
             Err(RelayError::Transient(msg)) => {
                 tracing::warn!(%job_id, %msg, "relay: transient submit failure; retrying next tick");
-                return; // back off to the next tick
+                return false;
             }
             Err(RelayError::Permanent(msg)) => {
                 tracing::error!(%job_id, %msg, "relay: permanent submit failure; draining paused (check coordinator authorization)");
-                return;
+                return false;
             }
         };
-
-        let marked = {
-            let store = state.store.lock().await;
-            store.mark_submitted(&job_id, &uid, now_secs())
-        };
-        match marked {
-            Ok(true) => {}
-            // The row was already marked (a concurrent/duplicate drain) — not an
-            // error, just nothing to do; keep draining the rest of the backlog.
-            Ok(false) => tracing::warn!(%job_id, "relay: receipt already marked submitted"),
-            Err(e) => {
-                tracing::error!(%job_id, ?e, "relay: mark_submitted failed");
-                return;
-            }
+        if !mark_relayed(state, job_id, &uid).await {
+            return false;
         }
     }
+    true
 }
 
 /// Marker `tx_hash` stored when the contract reports the debit is already spent
@@ -4820,143 +4926,212 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn drain_submits_each_pending_once_and_marks_it() {
-        let state = test_state_empty().await;
-        let jobs = [seed_job(), seed_job()];
+    /// Seed + settle `n` distinct jobs, returning them in insertion (oldest-first)
+    /// order so a batch test can map each job to its claimed slot.
+    async fn settle_n(state: &Arc<AppState>, n: usize) -> Vec<JobSpec> {
+        let jobs: Vec<JobSpec> = (0..n).map(|_| seed_job()).collect();
         for job in &jobs {
-            settle_one(&state, job).await;
+            settle_one(state, job).await;
         }
-        assert_eq!(pending(&state).await, 2);
+        jobs
+    }
+
+    async fn stored_uid(state: &Arc<AppState>, job_id: &Uuid) -> Option<String> {
+        state.store.lock().await.attestation_uid(job_id).unwrap()
+    }
+
+    /// A generous cap so most tests drain in one batch; the cap itself is pinned by
+    /// `drain_caps_the_batch_at_relay_batch_size`.
+    const TEST_BATCH: usize = 16;
+
+    #[tokio::test]
+    async fn drain_batches_all_pending_in_one_multiattest() {
+        let state = test_state_empty().await;
+        let jobs = settle_n(&state, 3).await;
+        assert_eq!(pending(&state).await, 3);
 
         let relay = MockRelay::succeeding();
-        drain_attestations(&state, &relay).await;
+        drain_attestations(&state, &relay, TEST_BATCH).await;
 
-        assert_eq!(pending(&state).await, 0, "both receipts drained");
-        assert_eq!(relay.calls(), 2);
-        let mut submitted = relay.submitted();
+        assert_eq!(pending(&state).await, 0, "all receipts drained");
+        assert_eq!(relay.batch_calls(), 1, "one multiAttest, not N issueReceipt");
+        assert_eq!(relay.calls(), 0, "no single submits on the happy path");
+        let mut submitted = relay.batch_submitted();
         submitted.sort();
         let mut expected: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
         expected.sort();
-        assert_eq!(
-            submitted, expected,
-            "each pending job submitted exactly once"
-        );
+        assert_eq!(submitted, expected, "every pending job in the one batch");
     }
 
     #[tokio::test]
     async fn drain_a_second_pass_with_an_empty_backlog_is_a_noop() {
         let state = test_state_empty().await;
-        let job = seed_job();
-        settle_one(&state, &job).await;
+        settle_n(&state, 1).await;
 
         let relay = MockRelay::succeeding();
-        drain_attestations(&state, &relay).await;
+        drain_attestations(&state, &relay, TEST_BATCH).await;
         assert_eq!(pending(&state).await, 0);
-        assert_eq!(relay.calls(), 1);
+        assert_eq!(relay.batch_calls(), 1);
 
         // Nothing pending → the relay is not called again.
-        drain_attestations(&state, &relay).await;
-        assert_eq!(relay.calls(), 1, "an empty backlog submits nothing");
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(relay.batch_calls(), 1, "an empty backlog submits nothing");
     }
 
-    /// Crash recovery: a prior `issueReceipt` landed on-chain but the process died
-    /// before the local mark, so the row is still pending. The re-submit hits the
-    /// contract's `DuplicateReceipt` fence (`AlreadyIssued`) and the drain marks
-    /// the row rather than double-attesting.
+    /// FM3: each job is marked with ITS OWN submission-order uid. The mock's batch
+    /// uid embeds the job id, so a mis-indexed zip would store the wrong job's uid.
     #[tokio::test]
-    async fn drain_marks_already_issued_without_resubmitting() {
+    async fn drain_marks_each_with_its_own_submission_order_uid() {
         let state = test_state_empty().await;
-        let job = seed_job();
-        settle_one(&state, &job).await;
+        let jobs = settle_n(&state, 4).await;
 
-        let relay = MockRelay::already_issued();
-        drain_attestations(&state, &relay).await;
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+
+        for j in &jobs {
+            let jid = eas::job_id_hex(&j.id);
+            assert_eq!(
+                stored_uid(&state, &j.id).await,
+                Some(format!("0xmockbatch-{jid}")),
+                "job mapped to its own uid, not a neighbour's"
+            );
+        }
+    }
+
+    /// FM1: a batch with ONE already-on-chain receipt reverts on the contract's
+    /// per-element `DuplicateReceipt` fence; the fallback isolates it so the other
+    /// N-1 still drain and the already-issued one is marked — never zero progress.
+    #[tokio::test]
+    async fn drain_isolates_an_already_issued_receipt_in_a_reverted_batch() {
+        let state = test_state_empty().await;
+        let jobs = settle_n(&state, 3).await;
+        let already = eas::job_id_hex(&jobs[1].id);
+
+        let relay = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_already_issued_job(already.clone());
+        drain_attestations(&state, &relay, TEST_BATCH).await;
 
         assert_eq!(
             pending(&state).await,
             0,
-            "already-on-chain receipt is marked"
+            "the other N-1 drain and the already-issued row is marked"
         );
-        assert_eq!(relay.calls(), 1);
-        assert!(
-            relay.submitted().is_empty(),
-            "AlreadyIssued submits nothing new"
-        );
-    }
-
-    #[tokio::test]
-    async fn drain_retries_a_transient_failure_on_the_next_tick() {
-        let state = test_state_empty().await;
-        let job = seed_job();
-        settle_one(&state, &job).await;
-
-        let relay = MockRelay::transient_then_ok(1);
-        // First tick: the transient failure leaves the receipt pending, not dropped.
-        drain_attestations(&state, &relay).await;
+        assert_eq!(relay.batch_calls(), 1, "one batch attempt, then fallback");
+        let mut singly = relay.submitted();
+        singly.sort();
+        let mut expected: Vec<String> = jobs
+            .iter()
+            .map(|j| eas::job_id_hex(&j.id))
+            .filter(|h| h != &already)
+            .collect();
+        expected.sort();
+        assert_eq!(singly, expected, "fallback single-submits every non-already receipt");
         assert_eq!(
-            pending(&state).await,
-            1,
-            "transient failure is not terminal"
+            stored_uid(&state, &jobs[1].id).await.as_deref(),
+            Some(ALREADY_ISSUED_UID),
+            "the already-issued row carries the sentinel, not a re-attestation"
         );
-        assert_eq!(relay.calls(), 1);
-        assert!(relay.submitted().is_empty());
-
-        // Next tick: it succeeds and drains.
-        drain_attestations(&state, &relay).await;
-        assert_eq!(pending(&state).await, 0);
-        assert_eq!(relay.calls(), 2);
-        assert_eq!(relay.submitted(), vec![eas::job_id_hex(&job.id)]);
     }
 
-    /// A transient error stops the batch (so a flaky RPC backs off to the next
-    /// tick) without dropping any receipt or hot-looping.
+    /// FM2: an atomic batch revert the fallback can't isolate this tick (every
+    /// single also faults) marks NOTHING — all rows stay pending and retry, never
+    /// partial-marked.
     #[tokio::test]
-    async fn drain_stops_the_batch_at_a_transient_error() {
+    async fn drain_reverted_batch_marks_nothing_when_unisolatable() {
         let state = test_state_empty().await;
-        for job in [seed_job(), seed_job()] {
-            settle_one(&state, &job).await;
-        }
+        settle_n(&state, 3).await;
 
-        let relay = MockRelay::transient_then_ok(usize::MAX); // never reaches the ok branch
-        drain_attestations(&state, &relay).await;
+        // Batch reverts and every single submit is transient (an RPC brownout).
+        let relay = MockRelay::transient_then_ok(usize::MAX).with_batch_reverts();
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+
+        assert_eq!(pending(&state).await, 3, "a reverted batch marks nothing");
+        assert_eq!(relay.batch_calls(), 1);
+        assert_eq!(relay.calls(), 1, "fallback stops at the first transient — no hot loop");
+        assert!(relay.submitted().is_empty());
+    }
+
+    /// A whole-batch transient backs off without the single fallback (singles would
+    /// hit the same fault) and drops nothing.
+    #[tokio::test]
+    async fn drain_transient_batch_leaves_all_pending() {
+        let state = test_state_empty().await;
+        settle_n(&state, 2).await;
+
+        let relay = MockRelay::succeeding().with_batch_transient();
+        drain_attestations(&state, &relay, TEST_BATCH).await;
 
         assert_eq!(pending(&state).await, 2, "nothing dropped");
-        assert_eq!(
-            relay.calls(),
-            1,
-            "batch stops at the first error — no hot loop"
-        );
+        assert_eq!(relay.batch_calls(), 1, "stops at the batch error — no hot loop");
+        assert_eq!(relay.calls(), 0, "no single fallback on a whole-batch transient");
     }
 
-    /// A permanent error (e.g. an unauthorized signer) neither drops the receipt
-    /// nor hot-loops — the drain stops for the operator to fix authorization.
+    /// A transient batch is not terminal: the rows survive and a later successful
+    /// tick drains them.
     #[tokio::test]
-    async fn drain_does_not_drop_on_a_permanent_error() {
+    async fn drain_retries_a_transient_batch_on_the_next_tick() {
         let state = test_state_empty().await;
-        let job = seed_job();
-        settle_one(&state, &job).await;
+        settle_n(&state, 2).await;
 
-        let relay = MockRelay::permanent();
-        drain_attestations(&state, &relay).await;
+        drain_attestations(&state, &MockRelay::succeeding().with_batch_transient(), TEST_BATCH).await;
+        assert_eq!(pending(&state).await, 2, "transient is not terminal");
 
-        assert_eq!(
-            pending(&state).await,
-            1,
-            "permanent error does not drop the receipt"
-        );
-        assert_eq!(relay.calls(), 1, "no hot loop");
-        assert!(relay.submitted().is_empty());
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert_eq!(pending(&state).await, 0, "drains once the batch succeeds");
     }
 
-    /// FM: the drain must not hold the store mutex across the slow on-chain submit,
-    /// or every settle/stats stalls behind RPC latency. The gated relay holds the
-    /// submit in-flight while we prove the store lock is still acquirable.
+    /// A whole-batch permanent (e.g. an unauthorized signer) neither drops a
+    /// receipt nor hot-loops — the drain stops for the operator.
     #[tokio::test]
-    async fn drain_holds_no_store_lock_across_the_submit() {
+    async fn drain_permanent_batch_leaves_all_pending() {
         let state = test_state_empty().await;
-        let job = seed_job();
-        settle_one(&state, &job).await;
+        settle_n(&state, 2).await;
+
+        let relay = MockRelay::succeeding().with_batch_permanent();
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+
+        assert_eq!(pending(&state).await, 2, "permanent batch error drops nothing");
+        assert_eq!(relay.batch_calls(), 1, "no hot loop");
+        assert_eq!(relay.calls(), 0, "no fallback on a whole-batch permanent");
+    }
+
+    /// The fallback keeps the single-submit Permanent-stops semantics: a reverted
+    /// batch whose receipts then fault Permanent stops the drain without dropping.
+    #[tokio::test]
+    async fn drain_fallback_stops_on_a_permanent_single() {
+        let state = test_state_empty().await;
+        settle_n(&state, 2).await;
+
+        let relay = MockRelay::permanent().with_batch_reverts();
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+
+        assert_eq!(pending(&state).await, 2, "fallback Permanent stops without dropping");
+        assert_eq!(relay.batch_calls(), 1);
+        assert_eq!(relay.calls(), 1, "stops at the first permanent single — no hot loop");
+    }
+
+    /// FM4: the batch is capped to the gas-safe N — a 5-receipt backlog drains in
+    /// ceil(5/2) batches, proving `claim_oldest_pending_batch` honours the limit
+    /// (an uncapped claim would be one batch).
+    #[tokio::test]
+    async fn drain_caps_the_batch_at_relay_batch_size() {
+        let state = test_state_empty().await;
+        settle_n(&state, 5).await;
+
+        let relay = MockRelay::succeeding();
+        drain_attestations(&state, &relay, 2).await;
+
+        assert_eq!(pending(&state).await, 0, "the whole backlog drains across capped chunks");
+        assert_eq!(relay.batch_calls(), 3, "5 receipts drain in ceil(5/2)=3 gas-bounded batches");
+    }
+
+    /// FM4: the drain must not hold the store mutex across the slow on-chain batch
+    /// submit, or every settle/stats stalls behind RPC latency. The gated relay
+    /// holds the multiAttest in-flight while we prove the store lock is acquirable.
+    #[tokio::test]
+    async fn drain_holds_no_store_lock_across_the_batch_submit() {
+        let state = test_state_empty().await;
+        settle_n(&state, 2).await;
 
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -4964,39 +5139,37 @@ mod tests {
 
         let drive = {
             let state = state.clone();
-            tokio::spawn(async move { drain_attestations(&state, &relay).await })
+            tokio::spawn(async move { drain_attestations(&state, &relay, TEST_BATCH).await })
         };
 
-        // The submit is now in-flight (claimed, lock dropped, awaiting release).
+        // The batch submit is now in-flight (claimed, lock dropped, awaiting release).
         started.notified().await;
 
         // If the drain held the lock across the await this deadlocks; the timeout
         // turns that regression into a failure instead of a hang.
         tokio::time::timeout(Duration::from_secs(5), async {
-            assert_eq!(pending(&state).await, 1, "claimed but not yet marked");
+            assert_eq!(pending(&state).await, 2, "claimed but not yet marked");
         })
         .await
-        .expect("store lock free during the in-flight submit");
+        .expect("store lock free during the in-flight batch submit");
 
         release.notify_one();
         drive.await.unwrap();
         assert_eq!(
             pending(&state).await,
             0,
-            "receipt marked once the submit returns"
+            "receipts marked once the batch returns"
         );
     }
 
     #[tokio::test]
     async fn stats_pending_attestations_drains_after_relay() {
         let state = test_state_empty().await;
-        for job in [seed_job(), seed_job()] {
-            settle_one(&state, &job).await;
-        }
+        settle_n(&state, 2).await;
         let before = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(before["pending_attestations"], 2);
 
-        drain_attestations(&state, &MockRelay::succeeding()).await;
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
 
         let after = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(
@@ -8082,6 +8255,20 @@ mod tests {
         assert_eq!(
             Args::parse_from(["coordinator", "--max-queued-jobs", "42"]).max_queued_jobs,
             42,
+            "the flag is honored"
+        );
+    }
+
+    #[test]
+    fn args_relay_batch_size_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).relay_batch_size,
+            DEFAULT_RELAY_BATCH_SIZE,
+            "unset default == the const"
+        );
+        assert_eq!(
+            Args::parse_from(["coordinator", "--relay-batch-size", "8"]).relay_batch_size,
+            8,
             "the flag is honored"
         );
     }

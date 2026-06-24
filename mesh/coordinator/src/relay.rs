@@ -290,7 +290,7 @@ impl Relay for MockRelay {
         if inner.permanent {
             return Err(RelayError::Permanent("mock permanent".into()));
         }
-        if inner.already_issued || inner.already_issued_jobs.iter().any(|j| *j == att.job_id) {
+        if inner.already_issued || inner.already_issued_jobs.contains(&att.job_id) {
             return Err(RelayError::AlreadyIssued);
         }
         if inner.transient_remaining > 0 {
