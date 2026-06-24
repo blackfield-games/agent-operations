@@ -5671,6 +5671,100 @@ mod tests {
         assert_eq!(pending(&state).await, 2);
     }
 
+    /// FM2: a re-armed receipt attests EXACTLY ONCE on the next drain, and a repeat
+    /// re-drive after it has attested is a no-op — no double-attest. The off-chain double
+    /// guard (`uid IS NULL AND dead_lettered_at IS NULL`) plus the on-chain
+    /// `DuplicateReceipt` fence keep a re-driven receipt to at most one attestation; the
+    /// single drain task is the only uid writer.
+    #[tokio::test]
+    async fn receipt_redrive_then_drain_attests_the_re_armed_receipt_exactly_once() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        dead_letter_one_attestation(&state, &job).await;
+
+        // Operator re-drives after the region fee is funded.
+        assert!(state.store.lock().await.redrive_dead_lettered_attestation(&job.id).unwrap());
+        assert_eq!(pending(&state).await, 1, "re-armed back into the backlog");
+
+        // Next drain attests it once.
+        let relay = MockRelay::succeeding();
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(relay.batch_calls(), 1);
+        assert!(stored_uid(&state, &job.id).await.is_some(), "the re-armed receipt attests exactly once");
+        assert_eq!(pending(&state).await, 0);
+        assert_eq!(dead_lettered_attestations(&state).await, 0);
+
+        // A repeat re-drive once attested is a no-op (uid set), and a further drain claims
+        // nothing — no double-attest on an operator double-call.
+        assert!(
+            !state.store.lock().await.redrive_dead_lettered_attestation(&job.id).unwrap(),
+            "an attested receipt can't be re-armed"
+        );
+        let relay2 = MockRelay::succeeding();
+        drain_attestations(&state, &relay2, TEST_BATCH).await;
+        assert_eq!(relay2.batch_calls(), 0, "nothing left to claim — no second attest");
+    }
+
+    /// FM3: if the cause is STILL unfixed (the region fee still unpayable), re-driving
+    /// then re-draining simply re-dead-letters the row — one more attempt per re-drive,
+    /// never an infinite auto-retry and never a panic. It stays quarantined until the next
+    /// EXPLICIT re-drive (a dead-lettered row is never auto-re-claimed).
+    #[tokio::test]
+    async fn receipt_redrive_re_dead_letters_on_a_repeat_permanent_error() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        dead_letter_one_attestation(&state, &job).await;
+
+        // Re-drive, then drain while the cause is still unfixed (permanent again).
+        assert!(state.store.lock().await.redrive_dead_lettered_attestation(&job.id).unwrap());
+        let poison = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&job.id));
+        drain_attestations(&state, &poison, TEST_BATCH).await;
+        assert_eq!(poison.batch_calls(), 1, "one more attempt — not a hot loop");
+        assert_eq!(dead_lettered_attestations(&state).await, 1, "re-dead-lettered, not dropped");
+        assert_eq!(pending(&state).await, 0);
+        assert_eq!(stored_uid(&state, &job.id).await, None, "still unattested");
+
+        // NOT auto-re-driven: a succeeding drain claims nothing until the next explicit re-drive.
+        let healthy = MockRelay::succeeding();
+        drain_attestations(&state, &healthy, TEST_BATCH).await;
+        assert_eq!(healthy.batch_calls(), 0, "a re-dead-lettered receipt is not auto-re-claimed");
+        assert_eq!(dead_lettered_attestations(&state).await, 1, "still quarantined");
+    }
+
+    /// FM3 (bulk): a bulk re-drive into a still-unfixed BROAD cause re-quarantines the
+    /// whole set in ONE bounded drain wave — one attempt per row, no hot loop — rather
+    /// than looping. Each re-armed row gets exactly one re-attempt and re-dead-letters.
+    #[tokio::test]
+    async fn receipts_redrive_all_re_dead_letters_into_a_still_unfixed_cause() {
+        let state = test_state_empty().await;
+        let a = seed_job();
+        let b = seed_job();
+        settle_one(&state, &a).await;
+        settle_one(&state, &b).await;
+        let relay = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&a.id))
+            .with_permanent_job(eas::job_id_hex(&b.id));
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 2);
+
+        // Bulk re-drive while the broad cause is still unfixed.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_attestations().unwrap(), 2);
+        assert_eq!(pending(&state).await, 2, "both re-armed back into the backlog");
+
+        // One bounded drain wave re-quarantines the whole set — one attempt per row.
+        let relay2 = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&a.id))
+            .with_permanent_job(eas::job_id_hex(&b.id));
+        drain_attestations(&state, &relay2, TEST_BATCH).await;
+        assert_eq!(relay2.batch_calls(), 1, "one batch attempt — not a hot loop");
+        assert_eq!(dead_lettered_attestations(&state).await, 2, "re-dead-lettered, not dropped");
+        assert_eq!(pending(&state).await, 0);
+    }
+
     // ---- debit relayer (drain loop) ----
 
     use meter::MockSpender;
