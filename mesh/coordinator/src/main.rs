@@ -735,6 +735,15 @@ struct Stats {
     /// earner, a rate-limit shed, or a validation failure. 0 on a healthy mesh. Additive
     /// and optional.
     earners_shed: usize,
+    /// Cumulative NEW earners admitted at a full registry (`--max-earners`) by EVICTING
+    /// the stalest past-TTL entry to make room, across both register paths, since boot —
+    /// the registry-CHURN signal completing the at-cap picture alongside `earners_shed`:
+    /// `earners_evicted` MADE room, `earners_shed` could NOT (all live). A fleet larger
+    /// than the cap constantly rotating (evict-and-readmit per registration) shows here
+    /// while staying invisible on `earners_shed`. Counts only a real eviction — never a
+    /// below-cap insert, an upsert of a known earner, or the all-live reject. 0 on a
+    /// healthy under-cap mesh. Additive and optional.
+    earners_evicted: usize,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -2924,6 +2933,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
     let registrations_shed = state.registrations_shed.load(Ordering::Relaxed) as usize;
     let jobs_shed = state.jobs_shed.load(Ordering::Relaxed) as usize;
     let earners_shed = state.earners_shed.load(Ordering::Relaxed) as usize;
+    let earners_evicted = state.earners_evicted.load(Ordering::Relaxed) as usize;
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -2952,6 +2962,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         registrations_shed,
         jobs_shed,
         earners_shed,
+        earners_evicted,
     }))
 }
 
