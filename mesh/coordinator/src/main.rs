@@ -4650,6 +4650,79 @@ mod tests {
         assert_eq!(json["jobs_completed"], 1);
     }
 
+    // -- earner-address canonical identity: a case-variant claim must not split
+    //    reputation across the registry, fault ledger, and leaderboard --
+
+    /// An uppercased-hex variant of `addr` (same address, EIP-55-style different
+    /// case) — what an inconsistent/adversarial client could present at one boundary.
+    fn upper_case_variant(addr: &str) -> String {
+        format!("0x{}", addr[2..].to_ascii_uppercase())
+    }
+
+    /// FM2: a registration presenting a mixed-case address is keyed on the canonical
+    /// lowercase identity (the recovered signer), not the as-sent case — so the same
+    /// earner can't occupy two registry slots / leaderboard rows by varying case.
+    #[tokio::test]
+    async fn register_folds_a_mixed_case_address_to_one_canonical_identity() {
+        let state = test_state_empty().await;
+        let sk = test_signing_key("case-earner");
+        let canonical = address_from_signing_key(&sk);
+        let upper = upper_case_variant(&canonical);
+        assert_ne!(upper, canonical, "the variant differs only by case");
+
+        let hello = signed_hello(&sk, &upper, "RTX 4090", 24, vec![JobKind::Terrain]);
+        let resp = post_json(state.clone(), "/register", &serde_json::to_value(hello).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "a case-variant claim still verifies");
+
+        let earners = state.earners.lock().await;
+        assert_eq!(earners.len(), 1, "exactly one identity");
+        assert!(earners.contains_key(&canonical), "keyed on the canonical lowercase identity");
+        assert!(!earners.contains_key(&upper), "not the as-sent mixed case");
+    }
+
+    /// FM3 (cross-boundary): a result submitted under a DIFFERENT case than the
+    /// signer's canonical address still verifies (case-insensitive gate) and is
+    /// credited to the canonical identity — the liveness lookup hits the registered
+    /// earner and the leaderboard/aggregate keys on one identity, not the submit's case.
+    #[tokio::test]
+    async fn submit_folds_a_mixed_case_address_to_the_canonical_identity() {
+        let state = test_state_empty().await;
+        let canonical = dev_address();
+        let upper = upper_case_variant(&canonical);
+
+        // Register canonical, then stale its liveness so a hitting lookup is observable.
+        post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(signed_hello(&dev_signing_key(), &canonical, "RTX 4090", 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        state.earners.lock().await.get_mut(&canonical).unwrap().last_seen = 0;
+
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap(); // in_flight
+
+        // Submit claiming the UPPER-case variant (the signing digest omits the
+        // address, so the signature is valid for either case).
+        let mut result = signed_result(job_id, "deadbeef");
+        result.earner_address = upper.clone();
+        let uri = format!("/jobs/{}/submit", job_id);
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&result).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the case-variant submit settles");
+
+        // Liveness lookup hit the canonical registry entry (last_seen advanced past 0).
+        assert!(
+            state.earners.lock().await.get(&canonical).unwrap().last_seen > 0,
+            "the case-variant submit refreshed the canonical earner's liveness"
+        );
+        // The completed credit (leaderboard aggregate) keys on the canonical identity.
+        let by_earner = state.store.lock().await.completed_count_by_earner().unwrap();
+        assert_eq!(by_earner.get(&canonical).copied(), Some(1), "credited to the canonical identity");
+        assert!(!by_earner.contains_key(&upper), "not the mixed case");
+    }
+
     #[tokio::test]
     async fn submit_with_tampered_signature_rejected() {
         let state = test_state();
