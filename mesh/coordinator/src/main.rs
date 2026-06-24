@@ -4997,6 +4997,36 @@ mod tests {
         }
     }
 
+    /// FM3 defensive: a misbehaving relay that returns fewer uids than receipts
+    /// must mark NOTHING — a positional zip over a short return would map jobs to
+    /// the wrong/stale uid. The contract itself reverts on this; the drain guards
+    /// it too rather than trusting the count.
+    #[tokio::test]
+    async fn drain_marks_nothing_when_the_batch_returns_too_few_uids() {
+        struct ShortBatchRelay;
+        impl Relay for ShortBatchRelay {
+            async fn submit(&self, _att: &eas::PendingAttestation) -> Result<String, RelayError> {
+                Ok("0xunused".into())
+            }
+            async fn submit_batch(
+                &self,
+                atts: &[eas::PendingAttestation],
+            ) -> Result<Vec<String>, BatchRelayError> {
+                // One fewer uid than requested.
+                Ok(atts.iter().skip(1).map(|_| "0xshort".to_string()).collect())
+            }
+        }
+
+        let state = test_state_empty().await;
+        settle_n(&state, 3).await;
+        drain_attestations(&state, &ShortBatchRelay, TEST_BATCH).await;
+        assert_eq!(
+            pending(&state).await,
+            3,
+            "a short uid return marks nothing — no mis-mapped uids"
+        );
+    }
+
     /// FM1: a batch with ONE already-on-chain receipt reverts on the contract's
     /// per-element `DuplicateReceipt` fence; the fallback isolates it so the other
     /// N-1 still drain and the already-issued one is marked — never zero progress.
