@@ -2213,6 +2213,10 @@ async fn register(
         tracing::warn!(address = %earner_address, reason, "rejected malformed registration");
         return Err(StatusCode::BAD_REQUEST);
     }
+    // Identity is keyed on the address string, so fold it to canonical lowercase now
+    // that the signature (which commits to the as-sent case) has verified — a client
+    // varying case across boundaries must not split into two identities.
+    let earner_address = verify::canonical_earner_address(&earner_address);
 
     let now = now_secs();
     let admitted = admit_earner(
@@ -2932,7 +2936,7 @@ async fn submit(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(result): Json<JobResult>,
+    Json(mut result): Json<JobResult>,
 ) -> Result<&'static str, StatusCode> {
     if result.job_id != id {
         return Err(StatusCode::BAD_REQUEST);
@@ -2964,6 +2968,10 @@ async fn submit(
         tracing::warn!(?id, earner = %result.earner_address, ?e, "rejected: bad attestation");
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // Fold the signer address to canonical lowercase post-verification so the liveness
+    // map lookup, the attestation earner, and per-earner aggregates all key on one
+    // identity regardless of the case this submit used.
+    result.earner_address = verify::canonical_earner_address(&result.earner_address);
     // Content gate: the signature proves who produced the result; this proves the
     // result is well-formed enough to meter and attest. A malformed output hash,
     // unfetchable url, or zero render-seconds is unprocessable — reject it before
@@ -3497,6 +3505,10 @@ async fn recv_hello_inner(
             tracing::warn!(address = %earner_address, reason, "ws: rejected malformed Hello; closing");
             return None;
         }
+        // Canonical-lowercase the session identity post-verification: the returned
+        // address keys the registry, every fault attribution, and job offers for this
+        // session, so they all derive from one case-invariant form.
+        let earner_address = verify::canonical_earner_address(&earner_address);
         let now = now_secs();
         let admitted = admit_earner(
             &mut *state.earners.lock().await,
@@ -3669,7 +3681,7 @@ async fn handle_submit(
     state: &Arc<AppState>,
     offered: &Option<(JobSpec, i64)>,
     accepted: bool,
-    result: JobResult,
+    mut result: JobResult,
 ) -> SubmitOutcome {
     let job_id = result.job_id;
     let rejected = |reason: &str| CoordinatorMsg::Rejected {
@@ -3708,6 +3720,9 @@ async fn handle_submit(
             RequeueKind::EarnerFault,
         );
     }
+    // Canonical-lowercase the verified signer so the attestation (record_completed)
+    // keys on the same identity the registry and fault ledger do — case-invariant.
+    result.earner_address = verify::canonical_earner_address(&result.earner_address);
 
     // Content gate: reject a result that is not well-formed enough to meter or
     // attest before touching the store. Requeue (not Drop) so the job — which may

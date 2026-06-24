@@ -43,6 +43,22 @@ fn address_from_verifying_key(vk: &VerifyingKey) -> String {
     format!("0x{}", hex::encode(&hash[12..]))
 }
 
+/// The canonical identity form of an earner address — the key the registry, the
+/// `earner_faults` ledger, and the `/stats` leaderboard all index on. EVM
+/// addresses are case-insensitive (EIP-55 only varies hex case for an integrity
+/// checksum), but identity is keyed on the raw string, so a client that presents
+/// one case at registration and another at submit would split into two identities:
+/// fault counts split (bypassing the max-faults dead-letter budget) and the
+/// leaderboard duplicates. Folding to lowercase yields exactly what
+/// [`address_from_verifying_key`] recovers (`hex::encode` emits lowercase), so for
+/// any signature the gate accepts — it matches case-insensitively
+/// ([`verify_recovered_address`]) — the normalized claim IS the recovered signer
+/// address: identity derived from the key, not the case the client chose. Apply at
+/// every identity boundary so all keys derive from one canonical form.
+pub fn canonical_earner_address(address: &str) -> String {
+    address.to_ascii_lowercase()
+}
+
 /// Recover the signer address from a hex-encoded `[r||s||v]` signature over
 /// `digest` and assert it equals `claimed_address` (case-insensitive). The
 /// shared core of both gates: identical decoding, low-S enforcement, and
@@ -389,5 +405,23 @@ mod tests {
             verify_hello_signature(&addr, "RTX 4090", 24, &supported, n, &sig),
             Ok(())
         );
+    }
+
+    #[test]
+    fn canonical_earner_address_folds_to_the_recovered_address() {
+        // The recovered address is the canonical lowercase identity.
+        let recovered = dev_address();
+        // An EIP-55-style mixed-case claim is the same address, different case.
+        let upper = format!("0x{}", recovered[2..].to_ascii_uppercase());
+        assert_ne!(upper, recovered, "the uppercased variant differs only by case");
+        // The gate accepts the mixed-case claim (case-insensitive match)...
+        let sk = dev_key();
+        let n: &[u8] = b"chal";
+        let sig = sign_digest_for_test(&sk, &hello_digest(&upper, "RTX 4090", 24, &[], n));
+        assert_eq!(verify_hello_signature(&upper, "RTX 4090", 24, &[], n, &sig), Ok(()));
+        // ...and normalizing that accepted claim yields exactly the recovered signer
+        // address, so every identity boundary keys on the key, not the chosen case.
+        assert_eq!(canonical_earner_address(&upper), recovered);
+        assert_eq!(canonical_earner_address(&recovered), recovered);
     }
 }
