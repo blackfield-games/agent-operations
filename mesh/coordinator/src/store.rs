@@ -1907,6 +1907,52 @@ impl Store {
         }
     }
 
+    /// The oldest still-pending attestations (`uid IS NULL`), oldest-first by
+    /// insert order, capped at `limit` — the batch twin of
+    /// [`claim_oldest_pending`](Self::claim_oldest_pending). Returns up to `limit`
+    /// rows in the order the drain submits them, so a later submission-order zip
+    /// against the uids `issueReceipts` returns maps each job to ITS OWN uid. A
+    /// pure read like its single sibling: it does NOT reserve or mutate the rows,
+    /// so the drain drops the store lock before the slow on-chain `issueReceipts`
+    /// and only re-acquires it to mark each. A single drain task is the only caller
+    /// and settles only ever INSERT new pending rows, so no reservation is needed
+    /// to avoid a double-claim. `limit == 0` returns an empty batch.
+    pub fn claim_oldest_pending_batch(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(uuid::Uuid, crate::eas::PendingAttestation)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, earner, job_id_b32, render_seconds, job_kind, output_hash, region_id_b32
+             FROM pending_attestations
+             WHERE uid IS NULL
+             ORDER BY created_at ASC, rowid ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            let job_id: String = r.get(0)?;
+            Ok((
+                job_id,
+                crate::eas::PendingAttestation {
+                    earner: r.get(1)?,
+                    job_id: r.get(2)?,
+                    render_seconds: r.get::<_, i64>(3)? as u64,
+                    job_kind: r.get::<_, i64>(4)? as u16,
+                    output_hash: r.get(5)?,
+                    region_id: r.get(6)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job_id, att) = row?;
+            let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
+                anyhow::anyhow!("pending_attestations.job_id not a uuid {job_id:?}: {e}")
+            })?;
+            out.push((uuid, att));
+        }
+        Ok(out)
+    }
+
     /// Mark a pending attestation relayed by writing its on-chain `uid` +
     /// `submitted_at`, but ONLY while it is still pending (`uid IS NULL`). Returns
     /// whether a row was updated. The `uid IS NULL` guard makes a re-mark after a
@@ -1946,6 +1992,23 @@ impl Store {
         );
         match row {
             Ok(a) => Ok(Some(a)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Test-only: the on-chain attestation `uid` marked for a job (NULL until the
+    /// relayer settles it), so a batch-drain test can assert each job_id was marked
+    /// with ITS OWN submission-order uid. `None` for a pending or absent row.
+    #[cfg(test)]
+    pub fn attestation_uid(&self, job_id: &uuid::Uuid) -> Result<Option<String>> {
+        let uid = self.conn.query_row(
+            "SELECT uid FROM pending_attestations WHERE job_id = ?1",
+            [&job_id.to_string()],
+            |r| r.get::<_, Option<String>>(0),
+        );
+        match uid {
+            Ok(u) => Ok(u),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
