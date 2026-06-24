@@ -16,6 +16,7 @@ Run from the agents/ dir:
 from pathlib import Path
 
 from common.types import LayerSpec, RegionCoord, WorldBrief
+from optimization import optimization
 from runtime.supervisor import _failing_specialist, _route_back_target
 from validator import validator
 
@@ -46,6 +47,42 @@ _ROLE_METRICS = {
     "optimization": {"over_budget": 0.0},
 }
 
+# The geometry the optimizer sees: the triangle metrics of every prior layer summed
+# the way optimization._resolve sums them. The validator's budget re-derivation checks
+# the optimization body's authoredTriangles against this, so a realistic optimization
+# fixture must record exactly this figure (else it would read as a STALE layer).
+SUMMED_PRIOR = float(sum(m.get("triangles", 0.0) for m in _ROLE_METRICS.values()))
+
+
+def _opt_body(
+    *,
+    budget: int = optimization.TRIANGLE_BUDGET,
+    authored: float = SUMMED_PRIOR,
+    observed: float | None = None,
+    over_budget: bool | None = None,
+    directives: str = "",
+) -> str:
+    """A realistic optimization layer body for the validator's budget re-derivation.
+
+    Defaults are mutually CONSISTENT: observed == authored (no shedding), overBudget
+    re-derived from observed vs budget, authored == the summed prior geometry. A test
+    overrides one field to model the desync (a stale layer, a phantom figure, a metric
+    that disagrees with the body) the validator must catch."""
+    if observed is None:
+        observed = authored
+    if over_budget is None:
+        over_budget = observed > budget
+    return (
+        "#usda 1.0\n(\n    defaultPrim = \"Optimization\"\n)\n\n"
+        'def Scope "Optimization"\n{\n'
+        f"    custom int triangleBudget = {budget}\n"
+        f"    custom double authoredTriangles = {authored}\n"
+        f"    custom double observedTriangles = {observed}\n"
+        f"    custom bool overBudget = {str(bool(over_budget)).lower()}\n"
+        f"    custom int resolvePasses = 0{directives}\n"
+        "}\n"
+    )
+
 
 def _layer(
     root: Path,
@@ -56,14 +93,21 @@ def _layer(
     """Write a layer file for `specialist` under `root` (skipped when body is
     None, to model a LayerSpec pointing at a missing file) and return its spec.
     `metrics` defaults to the role's contracted metrics so a layer satisfies the
-    schema unless a test deliberately overrides it."""
+    schema unless a test deliberately overrides it. The optimization layer defaults to
+    a realistic optimizer body (consistent with its over_budget metric) so the
+    validator's budget self-consistency re-derivation has a real artifact to audit;
+    pass an explicit body to model a malformed/garbage optimization file."""
     rel = f"{specialist}/{REGION}.usda"
+    if metrics is None:
+        metrics = dict(_ROLE_METRICS.get(specialist, {}))
+    if specialist == "optimization" and body is VALID_BODY:
+        ob = metrics.get("over_budget", 0.0)
+        over = isinstance(ob, (int, float)) and not isinstance(ob, bool) and ob > 0
+        body = _opt_body(budget=500_000 if over else optimization.TRIANGLE_BUDGET)
     if body is not None:
         full = root / rel
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(body)
-    if metrics is None:
-        metrics = dict(_ROLE_METRICS.get(specialist, {}))
     return LayerSpec(specialist=specialist, region_id=REGION, path=rel, summary="t", metrics=metrics)
 
 
