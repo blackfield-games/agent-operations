@@ -8776,6 +8776,73 @@ mod tests {
         assert_eq!(shed_counters(&state).await.0, 1, "the WS-Hello rate shed counts");
     }
 
+    /// FM1: `jobs_shed` counts ONLY the queue-cap shed. Successful creates leave it
+    /// flat, and a malformed spec at the cap is a `422` (validation precedes the cap
+    /// check) — not a shed — so it stays flat too; only the `503` cap reject bumps it.
+    #[tokio::test]
+    async fn jobs_shed_counts_only_the_queue_cap_shed() {
+        let state = test_state_empty_with_cap(2).await;
+        // Two creates fill the cap: a successful create is not a shed.
+        for _ in 0..2 {
+            assert_eq!(
+                post_json(state.clone(), "/jobs", &create_job_body()).await.status(),
+                StatusCode::CREATED
+            );
+        }
+        assert_eq!(shed_counters(&state).await.1, 0, "a successful create is not a shed");
+        // At the cap → 503, the one event that counts.
+        assert_eq!(
+            post_json(state.clone(), "/jobs", &create_job_body()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(shed_counters(&state).await.1, 1, "the queue-cap shed bumps jobs_shed");
+        // A malformed spec at the cap is a 422 (validation runs before the cap check), NOT
+        // a shed — jobs_shed stays 1, discriminating the counter onto the cap path.
+        let mut bad = create_job_body();
+        bad["max_payout_wei"] = serde_json::json!("not-a-number");
+        assert_eq!(
+            post_json(state.clone(), "/jobs", &bad).await.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(shed_counters(&state).await.1, 1, "a validation 422 is not a queue-cap shed");
+    }
+
+    /// FM3: `jobs_shed` is bumped from concurrent handlers via an atomic, so no
+    /// increment is lost — 12 concurrent creates against a cap of 3 record EXACTLY 9
+    /// sheds (the no-overshoot twin: exactly 3 admitted). A non-atomic counter would
+    /// undercount under the contended bump.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn jobs_shed_is_atomic_under_concurrent_sheds() {
+        let state = test_state_empty_with_cap(3).await;
+        let futs: Vec<_> = (0..12)
+            .map(|_| {
+                let s = state.clone();
+                async move { post_json(s, "/jobs", &create_job_body()).await.status() }
+            })
+            .collect();
+        let statuses = futures_util::future::join_all(futs).await;
+        let created = statuses.iter().filter(|s| **s == StatusCode::CREATED).count();
+        let shed = statuses.iter().filter(|s| **s == StatusCode::SERVICE_UNAVAILABLE).count();
+        assert_eq!(created, 3, "exactly cap jobs admitted");
+        assert_eq!(shed, 9, "the rest shed");
+        assert_eq!(shed_counters(&state).await.1, 9, "every concurrent shed counted — no lost increment");
+    }
+
+    /// FM4: the shed counters are additive/optional usize fields — a fresh `/stats`
+    /// serializes both at 0 alongside the existing counters, so a strict client still
+    /// reads the response and the prior fields are unchanged.
+    #[tokio::test]
+    async fn stats_includes_shed_counters_additively() {
+        let state = test_state_empty().await;
+        let s = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(s["registrations_shed"], 0, "fresh mesh: no registrations shed");
+        assert_eq!(s["jobs_shed"], 0, "fresh mesh: no jobs shed");
+        // Existing counters still present + unchanged (additive shape, no regression).
+        assert_eq!(s["jobs_queued"], 0);
+        assert_eq!(s["total_faults"], 0);
+        assert_eq!(s["jobs_redispatched"], 0);
+    }
+
     #[test]
     fn with_store_rejects_zero_max_queued_jobs() {
         let r = AppState::with_store(
