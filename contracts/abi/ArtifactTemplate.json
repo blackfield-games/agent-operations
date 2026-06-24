@@ -1079,6 +1079,11 @@
   },
   {
     "inputs": [],
+    "name": "ZeroMinter",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "ZeroRecipient",
     "type": "error"
   },
