@@ -3645,6 +3645,19 @@ mod tests {
         state
     }
 
+    /// Empty-queue state with a custom session read-idle timeout (handshake left at
+    /// the generous default so the Hello completes), for the ws idle-deadline tests
+    /// that need a sub-second bound and no seeded-job noise.
+    async fn test_state_empty_idle(session_idle_timeout: Duration) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            StoreConfig { session_idle_timeout, ..test_config() },
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
     /// Enqueue a job directly via the store (test helper replacing the old
     /// `state.queue.lock().await.push(job)`).
     async fn enqueue(state: &Arc<AppState>, job: &JobSpec) {
@@ -6432,6 +6445,141 @@ mod tests {
             1,
             "a timed-out handshake must not evict the live earner",
         );
+    }
+
+    /// THE post-Hello slowloris bound — the established-session twin of
+    /// `ws_handshake_times_out_when_no_hello_sent`. An earner that completes Hello
+    /// then goes silent (sends no application frame AND never answers the
+    /// coordinator's keepalive ping — a vanished/half-open peer) is closed within
+    /// the read-idle deadline, so it can't park a `ws_session` task + FD until OS TCP
+    /// keepalive. We deliberately do NOT poll the socket during the idle window, so
+    /// tungstenite never auto-pongs the probe (simulating the dead peer); then we
+    /// drain to observe the close. Discriminating: the old deadline-less recv loop
+    /// never closes this, so the outer timeout fails the suite instead of hanging it.
+    #[tokio::test]
+    async fn ws_established_idle_session_closes_when_silent() {
+        let idle = Duration::from_millis(200);
+        let state = test_state_empty_idle(idle).await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
+            .await
+            .unwrap();
+        // Established. Stay silent and DON'T poll (no auto-pong) past the bound so the
+        // coordinator's read-idle deadline fires server-side, then drain: the buffered
+        // keepalive ping(s) are skipped and the close is observed.
+        tokio::time::sleep(idle * 3).await;
+        tokio::time::timeout(idle * 25, expect_ws_closed(&mut ws))
+            .await
+            .expect("coordinator closed the idle established session within the bound");
+    }
+
+    /// FM3: an established session is NOT closed while the peer stays responsive — the
+    /// read-idle deadline RESETS on any inbound frame (here a client ping every
+    /// quarter-bound), unlike the single pre-Hello handshake deadline. A client that
+    /// keeps sending frames faster than the bound must still be connected well past
+    /// it; an implementation that ignored inbound frames (closing at the bound
+    /// regardless) would drop this responsive earner and red the test.
+    #[tokio::test]
+    async fn ws_established_idle_deadline_resets_on_inbound_frame() {
+        let idle = Duration::from_millis(200);
+        let state = test_state_empty_idle(idle).await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let (ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let (mut tx, mut rx) = ws.split();
+        let nonce = recv_challenge(&mut rx).await;
+        tx.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
+            .await
+            .unwrap();
+        // Keep the session responsive: an inbound ping every quarter-bound keeps the
+        // server's last-inbound deadline fresh.
+        let pinger = tokio::spawn(async move {
+            loop {
+                if tx.send(WsMessage::Ping(Vec::new())).await.is_err() {
+                    break; // coordinator closed the socket — stop pinging
+                }
+                tokio::time::sleep(idle / 4).await;
+            }
+        });
+        // Over 3x the bound the session must NOT close (expect_ws_closed times out).
+        let closed = tokio::time::timeout(idle * 3, expect_ws_closed(&mut rx)).await;
+        pinger.abort();
+        assert!(
+            closed.is_err(),
+            "a responsive (frame-sending) session must not be idle-closed",
+        );
+    }
+
+    /// FM4: a long-running render that keeps heartbeating is never idle-closed. The
+    /// deadline is driven by last-inbound-frame, NOT last-job-offer — an offered job
+    /// disables the idle poll tick, but the earner's periodic heartbeats still arrive
+    /// and reset the deadline. We accept the offer, heartbeat every quarter-bound for
+    /// 3x the bound, then submit a valid result and expect `Accepted`: a session that
+    /// was wrongly idle-reaped would have requeued the job and closed the socket, so
+    /// the surviving submit proves the in-flight job was never reaped.
+    #[tokio::test]
+    async fn ws_idle_does_not_reap_an_in_flight_heartbeating_job() {
+        let idle = Duration::from_millis(200);
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            StoreConfig { session_idle_timeout: idle, ..test_config() },
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        ws.send(WsMessage::text(serde_json::to_string(&ws_hello(&nonce)).unwrap()))
+            .await
+            .unwrap();
+
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        // Heartbeat past the bound. The coordinator sends only keepalive pings while
+        // the job is in flight, so we needn't read until the final submit (the pings
+        // buffer and are skipped then).
+        for _ in 0..12 {
+            ws.send(WsMessage::text(
+                serde_json::to_string(&EarnerMsg::Heartbeat {
+                    job_id: Some(job_id),
+                    progress_pct: 0,
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::sleep(idle / 4).await;
+        }
+
+        ws.send(WsMessage::text(
+            serde_json::to_string(&EarnerMsg::Submit(signed_result(job_id, "deadbeef"))).unwrap(),
+        ))
+        .await
+        .unwrap();
+        match next_coordinator_msg(&mut ws).await {
+            CoordinatorMsg::Accepted { job_id: jid, .. } => assert_eq!(jid, job_id),
+            other => panic!("expected Accepted (session survived the heartbeats), got {other:?}"),
+        }
     }
 
     /// The pre-routing slow-headers slowloris is bounded: a connection that sends
@@ -11265,6 +11413,24 @@ mod tests {
         );
     }
 
+    /// A zero session-idle timeout is rejected at construction: the first idle check
+    /// would see `last_inbound.elapsed() >= 0` and close every established session
+    /// immediately — the read-idle bound becomes a total session outage. Any positive
+    /// bound constructs fine.
+    #[test]
+    fn with_store_rejects_zero_session_idle_timeout() {
+        assert!(
+            AppState::with_store(Store::open_in_memory().unwrap(), StoreConfig { session_idle_timeout: Duration::ZERO, ..test_config() })
+                .is_err(),
+            "a zero session-idle timeout must be rejected"
+        );
+        assert!(
+            AppState::with_store(Store::open_in_memory().unwrap(), StoreConfig { session_idle_timeout: Duration::from_millis(1), ..test_config() })
+                .is_ok(),
+            "the smallest positive session-idle timeout constructs"
+        );
+    }
+
     /// The CLI/env default reproduces the prior hard-coded behavior, and the flag
     /// overrides it — so an unset deployment is unchanged and a dev/operator can
     /// retune without a rebuild.
@@ -11295,6 +11461,24 @@ mod tests {
         assert_eq!(
             Args::parse_from(["coordinator", "--handshake-timeout-secs", "3"]).handshake_timeout_secs,
             3,
+            "the flag is honored"
+        );
+    }
+
+    /// The session-idle-timeout knob defaults to the const (an unset deployment gets
+    /// the generous 90s read-idle bound) and honors the flag — an operator can tune
+    /// the post-Hello slowloris bound against the real fleet without a rebuild.
+    #[test]
+    fn args_session_idle_timeout_default_and_override() {
+        assert_eq!(
+            Args::parse_from(["coordinator"]).session_idle_timeout_secs,
+            DEFAULT_SESSION_IDLE_TIMEOUT.as_secs(),
+            "unset default == the const"
+        );
+        assert_eq!(
+            Args::parse_from(["coordinator", "--session-idle-timeout-secs", "45"])
+                .session_idle_timeout_secs,
+            45,
             "the flag is honored"
         );
     }
