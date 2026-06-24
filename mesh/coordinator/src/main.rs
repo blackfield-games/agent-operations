@@ -8907,9 +8907,9 @@ mod tests {
         assert_eq!(shed_counters(&state).await.1, 9, "every concurrent shed counted — no lost increment");
     }
 
-    /// FM4: the shed counters are additive/optional usize fields — a fresh `/stats`
-    /// serializes both at 0 alongside the existing counters, so a strict client still
-    /// reads the response and the prior fields are unchanged.
+    /// FM4: the shed counters + the eviction counter are additive/optional usize fields —
+    /// a fresh `/stats` serializes them all at 0 alongside the existing counters, so a
+    /// strict client still reads the response and the prior fields are unchanged.
     #[tokio::test]
     async fn stats_includes_shed_counters_additively() {
         let state = test_state_empty().await;
@@ -8917,6 +8917,7 @@ mod tests {
         assert_eq!(s["registrations_shed"], 0, "fresh mesh: no registrations shed");
         assert_eq!(s["jobs_shed"], 0, "fresh mesh: no jobs shed");
         assert_eq!(s["earners_shed"], 0, "fresh mesh: no earners shed");
+        assert_eq!(s["earners_evicted"], 0, "fresh mesh: no earners evicted");
         // Existing counters still present + unchanged (additive shape, no regression).
         assert_eq!(s["jobs_queued"], 0);
         assert_eq!(s["total_faults"], 0);
@@ -8974,6 +8975,75 @@ mod tests {
         ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap())).await.unwrap();
         expect_ws_closed(&mut ws).await;
         assert_eq!(shed_counters(&state).await.2, 1, "the WS registry-cap shed counts");
+    }
+
+    /// Read `/stats`'s `earners_evicted` — the registry-cap eviction counter, 0 on a
+    /// fresh mesh. The churn twin of the `earners_shed` slot in [`shed_counters`].
+    async fn evicted_counter(state: &Arc<AppState>) -> u64 {
+        body_json(get(state.clone(), "/stats").await).await["earners_evicted"]
+            .as_u64()
+            .expect("earners_evicted present")
+    }
+
+    /// FM1: `earners_evicted` counts ONLY the registry-cap evict-to-admit. A below-cap
+    /// insert (room was free), an in-place upsert of a known earner (no new slot), and
+    /// the all-live reject (a shed, not an admission) each leave it flat; only a NEW
+    /// earner admitted at the cap by displacing a stale past-TTL entry bumps it — and
+    /// that eviction is NOT an `earners_shed`, discriminating the churn counter from the
+    /// reject one it complements.
+    #[tokio::test]
+    async fn earners_evicted_counts_only_an_http_registry_cap_eviction() {
+        let state = test_state_empty_with_earner_cap(2).await;
+        // Below the cap: a fresh register inserts into free room — not an eviction.
+        assert_eq!(register_hello(&state, &hello("ev_a", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(evicted_counter(&state).await, 0, "a below-cap insert evicts nothing");
+        // Fill the 2nd slot with a STALE entry (last_seen=0, far past the 60s TTL) so the
+        // registry is full but has an evictable entry the cap policy can reclaim.
+        state.earners.lock().await.insert("0xstale".into(), earner_info(0));
+        // A NEW earner at the full cap reclaims the stale slot → eviction, the one bump.
+        assert_eq!(register_hello(&state, &hello("ev_b", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(evicted_counter(&state).await, 1, "the evict-to-admit bumps earners_evicted");
+        assert_eq!(shed_counters(&state).await.2, 0, "an eviction is not an all-live shed");
+        // An in-place upsert of a KNOWN earner at the (now all-live) cap: admitted, no new slot.
+        assert_eq!(register_hello(&state, &hello("ev_a", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(evicted_counter(&state).await, 1, "an upsert of a known earner evicts nothing");
+        // A NEW earner at the now-all-live cap is shed (503), evicting nothing.
+        assert_eq!(
+            register_hello(&state, &hello("ev_c", 24, vec![JobKind::Terrain])).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(evicted_counter(&state).await, 1, "the all-live reject evicts nothing");
+        assert_eq!(shed_counters(&state).await.2, 1, "the all-live reject bumped earners_shed, not earners_evicted");
+    }
+
+    /// FM2: the registry-cap eviction is metered on the WS `Hello` path too (the shared
+    /// `admit_earner` seam), so WS-driven churn is not invisible — mirroring `earners_shed`
+    /// FM2. The single slot is pre-filled with a stale entry; a WS Hello for a NEW earner
+    /// evicts it and is admitted, bumping `earners_evicted` (and not `earners_shed`).
+    #[tokio::test]
+    async fn earners_evicted_counts_a_ws_registry_cap_eviction() {
+        let state = test_state_empty_with_earner_cap(1).await;
+        state.earners.lock().await.insert("0xstale".into(), earner_info(0));
+        assert_eq!(evicted_counter(&state).await, 0, "fresh: nothing evicted yet");
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        let sk = test_signing_key("wsevict");
+        let hello = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+            &nonce,
+        );
+        ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap())).await.unwrap();
+        // The eviction admits the WS earner (the stale entry is gone), so the registry
+        // settles at exactly the one live earner — the signal the Hello was processed.
+        wait_for_gpus_joined(&state, 1).await;
+        assert_eq!(evicted_counter(&state).await, 1, "the WS-Hello eviction bumps earners_evicted");
+        assert_eq!(shed_counters(&state).await.2, 0, "a WS eviction is not an all-live shed");
     }
 
     #[test]
