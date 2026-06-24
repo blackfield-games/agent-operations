@@ -1119,26 +1119,32 @@ fn admit_earner(
     now: i64,
     ttl_secs: i64,
 ) -> Admission {
-    if earners.contains_key(&address) {
+    use std::collections::hash_map::Entry;
+    // A NEW earner at a full registry has to reclaim a slot before it can be admitted:
+    // evict the stalest entry already past its TTL, or reject when every entry is live.
+    // Resolved before the `entry` below, whose borrow would forbid scanning the map.
+    if !earners.contains_key(&address) && earners.len() >= max_earners {
+        let stalest = earners
+            .iter()
+            .filter(|(_, e)| !e.is_live(now, ttl_secs))
+            .min_by_key(|(_, e)| e.last_seen)
+            .map(|(k, _)| k.clone());
+        let Some(key) = stalest else { return Admission::Rejected };
+        earners.remove(&key);
         earners.insert(address, info);
-        return Admission::Upserted;
+        return Admission::Evicted;
     }
-    if earners.len() < max_earners {
-        earners.insert(address, info);
-        return Admission::Inserted;
-    }
-    let stalest = earners
-        .iter()
-        .filter(|(_, e)| !e.is_live(now, ttl_secs))
-        .min_by_key(|(_, e)| e.last_seen)
-        .map(|(k, _)| k.clone());
-    match stalest {
-        Some(key) => {
-            earners.remove(&key);
-            earners.insert(address, info);
-            Admission::Evicted
+    // A known earner upserts in place (never cap-blocked); a new one below the cap
+    // inserts. The entry API distinguishes the two without a second lookup.
+    match earners.entry(address) {
+        Entry::Occupied(mut e) => {
+            e.insert(info);
+            Admission::Upserted
         }
-        None => Admission::Rejected,
+        Entry::Vacant(slot) => {
+            slot.insert(info);
+            Admission::Inserted
+        }
     }
 }
 
