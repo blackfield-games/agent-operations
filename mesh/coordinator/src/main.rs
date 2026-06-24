@@ -8715,11 +8715,12 @@ mod tests {
 
     /// Read `/stats` and return its `(registrations_shed, jobs_shed)` — the two
     /// cumulative shed counters, both 0 on a fresh mesh.
-    async fn shed_counters(state: &Arc<AppState>) -> (u64, u64) {
+    async fn shed_counters(state: &Arc<AppState>) -> (u64, u64, u64) {
         let s = body_json(get(state.clone(), "/stats").await).await;
         (
             s["registrations_shed"].as_u64().expect("registrations_shed present"),
             s["jobs_shed"].as_u64().expect("jobs_shed present"),
+            s["earners_shed"].as_u64().expect("earners_shed present"),
         )
     }
 
@@ -8857,10 +8858,64 @@ mod tests {
         let s = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(s["registrations_shed"], 0, "fresh mesh: no registrations shed");
         assert_eq!(s["jobs_shed"], 0, "fresh mesh: no jobs shed");
+        assert_eq!(s["earners_shed"], 0, "fresh mesh: no earners shed");
         // Existing counters still present + unchanged (additive shape, no regression).
         assert_eq!(s["jobs_queued"], 0);
         assert_eq!(s["total_faults"], 0);
         assert_eq!(s["jobs_redispatched"], 0);
+    }
+
+    /// FM1+FM3: `earners_shed` counts ONLY the earner-registry-cap shed. Two registers
+    /// fill a cap of 2 (flat — success is not a shed); a NEW earner at the cap is
+    /// rejected `503` and bumps it; an in-place upsert of a KNOWN earner at the cap is
+    /// admitted `200` and leaves it flat (an upsert never counts). `registrations_shed`
+    /// stays 0 throughout, discriminating the registry-cap counter from the rate-limit one.
+    #[tokio::test]
+    async fn earners_shed_counts_only_the_registry_cap_shed() {
+        let state = test_state_empty_with_earner_cap(2).await;
+        assert_eq!(register_hello(&state, &hello("ea", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, &hello("eb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        let (reg0, _, earn0) = shed_counters(&state).await;
+        assert_eq!(earn0, 0, "a successful register is not a shed");
+        assert_eq!(reg0, 0, "no rate-limit shed");
+        // A NEW earner at the cap (all live, nothing to evict) → 503 registry-cap shed.
+        assert_eq!(
+            register_hello(&state, &hello("ec", 24, vec![JobKind::Terrain])).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let (reg1, _, earn1) = shed_counters(&state).await;
+        assert_eq!(earn1, 1, "the registry-cap shed bumps earners_shed");
+        assert_eq!(reg1, 0, "the registry-cap shed is NOT a rate-limit shed");
+        // An in-place upsert of a KNOWN earner at the cap is admitted (200), not a shed.
+        assert_eq!(register_hello(&state, &hello("ea", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(shed_counters(&state).await.2, 1, "an at-cap upsert of a known earner does not count");
+    }
+
+    /// FM2: the registry-cap shed fires on the WS `Hello` path too (the shared
+    /// `admit_earner` seam), so a WS registration into a full registry is shed (socket
+    /// closed) and counted — a WS-only saturation is not invisible. The cap of 1 is
+    /// filled by one live HTTP earner; a ws Hello for a new distinct earner is rejected.
+    #[tokio::test]
+    async fn earners_shed_counts_a_ws_registry_cap_shed() {
+        let state = test_state_empty_with_earner_cap(1).await;
+        assert_eq!(register_hello(&state, &hello("wsfull", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(shed_counters(&state).await.2, 0, "the live earner filled the cap, no shed yet");
+        let addr = serve_ephemeral(state.clone()).await;
+        let (mut ws, _resp) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        let sk = test_signing_key("wsnew");
+        let hello = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+            &nonce,
+        );
+        ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap())).await.unwrap();
+        expect_ws_closed(&mut ws).await;
+        assert_eq!(shed_counters(&state).await.2, 1, "the WS registry-cap shed counts");
     }
 
     #[test]
