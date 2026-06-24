@@ -9538,6 +9538,15 @@ mod tests {
             0,
             "migrated attempts default to 0"
         );
+        // progress_pct was also absent in the old schema; the migration defaults it to
+        // 0, so the redispatched in_flight job reads 0% until its first heartbeat lands.
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(0),
+            "migrated progress_pct defaults to 0"
+        );
+        assert!(store.touch(&job.id, seq, 1000, 35).unwrap());
+        assert_eq!(store.in_flight_progress_pct_avg().unwrap(), Some(35));
     }
 
     /// A DB created before the `dispatched_to` column boots through its migration,
@@ -10023,6 +10032,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stats_reports_in_flight_progress_pct_avg() {
+        // Build state with a truly-empty store (test_state_empty drains seeds via
+        // take_next, which leaves them in_flight — non-empty for this aggregate).
+        let state = Arc::new(AppState {
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            earners: Mutex::new(HashMap::new()),
+            max_attempts: 5,
+            max_faults: 10,
+            earner_ttl_secs: 60,
+            ttl_deadline_multiple: JOB_TTL_DEADLINE_MULTIPLE,
+            retention_secs: DEFAULT_RETENTION_SECS as i64,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ingest_token: None,
+            max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
+            max_earners: DEFAULT_MAX_EARNERS,
+            registration_buckets: Mutex::new(HashMap::new()),
+            max_registrations: DEFAULT_MAX_REGISTRATIONS,
+            trusted_proxies: TrustedProxies::default(),
+        });
+        // No in-flight jobs → null (stable key, absent value).
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert!(
+            json["in_flight_progress_pct_avg"].is_null(),
+            "no in-flight jobs → null"
+        );
+
+        // One job in flight, heartbeated to 70% → the field becomes that mean.
+        let job = job_with_deadline(60);
+        let id = job.id;
+        {
+            let store = state.store.lock().await;
+            store.enqueue(&job).unwrap();
+            let (_, seq) = store.take_next(|_| true).unwrap().unwrap();
+            assert!(store.touch(&id, seq, 1000, 70).unwrap());
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(
+            json["in_flight_progress_pct_avg"], 70,
+            "in-flight progress mean surfaces at /stats"
+        );
+    }
+
     #[test]
     fn redispatched_count_counts_jobs_dispatched_more_than_once() {
         const BIG_MAX: u32 = 999;
@@ -10164,6 +10216,121 @@ mod tests {
         assert!(
             !store.touch(&id, 1, 5000, 0).unwrap(),
             "touch must return false for a done job"
+        );
+    }
+
+    /// A heartbeat persists its `progress_pct`, and an out-of-range value (a `u8`
+    /// reaches 255) is clamped to 100 before it lands — FM2: a faulty/adversarial
+    /// earner can't poison the `/stats` figure. With exactly one job in flight, the
+    /// mean aggregate reads back that job's stored progress.
+    #[test]
+    fn touch_records_and_clamps_progress() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(100);
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap(); // seq 1, in_flight, progress reset to 0
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(0),
+            "a fresh dispatch reads 0%"
+        );
+        assert!(store.touch(&id, 1, 1000, 40).unwrap());
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(40),
+            "the heartbeat's progress persisted"
+        );
+        // 200 > 100 (and a u8 can reach 255) → clamped to 100, not stored raw.
+        assert!(store.touch(&id, 1, 1000, 200).unwrap());
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(100),
+            "out-of-range progress clamps to 100"
+        );
+    }
+
+    /// FM1: a heartbeat from a PREVIOUS holder (job reaped + reassigned, so its
+    /// `dispatch_seq` advanced) must not overwrite the NEW holder's progress. The
+    /// stale-seq write is fenced out atomically by `touch`'s `dispatch_seq = ?` clause.
+    /// Also pins FM4: `take_next` resets progress to 0 on the redispatch.
+    #[test]
+    fn stale_dispatch_heartbeat_does_not_overwrite_progress() {
+        let store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(100);
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+
+        // A takes the job (seq 1) and reports 40%.
+        let (_, seq_a) = store.take_next(|_| true).unwrap().unwrap();
+        assert_eq!(seq_a, 1);
+        assert!(store.touch(&id, seq_a, 1000, 40).unwrap());
+        assert_eq!(store.in_flight_progress_pct_avg().unwrap(), Some(40));
+
+        // Deadline lapses → requeue → B takes it (seq 2). The redispatch resets
+        // progress, so the new lease starts at 0 rather than inheriting A's 40 (FM4).
+        assert!(!store.requeue(&job, 999).unwrap(), "requeued, not dead-lettered");
+        let (_, seq_b) = store.take_next(|_| true).unwrap().unwrap();
+        assert_eq!(seq_b, 2);
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(0),
+            "redispatch reset progress to 0"
+        );
+
+        // A's STALE heartbeat (seq 1) for the now-B lease is a no-op — it can neither
+        // slide the deadline nor write progress over B's lease.
+        assert!(
+            !store.touch(&id, seq_a, 2000, 90).unwrap(),
+            "a stale-dispatch_seq heartbeat is fenced out"
+        );
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(0),
+            "B's progress is untouched by A's stale beat"
+        );
+
+        // B's current heartbeat (seq 2) lands normally.
+        assert!(store.touch(&id, seq_b, 2000, 60).unwrap());
+        assert_eq!(store.in_flight_progress_pct_avg().unwrap(), Some(60));
+    }
+
+    /// The `/stats` aggregate is the MEAN over `in_flight` jobs and reports `None`
+    /// when none are running. A terminal (or queued) job's last-known progress is
+    /// excluded — FM4: `/stats` never reports progress for a non-`in_flight` job.
+    #[test]
+    fn in_flight_progress_pct_avg_means_only_in_flight() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            None,
+            "nothing in flight → None"
+        );
+
+        let a = job_with_deadline(100);
+        let b = job_with_deadline(100);
+        let (id_a, id_b) = (a.id, b.id);
+        store.enqueue(&a).unwrap();
+        store.enqueue(&b).unwrap();
+        store.take_next(|j| j.id == id_a).unwrap(); // seq 1
+        store.take_next(|j| j.id == id_b).unwrap(); // seq 1
+        store.touch(&id_a, 1, 1000, 40).unwrap();
+        store.touch(&id_b, 1, 1000, 60).unwrap();
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(50),
+            "mean of 40 and 60 across the in-flight set"
+        );
+
+        // Complete a: it leaves in_flight, so its progress drops out of the mean and
+        // only b's 60 remains — a terminal job is never aggregated.
+        store
+            .record_completed(&signed_result(id_a, "cafebabe"))
+            .unwrap();
+        assert_eq!(
+            store.in_flight_progress_pct_avg().unwrap(),
+            Some(60),
+            "a completed job's progress is excluded from the mean"
         );
     }
 
