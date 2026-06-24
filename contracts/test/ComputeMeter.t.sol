@@ -305,6 +305,51 @@ contract ComputeMeterTest is Test {
         assertEq(token.balanceOf(meter.BURN_ADDRESS()), 350 ether);
     }
 
+    function test_depositFor_toSelfIsEquivalentToDeposit() public {
+        // The shared-core guarantee, end to end: depositFor(self) is byte-for-byte the
+        // same outcome as deposit — same burn, same credit target, same event — so the
+        // two entry points provably converge (no accounting drift, FM2).
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        vm.expectEmit(true, false, false, true);
+        emit Deposited(buyer, 100 ether, 100 ether);
+        meter.depositFor(buyer, 100 ether);
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 100 ether);
+        assertEq(token.balanceOf(meter.BURN_ADDRESS()), 100 ether);
+        assertEq(token.balanceOf(buyer), 900 ether);
+        assertEq(meter.totalBurned(), 100 ether);
+    }
+
+    function test_depositFor_topsUpSpentBuyerAndEmitsAccumulatedCredit() public {
+        // depositFor after a spend: a buyer whose credit was partly drawn down is
+        // topped up by a sponsor, and the Deposited event's newCredit reflects the
+        // ACCUMULATED balance (post-spend remainder + the top-up), not the top-up alone.
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        vm.prank(spender);
+        meter.spend(buyer, 60 ether, keccak256("draw"));
+        assertEq(meter.credit(buyer), 40 ether);
+
+        address sponsor = address(0x5907);
+        assertTrue(token.transfer(sponsor, 500 ether));
+        vm.startPrank(sponsor);
+        token.approve(address(meter), 250 ether);
+        vm.expectEmit(true, false, false, true);
+        emit Deposited(buyer, 250 ether, 290 ether); // 40 remaining + 250 top-up
+        meter.depositFor(buyer, 250 ether);
+        vm.stopPrank();
+
+        assertEq(meter.credit(buyer), 290 ether);
+        // The earlier spend's accounting is untouched by the top-up.
+        assertEq(meter.spentByBuyer(buyer), 60 ether);
+        assertEq(meter.totalBurned(), 350 ether);
+    }
+
     function test_depositFor_zeroAmount_isNoOpButEmits() public {
         // Mirrors deposit(0): a zero-amount sponsor deposit to a valid buyer moves no
         // tokens and credits nothing, but still emits the event (no ZeroAmount guard).
