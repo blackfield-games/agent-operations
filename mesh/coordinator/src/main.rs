@@ -527,13 +527,15 @@ struct BulkRedriveResponse {
 /// /debits/dead-lettered`). `job_id` is the UUID an operator passes to `POST
 /// /debits/{id}/redrive`; `amount_wei` is the owed charge as the persisted decimal
 /// string (a 1e18-scale value, never coerced to a number); `dead_lettered_at` is the
-/// epoch-second stamp it was quarantined.
+/// epoch-second stamp it was quarantined; `redrive_count` is how many times it has been
+/// re-driven, so a charge that keeps re-dead-lettering into an unfixed cause is visible.
 #[derive(Debug, Serialize)]
 struct DeadLetteredDebit {
     job_id: Uuid,
     buyer: String,
     amount_wei: String,
     dead_lettered_at: i64,
+    redrive_count: u32,
 }
 
 /// Response for `GET /debits/dead-lettered`: the dead-lettered debits (oldest-first,
@@ -552,8 +554,9 @@ struct DeadLetteredListing {
 /// /receipts/{id}/redrive`; `earner` is whose validated work the stuck attestation
 /// proves and `render_seconds` the compute it attests (the render-fee scale a
 /// `Permanent` revert is usually about), `job_kind` the numeric JobKind; `dead_lettered_at`
-/// is the epoch-second stamp it was quarantined. The attestation twin of
-/// [`DeadLetteredDebit`].
+/// is the epoch-second stamp it was quarantined; `redrive_count` is how many times it has
+/// been re-driven, so a receipt that keeps re-dead-lettering into an unfixed cause is
+/// visible. The attestation twin of [`DeadLetteredDebit`].
 #[derive(Debug, Serialize)]
 struct DeadLetteredReceipt {
     job_id: Uuid,
@@ -561,6 +564,7 @@ struct DeadLetteredReceipt {
     render_seconds: u64,
     job_kind: u16,
     dead_lettered_at: i64,
+    redrive_count: u32,
 }
 
 /// Response for `GET /receipts/dead-lettered`: the dead-lettered receipts (oldest-first,
@@ -2587,11 +2591,12 @@ async fn dead_lettered_debits(
     };
     let debits = rows
         .into_iter()
-        .map(|(job_id, buyer, amount_wei, dead_lettered_at)| DeadLetteredDebit {
+        .map(|(job_id, buyer, amount_wei, dead_lettered_at, redrive_count)| DeadLetteredDebit {
             job_id,
             buyer,
             amount_wei,
             dead_lettered_at,
+            redrive_count,
         })
         .collect::<Vec<_>>();
     let truncated = total > debits.len();
@@ -2648,12 +2653,15 @@ async fn dead_lettered_receipts(
     let receipts = rows
         .into_iter()
         .map(
-            |(job_id, earner, render_seconds, job_kind, dead_lettered_at)| DeadLetteredReceipt {
-                job_id,
-                earner,
-                render_seconds,
-                job_kind,
-                dead_lettered_at,
+            |(job_id, earner, render_seconds, job_kind, dead_lettered_at, redrive_count)| {
+                DeadLetteredReceipt {
+                    job_id,
+                    earner,
+                    render_seconds,
+                    job_kind,
+                    dead_lettered_at,
+                    redrive_count,
+                }
             },
         )
         .collect::<Vec<_>>();

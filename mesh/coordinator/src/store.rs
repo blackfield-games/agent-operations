@@ -38,10 +38,16 @@ pub struct ReapOutcome {
     pub failed: Vec<uuid::Uuid>,
 }
 
+/// One row of [`Store::list_dead_lettered_debits`]: `(job_id, buyer, amount_wei,
+/// dead_lettered_at, redrive_count)` — the operator-facing fields of a quarantined
+/// ComputeMeter debit, `redrive_count` being how many times it has been re-driven.
+pub type DeadLetteredDebitRow = (uuid::Uuid, String, String, i64, u32);
+
 /// One row of [`Store::list_dead_lettered_attestations`]: `(job_id, earner,
-/// render_seconds, job_kind, dead_lettered_at)` — the operator-facing fields of a
-/// quarantined render-receipt attestation.
-pub type DeadLetteredAttestationRow = (uuid::Uuid, String, u64, u16, i64);
+/// render_seconds, job_kind, dead_lettered_at, redrive_count)` — the operator-facing
+/// fields of a quarantined render-receipt attestation, `redrive_count` being how many
+/// times it has been re-driven.
+pub type DeadLetteredAttestationRow = (uuid::Uuid, String, u64, u16, i64, u32);
 
 /// Treat an `ALTER TABLE ... ADD COLUMN` that fails only because the column
 /// already exists as a success — that is the expected case for a DB created on
@@ -1933,8 +1939,8 @@ impl Store {
 
     /// The dead-lettered, not-yet-settled debits (`dead_lettered_at IS NOT NULL AND
     /// tx_hash IS NULL`), oldest-first by insert order, as `(job_id, buyer,
-    /// amount_wei, dead_lettered_at)` — the operator's enumeration of stuck charges so
-    /// each can be re-armed by id via [`redrive_dead_lettered_debit`](Self::redrive_dead_lettered_debit)
+    /// amount_wei, dead_lettered_at, redrive_count)` — the operator's enumeration of stuck
+    /// charges so each can be re-armed by id via [`redrive_dead_lettered_debit`](Self::redrive_dead_lettered_debit)
     /// after the buyer tops up. Capped at `limit` (the listing twin of
     /// [`list_jobs`](Self::list_jobs)) so a pathological dead-letter backlog can never
     /// return an unbounded body; the caller compares the returned length against
@@ -1942,13 +1948,12 @@ impl Store {
     /// The same state filter as the count: a still-pending row (drainable) and an
     /// already-settled row (`tx_hash` set, a paid charge) are excluded, so a listed
     /// row is always genuinely re-armable. `amount_wei` is the decimal-wei string
-    /// verbatim from the row (never re-derived), so an operator sees exactly what is owed.
-    pub fn list_dead_lettered_debits(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(uuid::Uuid, String, String, i64)>> {
+    /// verbatim from the row (never re-derived), so an operator sees exactly what is owed;
+    /// `redrive_count` is how many times the row has been re-driven, so a charge that keeps
+    /// re-dead-lettering into an unfixed cause stands out.
+    pub fn list_dead_lettered_debits(&self, limit: usize) -> Result<Vec<DeadLetteredDebitRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT job_id, buyer, amount_wei, dead_lettered_at
+            "SELECT job_id, buyer, amount_wei, dead_lettered_at, redrive_count
              FROM pending_debits
              WHERE dead_lettered_at IS NOT NULL AND tx_hash IS NULL
              ORDER BY created_at ASC, rowid ASC
@@ -1960,22 +1965,23 @@ impl Store {
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)? as u32,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (job_id, buyer, amount_wei, dead_lettered_at) = row?;
+            let (job_id, buyer, amount_wei, dead_lettered_at, redrive_count) = row?;
             let uuid = uuid::Uuid::parse_str(&job_id)
                 .map_err(|e| anyhow::anyhow!("pending_debits.job_id not a uuid {job_id:?}: {e}"))?;
-            out.push((uuid, buyer, amount_wei, dead_lettered_at));
+            out.push((uuid, buyer, amount_wei, dead_lettered_at, redrive_count));
         }
         Ok(out)
     }
 
     /// The dead-lettered, not-yet-attested receipts (`dead_lettered_at IS NOT NULL AND
     /// uid IS NULL`), oldest-first by insert order, as `(job_id, earner, render_seconds,
-    /// job_kind, dead_lettered_at)` — the operator's enumeration of stuck attestations so
-    /// each can be re-armed by id via
+    /// job_kind, dead_lettered_at, redrive_count)` — the operator's enumeration of stuck
+    /// attestations so each can be re-armed by id via
     /// [`redrive_dead_lettered_attestation`](Self::redrive_dead_lettered_attestation)
     /// once the `Permanent` cause is fixed (the region fee funded, or the signer
     /// re-authorized via `setCoordinator`). The attestation twin of
@@ -1989,12 +1995,14 @@ impl Store {
     /// truncation. The same state filter as the count's listable predicate: a still-pending
     /// row (`dead_lettered_at IS NULL`, drainable) and an already-attested row (`uid` set,
     /// a landed receipt) are excluded, so a listed row is always genuinely re-armable.
+    /// `redrive_count` is how many times the row has been re-driven, so a receipt that keeps
+    /// re-dead-lettering into an unfixed cause stands out.
     pub fn list_dead_lettered_attestations(
         &self,
         limit: usize,
     ) -> Result<Vec<DeadLetteredAttestationRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT job_id, earner, render_seconds, job_kind, dead_lettered_at
+            "SELECT job_id, earner, render_seconds, job_kind, dead_lettered_at, redrive_count
              FROM pending_attestations
              WHERE dead_lettered_at IS NOT NULL AND uid IS NULL
              ORDER BY created_at ASC, rowid ASC
@@ -2007,15 +2015,16 @@ impl Store {
                 r.get::<_, i64>(2)? as u64,
                 r.get::<_, i64>(3)? as u16,
                 r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)? as u32,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (job_id, earner, render_seconds, job_kind, dead_lettered_at) = row?;
+            let (job_id, earner, render_seconds, job_kind, dead_lettered_at, redrive_count) = row?;
             let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
                 anyhow::anyhow!("pending_attestations.job_id not a uuid {job_id:?}: {e}")
             })?;
-            out.push((uuid, earner, render_seconds, job_kind, dead_lettered_at));
+            out.push((uuid, earner, render_seconds, job_kind, dead_lettered_at, redrive_count));
         }
         Ok(out)
     }
