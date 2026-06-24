@@ -249,6 +249,14 @@ def _intent_attributions(
     "director") so the supervisor's text-scan fallback agrees with the structured
     attribution. No director intent, or a missing/malformed (hence not-well-formed) prop
     or biome layer, yields no pairs — the world validates exactly as before (FM3).
+
+    The npc loop mirrors these for ``intent:factions``: npc draws its single emitted
+    ``archetype`` from the director's faction roster (``npc._select_archetype`` over the
+    same comma-list ``_director_intent`` parses), so the gate rejects an npc layer whose
+    archetype is NOT a roster member — a stale/desynced/tampered pick — keying the message
+    off ``intent:factions`` and naming npc. It fires ONLY for a present archetype against a
+    non-empty roster (an empty roster means npc legitimately fell back to its default, so
+    the gate stays silent), preserving the FM1/FM2/FM3 contract above.
     """
     out: list[tuple[str, str]] = []
 
@@ -274,6 +282,29 @@ def _intent_attributions(
                 "(intent:must_not forbids dense vegetation) but its layer carries no "
                 "vegetationCapped marker",
             ))
+
+    # The npc loop: npc draws its single emitted `archetype` from the director's faction
+    # roster (intent:factions), so a present archetype that is NOT a roster member is a
+    # stale/desynced/tampered npc layer — reject it, naming npc. Fires ONLY for a non-empty
+    # roster (an empty roster means npc legitimately fell back to its default, nothing to
+    # verify) and a present archetype (a layer missing it is a structural fault the
+    # well-formedness gate owns, not this membership check). set(roster) is the exact list
+    # npc selected from, parsed by the same `_director_intent` the roster comes through.
+    roster = _director_intent(layers, layers_root, "factions")
+    if roster:
+        npc_text = _layer_text(layers, "npc", layers_root)
+        if npc_text is not None:
+            match = re.search(r'archetype\s*=\s*"([^"]+)"', npc_text)
+            if match and match.group(1) not in set(roster):
+                out.append((
+                    # The message names npc but NOT "director" (which is pipeline-earlier),
+                    # so the supervisor's word-boundary route-back scan targets npc, not the
+                    # director — mirroring the prop/biome messages' intent:* keying.
+                    "npc",
+                    f"intent:factions unmet: npc spawned archetype "
+                    f"{match.group(1)!r} not in the faction roster "
+                    f"{sorted(set(roster))}; re-run npc",
+                ))
     return out
 
 
