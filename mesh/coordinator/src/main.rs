@@ -6710,6 +6710,180 @@ mod tests {
         assert_eq!(spender2.calls(), 0, "no second charge on a double bulk call");
     }
 
+    // ---- redrive_count tracking ----
+
+    /// The `redrive_count` of a dead-lettered debit row, or `None` if `id` is not currently
+    /// listed (re-armed back to pending, or settled).
+    async fn debit_redrive_count(state: &Arc<AppState>, id: Uuid) -> Option<u32> {
+        state
+            .store
+            .lock()
+            .await
+            .list_dead_lettered_debits(MAX_DEAD_LETTERED_LIST)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == id)
+            .map(|r| r.4)
+    }
+
+    /// The `redrive_count` of a dead-lettered receipt row, or `None` if `id` is not
+    /// currently listed (re-armed back to pending, or attested).
+    async fn receipt_redrive_count(state: &Arc<AppState>, id: Uuid) -> Option<u32> {
+        state
+            .store
+            .lock()
+            .await
+            .list_dead_lettered_attestations(MAX_DEAD_LETTERED_LIST)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == id)
+            .map(|r| r.5)
+    }
+
+    /// A fresh relay that reverts the batch (forcing single-submit fallback) and returns a
+    /// `Permanent` error for each given job — so a drain dead-letters exactly those.
+    fn relay_permanent_for(ids: &[Uuid]) -> relay::MockRelay {
+        let mut r = relay::MockRelay::succeeding().with_batch_reverts();
+        for id in ids {
+            r = r.with_permanent_job(eas::job_id_hex(id));
+        }
+        r
+    }
+
+    /// FM1: a debit's `redrive_count` increments ONLY on an actual re-arm. The relayer's
+    /// dead-letter mark leaves it 0, a no-op re-drive (a settled or unknown row) bumps
+    /// nothing, and each successful re-drive raises it by exactly 1 — verified after the row
+    /// re-dead-letters back into the listing, so the bump came from the re-arm, not the mark.
+    #[tokio::test]
+    async fn redrive_count_increments_only_on_a_real_rearm() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let poison = seed_job();
+        let good = seed_job();
+        settle_one_metered(&state, &poison).await; // settled first → claimed first (the head)
+        settle_one_metered(&state, &good).await;
+        // Dead-letter the poison head; the good debit settles in the same pass.
+        drain_debits(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
+        assert_eq!(dead_lettered_debits(&state).await, 1);
+        assert_eq!(debit_redrive_count(&state, poison.id).await, Some(0), "the dead-letter mark does not bump");
+
+        // No-op re-drives bump nothing: a settled row (good) and an unknown id.
+        {
+            let store = state.store.lock().await;
+            assert!(!store.redrive_dead_lettered_debit(&good.id).unwrap(), "settled → no-op");
+            assert!(!store.redrive_dead_lettered_debit(&Uuid::new_v4()).unwrap(), "unknown → no-op");
+        }
+        assert_eq!(debit_redrive_count(&state, poison.id).await, Some(0), "no-op re-drives bump nothing");
+
+        // First real re-drive, then re-dead-letter (still underfunded): the count is exactly 1.
+        assert!(state.store.lock().await.redrive_dead_lettered_debit(&poison.id).unwrap());
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(
+            debit_redrive_count(&state, poison.id).await,
+            Some(1),
+            "one real re-arm → +1; the re-dead-letter mark did not double-count"
+        );
+
+        // Second real re-drive: the count accumulates to exactly 2 (+1 per re-arm).
+        assert!(state.store.lock().await.redrive_dead_lettered_debit(&poison.id).unwrap());
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(debit_redrive_count(&state, poison.id).await, Some(2), "+1 per real re-arm");
+    }
+
+    /// FM4: a bulk re-drive bumps each re-armed row's `redrive_count` by EXACTLY 1 per wave
+    /// (one UPDATE), never N. Two waves over three dead-lettered rows leave each at exactly 2.
+    #[tokio::test]
+    async fn redrive_all_bumps_each_re_armed_debit_exactly_once() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let jobs: Vec<JobSpec> = (0..3).map(|_| seed_job()).collect();
+        for j in &jobs {
+            settle_one_metered(&state, j).await;
+        }
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 3);
+        for j in &jobs {
+            assert_eq!(debit_redrive_count(&state, j.id).await, Some(0), "a fresh dead-letter starts at 0");
+        }
+
+        // First bulk wave: re-arm all three, then re-dead-letter (still failing).
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 3);
+        drain_debits(&state, &MockSpender::permanent()).await;
+        assert_eq!(dead_lettered_debits(&state).await, 3, "all three re-dead-lettered");
+        for j in &jobs {
+            assert_eq!(debit_redrive_count(&state, j.id).await, Some(1), "exactly +1 per row per wave, never N");
+        }
+
+        // Second bulk wave: each accumulates to exactly 2.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 3);
+        drain_debits(&state, &MockSpender::permanent()).await;
+        for j in &jobs {
+            assert_eq!(debit_redrive_count(&state, j.id).await, Some(2), "+1 per wave accumulates");
+        }
+    }
+
+    /// FM1 (attestation twin): a receipt's `redrive_count` increments ONLY on an actual
+    /// re-arm — the dead-letter mark leaves it 0, a no-op re-drive (an attested or unknown
+    /// row) bumps nothing, and each successful re-drive raises it by exactly 1.
+    #[tokio::test]
+    async fn attestation_redrive_count_increments_only_on_a_real_rearm() {
+        let state = test_state_empty().await;
+        let poison = seed_job();
+        let good = seed_job();
+        settle_one(&state, &poison).await; // settled first → claimed first (the head)
+        settle_one(&state, &good).await;
+        // Batch reverts → single-submit fallback: poison is Permanent (dead-lettered), good attests.
+        drain_attestations(&state, &relay_permanent_for(&[poison.id]), TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 1);
+        assert_eq!(receipt_redrive_count(&state, poison.id).await, Some(0), "the dead-letter mark does not bump");
+
+        // No-op re-drives bump nothing: an attested row (good) and an unknown id.
+        {
+            let store = state.store.lock().await;
+            assert!(!store.redrive_dead_lettered_attestation(&good.id).unwrap(), "attested → no-op");
+            assert!(!store.redrive_dead_lettered_attestation(&Uuid::new_v4()).unwrap(), "unknown → no-op");
+        }
+        assert_eq!(receipt_redrive_count(&state, poison.id).await, Some(0), "no-op re-drives bump nothing");
+
+        // Real re-drive then re-dead-letter (still failing): exactly 1, then 2.
+        assert!(state.store.lock().await.redrive_dead_lettered_attestation(&poison.id).unwrap());
+        drain_attestations(&state, &relay_permanent_for(&[poison.id]), TEST_BATCH).await;
+        assert_eq!(receipt_redrive_count(&state, poison.id).await, Some(1), "one real re-arm → +1");
+        assert!(state.store.lock().await.redrive_dead_lettered_attestation(&poison.id).unwrap());
+        drain_attestations(&state, &relay_permanent_for(&[poison.id]), TEST_BATCH).await;
+        assert_eq!(receipt_redrive_count(&state, poison.id).await, Some(2), "+1 per real re-arm");
+    }
+
+    /// FM4 (attestation twin): a bulk re-drive bumps each re-armed receipt's `redrive_count`
+    /// by exactly 1 per wave, never N. Two waves over three dead-lettered receipts leave each at 2.
+    #[tokio::test]
+    async fn receipts_redrive_all_bumps_each_re_armed_receipt_exactly_once() {
+        let state = test_state_empty().await;
+        let jobs = [seed_job(), seed_job(), seed_job()];
+        for job in &jobs {
+            settle_one(&state, job).await;
+        }
+        let ids: Vec<Uuid> = jobs.iter().map(|j| j.id).collect();
+        drain_attestations(&state, &relay_permanent_for(&ids), TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 3);
+        for job in &jobs {
+            assert_eq!(receipt_redrive_count(&state, job.id).await, Some(0), "a fresh dead-letter starts at 0");
+        }
+
+        // First bulk wave → re-dead-letter all three (still failing): each at exactly 1.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_attestations().unwrap(), 3);
+        drain_attestations(&state, &relay_permanent_for(&ids), TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 3);
+        for job in &jobs {
+            assert_eq!(receipt_redrive_count(&state, job.id).await, Some(1), "exactly +1 per row per wave, never N");
+        }
+
+        // Second wave → each accumulates to exactly 2.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_attestations().unwrap(), 3);
+        drain_attestations(&state, &relay_permanent_for(&ids), TEST_BATCH).await;
+        for job in &jobs {
+            assert_eq!(receipt_redrive_count(&state, job.id).await, Some(2), "+1 per wave accumulates");
+        }
+    }
+
     /// FM4 (zero / still-failing): a bulk re-drive with no dead-lettered rows is a clean
     /// `rearmed: 0` (not an error); and if the broad cause is NOT actually fixed the
     /// re-armed rows simply re-dead-letter on the next drain — one attempt each, never a
