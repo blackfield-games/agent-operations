@@ -314,6 +314,12 @@ impl Store {
              -- Fields mirror the contract's registered schema (see eas.rs). A row
              -- is PENDING while `uid IS NULL`; the relayer flips it by writing the
              -- returned attestation `uid` + `submitted_at` once issueReceipt lands.
+             -- `dead_lettered_at` quarantines a receipt the relayer hit a
+             -- non-retryable (Permanent) issueReceipt error on (e.g. a region whose
+             -- render fee the coordinator cannot cover): RETAINED + auditable (NEVER
+             -- deleted — the attestation is the canonical proof of validated work),
+             -- `uid` stays NULL so the retention sweep keeps it, but it is excluded
+             -- from the drainable backlog so one poison receipt never blocks the rest.
              -- `job_id` is NOT NULL (SQLite would otherwise permit a NULL in a TEXT
              -- PRIMARY KEY): the retention sweep gates on `id NOT IN (SELECT job_id
              -- ... WHERE uid IS NULL)`, and a single NULL in that subquery makes the
@@ -329,7 +335,8 @@ impl Store {
                  region_id_b32  TEXT NOT NULL,
                  created_at     INTEGER NOT NULL,
                  uid            TEXT,
-                 submitted_at   INTEGER
+                 submitted_at   INTEGER,
+                 dead_lettered_at INTEGER
              );
              -- Pending ComputeMeter debits: written atomically with the settle
              -- (see record_completed), the metering twin of pending_attestations,
@@ -366,6 +373,14 @@ impl Store {
         )?;
         ignore_duplicate_column(conn.execute(
             "ALTER TABLE pending_attestations ADD COLUMN submitted_at INTEGER",
+            [],
+        ))?;
+        // Migrate pre-existing DBs (created before the dead-letter quarantine). NULL
+        // on every existing row means "not dead-lettered", which is correct: nothing
+        // had been quarantined yet. Mirrors the pending_debits dead_lettered_at
+        // migration below. Swallow only the duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_attestations ADD COLUMN dead_lettered_at INTEGER",
             [],
         ))?;
         // Migrate pre-existing DBs (created before the debit relayer's `submitted_at`
@@ -1628,11 +1643,14 @@ impl Store {
 
     /// Number of settled jobs whose EAS render receipt has not yet been relayed
     /// on-chain — the attestation backlog depth, surfaced at `/stats`. A row is
-    /// pending while its `uid` is NULL; the relayer drains the backlog by writing
-    /// the on-chain attestation `uid`, so this count falls as receipts land.
+    /// pending while its `uid` is NULL and it is not dead-lettered; the relayer
+    /// drains the backlog by writing the on-chain attestation `uid`, so this count
+    /// falls as receipts land. A dead-lettered (quarantined) row is excluded here
+    /// and counted separately as the dead-letter depth, so a poison receipt drains
+    /// this metric to 0 rather than wedging it.
     pub fn pending_attestation_count(&self) -> Result<usize> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM pending_attestations WHERE uid IS NULL",
+            "SELECT COUNT(*) FROM pending_attestations WHERE uid IS NULL AND dead_lettered_at IS NULL",
             [],
             |row| row.get(0),
         )?;
@@ -1863,8 +1881,8 @@ impl Store {
         Ok(out)
     }
 
-    /// The oldest still-pending attestations (`uid IS NULL`), oldest-first by
-    /// insert order, capped at `limit` — the attestation-side twin of
+    /// The oldest still-drainable attestations (`uid IS NULL` and not dead-lettered),
+    /// oldest-first by insert order, capped at `limit` — the attestation-side twin of
     /// [`claim_oldest_pending_debit`](Self::claim_oldest_pending_debit). Returns up to `limit`
     /// rows in the order the drain submits them, so a later submission-order zip
     /// against the uids `issueReceipts` returns maps each job to ITS OWN uid. A
@@ -1872,7 +1890,9 @@ impl Store {
     /// so the drain drops the store lock before the slow on-chain `issueReceipts`
     /// and only re-acquires it to mark each. A single drain task is the only caller
     /// and settles only ever INSERT new pending rows, so no reservation is needed
-    /// to avoid a double-claim. `limit == 0` returns an empty batch.
+    /// to avoid a double-claim. The `dead_lettered_at IS NULL` filter unblocks the
+    /// head-of-line — a quarantined poison receipt is skipped, never re-claimed, so
+    /// the drain advances instead of wedging. `limit == 0` returns an empty batch.
     pub fn claim_oldest_pending_batch(
         &self,
         limit: usize,
@@ -1880,7 +1900,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT job_id, earner, job_id_b32, render_seconds, job_kind, output_hash, region_id_b32
              FROM pending_attestations
-             WHERE uid IS NULL
+             WHERE uid IS NULL AND dead_lettered_at IS NULL
              ORDER BY created_at ASC, rowid ASC
              LIMIT ?1",
         )?;
