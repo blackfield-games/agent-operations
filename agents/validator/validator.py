@@ -100,11 +100,13 @@ async def run(
     # over-budget. Reject and route back, naming the specialist. Checked before the
     # over_budget gate so a missing/garbage metric is reported as such, not masked
     # by the gate's `.get(..., 0.0)` default.
+    metrics_ok = True
     for layer in layers:
         layer_metrics = _metrics_issues(layer)
         if layer_metrics:
             issues.extend(layer_metrics)
             failing.add(layer.specialist)
+            metrics_ok = False
 
     # Read the gate only on a finite numeric value: a missing/garbage over_budget is
     # already reported by the metrics schema above, and comparing a non-number here
@@ -137,6 +139,25 @@ async def run(
             failing.add(layer.specialist)
         else:
             wellformed.append(layer)
+
+    # Budget self-consistency — defense-in-depth across the optimizer trust boundary.
+    # The over_budget gate above trusts optimization's self-reported metric; the
+    # validator is the last gate, so re-derive the verdict from the emitted body + the
+    # current summed geometry and reject a STALE or desynced optimization layer (its
+    # metric/body predate a route-back's re-authored geometry, or a number was changed in
+    # isolation) that would otherwise ship an over-budget world accepted — the
+    # cross-trust-boundary check that until now lived only in the optimizer's own tests.
+    # Runs ONLY when the inputs are trustworthy: every specialist present (complete
+    # geometry sum), no metrics-schema issue (over_budget + every triangles finite), and
+    # optimization's own layer well-formed — each is already rejected + routed above, so
+    # re-deriving on top would only double-report. A disagreement routes back to
+    # optimization to re-run (a re-emittable desync, NOT the genuine terminal over-budget
+    # verdict the metric gate owns when metric and body agree).
+    if opt is not None and not missing and metrics_ok and opt in wellformed:
+        opt_text = (layers_root / opt.path).read_text()
+        for message in _budget_self_consistency(opt, opt_text, _summed_prior_triangles(layers)):
+            issues.append(message)
+            failing.add("optimization")
 
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
@@ -293,6 +314,133 @@ def _metrics_issues(layer: LayerSpec) -> list[str]:
                 f"{layer.specialist} layer {layer.path} metric '{key}' must be a "
                 f"finite number, got {layer.metrics[key]!r}"
             )
+    return out
+
+
+def _opt_scalar(text: str, key: str) -> str | None:
+    """The raw value of optimization body scalar `key` (`key = <value>` to end of line),
+    or None when absent. The optimizer writes one scalar per line, so the rest of the
+    line is the value; the caller decides whether it parses as a number or a bool."""
+    m = re.search(rf"\b{key}\s*=\s*([^\n]+)", text)
+    return m.group(1).strip() if m else None
+
+
+def _opt_number(text: str, key: str) -> float | None:
+    """Optimization body field `key` as a float, or None if absent or non-numeric — so a
+    missing/garbage figure is reported as malformed, never raised (FM4). USD scalars here
+    carry no type suffix, so float() parses the int budget and the double triangle counts
+    alike."""
+    raw = _opt_scalar(text, key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _opt_bool(text: str, key: str) -> bool | None:
+    """Optimization body bool field `key`, or None if absent or not a USD bool literal."""
+    raw = _opt_scalar(text, key)
+    return True if raw == "true" else False if raw == "false" else None
+
+
+def _opt_reductions(text: str) -> float | None:
+    """Σ(authoredTriangles − effectiveTriangles) over the emitted LodDirectives — the
+    geometry the recorded LOD shedding removed. None when a directive is malformed (a
+    Scope missing/garbage authored/effective); no directives ⇒ 0.0 (nothing was shed)."""
+    total = 0.0
+    for block in re.finditer(r'def Scope "Lod_\d+"\s*\{(.*?)\}', text, re.DOTALL):
+        body = block.group(1)
+        authored = _opt_number(body, "authoredTriangles")
+        effective = _opt_number(body, "effectiveTriangles")
+        if authored is None or effective is None:
+            return None
+        total += authored - effective
+    return total
+
+
+def _summed_prior_triangles(layers: list[LayerSpec]) -> float:
+    """Σ the current geometry layers' triangle metrics — the figure optimization's
+    authoredTriangles must equal if it ran on THIS geometry. Mirrors
+    optimization._resolve's own sum (every prior layer's `triangles`, missing → 0); a
+    non-finite value is skipped (the metrics gate already rejected any contracted layer
+    carrying one, and this only runs when that gate is clean)."""
+    total = 0.0
+    for layer in layers:
+        if layer.specialist == "optimization":
+            continue
+        value = layer.metrics.get("triangles", 0.0)
+        if _is_finite_number(value):
+            total += value
+    return total
+
+
+def _budget_self_consistency(opt: LayerSpec, text: str, prior_triangles: float) -> list[str]:
+    """Why optimization's emitted artifact disagrees with its over_budget metric or the
+    current geometry, or [] when they are mutually consistent — the validator re-deriving
+    the budget verdict instead of trusting the metric across the optimizer trust boundary.
+
+    The optimizer is the deterministic budget authority, but a route-back can leave a
+    STALE optimization layer whose cached metric/body reflect the pre-route geometry, or
+    a number can be changed in isolation; either ships a genuinely-over-budget world as
+    accepted because the gate above believes the metric. Re-derive from the body and the
+    summed prior geometry and reject the mismatch, naming optimization so it re-runs (the
+    desync is a re-emittable flaw — the metric gate keeps ownership of the genuine,
+    terminal over-budget verdict when metric and body agree). A missing/non-numeric budget
+    field is reported as MALFORMED, not raised (FM4)."""
+    budget = _opt_number(text, "triangleBudget")
+    authored = _opt_number(text, "authoredTriangles")
+    observed = _opt_number(text, "observedTriangles")
+    body_over = _opt_bool(text, "overBudget")
+    reductions = _opt_reductions(text)
+    malformed = sorted(
+        name
+        for name, value in (
+            ("triangleBudget", budget),
+            ("authoredTriangles", authored),
+            ("observedTriangles", observed),
+            ("overBudget", body_over),
+            ("LodDirectives", reductions),
+        )
+        if value is None
+    )
+    if malformed:
+        return [
+            f"optimization layer {opt.path} budget body is malformed: cannot re-derive "
+            f"the over-budget verdict — field(s) {malformed} missing or non-numeric"
+        ]
+
+    out: list[str] = []
+    metric_over = opt.metrics.get("over_budget", 0.0) > 0
+    rederived_over = observed > budget
+    if metric_over != rederived_over:
+        out.append(
+            f"optimization layer {opt.path} over_budget metric disagrees with its body: "
+            f"the metric says {'over' if metric_over else 'within'} budget but "
+            f"observedTriangles {observed:.0f} vs triangleBudget {budget:.0f} re-derives "
+            f"{'over' if rederived_over else 'within'} — a desynced or stale optimization "
+            f"layer; re-run optimization"
+        )
+    if body_over != rederived_over:
+        out.append(
+            f"optimization layer {opt.path} body is internally inconsistent: overBudget="
+            f"{str(body_over).lower()} but observedTriangles {observed:.0f} vs "
+            f"triangleBudget {budget:.0f} re-derives {str(rederived_over).lower()}"
+        )
+    if not math.isclose(observed, authored - reductions, rel_tol=1e-9, abs_tol=1e-6):
+        out.append(
+            f"optimization layer {opt.path} body is internally inconsistent: "
+            f"observedTriangles {observed:.0f} != {authored - reductions:.0f} "
+            f"(authoredTriangles {authored:.0f} minus {reductions:.0f} of recorded LOD "
+            f"reductions) — a phantom triangle figure"
+        )
+    if not math.isclose(authored, prior_triangles, rel_tol=1e-9, abs_tol=1e-6):
+        out.append(
+            f"optimization layer {opt.path} is stale: its authoredTriangles {authored:.0f} "
+            f"!= the {prior_triangles:.0f} summed from the current prior layers — geometry "
+            f"changed after optimization last ran; re-run optimization"
+        )
     return out
 
 
