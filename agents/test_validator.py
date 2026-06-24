@@ -56,7 +56,7 @@ SUMMED_PRIOR = float(sum(m.get("triangles", 0.0) for m in _ROLE_METRICS.values()
 
 def _opt_body(
     *,
-    budget: int = optimization.TRIANGLE_BUDGET,
+    budget: int | str = optimization.TRIANGLE_BUDGET,
     authored: float = SUMMED_PRIOR,
     observed: float | None = None,
     over_budget: bool | None = None,
@@ -444,6 +444,19 @@ async def test_run_reports_a_malformed_optimization_body_not_raises(tmp_path):
     verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
     assert not verdict.accepted
     assert any("malformed" in i and "observedTriangles" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "optimization"
+
+
+async def test_run_reports_a_non_finite_budget_field_as_malformed(tmp_path):
+    # FM4 hardening: float() accepts 'inf'/'nan'/'1e999', so a body whose triangleBudget
+    # parses to a non-finite value would make observedTriangles > triangleBudget always
+    # false and silently accept an over-budget world. A tampered/stale body's non-finite
+    # figure must be MALFORMED, not trusted — the over_budget metric path already rejects
+    # non-finite, and the body path must too.
+    body = _opt_body(budget="1e999", over_budget=False)  # 1e999 overflows to inf
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("malformed" in i and "triangleBudget" in i for i in verdict.issues)
     assert _route_back_target(verdict) == "optimization"
 
 

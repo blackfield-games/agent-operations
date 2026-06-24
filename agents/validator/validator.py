@@ -326,17 +326,22 @@ def _opt_scalar(text: str, key: str) -> str | None:
 
 
 def _opt_number(text: str, key: str) -> float | None:
-    """Optimization body field `key` as a float, or None if absent or non-numeric — so a
-    missing/garbage figure is reported as malformed, never raised (FM4). USD scalars here
-    carry no type suffix, so float() parses the int budget and the double triangle counts
-    alike."""
+    """Optimization body field `key` as a FINITE float, or None if absent, non-numeric,
+    or non-finite — so a missing/garbage figure is reported as malformed, never trusted,
+    never raised (FM4). USD scalars here carry no type suffix, so float() parses the int
+    budget and the double triangle counts alike, but float() also accepts 'inf'/'nan'/
+    '1e999' — and an inf budget would make observedTriangles > triangleBudget always
+    false, silently accepting an over-budget world. Reject non-finite here, mirroring the
+    metrics path's `_is_finite_number`, so a tampered or stale body can't defeat the audit
+    with the very kind of number-changed-in-isolation this gate exists to catch."""
     raw = _opt_scalar(text, key)
     if raw is None:
         return None
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         return None
+    return value if math.isfinite(value) else None
 
 
 def _opt_bool(text: str, key: str) -> bool | None:
