@@ -341,7 +341,12 @@ impl Store {
                  created_at     INTEGER NOT NULL,
                  uid            TEXT,
                  submitted_at   INTEGER,
-                 dead_lettered_at INTEGER
+                 dead_lettered_at INTEGER,
+                 -- How many times an operator has re-driven this row, bumped ONLY on an
+                 -- actual re-arm (see redrive_dead_lettered_attestation), never on the
+                 -- relayer's own dead-letter mark: a row that keeps re-dead-lettering
+                 -- into a still-unfixed cause shows a rising count in the listing.
+                 redrive_count  INTEGER NOT NULL DEFAULT 0
              );
              -- Pending ComputeMeter debits: written atomically with the settle
              -- (see record_completed), the metering twin of pending_attestations,
@@ -366,7 +371,11 @@ impl Store {
                  created_at      INTEGER NOT NULL,
                  submitted_at    INTEGER,
                  tx_hash         TEXT,
-                 dead_lettered_at INTEGER
+                 dead_lettered_at INTEGER,
+                 -- See pending_attestations.redrive_count: per-row tally of operator
+                 -- re-drives, bumped only on an actual re-arm, so a debit that keeps
+                 -- re-dead-lettering into an unfixed cause is visible in the listing.
+                 redrive_count   INTEGER NOT NULL DEFAULT 0
              );",
         )?;
         // Migrate pre-existing DBs (created before the relayer's `uid` /
@@ -388,6 +397,14 @@ impl Store {
             "ALTER TABLE pending_attestations ADD COLUMN dead_lettered_at INTEGER",
             [],
         ))?;
+        // Migrate pre-existing DBs (created before per-row re-drive tracking). NOT NULL
+        // DEFAULT 0 back-fills every existing row to 0 — correct, none has been re-driven
+        // yet. Mirrors the dead_lettered_at migration above; swallow only the
+        // duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_attestations ADD COLUMN redrive_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        ))?;
         // Migrate pre-existing DBs (created before the debit relayer's `submitted_at`
         // / `tx_hash` columns). NULL on every existing row means "still pending",
         // which is correct: nothing had been spent on-chain yet. Mirrors the
@@ -405,6 +422,14 @@ impl Store {
         // above. Swallow only the duplicate-column error.
         ignore_duplicate_column(conn.execute(
             "ALTER TABLE pending_debits ADD COLUMN dead_lettered_at INTEGER",
+            [],
+        ))?;
+        // Migrate pre-existing DBs (created before per-row re-drive tracking). NOT NULL
+        // DEFAULT 0 back-fills every existing row to 0 (none re-driven yet). Mirrors the
+        // pending_attestations redrive_count migration above; swallow only the
+        // duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_debits ADD COLUMN redrive_count INTEGER NOT NULL DEFAULT 0",
             [],
         ))?;
         // Migrate pre-existing DBs (created before `started_at` was added). The
