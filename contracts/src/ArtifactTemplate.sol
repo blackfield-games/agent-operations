@@ -119,6 +119,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     error ZeroRegionAuthority();
     error ZeroRoyaltyRate();
     error ZeroRoyaltyToken();
+    error ZeroMinter();
     error SupplyExceeded(uint256 templateId, uint256 wouldMint, uint256 maxSupply);
 
     constructor(
@@ -147,7 +148,16 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         royaltyRate = royaltyRate_;
     }
 
+    /// @notice Owner sets the sole authorized minter. Zero is rejected so the minter gate
+    ///         can never be bricked into a permanent revert: `registerTemplate`/`mint` both
+    ///         require `msg.sender == minter`, and no real sender is `address(0)`, so a
+    ///         zero minter would silently fail every mint with `NotMinter` (mirrors the
+    ///         setMintFeeRate/setRoyaltyRate "never globally disable the gate" guards). The
+    ///         constructor's bootstrap state (`minter == 0`, minting disabled until wired)
+    ///         is a one-way door out of zero; to pause, rotate to a controlled holding
+    ///         address, not back to zero.
     function setMinter(address minter_) external onlyOwner {
+        if (minter_ == address(0)) revert ZeroMinter();
         minter = minter_;
         emit MinterSet(minter_);
     }
