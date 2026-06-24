@@ -262,7 +262,8 @@ impl Store {
                  dispatch_seq INTEGER NOT NULL DEFAULT 0,
                  created_at   INTEGER,
                  dispatched_to TEXT,
-                 buyer        TEXT
+                 buyer        TEXT,
+                 progress_pct INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS results (
                  job_id      TEXT NOT NULL,
@@ -428,6 +429,17 @@ impl Store {
         ignore_duplicate_column(
             conn.execute("ALTER TABLE jobs ADD COLUMN buyer TEXT", []),
         )?;
+        // Migrate pre-existing DBs (created before `progress_pct` — the latest
+        // in-flight progress an earner heartbeat reported, 0..=100 — was added). The
+        // column defaults to 0 on every existing row, which is correct: a job that
+        // never heartbeated (or a legacy/recovered in-flight job) reads 0% until its
+        // current holder's first heartbeat lands, and `take_next` resets it to 0 on
+        // every dispatch so it always reflects the current lease. Swallow only the
+        // duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE jobs ADD COLUMN progress_pct INTEGER NOT NULL DEFAULT 0",
+            [],
+        ))?;
         // Index the reaper's hot predicate. Every reap tick scans non-terminal jobs
         // by (status, age): the TTL reaper filters `status IN (queued, in_flight)
         // AND created_at IS NOT NULL`, the deadline/liveness reapers filter
@@ -657,7 +669,8 @@ impl Store {
                          started_at    = CAST(strftime('%s','now') AS INTEGER),
                          attempts      = attempts + 1,
                          dispatch_seq  = ?2,
-                         dispatched_to = ?4
+                         dispatched_to = ?4,
+                         progress_pct  = 0
                      WHERE id = ?3",
                     (STATUS_IN_FLIGHT, new_seq, &id, holder),
                 )?;
