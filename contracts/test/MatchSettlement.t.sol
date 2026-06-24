@@ -2335,6 +2335,85 @@ contract MatchSettlementTest is Test {
         settlement.settleFieldWager(MATCH, ps, ds, HASH);
         assertEq(token.balanceOf(address(settlement)), 2 * STAKE, "the 1v1 escrow is untouched");
     }
+
+    // --- fieldSeatOf: O(1) agent->seat inverse of fieldRoster (FM1-FM4) ---
+    //
+    // fieldSeatOf returns the raw seatPlus1: 0 = non-member, k = seat k-1, so
+    // fieldRoster(m)[fieldSeatOf(m,a)-1] == a. The map is written once at open and never
+    // cleared, so the seat survives every terminal resolution for post-hoc audits.
+
+    /// @dev FM1 encoding: each seat resolves to its 1-based index (distinct values catch a
+    ///      positional swap) and round-trips through fieldRoster's 0-based array.
+    function test_fieldSeatOf_resolvesEachSeatAndRoundTrips() public {
+        address[] memory ag = _roster3(); // [alice, bob, dave]
+        _openField(FIELD, ag, STAKE);
+
+        assertEq(settlement.fieldSeatOf(FIELD, alice), 1, "seat 0 -> seatPlus1 1");
+        assertEq(settlement.fieldSeatOf(FIELD, bob), 2, "seat 1 -> seatPlus1 2");
+        assertEq(settlement.fieldSeatOf(FIELD, dave), 3, "seat 2 -> seatPlus1 3");
+
+        address[] memory roster = settlement.fieldRoster(FIELD);
+        assertEq(roster[settlement.fieldSeatOf(FIELD, alice) - 1], alice, "round-trips seat 0");
+        assertEq(roster[settlement.fieldSeatOf(FIELD, bob) - 1], bob, "round-trips seat 1");
+        assertEq(roster[settlement.fieldSeatOf(FIELD, dave) - 1], dave, "round-trips seat 2");
+    }
+
+    /// @dev FM1/FM3: an address absent from the roster reads the default 0 and never reverts —
+    ///      the 0 sentinel is unambiguous because a real seat is always >= 1.
+    function test_fieldSeatOf_nonMemberReturnsZero() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        assertEq(settlement.fieldSeatOf(FIELD, carol), 0, "non-roster agent is not a member");
+        assertEq(settlement.fieldSeatOf(FIELD, address(0)), 0, "zero address is not a member");
+    }
+
+    /// @dev FM3: a never-opened id reads the default map for any agent and never reverts.
+    function test_fieldSeatOf_unknownMatchReturnsZero() public view {
+        bytes32 ghost = bytes32("never-opened");
+        assertEq(settlement.fieldSeatOf(ghost, alice), 0, "unknown match, known agent");
+        assertEq(settlement.fieldSeatOf(ghost, carol), 0, "unknown match, unknown agent");
+    }
+
+    /// @dev FM2 post-close: settleFieldWager leaves the seat map intact, so the seat is still
+    ///      resolvable after settlement — the lookup a payout/reputation audit needs.
+    function test_fieldSeatOf_persistsAfterSettle() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether); // sum == 3*STAKE
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Settled, "settled");
+        assertEq(settlement.fieldSeatOf(FIELD, alice), 1, "seat survives settle");
+        assertEq(settlement.fieldSeatOf(FIELD, bob), 2, "seat survives settle");
+        assertEq(settlement.fieldSeatOf(FIELD, dave), 3, "seat survives settle");
+    }
+
+    /// @dev FM2 post-close: cancelFieldMatch (the attester void) likewise never clears the seat.
+    function test_fieldSeatOf_persistsAfterCancel() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Cancelled, "cancelled");
+        assertEq(settlement.fieldSeatOf(FIELD, alice), 1, "seat survives cancel");
+        assertEq(settlement.fieldSeatOf(FIELD, dave), 3, "seat survives cancel");
+    }
+
+    /// @dev FM2 post-close: the deadline self-refund (refundFieldExpired) preserves the seat too.
+    function test_fieldSeatOf_persistsAfterExpire() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+        settlement.refundFieldExpired(FIELD);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Expired, "expired");
+        assertEq(settlement.fieldSeatOf(FIELD, bob), 2, "seat survives expire");
+        assertEq(settlement.fieldSeatOf(FIELD, dave), 3, "seat survives expire");
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
