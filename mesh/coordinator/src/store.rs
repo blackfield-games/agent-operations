@@ -1675,7 +1675,7 @@ impl Store {
     /// The oldest still-drainable debit (`tx_hash IS NULL` and not dead-lettered),
     /// oldest-first by insert order, as `(job_id, PendingDebit)` — or `None` when the
     /// drainable backlog is empty. The metering twin of
-    /// [`claim_oldest_pending`](Self::claim_oldest_pending): a pure read that does
+    /// [`claim_oldest_pending_batch`](Self::claim_oldest_pending_batch): a pure read that does
     /// NOT reserve or mutate the row, so the drain loop drops the store lock before
     /// the slow on-chain `spend` and only re-acquires it to `mark_debit_submitted`.
     /// A single drain task is the only caller and settles only ever INSERT new
@@ -1864,11 +1864,11 @@ impl Store {
     }
 
     /// The oldest still-pending attestations (`uid IS NULL`), oldest-first by
-    /// insert order, capped at `limit` — the batch twin of
-    /// [`claim_oldest_pending`](Self::claim_oldest_pending). Returns up to `limit`
+    /// insert order, capped at `limit` — the attestation-side twin of
+    /// [`claim_oldest_pending_debit`](Self::claim_oldest_pending_debit). Returns up to `limit`
     /// rows in the order the drain submits them, so a later submission-order zip
     /// against the uids `issueReceipts` returns maps each job to ITS OWN uid. A
-    /// pure read like its single sibling: it does NOT reserve or mutate the rows,
+    /// pure read: it does NOT reserve or mutate the rows,
     /// so the drain drops the store lock before the slow on-chain `issueReceipts`
     /// and only re-acquires it to mark each. A single drain task is the only caller
     /// and settles only ever INSERT new pending rows, so no reservation is needed
