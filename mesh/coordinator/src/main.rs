@@ -5443,6 +5443,234 @@ mod tests {
         );
     }
 
+    // -- POST /receipts/{id}/redrive + /receipts/redrive-all — operator re-drive of a
+    //    dead-lettered attestation --
+
+    /// Settle one job and drain it through a batch-reverting, per-job-permanent relay
+    /// so the receipt is dead-lettered — the precondition for every attestation
+    /// re-drive test. The batch reverts (→ single-submit fallback) and the single
+    /// submit faults `Permanent`, so the row is quarantined and nothing is drainable.
+    async fn dead_letter_one_attestation(state: &Arc<AppState>, job: &JobSpec) {
+        settle_one(state, job).await;
+        let poison = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&job.id));
+        drain_attestations(state, &poison, TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(state).await, 1, "precondition: one dead-lettered attestation");
+        assert_eq!(pending(state).await, 0, "precondition: nothing drainable");
+    }
+
+    /// Empty-queue state with an ingest token configured (so the re-drive endpoints are
+    /// gated), for the endpoint auth tests. No compute rate — an attestation accrues on
+    /// every settle, unlike a debit.
+    async fn test_state_with_token(token: &str) -> Arc<AppState> {
+        let state = AppState::with_store(
+            Store::open_in_memory().unwrap(),
+            StoreConfig { ingest_token: Some(token.to_string()), ..test_config() },
+        )
+        .unwrap();
+        drain_seeded_jobs(&state).await;
+        state
+    }
+
+    /// `POST /receipts/{id}/redrive` with an optional `Authorization` header (body-less).
+    async fn post_receipt_redrive(
+        state: Arc<AppState>,
+        id: Uuid,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/receipts/{id}/redrive"));
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// `POST /receipts/redrive-all` with an optional `Authorization` header (body-less).
+    async fn post_receipts_redrive_all(state: Arc<AppState>, authorization: Option<&str>) -> axum::response::Response {
+        let mut builder = Request::builder().method("POST").uri("/receipts/redrive-all");
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// FM1: re-drive re-arms ONLY a dead-lettered, not-yet-attested receipt. A
+    /// dead-lettered row is re-armed (→ drainable again); an already-attested row
+    /// (re-arming would resurrect a landed attestation), an unknown job, and a
+    /// still-pending row (already drainable) are all refused — the store method returns
+    /// false and nothing changes.
+    #[tokio::test]
+    async fn redrive_rearms_only_a_dead_lettered_unattested_receipt() {
+        let state = test_state_empty().await;
+        let poison = seed_job();
+        let good = seed_job();
+        settle_one(&state, &poison).await; // settled first → claimed first (the head)
+        settle_one(&state, &good).await;
+
+        // Dead-letter the poison head; the good receipt attests in the same pass (the
+        // batch reverts, falls to singles, the poison faults Permanent, the good lands).
+        let relay = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&poison.id));
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 1);
+        assert_eq!(pending(&state).await, 0, "good attested, poison quarantined");
+        assert!(stored_uid(&state, &good.id).await.is_some(), "good landed its uid");
+
+        {
+            let store = state.store.lock().await;
+            // Already-attested (good): uid set AND not dead-lettered, so the re-arm's
+            // `dead_lettered_at IS NOT NULL` clause refuses it (no resurrecting a landed
+            // attestation). The `uid IS NULL` clause is additional defense-in-depth — no
+            // reachable row is both attested and dead-lettered, so it can't be exercised here.
+            assert!(!store.redrive_dead_lettered_attestation(&good.id).unwrap(), "an attested receipt is not re-armed");
+            // Unknown job: nothing to re-arm.
+            assert!(!store.redrive_dead_lettered_attestation(&Uuid::new_v4()).unwrap(), "an unknown receipt is not re-armed");
+            // Dead-lettered (poison): re-armed.
+            assert!(store.redrive_dead_lettered_attestation(&poison.id).unwrap(), "a dead-lettered receipt is re-armed");
+        }
+        assert_eq!(dead_lettered_attestations(&state).await, 0, "poison left the dead-letter set");
+        assert_eq!(pending(&state).await, 1, "poison re-entered the drainable backlog");
+
+        // Now-pending poison: a second re-drive is a no-op (already drainable).
+        let store = state.store.lock().await;
+        assert!(!store.redrive_dead_lettered_attestation(&poison.id).unwrap(), "a still-pending receipt is not re-armed");
+    }
+
+    /// FM4 (over-reach): the bulk re-drive re-arms ONLY dead-lettered, unattested rows —
+    /// never a still-pending (already drainable) row and never an attested (landed) one.
+    /// With two dead-lettered, one attested, and one pending row present, it re-arms
+    /// exactly the two, leaves the pending row pending, and never resurrects the landed
+    /// attestation.
+    #[tokio::test]
+    async fn redrive_all_rearms_only_dead_lettered_unattested_receipts() {
+        let state = test_state_empty().await;
+        // Two poison heads → dead-lettered.
+        let poison_a = seed_job();
+        let poison_b = seed_job();
+        settle_one(&state, &poison_a).await;
+        settle_one(&state, &poison_b).await;
+        let relay = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&poison_a.id))
+            .with_permanent_job(eas::job_id_hex(&poison_b.id));
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 2);
+
+        // One good receipt → attested (the poisons are skipped, stay quarantined).
+        let good = seed_job();
+        settle_one(&state, &good).await;
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 2, "the poisons stay quarantined");
+        let good_uid = stored_uid(&state, &good.id).await.expect("good attested");
+
+        // One fresh receipt → still pending (never drained).
+        let fresh = seed_job();
+        settle_one(&state, &fresh).await;
+        assert_eq!(pending(&state).await, 1, "fresh is drainable");
+
+        // Bulk re-drive: only the two dead-lettered rows match.
+        let rearmed = state.store.lock().await.redrive_all_dead_lettered_attestations().unwrap();
+        assert_eq!(rearmed, 2, "exactly the two dead-lettered rows, not the pending or attested one");
+        assert_eq!(dead_lettered_attestations(&state).await, 0, "both poisons re-armed");
+        assert_eq!(pending(&state).await, 3, "the two re-armed poisons joined the fresh pending row");
+
+        // The attested `good` was untouched: its uid is unchanged and a succeeding drain
+        // attests exactly the 3 pending rows without resurrecting the landed one.
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert_eq!(stored_uid(&state, &good.id).await.as_deref(), Some(good_uid.as_str()), "the landed attestation is never re-driven");
+        assert_eq!(pending(&state).await, 0, "the 3 re-armed/fresh rows drained");
+    }
+
+    /// FM4: the re-drive endpoint requires the same bearer token as `POST /jobs`. A
+    /// missing-header and a wrong-token call are both `401` and re-arm NOTHING (the
+    /// receipt stays dead-lettered); the correct token re-arms it (`200 {"rearmed": true}`).
+    #[tokio::test]
+    async fn receipt_redrive_endpoint_rejects_unauthenticated_and_accepts_the_token() {
+        let state = test_state_with_token(TEST_INGEST_TOKEN).await;
+        let job = seed_job();
+        dead_letter_one_attestation(&state, &job).await;
+
+        // No Authorization header → 401, nothing re-armed.
+        let resp = post_receipt_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_attestations(&state).await, 1, "an unauthenticated re-drive re-arms nothing");
+        assert_eq!(pending(&state).await, 0);
+
+        // Wrong token → 401, still nothing re-armed.
+        let resp = post_receipt_redrive(state.clone(), job.id, Some("Bearer wrong-token")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_attestations(&state).await, 1);
+
+        // Correct token → 200, re-armed.
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_receipt_redrive(state.clone(), job.id, Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], true);
+        assert_eq!(dead_lettered_attestations(&state).await, 0, "the authenticated re-drive re-armed it");
+        assert_eq!(pending(&state).await, 1);
+    }
+
+    /// The endpoint mirrors `POST /jobs`' unconfigured-open posture: with no token a
+    /// re-drive needs no auth. Also pins that the no-op path (the row no longer
+    /// dead-lettered) is a successful `200 {"rearmed": false}`, not an error — so an
+    /// operator can replay a re-drive idempotently.
+    #[tokio::test]
+    async fn receipt_redrive_endpoint_open_and_idempotent_without_token() {
+        let state = test_state_empty().await; // no token configured
+        assert!(state.ingest_token.is_none());
+        let job = seed_job();
+        dead_letter_one_attestation(&state, &job).await;
+
+        // Open: re-drive with no auth re-arms the dead-lettered receipt.
+        let resp = post_receipt_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], true);
+        assert_eq!(pending(&state).await, 1);
+
+        // Idempotent no-op: a second re-drive (now pending, not dead-lettered) is a
+        // successful 200 false.
+        let resp = post_receipt_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], false);
+    }
+
+    /// FM4: the bulk re-drive is a privileged mass-recovery action — a missing, blank, or
+    /// wrong bearer token is `401` and re-arms NOTHING; the correct token re-arms the
+    /// whole set (`200 {"rearmed": 2}`).
+    #[tokio::test]
+    async fn receipts_redrive_all_endpoint_rejects_unauthenticated_and_accepts_the_token() {
+        let state = test_state_with_token(TEST_INGEST_TOKEN).await;
+        let a = seed_job();
+        let b = seed_job();
+        settle_one(&state, &a).await;
+        settle_one(&state, &b).await;
+        // Both poison the single-submit fallback, so one drain dead-letters the pair.
+        let relay = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&a.id))
+            .with_permanent_job(eas::job_id_hex(&b.id));
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 2);
+
+        // Missing / blank / wrong token → 401, nothing re-armed.
+        assert_eq!(post_receipts_redrive_all(state.clone(), None).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_receipts_redrive_all(state.clone(), Some("Bearer ")).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_receipts_redrive_all(state.clone(), Some("Bearer wrong-token")).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_attestations(&state).await, 2, "every unauthenticated bulk re-drive re-armed nothing");
+
+        // Correct token → 200 {"rearmed": 2}.
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_receipts_redrive_all(state.clone(), Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], 2);
+        assert_eq!(dead_lettered_attestations(&state).await, 0, "the authenticated bulk re-drive re-armed both");
+        assert_eq!(pending(&state).await, 2);
+    }
+
     // ---- debit relayer (drain loop) ----
 
     use meter::MockSpender;
