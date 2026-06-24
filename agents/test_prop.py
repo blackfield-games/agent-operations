@@ -121,7 +121,6 @@ async def test_prop_is_a_sheddable_non_floor_layer(tmp_path, monkeypatch):
     # realistically the bottleneck, so lower the budget to isolate prop as the sole
     # shed-able layer above the terrain floor and prove it gets collapsed.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(optimization, "TRIANGLE_BUDGET", 500_000)
     # force the heaviest asset so the scenario exceeds budget regardless of the
     # per-region asset pick — the test isolates shed-ability, not the selection hash.
     monkeypatch.setattr(prop, "_select_asset", lambda rid: "comms_tower_01")
@@ -129,6 +128,13 @@ async def test_prop_is_a_sheddable_non_floor_layer(tmp_path, monkeypatch):
     brief = WorldBrief(biome="scorched", region=RegionCoord(x=5, y=9))
     terr = await terrain.run(brief, [])
     prp = await prop.run(brief, [terr])
+    # Budget just above the (region-varied) terrain floor but below floor+prop, so the
+    # un-sheddable terrain fits while prop must LOD-collapse to resolve. Relative to the
+    # region's ACTUAL terrain — no longer a fixed 262144 — since a constant budget below
+    # the now-larger floor would make terrain alone terminal and mask prop's shed-ability.
+    monkeypatch.setattr(
+        optimization, "TRIANGLE_BUDGET", int(terr.metrics["triangles"] + prp.metrics["triangles"] // 2)
+    )
     assert terr.metrics["triangles"] + prp.metrics["triangles"] > optimization.TRIANGLE_BUDGET
     opt = await optimization.run(brief, [terr, prp])
     usd = (tmp_path / "layers" / f"optimization/{brief.region.region_id}.usda").read_text()

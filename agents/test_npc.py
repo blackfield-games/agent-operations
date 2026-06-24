@@ -115,11 +115,17 @@ async def test_npc_is_a_sheddable_non_floor_layer(tmp_path, monkeypatch):
     # LOD-collapse it when the world is over budget. Lower the budget to isolate npc as
     # the sole shed-able layer above the terrain floor and prove it gets collapsed.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(optimization, "TRIANGLE_BUDGET", 350_000)
     assert "npc" not in optimization.GEOMETRY_FLOOR
     brief = WorldBrief(biome="scorched", region=RegionCoord(x=5, y=9))
     terr = await terrain.run(brief, [])
     npcl = await npc.run(brief, [terr])
+    # Budget just above the (region-varied) terrain floor but below floor+npc, so the
+    # un-sheddable terrain fits while npc must LOD-collapse to resolve. Relative to the
+    # region's ACTUAL terrain — no longer a fixed 262144 — since a constant budget below
+    # the now-larger floor would make terrain alone terminal and mask npc's shed-ability.
+    monkeypatch.setattr(
+        optimization, "TRIANGLE_BUDGET", int(terr.metrics["triangles"] + npcl.metrics["triangles"] // 2)
+    )
     assert terr.metrics["triangles"] + npcl.metrics["triangles"] > optimization.TRIANGLE_BUDGET
     opt = await optimization.run(brief, [terr, npcl])
     usd = (tmp_path / "layers" / f"optimization/{brief.region.region_id}.usda").read_text()
