@@ -615,6 +615,14 @@ struct Stats {
     /// pending receipt; this drains once the (operator-gated) on-chain relayer
     /// submits them. Until then it tracks `jobs_completed`.
     pending_attestations: usize,
+    /// Receipts the relayer quarantined after a non-retryable (`Permanent`)
+    /// issueReceipt error — e.g. a receipt naming a region whose render fee the
+    /// coordinator cannot cover. The attestation is still owed proof of validated
+    /// work: the row is retained (not dropped) but excluded from
+    /// `pending_attestations` so one poison receipt cannot block the batch drain.
+    /// Nonzero here means a stuck receipt needs operator attention. 0 on a healthy
+    /// mesh. Additive and optional.
+    dead_lettered_attestations: usize,
     /// Settled jobs whose ComputeMeter debit has not yet been spent on-chain AND is
     /// still drainable — the debit backlog depth (the metering twin of
     /// `pending_attestations`). A debit is enqueued only for a metered settle (a job
@@ -2536,6 +2544,13 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let dead_lettered_attestations = match store.dead_lettered_attestation_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: dead_lettered_attestation_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let pending_debits = match store.pending_debit_count() {
         Ok(n) => n,
         Err(e) => {
@@ -2570,6 +2585,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_attempts,
         total_faults,
         pending_attestations,
+        dead_lettered_attestations,
         pending_debits,
         dead_lettered_debits,
     }))

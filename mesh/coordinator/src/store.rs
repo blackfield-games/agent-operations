@@ -1657,6 +1657,22 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Number of attestations quarantined by the relayer after a non-retryable
+    /// (`Permanent`) issueReceipt error — the dead-letter depth, surfaced at
+    /// `/stats`. The attestation is still owed proof of validated work: the row is
+    /// retained (never deleted, `uid` stays NULL so retention keeps it auditable)
+    /// but excluded from the drainable backlog
+    /// ([`pending_attestation_count`](Self::pending_attestation_count)) so it cannot
+    /// block it. Operator-visible so a stuck receipt surfaces instead of vanishing.
+    pub fn dead_lettered_attestation_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_attestations WHERE dead_lettered_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     /// Number of settled jobs whose ComputeMeter debit has not yet been spent
     /// on-chain AND is still drainable — the debit backlog depth, surfaced at
     /// `/stats` (the metering twin of
