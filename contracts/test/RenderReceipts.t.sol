@@ -1218,6 +1218,270 @@ contract RenderReceiptsTest is Test {
         assertEq(evilRegion.accruedFees(claimedRegion), RENDER_FEE_RATE * 1);
     }
 
+    // --- batch issuance (issueReceipts) ---
+
+    /// @dev Build one batch element; field order mirrors issueReceipt's positional args.
+    function _req(address e, bytes32 jobId, uint64 rs, uint16 jk, bytes32 oh, bytes32 rid)
+        internal
+        pure
+        returns (RenderReceipts.ReceiptRequest memory)
+    {
+        return RenderReceipts.ReceiptRequest(e, jobId, rs, jk, oh, rid);
+    }
+
+    /// @dev The uid the (mock) EAS derives for an element — keccak(schema, recipient, data),
+    ///      identical to the single-attest path, so a batch-issued uid is predictable and
+    ///      equals what issueReceipt would have minted for the same args.
+    function _predictUid(address e, bytes32 jobId, uint64 rs, uint16 jk, bytes32 oh, bytes32 rid)
+        internal
+        view
+        returns (bytes32)
+    {
+        bytes memory data = abi.encode(e, jobId, rs, jk, oh, rid);
+        return keccak256(abi.encode(registry.FIXED_UID(), e, data));
+    }
+
+    function test_issueReceipts_happyPath_issuesAllViaOneMultiAttest() public {
+        _arm();
+        address earnerB = address(0xEA34);
+        address earnerC = address(0xEA56);
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](3);
+        items[0] = _req(earner, keccak256("b-j1"), 10, 0, keccak256("o1"), bytes32(0));
+        items[1] = _req(earnerB, keccak256("b-j2"), 20, 1, keccak256("o2"), bytes32(0));
+        items[2] = _req(earner, keccak256("b-j3"), 30, 3, keccak256("o3"), bytes32(0));
+
+        vm.prank(coordinator);
+        bytes32[] memory uids = receipts.issueReceipts(items);
+
+        // One multiAttest, zero single attests — the batch path was taken, not N issues.
+        assertEq(eas.multiAttestCalls(), 1);
+        assertEq(eas.attestCalls(), 0);
+        assertEq(eas.lastBatchSize(), 3);
+
+        // Every job issued, counted, and uid-mapped to ITS OWN attestation (FM2).
+        assertEq(uids.length, 3);
+        assertEq(receipts.receiptCount(), 3);
+        for (uint256 i = 0; i < 3; i++) {
+            bytes32 expected = _predictUid(
+                items[i].earner,
+                items[i].jobId,
+                items[i].renderSeconds,
+                items[i].jobKind,
+                items[i].outputHash,
+                items[i].regionId
+            );
+            assertEq(uids[i], expected);
+            assertTrue(receipts.receiptIssued(items[i].jobId));
+            assertEq(receipts.receiptUid(items[i].jobId), expected);
+        }
+        // Per-earner counts: earner has 2 (j1,j3), earnerB 1 (j2), earnerC none; they sum.
+        assertEq(receipts.receiptsByEarner(earner), 2);
+        assertEq(receipts.receiptsByEarner(earnerB), 1);
+        assertEq(receipts.receiptsByEarner(earnerC), 0);
+        // Distinct jobs -> distinct uids: no collision, no mis-map.
+        assertTrue(uids[0] != uids[1] && uids[1] != uids[2] && uids[0] != uids[2]);
+    }
+
+    function test_issueReceipts_emitsReceiptIssuedPerElement() public {
+        _arm();
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](2);
+        items[0] = _req(earner, keccak256("e1"), 10, 0, bytes32(0), bytes32(0));
+        items[1] = _req(earner, keccak256("e2"), 20, 1, bytes32(0), bytes32(0));
+
+        bytes32 uid0 = _predictUid(earner, items[0].jobId, 10, 0, bytes32(0), bytes32(0));
+        bytes32 uid1 = _predictUid(earner, items[1].jobId, 20, 1, bytes32(0), bytes32(0));
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceiptIssued(uid0, earner, items[0].jobId, 0, 10);
+        vm.expectEmit(true, true, true, true);
+        emit ReceiptIssued(uid1, earner, items[1].jobId, 1, 20);
+
+        vm.prank(coordinator);
+        receipts.issueReceipts(items);
+    }
+
+    /// @dev FM2: each jobId maps to ITS OWN multiAttest uid end-to-end — a revoke routed by
+    ///      jobId reaches the right attestation. Reverse-order revoke so a mis-index can't
+    ///      pass by coincidence; the per-earner decrements also track the stored earner.
+    function test_issueReceipts_eachJobMapsToOwnUidAndIsRevocable() public {
+        _arm();
+        address earnerB = address(0xEA34);
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](2);
+        items[0] = _req(earner, keccak256("m-j1"), 11, 0, keccak256("mo1"), bytes32(0));
+        items[1] = _req(earnerB, keccak256("m-j2"), 22, 2, keccak256("mo2"), bytes32(0));
+
+        vm.prank(coordinator);
+        receipts.issueReceipts(items);
+
+        bytes32 uid0 = _predictUid(earner, items[0].jobId, 11, 0, keccak256("mo1"), bytes32(0));
+        bytes32 uid1 = _predictUid(earnerB, items[1].jobId, 22, 2, keccak256("mo2"), bytes32(0));
+        assertTrue(uid0 != uid1);
+        assertEq(receipts.receiptUid(items[0].jobId), uid0);
+        assertEq(receipts.receiptUid(items[1].jobId), uid1);
+
+        vm.startPrank(coordinator);
+        receipts.revokeReceipt(items[1].jobId);
+        assertEq(eas.lastRevokedUid(), uid1);
+        receipts.revokeReceipt(items[0].jobId);
+        assertEq(eas.lastRevokedUid(), uid0);
+        vm.stopPrank();
+
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.revokedCount(), 2);
+        assertEq(receipts.receiptsByEarner(earner), 0);
+        assertEq(receipts.receiptsByEarner(earnerB), 0);
+    }
+
+    /// @dev FM1: a jobId repeated WITHIN one batch double-issues unless the fence is checked
+    ///      per element. The second occurrence hits the flag the first set -> revert, whole
+    ///      batch rolled back (reverts in phase 1, before any attestation).
+    function test_issueReceipts_intraBatchDuplicateReverts() public {
+        _arm();
+        bytes32 dup = keccak256("dup-job");
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](3);
+        items[0] = _req(earner, keccak256("ok-1"), 10, 0, bytes32(0), bytes32(0));
+        items[1] = _req(earner, dup, 10, 0, bytes32(0), bytes32(0));
+        items[2] = _req(earner, dup, 10, 0, bytes32(0), bytes32(0));
+
+        vm.prank(coordinator);
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.DuplicateReceipt.selector, dup));
+        receipts.issueReceipts(items);
+
+        assertEq(receipts.receiptCount(), 0);
+        assertFalse(receipts.receiptIssued(keccak256("ok-1")));
+        assertFalse(receipts.receiptIssued(dup));
+        assertEq(eas.multiAttestCalls(), 0);
+    }
+
+    /// @dev FM1 (cross-call): the per-job fence also rejects a batch element whose job was
+    ///      already issued by a prior single issueReceipt; the prior receipt is untouched.
+    function test_issueReceipts_revertsOnJobAlreadyIssuedSingly() public {
+        _arm();
+        bytes32 jobId = keccak256("prior-job");
+        vm.prank(coordinator);
+        receipts.issueReceipt(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](2);
+        items[0] = _req(earner, keccak256("new-job"), 10, 0, bytes32(0), bytes32(0));
+        items[1] = _req(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.prank(coordinator);
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.DuplicateReceipt.selector, jobId));
+        receipts.issueReceipts(items);
+
+        assertEq(receipts.receiptCount(), 1);
+        assertFalse(receipts.receiptIssued(keccak256("new-job")));
+    }
+
+    /// @dev FM3: one element's fee route failing (coordinator funded for only one fee, two
+    ///      claimed-region elements) must roll the WHOLE batch back — never some jobs
+    ///      attested-but-unpaid. Phase-4 routing runs after multiAttest, so this proves the
+    ///      post-attestation revert unwinds the attestations too.
+    function test_issueReceipts_partialFeeFailureRevertsWholeBatch() public {
+        _arm();
+        uint64 rs = 1000;
+        uint256 oneFee = RENDER_FEE_RATE * rs;
+        _fundCoordinator(oneFee);
+        uint256 coordBefore = token.balanceOf(coordinator);
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](2);
+        items[0] = _req(earner, keccak256("fee-ok"), rs, 0, bytes32(0), claimedRegionId);
+        items[1] = _req(earner, keccak256("fee-fail"), rs, 0, bytes32(0), claimedRegionId);
+
+        vm.prank(coordinator);
+        vm.expectRevert();
+        receipts.issueReceipts(items);
+
+        assertEq(receipts.receiptCount(), 0);
+        assertFalse(receipts.receiptIssued(keccak256("fee-ok")));
+        assertFalse(receipts.receiptIssued(keccak256("fee-fail")));
+        assertEq(token.balanceOf(coordinator), coordBefore);
+        assertEq(region.accruedFees(claimedRegion), 0);
+    }
+
+    /// @dev FM4: an empty batch reverts rather than touching EAS / emitting / bumping the
+    ///      counter for zero work.
+    function test_issueReceipts_emptyBatchReverts() public {
+        _arm();
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](0);
+        vm.prank(coordinator);
+        vm.expectRevert(RenderReceipts.EmptyBatch.selector);
+        receipts.issueReceipts(items);
+        assertEq(eas.multiAttestCalls(), 0);
+        assertEq(receipts.receiptCount(), 0);
+    }
+
+    function test_issueReceipts_revertsNotAuthorized() public {
+        _arm();
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](1);
+        items[0] = _req(earner, keccak256("na"), 10, 0, bytes32(0), bytes32(0));
+        vm.prank(stranger);
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        receipts.issueReceipts(items);
+    }
+
+    function test_issueReceipts_revertsSchemaNotSet() public {
+        // Authorize the coordinator but leave the schema unregistered: auth is checked first,
+        // so this reaches the schema gate.
+        vm.prank(owner);
+        receipts.setCoordinator(coordinator, true);
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](1);
+        items[0] = _req(earner, keccak256("ss"), 10, 0, bytes32(0), bytes32(0));
+        vm.prank(coordinator);
+        vm.expectRevert(RenderReceipts.SchemaNotSet.selector);
+        receipts.issueReceipts(items);
+    }
+
+    /// @dev The per-element fee route + skip policy matches issueReceipt: a claimed region
+    ///      routes renderFeeRate*renderSeconds, a zero-fee or unclaimed-region element skips
+    ///      (still attested), and the contract nets zero token across the batch.
+    function test_issueReceipts_routesFeesPerElementAndSkips() public {
+        _arm();
+        _fundCoordinator(1 ether);
+        uint256 coordBefore = token.balanceOf(coordinator);
+        bytes32 unknownRegion = keccak256("never-claimed");
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](4);
+        items[0] = _req(earner, keccak256("p1"), 100, 0, bytes32(0), claimedRegionId);
+        items[1] = _req(earner, keccak256("p2"), 0, 0, bytes32(0), claimedRegionId);
+        items[2] = _req(earner, keccak256("p3"), 250, 0, bytes32(0), claimedRegionId);
+        items[3] = _req(earner, keccak256("p4"), 500, 0, bytes32(0), unknownRegion);
+
+        vm.prank(coordinator);
+        receipts.issueReceipts(items);
+
+        uint256 expectedRouted = RENDER_FEE_RATE * (100 + 250);
+        assertEq(region.accruedFees(claimedRegion), expectedRouted);
+        assertEq(token.balanceOf(coordinator), coordBefore - expectedRouted);
+        assertEq(receipts.receiptCount(), 4);
+        // No standing balance/allowance survives the batch (every route nets to zero).
+        assertEq(token.balanceOf(address(receipts)), 0);
+        assertEq(token.allowance(address(receipts), address(region)), 0);
+    }
+
+    /// @dev A one-element batch is byte-for-byte equivalent to a single issueReceipt: same
+    ///      uid, same persisted state, same forwarded EAS payload.
+    function test_issueReceipts_singleElementMatchesIssueReceipt() public {
+        _arm();
+        bytes32 jobId = keccak256("equiv-job");
+        uint64 rs = 1234;
+        uint16 jk = 3;
+        bytes32 oh = keccak256("equiv-out");
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](1);
+        items[0] = _req(earner, jobId, rs, jk, oh, bytes32(0));
+
+        vm.prank(coordinator);
+        bytes32[] memory uids = receipts.issueReceipts(items);
+
+        assertEq(uids[0], _predictUid(earner, jobId, rs, jk, oh, bytes32(0)));
+        assertEq(receipts.receiptUid(jobId), uids[0]);
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.receiptsByEarner(earner), 1);
+        assertEq(eas.lastData(), abi.encode(earner, jobId, rs, jk, oh, bytes32(0)));
+    }
+
     // --- Ownable2Step ---
 
     function test_ownership_twoStepTransfer() public {
