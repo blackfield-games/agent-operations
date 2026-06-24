@@ -1068,24 +1068,6 @@ fn prune_stale_earners(
     before - earners.len()
 }
 
-/// Admit an earner registration into the `earners` registry under the size cap
-/// `max_earners`, returning whether it was admitted. Shared by both registration
-/// paths (HTTP `register`, WS `recv_hello_inner`) so the bound is enforced
-/// identically; the caller runs it while holding the `earners` lock, so the
-/// size check, eviction, and insert are atomic against a concurrent registration
-/// (no TOCTOU over-fill).
-///
-/// Policy:
-/// - An UPSERT of an already-registered address overwrites in place and always
-///   succeeds — it doesn't grow the map, so a known earner (even one gone stale)
-///   re-registering / changing capabilities is never blocked by the cap.
-/// - A NEW address below the cap is inserted unconditionally.
-/// - A NEW address AT the cap is admitted only by evicting the stalest entry that
-///   is already past its TTL (`is_live == false`, smallest `last_seen`) — an entry
-///   the reaper would prune and `/stats`/`/earners` already filter out. A LIVE
-///   earner is never displaced; when every entry is live (a genuinely full fleet),
-///   the registration is rejected (`false`). The at-cap scan is O(n) but only runs
-///   when the backstop engages, and `n` is bounded by `max_earners`.
 /// The outcome of an [`admit_earner`] call. The three admitting variants are kept
 /// distinct so a caller can meter registry-cap CHURN — only [`Evicted`](Admission::Evicted)
 /// reclaimed a slot by displacing a stale past-TTL entry — separately from the all-live
@@ -1109,6 +1091,26 @@ impl Admission {
     }
 }
 
+/// Admit an earner registration into the `earners` registry under the size cap
+/// `max_earners`, returning which [`Admission`] outcome resulted. Shared by both
+/// registration paths (HTTP `register`, WS `recv_hello_inner`) so the bound is
+/// enforced identically; the caller runs it while holding the `earners` lock, so the
+/// size check, eviction, and insert are atomic against a concurrent registration
+/// (no TOCTOU over-fill).
+///
+/// Policy:
+/// - An UPSERT of an already-registered address overwrites in place and always
+///   succeeds ([`Upserted`](Admission::Upserted)) — it doesn't grow the map, so a
+///   known earner (even one gone stale) re-registering / changing capabilities is
+///   never blocked by the cap.
+/// - A NEW address below the cap is inserted unconditionally ([`Inserted`](Admission::Inserted)).
+/// - A NEW address AT the cap is admitted only by evicting the stalest entry that
+///   is already past its TTL (`is_live == false`, smallest `last_seen`) — an entry
+///   the reaper would prune and `/stats`/`/earners` already filter out
+///   ([`Evicted`](Admission::Evicted)). A LIVE earner is never displaced; when every
+///   entry is live (a genuinely full fleet), the registration is rejected
+///   ([`Rejected`](Admission::Rejected)). The at-cap scan is O(n) but only runs when
+///   the backstop engages, and `n` is bounded by `max_earners`.
 fn admit_earner(
     earners: &mut std::collections::HashMap<String, EarnerInfo>,
     address: String,
