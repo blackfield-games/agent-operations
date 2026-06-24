@@ -358,6 +358,160 @@ async def test_run_routes_to_earliest_when_metric_and_wellformedness_issues_coex
     assert _failing_specialist(verdict.issues) == "terrain"
 
 
+# ---- budget self-consistency re-derivation (defense-in-depth across the optimizer
+# trust boundary) ----
+#
+# The over_budget gate trusts optimization's self-reported metric; these pin that the
+# validator — the last gate — independently re-derives the verdict from the emitted body
+# (triangleBudget/observedTriangles/overBudget/LodDirectives) + the summed current prior
+# geometry, so a STALE or desynced optimization layer can't ship an over-budget world
+# accepted. A mismatch routes back to optimization to re-run; a malformed body field is
+# reported, not raised.
+
+
+def _opt_override(root: Path, *, body: str, over_budget: float = 0.0) -> list[LayerSpec]:
+    """A full well-formed default-geometry set (summed prior triangles == SUMMED_PRIOR)
+    with the optimization layer carrying `body` and the given over_budget metric."""
+    opt = _layer(root, "optimization", body=body, metrics={"over_budget": over_budget})
+    return _with_override(root, "optimization", opt)
+
+
+async def test_run_rejects_over_budget_body_with_within_budget_metric(tmp_path):
+    # FM1: optimization reports over_budget=0.0 but its body records observedTriangles
+    # over triangleBudget (overBudget=true). The metric the gate trusts and the body
+    # disagree; the validator re-derives observed>budget and rejects, routing back to
+    # optimization — the over-budget world is NOT shipped accepted on the stale metric.
+    layers = _opt_override(tmp_path, body=_opt_body(budget=500_000), over_budget=0.0)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("over_budget metric disagrees with its body" in i for i in verdict.issues)
+    assert "optimization" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "optimization"
+
+
+async def test_run_rejects_body_overbudget_flag_inconsistent_with_its_numbers(tmp_path):
+    # FM1 variant: the body's overBudget flag claims over budget while its own
+    # observedTriangles sits within triangleBudget (and the metric agrees: within). The
+    # flag contradicts the numbers printed beside it — a value changed in isolation — so
+    # the re-derivation rejects it even though metric and re-derived numeric verdict match.
+    body = _opt_body(budget=1_500_000, observed=SUMMED_PRIOR, over_budget=True)
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("overBudget=true" in i and "internally inconsistent" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "optimization"
+
+
+async def test_run_rejects_a_stale_optimization_layer(tmp_path):
+    # FM2: the geometry re-ran heavier after a route-back but optimization's cached layer
+    # did not — its authoredTriangles records the OLD lighter geometry and its metric says
+    # within budget, while the current prior layers sum OVER the budget it used. The cached
+    # metric would ship the over-budget world accepted; the validator re-derives authored
+    # against the current geometry and rejects the stale layer.
+    stale = 300_000.0
+    body = _opt_body(budget=500_000, authored=stale, observed=stale, over_budget=False)
+    assert SUMMED_PRIOR > 500_000  # the current geometry genuinely exceeds the used budget
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("stale" in i and "summed from the current prior layers" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "optimization"
+
+
+async def test_run_rejects_a_phantom_observed_triangle_figure(tmp_path):
+    # FM3: the body claims observedTriangles far under authoredTriangles but records NO LOD
+    # reductions to account for the drop — a number changed in isolation that hides a
+    # genuinely over-budget world (authored 602144 over the 500k budget) behind a fake
+    # observed. The metric, computed from the same phantom, says within. The re-derivation
+    # reconstructs observed from authored minus the recorded reductions and rejects it.
+    body = _opt_body(budget=500_000, authored=SUMMED_PRIOR, observed=400_000, over_budget=False)
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("phantom triangle figure" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "optimization"
+
+
+async def test_run_reports_a_malformed_optimization_body_not_raises(tmp_path):
+    # FM4: a well-formed USD optimization layer (header + defaultPrim) whose budget body is
+    # missing observedTriangles. The re-derivation must report MALFORMED with a clear
+    # reason and route back to optimization — never crash the final gate on the parse.
+    body = (
+        '#usda 1.0\n(\n    defaultPrim = "Optimization"\n)\n\n'
+        'def Scope "Optimization"\n{\n'
+        "    custom int triangleBudget = 1500000\n"
+        "    custom double authoredTriangles = 602144.0\n"
+        "    custom bool overBudget = false\n"
+        "}\n"
+    )
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("malformed" in i and "observedTriangles" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "optimization"
+
+
+async def test_run_accepts_a_resolved_world_with_recorded_lod_reductions(tmp_path):
+    # A genuinely over-authored world the optimizer RESOLVED by shedding: observed sits
+    # under budget, the drop is fully accounted for by recorded LodDirectives, and authored
+    # matches the summed geometry. The re-derivation reconstructs observed from authored
+    # minus the reductions, agrees on every check, and stays silent — accepted.
+    directives = (
+        '\n\n    def Scope "LodDirectives"\n    {\n'
+        '        def Scope "Lod_0"\n        {\n'
+        '            custom string specialist = "biome"\n'
+        '            custom string layer = "biome/r.usda"\n'
+        "            custom int lodLevel = 1\n"
+        "            custom double lodScale = 0.5\n"
+        "            custom double authoredTriangles = 202144.0\n"
+        "            custom double effectiveTriangles = 101072.0\n"
+        "        }\n    }"
+    )
+    # authored 602144, shed 202144 -> 101072 (reductions 101072), observed 501072 (within).
+    body = _opt_body(
+        budget=1_500_000, authored=SUMMED_PRIOR, observed=501_072.0, over_budget=False,
+        directives=directives,
+    )
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_skips_re_derivation_when_a_geometry_layer_is_missing(tmp_path):
+    # The re-derivation runs only when the inputs are trustworthy: a missing geometry
+    # specialist makes the summed prior incomplete, so the stale-check would spuriously
+    # fire. With biome absent, the missing-layer gate owns the rejection and routes to
+    # biome; the budget re-derivation does not pile on a bogus optimization blame.
+    layers = [layer for layer in _opt_override(tmp_path, body=_opt_body()) if layer.specialist != "biome"]
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert "optimization" not in verdict.failing_specialists
+    assert _route_back_target(verdict) == "biome"
+
+
+def test_summed_prior_triangles_sums_geometry_skips_optimization_and_nonfinite():
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r", path="t", summary="", metrics={"triangles": 262144.0}),
+        LayerSpec(specialist="prop", region_id="r", path="p", summary="", metrics={"triangles": 96000.0}),
+        # optimization's own triangles (if any) must not count toward the prior sum.
+        LayerSpec(specialist="optimization", region_id="r", path="o", summary="", metrics={"triangles": 9.9, "over_budget": 0.0}),
+        LayerSpec(specialist="director", region_id="r", path="d", summary="", metrics={}),
+    ]
+    assert validator._summed_prior_triangles(layers) == 358144.0
+
+
+def test_opt_number_and_bool_parse_or_none_on_garbage():
+    # FM4 at the parse layer: a missing or non-numeric field returns None (so the caller
+    # reports MALFORMED) instead of raising.
+    text = (
+        "custom int triangleBudget = 1500000\n"
+        "custom double observedTriangles = 602144.0\n"
+        "custom bool overBudget = false\n"
+        "custom double garbage = lots\n"
+    )
+    assert validator._opt_number(text, "triangleBudget") == 1500000.0
+    assert validator._opt_number(text, "observedTriangles") == 602144.0
+    assert validator._opt_number(text, "missing") is None
+    assert validator._opt_number(text, "garbage") is None
+    assert validator._opt_bool(text, "overBudget") is False
+    assert validator._opt_bool(text, "missing") is None
+
+
 # ---- composition conflicts (cross-layer) ----
 
 # /World/Hub as a Mesh vs. as an Xform — the two bodies disagree only on Hub's
