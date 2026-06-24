@@ -926,7 +926,12 @@ async def test_run_attributes_malformed_layer_to_its_specialist(tmp_path):
 # real violation back to the offending specialist.
 
 
-def _director_body(*, must_have: str | None = None, must_not: str | None = None) -> str:
+def _director_body(
+    *,
+    must_have: str | None = None,
+    must_not: str | None = None,
+    factions: str | None = None,
+) -> str:
     """A well-formed director layer seeding the given intent. An omitted field emits no
     attribute (the director predates it / seeded nothing) so the gate stays silent."""
     lines = ["#usda 1.0", "(", '    defaultPrim = "Director"', ")", "", 'def Scope "Director"', "{"]
@@ -934,6 +939,8 @@ def _director_body(*, must_have: str | None = None, must_not: str | None = None)
         lines.append(f'    custom string intent:must_have = "{must_have}"')
     if must_not is not None:
         lines.append(f'    custom string intent:must_not = "{must_not}"')
+    if factions is not None:
+        lines.append(f'    custom string intent:factions = "{factions}"')
     lines.append("}")
     return "\n".join(lines) + "\n"
 
@@ -959,6 +966,17 @@ def _biome_body(*, capped: bool) -> str:
     return (
         '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\n'
         f'def PointInstancer "Scatter"\n{{\n    custom int instanceCount = 100{cap}\n}}\n'
+    )
+
+
+def _npc_body(archetype: str) -> str:
+    """An npc layer emitting one `archetype` marker in its Spawns block — mirroring
+    npc.run, the field the intent gate keys on."""
+    return (
+        '#usda 1.0\n(\n    defaultPrim = "NPCs"\n)\n\n'
+        'def Xform "NPCs"\n{\n    def Xform "Spawns"\n    {\n'
+        f'        custom string archetype = "{archetype}"\n'
+        "        custom int spawnCount = 6\n    }\n}\n"
     )
 
 
@@ -1077,3 +1095,80 @@ async def test_run_intent_gate_degrades_on_a_missing_biome_layer(tmp_path):
     assert not verdict.accepted
     assert "biome" in verdict.failing_specialists
     assert _route_back_target(verdict) == "biome"
+
+
+# ---- npc loop: archetype must be drawn from the director's faction roster ----
+#
+# The director DECLARES intent:factions and npc HONORS it by spawning an archetype from
+# that roster; these pin that the validator VERIFIES it — accepting ANY roster member,
+# rejecting an off-roster pick (a stale/desynced npc layer) routed back to npc, and
+# degrading silently when there is no roster or the layer is missing.
+
+
+async def test_run_accepts_npc_archetype_in_the_director_roster(tmp_path):
+    # FM1 (no false reject): npc picks ONE archetype from the roster by a region hash, so
+    # the gate must accept ANY roster member — never demand a particular pick. Both members
+    # validate; membership is the only requirement.
+    for archetype in ("raider", "sentinel"):
+        layers = _set_with(tmp_path, {
+            "director": _director_body(factions="raider,sentinel"),
+            "npc": _npc_body(archetype),
+        })
+        verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+        assert verdict.accepted, (archetype, verdict.issues)
+
+
+async def test_run_rejects_an_off_roster_npc_archetype_and_routes_to_npc(tmp_path):
+    # FM2 (false accept): the director rosters {raider, sentinel} but npc's layer spawns
+    # "drone" — a stale/desynced/tampered pick not in the roster. The gate must catch it,
+    # name npc, and key the message off intent:factions (never the word "director", which
+    # is pipeline-earlier) so the text-scan fallback agrees and route-back targets npc.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(factions="raider,sentinel"),
+        "npc": _npc_body("drone"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:factions" in i and "drone" in i for i in verdict.issues)
+    assert "npc" in verdict.failing_specialists
+    # the message names no pipeline-earlier specialist, so even the text-scan fallback
+    # routes to npc (a "director's roster" phrasing would misroute to director).
+    assert _failing_specialist(verdict.issues) == "npc"
+    assert _route_back_target(verdict) == "npc"
+
+
+async def test_run_npc_intent_gate_silent_when_director_seeds_no_roster(tmp_path):
+    # FM3 (back-compat): with no intent:factions the gate is dormant — even an npc layer
+    # whose archetype would be off any roster validates, because there is no roster to
+    # check against (npc legitimately fell back to its default).
+    layers = _set_with(tmp_path, {
+        "director": _director_body(),
+        "npc": _npc_body("drone"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_npc_intent_gate_degrades_on_a_missing_npc_layer(tmp_path):
+    # FM3 (missing-layer degrade): the director rosters factions but npc's FILE is gone.
+    # The intent gate must skip the unreadable layer (never crash the final gate); the
+    # missing-layer gate rejects and routes back to npc.
+    bodies = {"director": _director_body(factions="raider,sentinel")}
+    verdict = await validator.run(
+        _brief(), _set_with_missing(tmp_path, bodies, missing="npc"), layers_root=tmp_path
+    )
+    assert not verdict.accepted
+    assert "npc" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "npc"
+
+
+async def test_run_npc_intent_gate_does_not_special_case_the_fallback_archetype(tmp_path):
+    # FM4 (fallback confusion): npc's no-roster fallback is "scavenger", but the gate must
+    # treat it as an ordinary token — a roster that legitimately CONTAINS scavenger and an
+    # npc layer spawning it is honored (accepted), NOT rejected as "the fallback".
+    layers = _set_with(tmp_path, {
+        "director": _director_body(factions="scavenger,raider"),
+        "npc": _npc_body("scavenger"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
