@@ -8691,6 +8691,91 @@ mod tests {
         assert_eq!(body_json(get(state, "/stats").await).await["jobs_queued"], 3);
     }
 
+    // ---- shed counters (registrations_shed / jobs_shed on /stats) ----
+
+    /// Read `/stats` and return its `(registrations_shed, jobs_shed)` — the two
+    /// cumulative shed counters, both 0 on a fresh mesh.
+    async fn shed_counters(state: &Arc<AppState>) -> (u64, u64) {
+        let s = body_json(get(state.clone(), "/stats").await).await;
+        (
+            s["registrations_shed"].as_u64().expect("registrations_shed present"),
+            s["jobs_shed"].as_u64().expect("jobs_shed present"),
+        )
+    }
+
+    /// FM1: `registrations_shed` counts ONLY a rate-limit shed. A successful register
+    /// leaves it flat, and a validation-rejected register (a `400` with tokens still
+    /// available) leaves it flat too — only the `429` over-limit shed bumps it, which
+    /// discriminates the counter onto the rate-limit path, not the validation path.
+    #[tokio::test]
+    async fn registrations_shed_counts_only_the_rate_limit_shed() {
+        let state = test_state_empty_with_registrations(2).await;
+        // Two successful registers under the cap: success is not a shed.
+        assert_eq!(register_hello(&state, &hello("ra", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, &hello("rb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(shed_counters(&state).await.0, 0, "a successful register is not a shed");
+        // The 3rd from the same loopback source is over the cap → 429, the one event that counts.
+        assert_eq!(
+            register_hello(&state, &hello("rc", 24, vec![JobKind::Terrain])).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(shed_counters(&state).await.0, 1, "the rate-limit shed bumps registrations_shed");
+
+        // A malformed register with tokens still available is a 400, NOT a shed — on a
+        // fresh source the counter stays 0 even though the registration failed.
+        let other = test_state_empty_with_registrations(5).await;
+        assert_eq!(
+            register_hello(&other, &hello_claiming("0xnope", 24, vec![JobKind::Terrain])).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(shed_counters(&other).await.0, 0, "a validation 400 is not a rate-limit shed");
+    }
+
+    /// FM2: a registration flood shed on the WS `Hello` path also counts, so a WS-only
+    /// flood is not invisible. Two earners register under a cap of 2 (counter flat); the
+    /// 3rd Hello from the same loopback source is rate-shed (socket closed) and bumps
+    /// `registrations_shed` — the WS twin of the HTTP `429` path.
+    #[tokio::test]
+    async fn registrations_shed_counts_a_ws_hello_flood() {
+        let state = test_state_empty_with_registrations(2).await;
+        let addr = serve_ephemeral(state.clone()).await;
+        let mut keep_open = Vec::new();
+        for (i, label) in ["wssa", "wssb"].iter().enumerate() {
+            let (mut ws, _resp) =
+                tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+            let nonce = recv_challenge(&mut ws).await;
+            let sk = test_signing_key(label);
+            let hello = signed_hello_with_nonce(
+                &sk,
+                &address_from_signing_key(&sk),
+                "RTX 4090",
+                24,
+                vec![JobKind::Terrain],
+                &nonce,
+            );
+            ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap())).await.unwrap();
+            wait_for_gpus_joined(&state, (i + 1) as u64).await;
+            keep_open.push(ws); // hold the live session so its token stays consumed
+        }
+        assert_eq!(shed_counters(&state).await.0, 0, "two registers under the cap shed nothing");
+        // The 3rd Hello from the same source is over the cap → closed before any registry work.
+        let (mut ws, _resp) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        let sk = test_signing_key("wssc");
+        let hello = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+            &nonce,
+        );
+        ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap())).await.unwrap();
+        expect_ws_closed(&mut ws).await;
+        assert_eq!(shed_counters(&state).await.0, 1, "the WS-Hello rate shed counts");
+    }
+
     #[test]
     fn with_store_rejects_zero_max_queued_jobs() {
         let r = AppState::with_store(
