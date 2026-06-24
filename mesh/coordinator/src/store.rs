@@ -1178,16 +1178,26 @@ impl Store {
         Ok(outcome)
     }
 
-    /// Bump an in-flight job's `started_at` to `now_secs` on an earner heartbeat,
-    /// so the deadline reaper measures the deadline window from the last sign of
-    /// life rather than from dispatch. A job that keeps heartbeating is making
+    /// Record an earner heartbeat for the dispatch identified by `seq`: bump the
+    /// job's `started_at` to `now_secs` (so the deadline reaper measures the window
+    /// from the last sign of life rather than from dispatch) and persist the reported
+    /// `progress_pct` (clamped to `0..=100`). A job that keeps heartbeating is making
     /// progress and won't be reaped; a silent earner still hits the deadline.
-    /// No-op (returns `false`) for a job that is not currently `in_flight`
-    /// (a stale/late heartbeat for an already-completed or requeued job).
-    pub fn touch(&self, job_id: &uuid::Uuid, now_secs: i64) -> Result<bool> {
+    ///
+    /// FENCED on the dispatch: the write lands only when the job is still `in_flight`
+    /// AND its `dispatch_seq` still equals `seq` — the same fence that guards settle /
+    /// requeue. A heartbeat from a PREVIOUS holder (the job was reaped and reassigned,
+    /// bumping `dispatch_seq`) finds no matching row and is a no-op (`false`), so it
+    /// can neither keep the new holder's lease alive nor overwrite its progress. A
+    /// stale/late heartbeat for an already-completed or requeued job is likewise a
+    /// no-op. The clamp keeps a faulty/adversarial earner's out-of-range `progress_pct`
+    /// (a `u8` reaches 255) from poisoning the `/stats` aggregate.
+    pub fn touch(&self, job_id: &uuid::Uuid, seq: i64, now_secs: i64, progress_pct: u8) -> Result<bool> {
+        let pct = progress_pct.min(100) as i64;
         let updated = self.conn.execute(
-            "UPDATE jobs SET started_at = ?1 WHERE id = ?2 AND status = ?3",
-            (now_secs, job_id.to_string(), STATUS_IN_FLIGHT),
+            "UPDATE jobs SET started_at = ?1, progress_pct = ?2
+             WHERE id = ?3 AND status = ?4 AND dispatch_seq = ?5",
+            (now_secs, pct, job_id.to_string(), STATUS_IN_FLIGHT, seq),
         )?;
         Ok(updated > 0)
     }

@@ -3011,43 +3011,29 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, source: IpAddr)
                     }
                     EarnerMsg::Heartbeat { job_id, progress_pct } => {
                         // When the heartbeat carries a job_id that matches the
-                        // currently offered job, bump `started_at` so the
-                        // reaper's deadline window resets from "last sign of
-                        // life" rather than from dispatch. A job that keeps
-                        // heartbeating is making progress and won't be reaped;
-                        // a silent earner still hits the original window.
+                        // currently offered job, bump `started_at` (so the reaper's
+                        // deadline window resets from "last sign of life" rather than
+                        // from dispatch) and record the reported progress. `store.touch`
+                        // is fenced on `*seq`: only the holder of THIS dispatch writes —
+                        // a heartbeat for a job since reaped+reassigned (newer seq) finds
+                        // no matching row and is a no-op, so it can't keep the new
+                        // holder's lease alive nor overwrite its progress. The clamp to
+                        // 0..=100 lives in the store.
                         match (job_id, &offered) {
                             (Some(jid), Some((job, seq))) if jid == job.id => {
                                 let store = state.store.lock().await;
-                                // Fence: only the holder of the current dispatch
-                                // may slide the deadline. A stale heartbeat for a
-                                // job since reaped+reassigned (newer seq) must not
-                                // keep the new holder's lease alive.
-                                let holds_current = matches!(
-                                    store.current_dispatch_seq(&jid),
-                                    Ok(Some(cur)) if cur == *seq
-                                );
-                                if !holds_current {
-                                    tracing::debug!(
-                                        earner = %earner_address,
-                                        %jid,
-                                        progress_pct,
-                                        "heartbeat for a reassigned/stale dispatch ignored",
-                                    );
-                                    continue;
-                                }
-                                match store.touch(&jid, now_secs()) {
+                                match store.touch(&jid, *seq, now_secs(), progress_pct) {
                                     Ok(true) => tracing::debug!(
                                         earner = %earner_address,
                                         %jid,
                                         progress_pct,
-                                        "heartbeat: liveness bumped",
+                                        "heartbeat: liveness + progress recorded",
                                     ),
                                     Ok(false) => tracing::debug!(
                                         earner = %earner_address,
                                         %jid,
                                         progress_pct,
-                                        "heartbeat for non-in-flight job ignored",
+                                        "heartbeat for a reassigned/stale/non-in-flight dispatch ignored",
                                     ),
                                     Err(e) => tracing::error!(
                                         earner = %earner_address,
@@ -9930,7 +9916,7 @@ mod tests {
         store.take_next(|_| true).unwrap(); // → in_flight
 
         assert!(
-            store.touch(&id, 5000).unwrap(),
+            store.touch(&id, 1, 5000, 0).unwrap(),
             "touch must return true for an in_flight job"
         );
 
@@ -9963,8 +9949,8 @@ mod tests {
         store.enqueue(&b).unwrap();
         store.take_next(|_| true).unwrap();
         store.take_next(|_| true).unwrap();
-        store.touch(&id_a, 5000).unwrap();
-        store.touch(&id_b, 4000).unwrap();
+        store.touch(&id_a, 1, 5000, 0).unwrap();
+        store.touch(&id_b, 1, 4000, 0).unwrap();
 
         // The oldest is the MINIMUM started_at across the in-flight set.
         assert_eq!(store.oldest_in_flight_started_at().unwrap(), Some(4000));
@@ -10031,7 +10017,7 @@ mod tests {
 
         // First dispatch (attempts → 1): not yet redispatched.
         store.take_next(|_| true).unwrap();
-        store.touch(&id, 1000).unwrap();
+        store.touch(&id, 1, 1000, 0).unwrap();
         assert_eq!(store.redispatched_count().unwrap(), 0);
 
         // Reaper requeues it past the deadline (attempts unchanged), then it is
@@ -10065,7 +10051,7 @@ mod tests {
         // Reaper requeues past the deadline (attempts unchanged), then a second
         // dispatch (attempts → 2). Gross attempts (2) now exceeds the number of
         // distinct redispatched jobs (1): the contradiction FM3 warns about.
-        store.touch(&id, 1000).unwrap();
+        store.touch(&id, 1, 1000, 0).unwrap();
         store.reap_expired(1100, BIG).unwrap();
         store.take_next(|_| true).unwrap();
         assert_eq!(store.attempt_fault_totals().unwrap(), (2, 0));
@@ -10105,7 +10091,7 @@ mod tests {
         store.enqueue(&job).unwrap();
         store.take_next(|_| true).unwrap();
 
-        store.touch(&id, 5000).unwrap();
+        store.touch(&id, 1, 5000, 0).unwrap();
         let outcome = store.reap_expired(5090, BIG).unwrap();
         assert!(
             outcome.requeued.is_empty(),
@@ -10114,7 +10100,7 @@ mod tests {
         assert!(outcome.failed.is_empty());
 
         // Second heartbeat at t=5090.
-        store.touch(&id, 5090).unwrap();
+        store.touch(&id, 1, 5090, 0).unwrap();
         let outcome = store.reap_expired(5180, BIG).unwrap();
         assert!(
             outcome.requeued.is_empty(),
@@ -10145,7 +10131,7 @@ mod tests {
         store.enqueue(&job).unwrap();
 
         assert!(
-            !store.touch(&id, 5000).unwrap(),
+            !store.touch(&id, 0, 5000, 0).unwrap(),
             "touch must return false for a queued (not in_flight) job"
         );
 
@@ -10158,7 +10144,7 @@ mod tests {
             .record_completed(&signed_result(id, "cafebabe"))
             .unwrap();
         assert!(
-            !store.touch(&id, 5000).unwrap(),
+            !store.touch(&id, 1, 5000, 0).unwrap(),
             "touch must return false for a done job"
         );
     }
@@ -11158,7 +11144,7 @@ mod tests {
             let store = state.store.lock().await;
             store.enqueue(&job).unwrap();
             store.take_next(|j| j.id == id).unwrap(); // attempts → 1
-            store.touch(&id, 1000).unwrap();
+            store.touch(&id, 1, 1000, 0).unwrap();
             store.reap_expired(1100, 999).unwrap(); // requeue past deadline (attempts unchanged)
             store.take_next(|j| j.id == id).unwrap(); // attempts → 2 (redispatched)
             store.requeue_earner_fault(&job, 999, None).unwrap(); // attempts → 1, faults → 1
