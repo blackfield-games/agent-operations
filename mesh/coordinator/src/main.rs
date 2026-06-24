@@ -8251,6 +8251,81 @@ mod tests {
         );
     }
 
+    /// FM2: the redrive_count migration is idempotent and back-fills existing rows to 0. A
+    /// DB written by a PRE-migration coordinator (the pending tables lack redrive_count)
+    /// opens cleanly — the ADD COLUMN runs, defaulting every existing row to 0 — and a
+    /// second open re-runs the now-duplicate ALTER without error or data loss.
+    #[test]
+    fn redrive_count_defaults_to_zero_on_a_pre_migration_db() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+        let debit_id = Uuid::new_v4();
+        let receipt_id = Uuid::new_v4();
+        {
+            // Hand-build the PRE-redrive_count schema (the columns a prior coordinator
+            // wrote) and insert one dead-lettered row in each table — no redrive_count
+            // column exists yet, so CREATE TABLE IF NOT EXISTS in open() is a no-op for
+            // these two and the column can only come from the ALTER migration.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pending_debits (
+                     job_id TEXT PRIMARY KEY NOT NULL,
+                     buyer TEXT NOT NULL,
+                     amount_wei TEXT NOT NULL,
+                     job_id_b32 TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     submitted_at INTEGER,
+                     tx_hash TEXT,
+                     dead_lettered_at INTEGER
+                 );
+                 CREATE TABLE pending_attestations (
+                     job_id TEXT PRIMARY KEY NOT NULL,
+                     earner TEXT NOT NULL,
+                     job_id_b32 TEXT NOT NULL,
+                     render_seconds INTEGER NOT NULL,
+                     job_kind INTEGER NOT NULL,
+                     output_hash TEXT NOT NULL,
+                     region_id_b32 TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     uid TEXT,
+                     submitted_at INTEGER,
+                     dead_lettered_at INTEGER
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_debits (job_id, buyer, amount_wei, job_id_b32, created_at, dead_lettered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (debit_id.to_string(), TEST_BUYER, "1000000000000", "b32", 100i64, 200i64),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_attestations (job_id, earner, job_id_b32, render_seconds, job_kind, output_hash, region_id_b32, created_at, dead_lettered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (receipt_id.to_string(), "0xearner", "b32", 1i64, 0i64, "hash", "region", 100i64, 200i64),
+            )
+            .unwrap();
+        }
+
+        // Open through the Store: the ADD COLUMN redrive_count migration runs on the
+        // existing tables and back-fills both rows to 0.
+        let store = Store::open(&db_path).unwrap();
+        let debit = store.list_dead_lettered_debits(10).unwrap();
+        assert_eq!(debit.len(), 1);
+        assert_eq!(debit[0].0, debit_id);
+        assert_eq!(debit[0].4, 0, "an existing debit row back-fills to redrive_count 0");
+        let receipt = store.list_dead_lettered_attestations(10).unwrap();
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(receipt[0].0, receipt_id);
+        assert_eq!(receipt[0].5, 0, "an existing receipt row back-fills to redrive_count 0");
+        drop(store);
+
+        // Idempotent: a second open re-runs the now-duplicate ALTER without error, rows intact.
+        let reopened = Store::open(&db_path).unwrap();
+        assert_eq!(reopened.list_dead_lettered_debits(10).unwrap()[0].4, 0);
+        assert_eq!(reopened.list_dead_lettered_attestations(10).unwrap()[0].5, 0);
+    }
+
     #[tokio::test]
     async fn create_job_rejects_zero_deadline() {
         let state = test_state_empty().await;
