@@ -24,6 +24,7 @@ use proto::{CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec, RegionCoord}
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -338,6 +339,20 @@ struct AppState {
     /// default) => XFF is ignored everywhere. Read by `resolve_source_ip` on both
     /// registration paths. Mirrors `--trusted-proxies` / `COORDINATOR_TRUSTED_PROXIES`.
     trusted_proxies: TrustedProxies,
+    /// Cumulative count of registrations shed by the per-source rate limiter on
+    /// EITHER path (`429` on HTTP `/register`, socket close on the WS `Hello`),
+    /// bumped only when `check_registration_rate` rejects — never on a signature
+    /// failure or a successful register. Surfaced on `/stats` as the registration
+    /// flood signal (the twin of the queue-backpressure `jobs_shed`). `Relaxed` is
+    /// the standard ordering for a pure observability counter — the atomic RMW alone
+    /// guarantees no lost increment and a monotonic value; it carries no happens-before.
+    registrations_shed: AtomicU64,
+    /// Cumulative count of `POST /jobs` ingestions shed by the queued-backlog cap
+    /// (`503` once `queued` is at `--max-queued-jobs`), bumped only on that cap reject
+    /// — never on a validation `4xx` or a successful create. Surfaced on `/stats` as
+    /// the ingest-backpressure signal (the twin of the flood `registrations_shed`).
+    /// `Relaxed` for the same reason: a pure observability counter, no happens-before.
+    jobs_shed: AtomicU64,
 }
 
 /// The non-store construction knobs for [`AppState::with_store`], named so a long
@@ -444,6 +459,8 @@ impl AppState {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: cfg.max_registrations,
             trusted_proxies: cfg.trusted_proxies,
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         }))
     }
 }
@@ -679,6 +696,19 @@ struct Stats {
     /// the dead-lettered, not-yet-settled rows), or `null` when none are stuck — the debit
     /// twin of `oldest_dead_lettered_attestation_secs`. Additive and optional.
     oldest_dead_lettered_debit_secs: Option<u64>,
+    /// Cumulative registrations shed by the per-source rate limiter on either path
+    /// (`429` on HTTP `/register`, socket close on the WS `Hello`) since boot — the
+    /// registration-flood signal. Counts ONLY a rate-limit shed (`check_registration_rate`
+    /// reject), never a signature-verify failure or a successful register, so a climbing
+    /// value means a source is being throttled, not that registrations are failing
+    /// validation. 0 on a healthy mesh. Additive and optional.
+    registrations_shed: usize,
+    /// Cumulative `POST /jobs` ingestions shed by the queued-backlog cap (`503` at
+    /// `--max-queued-jobs`) since boot — the ingest-backpressure signal. Counts ONLY
+    /// the cap shed, never a validation `4xx` or a successful create, so a climbing
+    /// value means producers are outrunning drain, not that jobs are malformed. 0 on a
+    /// healthy mesh. Additive and optional.
+    jobs_shed: usize,
 }
 
 /// One earner in the `GET /earners` live leaderboard: the capabilities it
@@ -2235,6 +2265,7 @@ async fn register(
             REGISTRATION_WINDOW_SECS,
             MAX_REGISTRATION_BUCKETS,
         ) {
+            state.registrations_shed.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(%source, "rejected registration: per-source rate limit exceeded");
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
@@ -2354,6 +2385,7 @@ async fn create_job(
                 // Backlog full: shed with a retryable 503 (NOT a 500) so a
                 // well-behaved producer backs off and retries rather than treating
                 // it as a hard failure. A dispatched or reaped job frees a slot.
+                state.jobs_shed.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(cap = state.max_queued_jobs, "rejected: job queue at capacity");
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
@@ -2828,6 +2860,10 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    // In-process shed counters — a plain Relaxed load (observability only, no store
+    // lock). u64→usize is lossless on the 64-bit targets the coordinator runs on.
+    let registrations_shed = state.registrations_shed.load(Ordering::Relaxed) as usize;
+    let jobs_shed = state.jobs_shed.load(Ordering::Relaxed) as usize;
     Ok(Json(Stats {
         gpus_joined,
         total_vram_gb,
@@ -2853,6 +2889,8 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         dead_lettered_debits,
         oldest_dead_lettered_attestation_secs,
         oldest_dead_lettered_debit_secs,
+        registrations_shed,
+        jobs_shed,
     }))
 }
 
@@ -3624,6 +3662,7 @@ async fn recv_hello_inner(
                 REGISTRATION_WINDOW_SECS,
                 MAX_REGISTRATION_BUCKETS,
             ) {
+                state.registrations_shed.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     %source,
                     "ws: rejected registration: per-source rate limit exceeded; closing"
@@ -11774,6 +11813,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -11915,6 +11956,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -13170,6 +13213,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         let job = seed_job();
         let job_id = job.id;
@@ -13975,6 +14020,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -14032,6 +14079,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
 
         let terrain_job = JobSpec {
@@ -14094,6 +14143,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -14119,6 +14170,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
 
         let mut ids = Vec::new();
@@ -14217,6 +14270,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
 
         let queued = job_with_deadline(60);
@@ -14331,6 +14386,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14383,6 +14440,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14448,6 +14507,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14507,6 +14568,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -14557,6 +14620,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -14620,6 +14685,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -14689,6 +14756,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -14757,6 +14826,8 @@ mod tests {
             registration_buckets: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
+            registrations_shed: AtomicU64::new(0),
+            jobs_shed: AtomicU64::new(0),
         });
         let pay = test_address("pay");
         let resp = post_json(
