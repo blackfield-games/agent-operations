@@ -709,6 +709,23 @@ contract MatchSettlement is Ownable2Step {
         return fieldMatches[matchId].agents;
     }
 
+    /// @notice The seat `agent` holds in field match `matchId`, PLUS ONE — the O(1) inverse
+    ///         of `fieldRoster` (which maps seat -> agent). Returns `0` when `agent` is not a
+    ///         roster member (including an unknown `matchId`); otherwise the 1-based seat, so
+    ///         `fieldRoster(matchId)[fieldSeatOf(matchId, agent) - 1] == agent`. The `+1`
+    ///         encoding lets one `uint256` carry both the seat and membership without a
+    ///         sentinel collision (seat 0 is a real seat), and mirrors the internal
+    ///         `fieldSeatPlus1` every funder/settle path already reads as `1 << (seat - 1)`,
+    ///         so an off-chain consumer indexes `fundedBits`/the `settleFieldWager` vectors the
+    ///         same way the contract does. NEVER reverts — a read-only consumer can probe any
+    ///         id/agent. The map is written once at open and intentionally never cleared (the
+    ///         id is single-use), so this keeps returning the HISTORICAL seat after the match
+    ///         settles/cancels/expires — the lookup a post-hoc payout or reputation audit
+    ///         needs. Exposes nothing new: the roster is already public via `fieldRoster`.
+    function fieldSeatOf(bytes32 matchId, address agent) external view returns (uint256) {
+        return fieldSeatPlus1[matchId][agent];
+    }
+
     /// @notice Settle a fully-funded N-seat field wager in ONE attester-gated, fenced
     ///         resolution: distribute the funded pot by placement AND write the zero-sum
     ///         per-seat reputation — the field analog of the 1v1 decisive `settle`. The
