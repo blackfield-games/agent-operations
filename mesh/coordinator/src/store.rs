@@ -38,6 +38,11 @@ pub struct ReapOutcome {
     pub failed: Vec<uuid::Uuid>,
 }
 
+/// One row of [`Store::list_dead_lettered_attestations`]: `(job_id, earner,
+/// render_seconds, job_kind, dead_lettered_at)` — the operator-facing fields of a
+/// quarantined render-receipt attestation.
+pub type DeadLetteredAttestationRow = (uuid::Uuid, String, u64, u16, i64);
+
 /// Treat an `ALTER TABLE ... ADD COLUMN` that fails only because the column
 /// already exists as a success — that is the expected case for a DB created on
 /// a later boot. Any other error propagates unchanged.
@@ -1893,6 +1898,54 @@ impl Store {
             let uuid = uuid::Uuid::parse_str(&job_id)
                 .map_err(|e| anyhow::anyhow!("pending_debits.job_id not a uuid {job_id:?}: {e}"))?;
             out.push((uuid, buyer, amount_wei, dead_lettered_at));
+        }
+        Ok(out)
+    }
+
+    /// The dead-lettered, not-yet-attested receipts (`dead_lettered_at IS NOT NULL AND
+    /// uid IS NULL`), oldest-first by insert order, as `(job_id, earner, render_seconds,
+    /// job_kind, dead_lettered_at)` — the operator's enumeration of stuck attestations so
+    /// each can be re-armed by id via
+    /// [`redrive_dead_lettered_attestation`](Self::redrive_dead_lettered_attestation)
+    /// once the `Permanent` cause is fixed (the region fee funded, or the signer
+    /// re-authorized via `setCoordinator`). The attestation twin of
+    /// [`list_dead_lettered_debits`](Self::list_dead_lettered_debits): `earner` +
+    /// `render_seconds` are the attestation's "who did how much compute" (the
+    /// render-fee scale a `Permanent` revert is usually about), the counterpart of the
+    /// debit listing's `buyer` + `amount_wei`. Capped at `limit` so a pathological
+    /// dead-letter backlog can never return an unbounded body; the caller compares the
+    /// returned length against
+    /// [`dead_lettered_attestation_count`](Self::dead_lettered_attestation_count) to flag
+    /// truncation. The same state filter as the count's listable predicate: a still-pending
+    /// row (`dead_lettered_at IS NULL`, drainable) and an already-attested row (`uid` set,
+    /// a landed receipt) are excluded, so a listed row is always genuinely re-armable.
+    pub fn list_dead_lettered_attestations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DeadLetteredAttestationRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, earner, render_seconds, job_kind, dead_lettered_at
+             FROM pending_attestations
+             WHERE dead_lettered_at IS NOT NULL AND uid IS NULL
+             ORDER BY created_at ASC, rowid ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, i64>(3)? as u16,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job_id, earner, render_seconds, job_kind, dead_lettered_at) = row?;
+            let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
+                anyhow::anyhow!("pending_attestations.job_id not a uuid {job_id:?}: {e}")
+            })?;
+            out.push((uuid, earner, render_seconds, job_kind, dead_lettered_at));
         }
         Ok(out)
     }

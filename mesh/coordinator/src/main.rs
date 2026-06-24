@@ -547,6 +547,34 @@ struct DeadLetteredListing {
     truncated: bool,
 }
 
+/// One dead-lettered EAS render receipt in the operator listing (`GET
+/// /receipts/dead-lettered`). `job_id` is the UUID an operator passes to `POST
+/// /receipts/{id}/redrive`; `earner` is whose validated work the stuck attestation
+/// proves and `render_seconds` the compute it attests (the render-fee scale a
+/// `Permanent` revert is usually about), `job_kind` the numeric JobKind; `dead_lettered_at`
+/// is the epoch-second stamp it was quarantined. The attestation twin of
+/// [`DeadLetteredDebit`].
+#[derive(Debug, Serialize)]
+struct DeadLetteredReceipt {
+    job_id: Uuid,
+    earner: String,
+    render_seconds: u64,
+    job_kind: u16,
+    dead_lettered_at: i64,
+}
+
+/// Response for `GET /receipts/dead-lettered`: the dead-lettered receipts (oldest-first,
+/// capped at [`MAX_DEAD_LETTERED_LIST`]) plus the full `total` so a truncated list is
+/// never mistaken for the whole set. `truncated` is `true` when `total` exceeds the
+/// returned page — the operator's signal that more stuck receipts exist beyond the cap.
+/// The attestation twin of [`DeadLetteredListing`].
+#[derive(Debug, Serialize)]
+struct DeadLetteredReceiptListing {
+    receipts: Vec<DeadLetteredReceipt>,
+    total: usize,
+    truncated: bool,
+}
+
 /// Aggregate mesh stats. Backs the wedge requirement
 /// "Mesh GPUs joined count exposed at /stats".
 #[derive(Debug, Serialize)]
@@ -2036,6 +2064,7 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/debits/dead-lettered", get(dead_lettered_debits))
         .route("/debits/{id}/redrive", post(redrive_debit))
         .route("/debits/redrive-all", post(redrive_all_debits))
+        .route("/receipts/dead-lettered", get(dead_lettered_receipts))
         .route("/receipts/{id}/redrive", post(redrive_receipt))
         .route("/receipts/redrive-all", post(redrive_all_receipts))
         .route("/ws", get(ws_handler))
@@ -2556,6 +2585,69 @@ async fn dead_lettered_debits(
         .collect::<Vec<_>>();
     let truncated = total > debits.len();
     Ok(Json(DeadLetteredListing { debits, total, truncated }))
+}
+
+/// `GET /receipts/dead-lettered` — operator enumeration of quarantined EAS render
+/// receipts, so a stuck attestation can be located and re-driven by id (`POST
+/// /receipts/{id}/redrive`) once its `Permanent` cause is fixed (the region fee funded,
+/// or the signer re-authorized via `setCoordinator`). Returns each dead-lettered,
+/// not-yet-attested receipt (oldest-first, capped at [`MAX_DEAD_LETTERED_LIST`]) plus the
+/// full `total` and a `truncated` flag, so a capped page is never mistaken for the whole
+/// set. The attestation twin of [`dead_lettered_debits`] — it closes the
+/// `mesh-attestation-dead-letter-redrive` deferral (no way to DISCOVER the stuck ids the
+/// by-id re-drive needs; `/stats dead_lettered_attestations` surfaced only the count).
+///
+/// The listing exposes earner addresses + the attested compute (a privileged operational
+/// view), so it carries the SAME bearer-token gate as `POST /jobs` and the re-drive
+/// endpoints: a missing/malformed/wrong/blank token is `401` before any store work; open
+/// when no token is configured (the dev posture). A listed row is always genuinely
+/// re-armable — the store filters to `dead_lettered_at IS NOT NULL AND uid IS NULL`, so a
+/// still-pending (drainable) or already-attested (landed) receipt never appears.
+async fn dead_lettered_receipts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<DeadLetteredReceiptListing>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!("rejected: GET /receipts/dead-lettered missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    let rows = match store.list_dead_lettered_attestations(MAX_DEAD_LETTERED_LIST) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(?e, "dead_lettered_receipts: list query failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    // `total` is the dead-letter count (the same value `/stats dead_lettered_attestations`
+    // shows). It equals the count of LISTABLE rows because no attestation is ever both
+    // dead-lettered and attested — `mark_attestation_dead_lettered` requires `uid IS NULL`
+    // and `claim_oldest_pending_batch` skips dead-lettered rows, so the listing's extra
+    // `uid IS NULL` filter never excludes a counted row. Thus `truncated` is exact today;
+    // if that state-machine invariant ever changes, count the listable predicate here instead.
+    let total = match store.dead_lettered_attestation_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "dead_lettered_receipts: count query failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let receipts = rows
+        .into_iter()
+        .map(
+            |(job_id, earner, render_seconds, job_kind, dead_lettered_at)| DeadLetteredReceipt {
+                job_id,
+                earner,
+                render_seconds,
+                job_kind,
+                dead_lettered_at,
+            },
+        )
+        .collect::<Vec<_>>();
+    let truncated = total > receipts.len();
+    Ok(Json(DeadLetteredReceiptListing { receipts, total, truncated }))
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, StatusCode> {
