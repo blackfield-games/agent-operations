@@ -135,6 +135,59 @@ contract ArtifactTemplateTest is Test {
         art.setMinter(stranger);
     }
 
+    /// @dev FM1: a zero minter is rejected, not silently accepted. Accepting it would
+    ///      brick every mint/register (msg.sender == minter is unsatisfiable at zero), so
+    ///      the guard reverts before the storage write.
+    function test_setMinter_revertsZeroMinter() public {
+        vm.expectRevert(ArtifactTemplate.ZeroMinter.selector);
+        vm.prank(owner);
+        art.setMinter(address(0));
+    }
+
+    /// @dev FM2: a rejected setMinter(0) leaves the prior minter untouched (the revert is
+    ///      before the write), and a corrective non-zero set still works — the owner keeps
+    ///      recovery control, the gate is never half-mutated.
+    function test_setMinter_zeroRevertLeavesMinterIntactAndRecoverable() public {
+        assertEq(art.minter(), minter);
+        vm.prank(owner);
+        vm.expectRevert(ArtifactTemplate.ZeroMinter.selector);
+        art.setMinter(address(0));
+        assertEq(art.minter(), minter);
+
+        vm.prank(owner);
+        art.setMinter(stranger);
+        assertEq(art.minter(), stranger);
+    }
+
+    /// @dev FM3: the guard rejects ONLY zero — it must not over-reach onto a legitimate
+    ///      non-zero rotation. address(1), the smallest non-zero, is the boundary the
+    ///      guard must still accept.
+    function test_setMinter_acceptsSmallestNonZero() public {
+        vm.expectEmit(true, false, false, true);
+        emit MinterSet(address(1));
+        vm.prank(owner);
+        art.setMinter(address(1));
+        assertEq(art.minter(), address(1));
+    }
+
+    /// @dev FM4: the constructor's bootstrap state (minter == 0, minting disabled until
+    ///      wired) is untouched by the setter guard — a fresh deploy succeeds with a zero
+    ///      minter and mint/register revert NotMinter (not the owner, not anyone), so zero
+    ///      stays a valid INITIAL state even though it is no longer a reachable SET state.
+    function test_freshDeployBootstrapsDisabledWithZeroMinter() public {
+        ArtifactTemplate fresh =
+            new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE, address(region), ROYALTY_RATE);
+        assertEq(fresh.minter(), address(0));
+
+        vm.prank(owner);
+        vm.expectRevert(ArtifactTemplate.NotMinter.selector);
+        fresh.registerTemplate(author, 0, bytes32(0), 0);
+
+        vm.prank(owner);
+        vm.expectRevert(ArtifactTemplate.NotMinter.selector);
+        fresh.mint(player, 1, 1, regionId, "");
+    }
+
     // --- setURI ---
 
     function test_setURI_updatesUri() public {
