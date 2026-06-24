@@ -43,6 +43,7 @@ contract ComputeMeter is Ownable2Step {
     error NotAuthorized();
     error InsufficientCredit();
     error AlreadySpent();
+    error ZeroAddressBuyer();
 
     constructor(address token_, address owner_) Ownable(owner_) {
         TOKEN = IERC20(token_);
@@ -50,12 +51,36 @@ contract ComputeMeter is Ownable2Step {
 
     /// @notice Buyer deposits $TOKEN; tokens are burned and credit is recorded 1:1.
     function deposit(uint256 amount) external {
+        _deposit(msg.sender, amount);
+    }
+
+    /// @notice Sponsor-fund another address's compute credit: the CALLER's $TOKEN is
+    ///         burned and the credit lands on `buyer`, so a treasury / region authority /
+    ///         game backend can pre-fund a player's meter (the recipient ArtifactTemplate
+    ///         and the render-debit relayer already spend against). Permissionless — it
+    ///         only ever ADDS spendable credit to `buyer` at the caller's expense, never
+    ///         debits it, so there is no griefing vector. Reverts `ZeroAddressBuyer`
+    ///         rather than burn the caller's tokens into unspendable zero-address credit
+    ///         (a sponsor fat-finger); `deposit` needs no such guard because it credits
+    ///         `msg.sender`, which is never the zero address.
+    function depositFor(address buyer, uint256 amount) external {
+        if (buyer == address(0)) revert ZeroAddressBuyer();
+        _deposit(buyer, amount);
+    }
+
+    /// @dev Shared deposit core: pull the CALLER's tokens to the burn address and credit
+    ///      `account` 1:1. `msg.sender` is preserved across the internal call, so the
+    ///      tokens always come from the external caller while the credit lands on
+    ///      `account` — identical transfer + credit + totalBurned accounting for the
+    ///      self-deposit (`deposit`) and sponsor-deposit (`depositFor`) entry points, so
+    ///      the two can never drift.
+    function _deposit(address account, uint256 amount) internal {
         TOKEN.safeTransferFrom(msg.sender, BURN_ADDRESS, amount);
         unchecked {
-            credit[msg.sender] += amount;
+            credit[account] += amount;
             totalBurned += amount;
         }
-        emit Deposited(msg.sender, amount, credit[msg.sender]);
+        emit Deposited(account, amount, credit[account]);
     }
 
     /// @notice Authorized spender debits a buyer's credit. REPEATABLE per `jobId`
