@@ -5326,6 +5326,50 @@ mod tests {
         assert_eq!(run(), run(), "identical runs produce identical memory surfacing");
     }
 
+    #[test]
+    fn perception_memory_refreshes_z_on_resight_not_a_stale_ground_ghost() {
+        // Composition seam: perception memory (window > 0) × z-coupled play (gravity > 0).
+        // Every other perception_memory_* test runs at z == 0 and every z-coupled/vertical
+        // test disables memory, so this is the only guard that a re-sighted enemy surfaces
+        // its CURRENT elevation from memory, never the stale ground z of an earlier
+        // sighting — a low-z ghost would tell an agent a target is grounded / reachable
+        // over cover when it has actually jumped. The refresh runs pre-movement, so memory
+        // always holds the z the seat last actually PERCEIVED, refreshed on every re-sight.
+        let rules = Rules { perception_memory_ticks: 4, gravity: 500, ..Rules::default() };
+        let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = SEEN_AT;
+
+        // Tick 0: the enemy is perceived on the ground — memory records z == 0.
+        m.step(&BTreeMap::new());
+        assert_eq!(m.pawns[1].z, 0, "the enemy starts grounded");
+
+        // It jumps while IN sight. The jump takes effect this tick (after the pre-movement
+        // refresh), so memory still reads the ground z until the next refresh sees it
+        // airborne.
+        step_with(&mut m, &[(1, jump_press())]);
+        assert!(m.pawns[1].z > 0, "the enemy is airborne after the jump press");
+
+        // Next tick: the pre-movement refresh now perceives the enemy AIRBORNE in sight and
+        // overwrites memory with the current elevated z (the value it holds entering this
+        // step, before this tick's arc advances it).
+        let resighted_z = m.pawns[1].z;
+        step_with(&mut m, &[(1, intent(Vec2::ZERO, EAST, false))]);
+
+        // Lost again: memory must surface the REFRESHED airborne z, not the stale ground z.
+        m.pawns[1].pos = OUT_OF_RANGE;
+        let visible = m.observe(0).visible;
+        assert_eq!(visible.len(), 1, "the lost enemy is surfaced once — no stale-z duplicate");
+        assert_eq!(visible[0].entity_id, 1);
+        assert!(!visible[0].in_line_of_sight, "a remembered entity is flagged out of sight");
+        assert_eq!(
+            visible[0].z, resighted_z,
+            "memory refreshed to the re-sighted elevation, not the stale ground z"
+        );
+        assert!(visible[0].z > 0, "a stale ground-level ghost would report z == 0");
+    }
+
     fn intent(move_dir: Vec2, aim: Bam, fire: bool) -> ActionIntent {
         ActionIntent {
             move_dir,
