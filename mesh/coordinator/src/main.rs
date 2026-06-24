@@ -5989,6 +5989,61 @@ mod tests {
         assert_eq!(pending(&state).await, 0);
     }
 
+    // ---- dead-lettered attestation listing (GET /receipts/dead-lettered) ----
+
+    /// FM1: the listing returns ONLY dead-lettered, not-yet-attested receipts — a
+    /// still-pending row (drainable, dead_lettered_at IS NULL) and an already-attested
+    /// row (uid set, a landed receipt) are both excluded, so every listed receipt is
+    /// genuinely re-armable by id. FM5: the new one-segment GET /receipts/dead-lettered
+    /// route resolves to this listing handler (not shadowed by /receipts/{id}/redrive).
+    #[tokio::test]
+    async fn dead_lettered_receipt_listing_returns_only_dead_lettered_unattested_receipts() {
+        let state = test_state_empty().await;
+
+        // attested: settle + a clean drain → uid set (a landed receipt, never listed).
+        let attested = seed_job();
+        settle_one(&state, &attested).await;
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert!(stored_uid(&state, &attested.id).await.is_some(), "precondition: attested");
+
+        // dead-lettered: the one stuck receipt the operator needs to discover.
+        let deadletter = seed_job();
+        dead_letter_one_attestation(&state, &deadletter).await;
+
+        // pending: settled but never drained → drainable, not dead-lettered.
+        let pending_job = seed_job();
+        settle_one(&state, &pending_job).await;
+        assert_eq!(pending(&state).await, 1, "precondition: one drainable receipt");
+
+        let listing = body_json(get(state.clone(), "/receipts/dead-lettered").await).await;
+        let receipts = listing["receipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 1, "only the dead-lettered receipt is listed");
+        assert_eq!(
+            receipts[0]["job_id"], deadletter.id.to_string(),
+            "the dead-lettered one (not attested/pending)"
+        );
+        assert_eq!(listing["total"], 1);
+        assert_eq!(listing["truncated"], false);
+    }
+
+    /// FM4: each listed row carries the EXACT persisted fields (job_id, earner,
+    /// render_seconds, job_kind, dead_lettered_at), never re-derived or coerced — an
+    /// operator sees which earner's proof of how much compute is stuck, and when.
+    #[tokio::test]
+    async fn dead_lettered_receipt_listing_carries_the_exact_persisted_fields() {
+        let state = test_state_empty().await;
+        let job = seed_job(); // JobKind::Terrain (0); signed_result render_seconds = 1
+        dead_letter_one_attestation(&state, &job).await;
+
+        let listing = body_json(get(state.clone(), "/receipts/dead-lettered").await).await;
+        let r = &listing["receipts"][0];
+        assert_eq!(r["job_id"], job.id.to_string());
+        assert_eq!(r["earner"], dev_address(), "the settling earner, verbatim");
+        assert_eq!(r["render_seconds"], 1, "the attested compute, exact");
+        assert_eq!(r["job_kind"], 0, "JobKind::Terrain numeric");
+        assert!(r["dead_lettered_at"].as_i64().unwrap() > 0, "the quarantine stamp is present");
+    }
+
     // ---- debit relayer (drain loop) ----
 
     use meter::MockSpender;
