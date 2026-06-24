@@ -1677,11 +1677,13 @@ fn spawn_relayer<R: Relay + 'static>(
 /// `issueReceipts` is atomic — any element reverting (one already on-chain, or one
 /// bad arg) rolls the WHOLE batch back. So a batch revert falls back to
 /// per-receipt single `submit`s ([`drain_singly`]) to isolate the offender: the
-/// already-issued/bad element self-identifies (`AlreadyIssued` → marked, Permanent
-/// → stop) while the rest still drain. A whole-batch Transient backs off to the
-/// next tick; a whole-batch Permanent stops loudly. Either leaves every row in the
-/// chunk pending (nothing partial-marked), so the atomic revert reconciles to
-/// all-pending and is retried.
+/// already-issued/bad element self-identifies (`AlreadyIssued` → marked, a per-row
+/// Permanent → DEAD-LETTERED + skipped) while the rest still drain. A whole-batch
+/// Transient backs off to the next tick; a whole-batch Permanent stops loudly (a
+/// global misconfig — an unauthorized signer — never folded into the per-row
+/// dead-letter). A reverted/failed chunk leaves every un-dead-lettered row pending
+/// (nothing partial-marked), so the atomic revert reconciles to all-pending and is
+/// retried.
 ///
 /// The store lock is NEVER held across a submit await: a chunk is claimed under
 /// the lock, the lock is dropped for the (slow) on-chain call, and only
@@ -1766,14 +1768,38 @@ async fn mark_relayed(state: &Arc<AppState>, job_id: &uuid::Uuid, uid: &str) -> 
     }
 }
 
+/// Quarantine one receipt the relayer hit a non-retryable (`Permanent`) error on,
+/// under the lock. Returns `false` only on a store error (the caller stops the
+/// drain); a no-op mark (the row was already submitted or already dead-lettered by
+/// a recovered/duplicate drain) is logged and treated as handled so the rest of the
+/// chunk keeps draining. Mirrors [`mark_relayed`].
+async fn dead_letter_attestation(state: &Arc<AppState>, job_id: &uuid::Uuid) -> bool {
+    let marked = {
+        let store = state.store.lock().await;
+        store.mark_attestation_dead_lettered(job_id, now_secs())
+    };
+    match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(%job_id, "relay: receipt already settled or dead-lettered; skipping");
+            true
+        }
+        Err(e) => {
+            tracing::error!(%job_id, ?e, "relay: mark_attestation_dead_lettered failed");
+            false
+        }
+    }
+}
+
 /// Isolate a reverted batch: re-submit each claimed receipt singly so the one
 /// offending element (already on-chain, or bad) self-identifies while the rest
 /// still drain. Mirrors the single-submit semantics — `AlreadyIssued` is an
-/// idempotent success (marked with the sentinel), `Transient` backs off, and
-/// `Permanent` stops the drain loudly. Returns `true` only if every receipt was
-/// handled (so the outer loop claims the next chunk); a Transient/Permanent single
-/// — or a store error — returns `false` to stop this tick, leaving the unhandled
-/// rows pending.
+/// idempotent success (marked with the sentinel), `Transient` backs off, and a
+/// per-row `Permanent` DEAD-LETTERS that one receipt (quarantined + retained +
+/// surfaced at `/stats dead_lettered_attestations`) and CONTINUES, so one poison
+/// receipt never blocks the rest. Returns `true` once every receipt was handled (so
+/// the outer loop claims the next chunk); a `Transient` single — or a store error —
+/// returns `false` to stop this tick, leaving the unhandled rows pending.
 async fn drain_singly<R: Relay>(
     state: &Arc<AppState>,
     relay: &R,
@@ -1791,8 +1817,20 @@ async fn drain_singly<R: Relay>(
                 return false;
             }
             Err(RelayError::Permanent(msg)) => {
-                tracing::error!(%job_id, %msg, "relay: permanent submit failure; draining paused (check coordinator authorization)");
-                return false;
+                // A per-row, non-retryable fault (e.g. a receipt naming a region
+                // whose render fee the coordinator can't cover, so issueReceipt
+                // reverts) — NOT a global config problem like a whole-batch
+                // unauthorized-signer revert. Quarantine THIS receipt and keep
+                // draining the rest of the chunk, so one poison receipt never blocks
+                // the others. The row is retained (the attestation is the canonical
+                // proof of validated work + stays auditable) and surfaced at
+                // `/stats dead_lettered_attestations`. On a mark error the row stays
+                // pending, so stop rather than hot-loop.
+                tracing::error!(%job_id, %msg, "relay: permanent submit failure; dead-lettering this receipt and continuing");
+                if !dead_letter_attestation(state, job_id).await {
+                    return false;
+                }
+                continue;
             }
         };
         if !mark_relayed(state, job_id, &uid).await {
@@ -4942,6 +4980,15 @@ mod tests {
             .unwrap()
     }
 
+    async fn dead_lettered_attestations(state: &Arc<AppState>) -> usize {
+        state
+            .store
+            .lock()
+            .await
+            .dead_lettered_attestation_count()
+            .unwrap()
+    }
+
     /// Seed + settle `n` distinct jobs, returning them in insertion (oldest-first)
     /// order so a batch test can map each job to its claimed slot.
     async fn settle_n(state: &Arc<AppState>, n: usize) -> Vec<JobSpec> {
@@ -5139,21 +5186,102 @@ mod tests {
         assert_eq!(pending(&state).await, 2, "permanent batch error drops nothing");
         assert_eq!(relay.batch_calls(), 1, "no hot loop");
         assert_eq!(relay.calls(), 0, "no fallback on a whole-batch permanent");
+        // FM3: a whole-batch Permanent is a GLOBAL misconfig (unauthorized signer),
+        // never folded into the per-row dead-letter — masking it would quarantine
+        // every receipt and hide the misconfig.
+        assert_eq!(
+            dead_lettered_attestations(&state).await,
+            0,
+            "a whole-batch permanent is never per-row dead-lettered"
+        );
     }
 
-    /// The fallback keeps the single-submit Permanent-stops semantics: a reverted
-    /// batch whose receipts then fault Permanent stops the drain without dropping.
+    /// FM1: a reverted batch whose ONE poison receipt faults `Permanent` (e.g. an
+    /// unpayable region fee) dead-letters that receipt and DRAINS THE REST the same
+    /// tick — the head-of-line is unblocked, the poison retained (never dropped or
+    /// attested), surfaced as the dead-letter depth.
     #[tokio::test]
-    async fn drain_fallback_stops_on_a_permanent_single() {
+    async fn drain_dead_letters_the_poison_receipt_and_drains_the_rest() {
+        let state = test_state_empty().await;
+        let jobs = settle_n(&state, 3).await;
+        let poison = &jobs[1]; // mid-chunk, so a downstream receipt must still drain
+
+        let relay = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&poison.id));
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+
+        assert_eq!(
+            dead_lettered_attestations(&state).await,
+            1,
+            "the poison is quarantined, not dropped"
+        );
+        assert_eq!(pending(&state).await, 0, "the other two still drained this tick");
+        assert_eq!(
+            stored_uid(&state, &poison.id).await,
+            None,
+            "the poison is retained but never attested"
+        );
+        for good in [&jobs[0], &jobs[2]] {
+            assert!(
+                stored_uid(&state, &good.id).await.is_some(),
+                "a non-poison receipt is attested despite the poison sibling"
+            );
+        }
+    }
+
+    /// FM2: a `Transient` single (an RPC hiccup) inside a reverted batch backs off
+    /// and is retried next tick — NEVER dead-lettered (quarantining a relayable
+    /// receipt would lose it).
+    #[tokio::test]
+    async fn drain_does_not_dead_letter_a_transient_single() {
         let state = test_state_empty().await;
         settle_n(&state, 2).await;
 
-        let relay = MockRelay::permanent().with_batch_reverts();
+        let relay = MockRelay::transient_then_ok(1).with_batch_reverts();
         drain_attestations(&state, &relay, TEST_BATCH).await;
 
-        assert_eq!(pending(&state).await, 2, "fallback Permanent stops without dropping");
-        assert_eq!(relay.batch_calls(), 1);
-        assert_eq!(relay.calls(), 1, "stops at the first permanent single — no hot loop");
+        assert_eq!(
+            dead_lettered_attestations(&state).await,
+            0,
+            "a transient single is retried, never dead-lettered"
+        );
+        assert_eq!(pending(&state).await, 2, "both stay pending for the next tick");
+    }
+
+    /// FM4: a dead-lettered receipt is not re-claimed by a later drain (the claim
+    /// skips dead-lettered rows) and the mark is idempotent — so an eventual
+    /// operator re-drive cannot double-attest or double-mark.
+    #[tokio::test]
+    async fn drain_does_not_redrive_a_dead_lettered_receipt() {
+        let state = test_state_empty().await;
+        let jobs = settle_n(&state, 1).await;
+        let job = &jobs[0];
+
+        let poison = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&job.id));
+        drain_attestations(&state, &poison, TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 1);
+
+        // A later drain with a healthy relay neither re-claims nor re-submits it.
+        let healthy = MockRelay::succeeding();
+        drain_attestations(&state, &healthy, TEST_BATCH).await;
+        assert_eq!(healthy.batch_calls(), 0, "the dead-lettered row is never re-claimed");
+        assert_eq!(healthy.calls(), 0, "nor re-submitted singly");
+        assert_eq!(dead_lettered_attestations(&state).await, 1, "still quarantined");
+        assert_eq!(stored_uid(&state, &job.id).await, None, "never attested");
+
+        // The mark is idempotent: a re-mark of an already-dead-lettered row is a no-op.
+        assert!(
+            !state
+                .store
+                .lock()
+                .await
+                .mark_attestation_dead_lettered(&job.id, 123)
+                .unwrap(),
+            "re-marking an already-dead-lettered receipt is a no-op"
+        );
     }
 
     /// FM4: the batch is capped to the gas-safe N — a 5-receipt backlog drains in

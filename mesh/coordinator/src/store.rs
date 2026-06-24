@@ -1959,6 +1959,30 @@ impl Store {
         Ok(updated > 0)
     }
 
+    /// Quarantine a pending attestation after a non-retryable (`Permanent`)
+    /// issueReceipt error by stamping `dead_lettered_at`, but ONLY while it is still
+    /// pending and not already dead-lettered (`uid IS NULL AND dead_lettered_at IS
+    /// NULL`). Returns whether a row was updated. The row is RETAINED (never deleted
+    /// — the attestation is the canonical proof of validated work and stays
+    /// auditable); it just leaves the drainable backlog so it cannot block downstream
+    /// receipts. The double guard makes this idempotent: a re-driven row that already
+    /// settled (`uid` set) or was already quarantined is a no-op, so an operator
+    /// replay never double-marks and — paired with the on-chain `DuplicateReceipt`
+    /// jobId fence — never double-attests. The attestation twin of
+    /// [`mark_debit_dead_lettered`](Self::mark_debit_dead_lettered).
+    pub fn mark_attestation_dead_lettered(
+        &self,
+        job_id: &uuid::Uuid,
+        now_secs: i64,
+    ) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET dead_lettered_at = ?1
+             WHERE job_id = ?2 AND uid IS NULL AND dead_lettered_at IS NULL",
+            (now_secs, job_id.to_string()),
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Test-only: read back the pending attestation recorded for a job, rebuilt
     /// as an `eas::PendingAttestation` so a test can assert the settle-time
     /// mapping round-trips. `None` when no pending row exists for the job.
