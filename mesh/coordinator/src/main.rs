@@ -9302,6 +9302,75 @@ mod tests {
         assert_eq!(json["jobs_completed"], 0);
     }
 
+    /// FM1/FM3 (ws path): a WS earner that registers under a mixed-case address has
+    /// its genuine quality fault attributed to the canonical lowercase identity — the
+    /// session address `recv_hello` returns, which keys the registry AND the fault
+    /// ledger. Without that normalization the fault would land under the case variant,
+    /// splitting the count so the max-faults dead-letter budget is never reached.
+    #[tokio::test]
+    async fn ws_mixed_case_registration_faults_under_one_canonical_identity() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let sk = dev_signing_key();
+        let canonical = address_from_signing_key(&sk);
+        let upper = upper_case_variant(&canonical);
+        assert_ne!(upper, canonical);
+
+        let srv = serve_ephemeral(state.clone()).await;
+        let (mut ws, _r) = tokio_tungstenite::connect_async(format!("ws://{srv}/ws"))
+            .await
+            .unwrap();
+        let nonce = recv_challenge(&mut ws).await;
+        // Register claiming the UPPER-case variant (signed over the nonce + that case).
+        let hello = signed_hello_with_nonce(&sk, &upper, "RTX 4090", 24, vec![JobKind::Terrain], &nonce);
+        ws.send(WsMessage::text(serde_json::to_string(&hello).unwrap()))
+            .await
+            .unwrap();
+
+        let offer = next_coordinator_msg(&mut ws).await;
+        let CoordinatorMsg::JobOffer(offered) = offer else {
+            panic!("expected JobOffer, got {offer:?}");
+        };
+        assert_eq!(offered.id, job_id);
+
+        // Accept, then submit a bad-signature result — a genuine earner fault.
+        ws.send(WsMessage::text(serde_json::to_string(&EarnerMsg::Accept { job_id }).unwrap()))
+            .await
+            .unwrap();
+        let mut bad = signed_result(job_id, "deadbeef");
+        bad.signature_hex.pop();
+        bad.signature_hex.push('f');
+        ws.send(WsMessage::text(serde_json::to_string(&EarnerMsg::Submit(bad)).unwrap()))
+            .await
+            .unwrap();
+        let verdict = next_coordinator_msg(&mut ws).await;
+        assert!(matches!(verdict, CoordinatorMsg::Rejected { .. }), "the faulty submit is rejected");
+
+        // The fault is attributed AFTER the Rejected reply is sent, so poll for it.
+        let want = canonical.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.store.lock().await.faults_by_earner().unwrap().get(&want).copied() == Some(1) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fault is recorded under the canonical identity");
+
+        // Registry and fault ledger agree on the ONE canonical identity — never the
+        // case variant the client sent.
+        let faults = state.store.lock().await.faults_by_earner().unwrap();
+        assert!(!faults.contains_key(&upper), "the fault is not split onto the mixed-case variant");
+        let earners = state.earners.lock().await;
+        assert!(earners.contains_key(&canonical), "the registry keys on the canonical identity");
+        assert!(!earners.contains_key(&upper), "not the mixed case");
+    }
+
     /// A ws offer that goes stale before Submit — the job is dead-lettered out
     /// from under the session — is rejected, and the earner's late, validly
     /// signed result neither completes the job nor resurrects it from `failed`.
