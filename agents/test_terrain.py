@@ -7,7 +7,10 @@ Run from the agents/ dir:
     .venv/bin/python -m pytest test_terrain.py -v
 """
 
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 
@@ -52,12 +55,32 @@ async def test_emission_is_deterministic(tmp_path, monkeypatch):
     assert a.metrics == b.metrics
 
 
-def test_resolution_is_stable_for_a_region_no_hash_salt():
-    # FM4 (no salt): the pure resolution fn is hashlib-derived, not the per-process-salted
-    # builtin hash(), so it survives a fresh interpreter — the pipeline-determinism contract
-    # the sibling layers' _scatter_count/_spawn_count also pin.
+def test_resolution_is_stable_across_processes():
+    # FM4 (the real guard): a pipeline re-run is a FRESH process, so byte-for-byte
+    # reproducibility needs a digest stable across interpreters — precisely what the
+    # per-process-salted builtin hash() is NOT (it reseeds every process). Recompute
+    # _grid_resolution in subprocesses under different PYTHONHASHSEEDs; a regression to
+    # builtin hash() would diverge here, which the same-process emission check above (one
+    # interpreter) structurally cannot catch.
     rid = RegionCoord(x=3, y=7).region_id
-    assert terrain._grid_resolution(rid) == terrain._grid_resolution(rid)
+    agents_dir = os.path.dirname(os.path.abspath(__file__))
+    snippet = (
+        "import sys; sys.path.insert(0, '.'); "
+        "from terrain import terrain; print(terrain._grid_resolution(sys.argv[1]))"
+    )
+    outs = set()
+    for seed in ("0", "1", "42"):
+        proc = subprocess.run(
+            [sys.executable, "-c", snippet, rid],
+            capture_output=True,
+            text=True,
+            cwd=agents_dir,
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        )
+        assert proc.returncode == 0, proc.stderr
+        outs.add(proc.stdout.strip())
+    # one value across every seed, and it equals the in-process result -> hashlib, not hash()
+    assert outs == {str(terrain._grid_resolution(rid))}
 
 
 def test_distinct_regions_vary():
