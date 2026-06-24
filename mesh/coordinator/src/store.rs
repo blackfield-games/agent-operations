@@ -1881,9 +1881,14 @@ impl Store {
     /// re-drive, never an infinite auto-retry. A second re-drive of the same row once
     /// it has settled is a no-op (`tx_hash` set), so an operator double-call can't
     /// double-charge.
+    ///
+    /// A successful re-arm also bumps `redrive_count` in the SAME guarded UPDATE, so the
+    /// tally counts only an actual re-arm (a no-op re-drive matches no row → no bump, and
+    /// the relayer's own dead-letter mark never touches it) and the listing surfaces a
+    /// charge that keeps re-dead-lettering into a still-unfixed cause.
     pub fn redrive_dead_lettered_debit(&self, job_id: &uuid::Uuid) -> Result<bool> {
         let updated = self.conn.execute(
-            "UPDATE pending_debits SET dead_lettered_at = NULL
+            "UPDATE pending_debits SET dead_lettered_at = NULL, redrive_count = redrive_count + 1
              WHERE job_id = ?1 AND dead_lettered_at IS NOT NULL AND tx_hash IS NULL",
             (job_id.to_string(),),
         )?;
@@ -1913,9 +1918,13 @@ impl Store {
     /// re-drive, never a hot loop). A second bulk call once the set has settled re-arms
     /// nothing (every row now `tx_hash`-set), so an operator double-call can't double-charge.
     /// `0` is returned when there is nothing to re-arm — a clean no-op, not an error.
+    ///
+    /// Each re-armed row's `redrive_count` is bumped exactly once (a single UPDATE touches
+    /// each matched row once), so a bulk re-drive of K rows raises each row's tally by 1 —
+    /// never N — and a still-pending or settled row is untouched.
     pub fn redrive_all_dead_lettered_debits(&self) -> Result<usize> {
         let updated = self.conn.execute(
-            "UPDATE pending_debits SET dead_lettered_at = NULL
+            "UPDATE pending_debits SET dead_lettered_at = NULL, redrive_count = redrive_count + 1
              WHERE dead_lettered_at IS NOT NULL AND tx_hash IS NULL",
             (),
         )?;
@@ -2126,9 +2135,14 @@ impl Store {
     /// re-dead-letters on the next error — one more attempt per re-drive, never an
     /// infinite auto-retry. A second re-drive of the same row once it has attested is a
     /// no-op (`uid` set), so an operator double-call can't double-attest.
+    ///
+    /// A successful re-arm also bumps `redrive_count` in the SAME guarded UPDATE (the twin
+    /// of the debit re-drive), so the tally counts only an actual re-arm — never a no-op
+    /// re-drive or the relayer's dead-letter mark — and the listing surfaces a receipt that
+    /// keeps re-dead-lettering into a still-unfixed cause.
     pub fn redrive_dead_lettered_attestation(&self, job_id: &uuid::Uuid) -> Result<bool> {
         let updated = self.conn.execute(
-            "UPDATE pending_attestations SET dead_lettered_at = NULL
+            "UPDATE pending_attestations SET dead_lettered_at = NULL, redrive_count = redrive_count + 1
              WHERE job_id = ?1 AND dead_lettered_at IS NOT NULL AND uid IS NULL",
             (job_id.to_string(),),
         )?;
@@ -2157,9 +2171,13 @@ impl Store {
     /// re-drive, never a hot loop). A second bulk call once the set has attested re-arms
     /// nothing (every row now `uid`-set), so an operator double-call can't double-attest.
     /// `0` is returned when there is nothing to re-arm — a clean no-op, not an error.
+    ///
+    /// Each re-armed row's `redrive_count` is bumped exactly once (a single UPDATE touches
+    /// each matched row once), so a bulk re-drive of K rows raises each row's tally by 1,
+    /// the twin of the debit bulk re-drive.
     pub fn redrive_all_dead_lettered_attestations(&self) -> Result<usize> {
         let updated = self.conn.execute(
-            "UPDATE pending_attestations SET dead_lettered_at = NULL
+            "UPDATE pending_attestations SET dead_lettered_at = NULL, redrive_count = redrive_count + 1
              WHERE dead_lettered_at IS NOT NULL AND uid IS NULL",
             (),
         )?;
