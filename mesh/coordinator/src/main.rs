@@ -2814,6 +2814,11 @@ async fn next_job(State(state): State<Arc<AppState>>, Query(q): Query<NextJobQue
     // out HERE, before the store lock, so the two locks never overlap.
     let supported = match q.earner.as_deref() {
         Some(addr) => {
+            // Resolve the poll to the canonical identity it registered under, so a
+            // case-variant `earner=` param hits the same registry entry rather than
+            // being treated as an unknown earner (which would skip the liveness
+            // refresh and lapse to unfiltered dispatch).
+            let addr = verify::canonical_earner_address(addr);
             // An identified poll is a sign of life: refresh last_seen (mirroring
             // the submit path) so an actively-polling HTTP earner stays live in
             // the registry — counted in /stats, and keeping THIS filter applicable
@@ -2821,7 +2826,7 @@ async fn next_job(State(state): State<Arc<AppState>>, Query(q): Query<NextJobQue
             // the advertised kinds out; the earners lock drops at the block end,
             // before the store lock.
             let mut earners = state.earners.lock().await;
-            earners.get_mut(addr).map(|e| {
+            earners.get_mut(&addr).map(|e| {
                 e.last_seen = now_secs();
                 e.supported.clone()
             })
@@ -4721,6 +4726,45 @@ mod tests {
         let by_earner = state.store.lock().await.completed_count_by_earner().unwrap();
         assert_eq!(by_earner.get(&canonical).copied(), Some(1), "credited to the canonical identity");
         assert!(!by_earner.contains_key(&upper), "not the mixed case");
+    }
+
+    /// FM3 (dispatch poll): an HTTP `/jobs/next?earner=` poll using a case variant of
+    /// the registered address resolves to the canonical identity — it applies that
+    /// earner's capability filter (and refreshes its liveness) instead of being
+    /// treated as an unknown earner, which would lapse to unfiltered dispatch and skip
+    /// the liveness refresh.
+    #[tokio::test]
+    async fn next_job_poll_folds_a_mixed_case_earner_to_the_registered_identity() {
+        let state = test_state_empty().await;
+        // Older unsupported job first, newer supported job second.
+        enqueue(&state, &job_of(JobKind::DiffusionTile)).await;
+        let terrain = job_of(JobKind::Terrain);
+        enqueue(&state, &terrain).await;
+
+        // Register canonical supporting only Terrain, then stale its liveness.
+        let sk = test_signing_key("poll-earner");
+        let canonical = address_from_signing_key(&sk);
+        let upper = upper_case_variant(&canonical);
+        post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(signed_hello(&sk, &canonical, "RTX 4090", 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        state.earners.lock().await.get_mut(&canonical).unwrap().last_seen = 0;
+
+        // Poll with the UPPER-case variant: it must resolve to the registered earner.
+        let resp = get(state.clone(), &format!("/jobs/next?earner={upper}")).await;
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["id"].as_str().unwrap(),
+            terrain.id.to_string(),
+            "the case-variant poll applied the registered Terrain filter, not unfiltered dispatch"
+        );
+        assert!(
+            state.earners.lock().await.get(&canonical).unwrap().last_seen > 0,
+            "the case-variant poll refreshed the canonical earner's liveness"
+        );
     }
 
     #[tokio::test]
