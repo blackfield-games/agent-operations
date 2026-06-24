@@ -1540,6 +1540,25 @@ impl Store {
         Ok(oldest)
     }
 
+    /// Mean `progress_pct` across every `in_flight` job (rounded to a whole percent),
+    /// or `None` when nothing is in flight — the `/stats` in-flight progress signal.
+    /// Only `in_flight` rows are aggregated, so a queued/terminal job's last-known
+    /// progress is never reported (and `take_next` resets it to 0 on each dispatch),
+    /// keeping the figure to the work currently running. A mean, so a single wedged
+    /// job is diluted by healthy ones — read it alongside `oldest_in_flight_secs`,
+    /// which surfaces a lone stuck dispatch the mean would hide. Served by the leading
+    /// `status` column of `idx_jobs_status_created_at` over the bounded live set, not
+    /// the unbounded terminal history.
+    pub fn in_flight_progress_pct_avg(&self) -> Result<Option<u8>> {
+        // AVG over zero matching rows is NULL → None.
+        let avg: Option<f64> = self.conn.query_row(
+            "SELECT AVG(progress_pct) FROM jobs WHERE status = ?1",
+            [STATUS_IN_FLIGHT],
+            |row| row.get(0),
+        )?;
+        Ok(avg.map(|a| a.round() as u8))
+    }
+
     /// Count of jobs whose renderability budget shows more than one dispatch
     /// (`attempts > 1`): `take_next` handed them out, the reaper requeued them on
     /// a missed deadline, and they were dispatched again. A cumulative

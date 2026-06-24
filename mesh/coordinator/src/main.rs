@@ -548,6 +548,14 @@ struct Stats {
     /// queue-health signal for the HUD: it climbs when an earner is slow or stuck
     /// and resets as jobs complete or get reaped. Needs no schema migration.
     oldest_in_flight_secs: Option<u64>,
+    /// Mean progress (whole percent, `0..=100`) across the jobs currently in flight,
+    /// from the latest `progress_pct` each earner reported on its heartbeats — or
+    /// `null` when nothing is in flight. A working-vs-wedged signal for the HUD: it
+    /// climbs as earners report progress and is reset to 0 for each job on dispatch,
+    /// so it reflects only the work running now. Being a MEAN, a single stuck job is
+    /// diluted by healthy ones — pair it with `oldest_in_flight_secs` (which surfaces
+    /// a lone long-running dispatch the mean would hide). Additive and optional.
+    in_flight_progress_pct_avg: Option<u8>,
     /// Count of jobs dispatched more than once (`attempts > 1`): the reaper
     /// requeued them on a missed deadline and they were handed out again. A
     /// cumulative reaper-churn signal for the HUD; 0 on a healthy mesh.
@@ -2359,6 +2367,15 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    // Mean in-flight progress (None when nothing is in flight). Still under the held
+    // store lock, preserving the load-bearing `earners ⊃ store` order.
+    let in_flight_progress_pct_avg = match store.in_flight_progress_pct_avg() {
+        Ok(avg) => avg,
+        Err(e) => {
+            tracing::error!(?e, "stats: in_flight_progress_pct_avg failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let jobs_redispatched = match store.redispatched_count() {
         Ok(n) => n,
         Err(e) => {
@@ -2412,6 +2429,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_render_seconds,
         total_payout_wei,
         oldest_in_flight_secs,
+        in_flight_progress_pct_avg,
         jobs_redispatched,
         total_attempts,
         total_faults,
