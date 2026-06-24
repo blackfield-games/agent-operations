@@ -6044,6 +6044,86 @@ mod tests {
         assert!(r["dead_lettered_at"].as_i64().unwrap() > 0, "the quarantine stamp is present");
     }
 
+    /// FM2: the store listing is capped and oldest-first — a limit smaller than the
+    /// dead-letter backlog returns the OLDEST `limit` rows in insertion order, and the
+    /// full count exceeds the page (the `total > len` the endpoint reports as
+    /// `truncated`), so a capped page is never mistaken for the whole set.
+    #[tokio::test]
+    async fn list_dead_lettered_attestations_caps_and_orders_oldest_first() {
+        let state = test_state_empty().await;
+        let jobs = [seed_job(), seed_job(), seed_job()];
+        for job in &jobs {
+            settle_one(&state, job).await;
+        }
+        // One drain dead-letters all three: the batch reverts → single-submit fallback →
+        // each single submit is Permanent for its job.
+        let poison = MockRelay::succeeding()
+            .with_batch_reverts()
+            .with_permanent_job(eas::job_id_hex(&jobs[0].id))
+            .with_permanent_job(eas::job_id_hex(&jobs[1].id))
+            .with_permanent_job(eas::job_id_hex(&jobs[2].id));
+        drain_attestations(&state, &poison, TEST_BATCH).await;
+        assert_eq!(dead_lettered_attestations(&state).await, 3, "precondition: all three quarantined");
+
+        let store = state.store.lock().await;
+        // Capped: a limit of 2 over 3 dead-lettered returns the 2 OLDEST, in order.
+        let page = store.list_dead_lettered_attestations(2).unwrap();
+        assert_eq!(
+            page.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![jobs[0].id, jobs[1].id],
+            "oldest two, in order"
+        );
+        // total exceeds the page → the endpoint's `truncated` signal (total > len).
+        assert_eq!(store.dead_lettered_attestation_count().unwrap(), 3);
+        // Uncapped (limit >= total) returns all three, oldest-first.
+        let all = store.list_dead_lettered_attestations(10).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.0).collect::<Vec<_>>(),
+            jobs.iter().map(|j| j.id).collect::<Vec<_>>(),
+            "all three, oldest-first"
+        );
+    }
+
+    /// FM3: the listing exposes earner addresses + the attested compute, so it requires
+    /// the same bearer token as POST /jobs — a missing or wrong token is 401 and lists
+    /// nothing; the correct token returns the dead-lettered receipt. FM5: the by-id
+    /// re-drive sibling still resolves under the same router (no route collision).
+    #[tokio::test]
+    async fn dead_lettered_receipt_listing_requires_the_ingest_token() {
+        let state = test_state_with_token(TEST_INGEST_TOKEN).await;
+        let job = seed_job();
+        dead_letter_one_attestation(&state, &job).await;
+
+        assert_eq!(
+            get(state.clone(), "/receipts/dead-lettered").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "no Authorization header → 401"
+        );
+        assert_eq!(
+            get_auth(state.clone(), "/receipts/dead-lettered", Some("Bearer wrong-token"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token → 401"
+        );
+
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = get_auth(state.clone(), "/receipts/dead-lettered", Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listing = body_json(resp).await;
+        assert_eq!(
+            listing["receipts"].as_array().unwrap().len(),
+            1,
+            "the authenticated listing shows the receipt"
+        );
+        assert_eq!(listing["receipts"][0]["job_id"], job.id.to_string());
+
+        // FM5: the by-id re-drive sibling still routes (not shadowed by the new
+        // one-segment /receipts/dead-lettered) — it returns its own 200 under the token.
+        let redrive = post_receipt_redrive(state.clone(), job.id, Some(&auth)).await;
+        assert_eq!(redrive.status(), StatusCode::OK, "POST /receipts/{{id}}/redrive still routes");
+    }
+
     // ---- debit relayer (drain loop) ----
 
     use meter::MockSpender;
