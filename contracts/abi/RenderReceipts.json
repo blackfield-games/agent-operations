@@ -122,6 +122,57 @@
     "type": "function"
   },
   {
+    "inputs": [
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "earner",
+            "type": "address"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "jobId",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "uint64",
+            "name": "renderSeconds",
+            "type": "uint64"
+          },
+          {
+            "internalType": "uint16",
+            "name": "jobKind",
+            "type": "uint16"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "outputHash",
+            "type": "bytes32"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "regionId",
+            "type": "bytes32"
+          }
+        ],
+        "internalType": "struct RenderReceipts.ReceiptRequest[]",
+        "name": "items",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "issueReceipts",
+    "outputs": [
+      {
+        "internalType": "bytes32[]",
+        "name": "uids",
+        "type": "bytes32[]"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
     "inputs": [],
     "name": "owner",
     "outputs": [
@@ -561,6 +612,11 @@
       }
     ],
     "name": "DuplicateReceipt",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "EmptyBatch",
     "type": "error"
   },
   {
