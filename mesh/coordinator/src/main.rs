@@ -361,6 +361,15 @@ struct AppState {
     /// earner, a rate-limit shed, or a validation failure. The registry-cap third of
     /// the shed trio, surfaced on `/stats`. `Relaxed`: a pure observability counter.
     earners_shed: AtomicU64,
+    /// Cumulative count of NEW earners admitted at a FULL registry by EVICTING the
+    /// stalest past-TTL entry to make room — the `admit_earner` seam reclaiming a slot
+    /// (`--max-earners` reached, a stale entry displaced), on EITHER path (HTTP
+    /// `/register` or the WS `Hello`). The registry-CHURN twin of `earners_shed`: this
+    /// counts the at-cap registration that MADE room (evict-to-admit), `earners_shed`
+    /// the one that could NOT (all live). Bumped only on a real eviction — never on a
+    /// below-cap insert (room was free), an in-place upsert of a known earner (no new
+    /// slot), or the all-live reject. `Relaxed`: a pure observability counter.
+    earners_evicted: AtomicU64,
 }
 
 /// The non-store construction knobs for [`AppState::with_store`], named so a long
@@ -470,6 +479,7 @@ impl AppState {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         }))
     }
 }
@@ -2361,6 +2371,11 @@ async fn register(
         );
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    if admission == Admission::Evicted {
+        // The newcomer reclaimed a slot from a stale past-TTL earner — registry-cap
+        // churn, distinct from the all-live shed above. Bump only on a real eviction.
+        state.earners_evicted.fetch_add(1, Ordering::Relaxed);
+    }
     tracing::info!(address = %earner_address, vram_gb, "earner registered");
     Ok("registered")
 }
@@ -3756,6 +3771,11 @@ async fn recv_hello_inner(
                 "ws: rejected registration: earner registry at capacity (all earners live); closing"
             );
             return None;
+        }
+        if admission == Admission::Evicted {
+            // Same registry-cap eviction churn as HTTP /register (FM2 parity): this WS
+            // Hello reclaimed a slot from a stale past-TTL earner. Bump only on an eviction.
+            state.earners_evicted.fetch_add(1, Ordering::Relaxed);
         }
         tracing::info!(address = %earner_address, vram_gb, "earner registered (ws)");
         return Some(earner_address);
@@ -12070,6 +12090,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -12214,6 +12235,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         // No in-flight jobs → null (stable key, absent value).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -13472,6 +13494,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         let job = seed_job();
         let job_id = job.id;
@@ -14280,6 +14303,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
 
         // A queued job: detail returns its spec, no result yet.
@@ -14340,6 +14364,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
 
         let terrain_job = JobSpec {
@@ -14405,6 +14430,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         let resp = get(state.clone(), "/jobs").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -14433,6 +14459,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
 
         let mut ids = Vec::new();
@@ -14534,6 +14561,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
 
         let queued = job_with_deadline(60);
@@ -14651,6 +14679,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14706,6 +14735,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14774,6 +14804,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         let mk = |kind: JobKind, seed: u64| JobSpec {
             id: Uuid::new_v4(),
@@ -14836,6 +14867,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         // No completed jobs yet → 0.
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -14889,6 +14921,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         // No completed jobs yet → "0" (serialized as a string).
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -14955,6 +14988,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
 
         // Register two earners; then force one far into the past → stale (ttl=60).
@@ -15027,6 +15061,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
@@ -15098,6 +15133,7 @@ mod tests {
             registrations_shed: AtomicU64::new(0),
             jobs_shed: AtomicU64::new(0),
             earners_shed: AtomicU64::new(0),
+            earners_evicted: AtomicU64::new(0),
         });
         let pay = test_address("pay");
         let resp = post_json(
