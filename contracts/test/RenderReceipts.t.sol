@@ -71,6 +71,10 @@ contract ReentrantFeeToken is ERC20 {
 contract MockEAS is IEAS {
     IEAS.AttestationRequest public lastRequest;
     uint256 public attestCalls;
+    // Separate from attestCalls so a batch test can prove issueReceipts took the multiAttest
+    // path (one call) and NOT N single attests.
+    uint256 public multiAttestCalls;
+    uint256 public lastBatchSize;
 
     // Flattened mirror of the last request so tests can read nested fields easily.
     bytes32 public lastSchema;
@@ -113,12 +117,42 @@ contract MockEAS is IEAS {
         lastRevokeSchema = request.schema;
     }
 
-    function multiAttest(IEAS.MultiAttestationRequest[] calldata)
+    /// @dev Mirrors `attest`'s per-element uid derivation so a batch-issued receipt is
+    ///      revocable (revoke checks `isAttested[uid]`) and predictable, and returns the
+    ///      flat uid[] across all groups in submission order — exactly the real EAS
+    ///      contract. RenderReceipts sends a single group, so the returned length equals
+    ///      that group's element count.
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata multiRequests)
         external
         payable
         returns (bytes32[] memory)
     {
-        revert("not implemented");
+        multiAttestCalls++;
+        uint256 total;
+        for (uint256 g = 0; g < multiRequests.length; g++) {
+            total += multiRequests[g].data.length;
+        }
+        lastBatchSize = total;
+
+        bytes32[] memory uids = new bytes32[](total);
+        uint256 k;
+        for (uint256 g = 0; g < multiRequests.length; g++) {
+            bytes32 schema = multiRequests[g].schema;
+            IEAS.AttestationRequestData[] calldata items = multiRequests[g].data;
+            for (uint256 i = 0; i < items.length; i++) {
+                bytes32 uid = keccak256(abi.encode(schema, items[i].recipient, items[i].data));
+                isAttested[uid] = true;
+                uids[k++] = uid;
+                lastSchema = schema;
+                lastRecipient = items[i].recipient;
+                lastExpirationTime = items[i].expirationTime;
+                lastRevocable = items[i].revocable;
+                lastRefUid = items[i].refUid;
+                lastData = items[i].data;
+                lastValue = items[i].value;
+            }
+        }
+        return uids;
     }
 }
 
