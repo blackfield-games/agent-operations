@@ -6082,6 +6082,7 @@ mod tests {
         assert_eq!(r["render_seconds"], 1, "the attested compute, exact");
         assert_eq!(r["job_kind"], 0, "JobKind::Terrain numeric");
         assert!(r["dead_lettered_at"].as_i64().unwrap() > 0, "the quarantine stamp is present");
+        assert_eq!(r["redrive_count"], 0, "a fresh dead-letter starts at 0");
     }
 
     /// FM2: the store listing is capped and oldest-first — a limit smaller than the
@@ -7048,6 +7049,63 @@ mod tests {
         assert_eq!(d["amount_wei"], "1000000000000", "DRAIN_RATE * 1, the persisted decimal string, exact");
         assert_eq!(d["buyer"], TEST_BUYER);
         assert!(d["dead_lettered_at"].as_i64().unwrap() > 0, "the quarantine stamp is present");
+        assert_eq!(d["redrive_count"], 0, "a fresh dead-letter starts at 0");
+    }
+
+    /// FM3: `redrive_count` is an ADDITIVE listing field — both listings still carry every
+    /// existing field in oldest-first order with an unchanged `total`/`truncated`, and a
+    /// re-driven-then-re-dead-lettered row shows its incremented count while a never-re-driven
+    /// row stays 0.
+    #[tokio::test]
+    async fn dead_letter_listings_reflect_an_incremented_redrive_count() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let older = seed_job();
+        let newer = seed_job();
+        settle_one_metered(&state, &older).await; // oldest → the head of the oldest-first listing
+        settle_one_metered(&state, &newer).await;
+        // Each metered settle accrues both a debit and a receipt; dead-letter both kinds.
+        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_attestations(&state, &relay_permanent_for(&[older.id, newer.id]), TEST_BATCH).await;
+        assert_eq!(dead_lettered_debits(&state).await, 2);
+        assert_eq!(dead_lettered_attestations(&state).await, 2);
+
+        // Re-drive only the older row of each kind, then re-dead-letter it (still failing).
+        {
+            let store = state.store.lock().await;
+            assert!(store.redrive_dead_lettered_debit(&older.id).unwrap());
+            assert!(store.redrive_dead_lettered_attestation(&older.id).unwrap());
+        }
+        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_attestations(&state, &relay_permanent_for(&[older.id]), TEST_BATCH).await;
+        assert_eq!(dead_lettered_debits(&state).await, 2, "older re-dead-lettered, both still stuck");
+        assert_eq!(dead_lettered_attestations(&state).await, 2);
+
+        // Debit listing: oldest-first, every existing field intact, older=1 / newer=0, total/truncated exact.
+        let debits = body_json(get(state.clone(), "/debits/dead-lettered").await).await;
+        assert_eq!(debits["total"], 2);
+        assert_eq!(debits["truncated"], false);
+        let d = debits["debits"].as_array().unwrap();
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0]["job_id"], older.id.to_string(), "oldest-first preserved");
+        assert_eq!(d[0]["redrive_count"], 1, "the re-driven row's incremented count");
+        assert_eq!(d[0]["buyer"], TEST_BUYER, "existing fields still serialized");
+        assert_eq!(d[0]["amount_wei"], "1000000000000");
+        assert!(d[0]["dead_lettered_at"].as_i64().unwrap() > 0);
+        assert_eq!(d[1]["job_id"], newer.id.to_string());
+        assert_eq!(d[1]["redrive_count"], 0, "the never-re-driven row stays 0");
+
+        // Receipt listing: same additive shape.
+        let receipts = body_json(get(state.clone(), "/receipts/dead-lettered").await).await;
+        assert_eq!(receipts["total"], 2);
+        assert_eq!(receipts["truncated"], false);
+        let r = receipts["receipts"].as_array().unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0]["job_id"], older.id.to_string(), "oldest-first preserved");
+        assert_eq!(r[0]["redrive_count"], 1, "the re-driven row's incremented count");
+        assert_eq!(r[0]["earner"], dev_address(), "existing fields still serialized");
+        assert_eq!(r[0]["render_seconds"], 1);
+        assert_eq!(r[1]["job_id"], newer.id.to_string());
+        assert_eq!(r[1]["redrive_count"], 0, "the never-re-driven row stays 0");
     }
 
     /// FM2: the drain must not hold the store mutex across the slow on-chain spend,
