@@ -131,6 +131,11 @@ struct MockInner {
     /// succeed) — models ONE already-on-chain receipt inside a reverted batch, so
     /// the fallback isolates it. Empty on the production dev path.
     already_issued_jobs: Vec<String>,
+    /// Specific `job_id`s whose single `submit` returns `Permanent` (the rest
+    /// succeed) — models ONE poison receipt (e.g. an unpayable region fee) inside a
+    /// reverted batch, so the fallback dead-letters it while the rest drain. Empty
+    /// on the production dev path.
+    permanent_jobs: Vec<String>,
     /// Fail `submit_batch` with `Reverted` (models the contract's atomic batch
     /// revert — one bad/duplicate element rolls the whole call back).
     batch_reverts: bool,
@@ -159,6 +164,7 @@ impl MockRelay {
                 permanent: false,
                 already_issued: false,
                 already_issued_jobs: Vec::new(),
+                permanent_jobs: Vec::new(),
                 batch_reverts: false,
                 batch_transient: false,
                 batch_permanent: false,
@@ -238,6 +244,14 @@ impl MockRelay {
         self
     }
 
+    /// Make this specific `job_id`'s single `submit` return `Permanent` (the rest
+    /// succeed) — one poison receipt for the fallback to dead-letter + isolate.
+    #[cfg(test)]
+    pub fn with_permanent_job(mut self, job_id: String) -> Self {
+        self.inner.get_mut().unwrap().permanent_jobs.push(job_id);
+        self
+    }
+
     /// Total `submit` calls so far.
     #[cfg(test)]
     pub fn calls(&self) -> usize {
@@ -287,7 +301,7 @@ impl Relay for MockRelay {
         }
         let mut inner = self.inner.lock().unwrap();
         inner.calls += 1;
-        if inner.permanent {
+        if inner.permanent || inner.permanent_jobs.contains(&att.job_id) {
             return Err(RelayError::Permanent("mock permanent".into()));
         }
         if inner.already_issued || inner.already_issued_jobs.contains(&att.job_id) {
@@ -434,6 +448,18 @@ mod tests {
         assert!(matches!(
             r.submit(&batch[0]).await,
             Err(RelayError::AlreadyIssued)
+        ));
+        assert!(r.submit(&batch[1]).await.is_ok(), "the rest still submit");
+        assert_eq!(r.submitted(), vec!["b"]);
+    }
+
+    #[tokio::test]
+    async fn submit_isolates_a_permanent_job() {
+        let r = MockRelay::succeeding().with_permanent_job("a".into());
+        let batch = atts(&["a", "b"]);
+        assert!(matches!(
+            r.submit(&batch[0]).await,
+            Err(RelayError::Permanent(_))
         ));
         assert!(r.submit(&batch[1]).await.is_ok(), "the rest still submit");
         assert_eq!(r.submitted(), vec!["b"]);
