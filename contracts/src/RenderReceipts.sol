@@ -154,6 +154,7 @@ contract RenderReceipts is Ownable2Step {
     error ZeroRegionAuthority();
     error ZeroFeeRate();
     error ZeroFeeToken();
+    error EmptyBatch();
 
     constructor(address eas_, address owner_, address regionAuthority_, uint256 renderFeeRate_)
         Ownable(owner_)
@@ -274,6 +275,111 @@ contract RenderReceipts is Ownable2Step {
             feeToken.forceApprove(address(regionAuthority), fee);
             regionAuthority.depositFees(regionTokenId, fee);
             emit RenderFeeRouted(jobId, regionTokenId, fee);
+        }
+    }
+
+    /// @notice One element of an `issueReceipts` batch — the same six fields `issueReceipt`
+    ///         takes positionally. A struct array (not six parallel vectors) so a batch can
+    ///         never be built with mismatched-length columns, the per-element fields stay
+    ///         grouped, and the call mirrors EAS's own `MultiAttestationRequest` shape.
+    struct ReceiptRequest {
+        address earner;
+        bytes32 jobId;
+        uint64 renderSeconds;
+        uint16 jobKind;
+        bytes32 outputHash;
+        bytes32 regionId;
+    }
+
+    /// @notice Issue render receipts for a batch of validated jobs in ONE transaction and
+    ///         ONE `EAS.multiAttest`, instead of N separate `issueReceipt` calls. Every
+    ///         per-job effect of `issueReceipt` applies PER ELEMENT — the `receiptIssued`
+    ///         fence, the live counters, the uid persisted against each job, and the region
+    ///         fee-share route — but amortized: a coordinator settling the N jobs that
+    ///         landed in one block pays one base tx cost and one attestation call.
+    ///
+    ///         An empty batch reverts (`EmptyBatch`) rather than silently attesting nothing
+    ///         — a zero-length call is a caller bug, not a no-op. Authorization and the
+    ///         schema gate are identical to `issueReceipt`.
+    ///
+    ///         Atomicity: every effect runs in this one tx, so ANY element reverting — a
+    ///         jobId already issued OR repeated within this batch (it hits the fence an
+    ///         earlier element set), or a claimed region whose fee the coordinator can't
+    ///         cover — rolls the WHOLE batch back. All-or-nothing: never some jobs
+    ///         attested-but-unpaid.
+    ///
+    ///         CEI mirrors `issueReceipt` and `MatchSettlement.settleFieldWager`: fence +
+    ///         credit every element and build the single `MultiAttestationRequest` BEFORE
+    ///         the external `multiAttest`; then persist each uid against its OWN jobId and
+    ///         emit — fully materializing every receipt — BEFORE routing any fee. So the
+    ///         same reentrancy reasoning as `issueReceipt` holds: the fences reject a
+    ///         reentrant re-issue, the `uid == 0` guard rejects a reentrant revoke, and
+    ///         `feeToken` is the trusted callback-free $BLCKFLD, never a coordinator.
+    function issueReceipts(ReceiptRequest[] calldata items) external returns (bytes32[] memory uids) {
+        if (!authorizedCoordinators[msg.sender]) revert NotAuthorized();
+        if (schemaUid == bytes32(0)) revert SchemaNotSet();
+
+        uint256 n = items.length;
+        if (n == 0) revert EmptyBatch();
+
+        // Phase 1 (checks + effects): fence each job, credit the counters, and build the one
+        // multiAttest payload. The fence is per ELEMENT, so a jobId repeated within the batch
+        // hits the receiptIssued flag the earlier element set and reverts — an intra-batch
+        // duplicate can never double-issue.
+        IEAS.AttestationRequestData[] memory data = new IEAS.AttestationRequestData[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            ReceiptRequest calldata it = items[i];
+            if (receiptIssued[it.jobId]) revert DuplicateReceipt(it.jobId);
+            receiptIssued[it.jobId] = true;
+            _receiptEarner[it.jobId] = it.earner;
+            ++receiptCount;
+            ++receiptsByEarner[it.earner];
+            data[i] = IEAS.AttestationRequestData({
+                recipient: it.earner,
+                expirationTime: 0,
+                revocable: true,
+                refUid: bytes32(0),
+                data: abi.encode(
+                    it.earner, it.jobId, it.renderSeconds, it.jobKind, it.outputHash, it.regionId
+                ),
+                value: 0
+            });
+        }
+
+        // Phase 2: one multiAttest for the whole batch. EAS returns the uids flat across the
+        // single group — exactly `n`, in submission order — so uids[i] is element i's. An
+        // indexed read of a short return reverts (atomic) rather than mis-mapping a job to a
+        // stale uid; the same trust placed in EAS.attest's single return by issueReceipt.
+        IEAS.MultiAttestationRequest[] memory requests = new IEAS.MultiAttestationRequest[](1);
+        requests[0] = IEAS.MultiAttestationRequest({schema: schemaUid, data: data});
+        uids = EAS.multiAttest(requests);
+
+        // Phase 3: persist each uid against its OWN jobId and emit, fully materializing every
+        // receipt before any fee token gets control (the batch twin of issueReceipt's
+        // set-uid-then-emit, run for the whole batch before phase 4).
+        for (uint256 i = 0; i < n; ++i) {
+            ReceiptRequest calldata it = items[i];
+            receiptUid[it.jobId] = uids[i];
+            emit ReceiptIssued(uids[i], it.earner, it.jobId, it.jobKind, it.renderSeconds);
+        }
+
+        // Phase 4: route each element's region fee-share LAST. Identical per-element policy
+        // to issueReceipt — fee = renderFeeRate * renderSeconds (checked mul), a zero fee or
+        // an unclaimed region skips the route (the attestation still stands), the fee is
+        // pulled from the issuing coordinator (msg.sender), and the allowance is set to
+        // exactly `fee` and fully consumed by depositFees. A claimed region the coordinator
+        // can't cover reverts the whole batch (nothing attested-but-unpaid). Per-job
+        // RenderFeeRouted events preserve the same audit trail as N single issues.
+        for (uint256 i = 0; i < n; ++i) {
+            ReceiptRequest calldata it = items[i];
+            uint256 fee = renderFeeRate * it.renderSeconds;
+            uint256 regionTokenId = uint256(it.regionId);
+            if (fee != 0 && regionAuthority.regionExists(regionTokenId)) {
+                feeToken.safeTransferFrom(msg.sender, address(this), fee);
+                feeToken.forceApprove(address(regionAuthority), fee);
+                regionAuthority.depositFees(regionTokenId, fee);
+                emit RenderFeeRouted(it.jobId, regionTokenId, fee);
+            }
         }
     }
 
