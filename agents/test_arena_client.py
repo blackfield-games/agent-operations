@@ -1135,6 +1135,9 @@ def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
         run_local_match("/no/such/harness", [0, 1], policies, mode="mixed")
     with pytest.raises(ValueError, match="human"):
         run_local_match("/no/such/harness", [0, 1], policies, mode="mixed", human_seats=[0, 1])
+    # An unknown mode is caught here, not as an opaque harness crash downstream.
+    with pytest.raises(ValueError, match="human, agent, or mixed"):
+        run_local_match("/no/such/harness", [0, 1], policies, mode="ranked", signing_keys={0: _DEV_KEY})
 
 
 def test_e2e_match_is_required_in_ci_not_skipped(monkeypatch):

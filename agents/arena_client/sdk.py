@@ -391,6 +391,8 @@ def run_local_match(
     humans = human_seats or []
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if mode is not None:
+        if mode not in ("human", "agent", "mixed"):
+            raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
         argv += ["--mode", mode]
         if mode == "agent":
             unkeyed = [s for s in seats if s not in keys]
