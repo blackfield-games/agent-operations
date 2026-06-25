@@ -1046,6 +1046,97 @@ def test_run_local_match_unranked_default_is_unchanged():
     assert empty[0].replay_hash == base[0].replay_hash
 
 
+def test_run_matchmade_agent_mode_forms_through_the_matchmaker():
+    # The headline: an Agent-mode match formed through the harness's arena-match
+    # Matchmaker, driven from the SDK. Both seats sign, the matchmaker admits each
+    # ranked identity, and a decisive match forms + settles. Forming is itself the
+    # proof — a rejected ranked join would raise HandshakeRejected before tick 0, and a
+    # sequential connect would DEADLOCK (the matchmaker withholds every Welcome until
+    # the last join), so a clean run is the proof the batched handshake works.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    salt = "00000000-0000-4000-8000-000000000000"
+    a = run_local_match(harness, [0, 1], policies, seed=5, match_id=salt, mode="agent", signing_keys=keys)
+    assert set(a) == {0, 1}
+    assert a[0] == a[1], "every seat sees the same canonical result"
+    assert 0 < a[0].final_tick < 3600
+    assert len([o for o in a[0].outcomes if o.alive_at_end]) == 1
+    assert len(a[0].replay_hash) == 64
+
+    # The matchmaker mints its OWN match id (Uuid::new_v4), not the argv salt the
+    # challenge nonce is derived from — so the formed match carries a fresh id, and a
+    # second run mints a DIFFERENT one (the matchmade path is non-deterministic by
+    # design, unlike the direct path). Both inequalities would fail were the SDK
+    # silently on the direct-seating path (which pins the id to the argv salt).
+    assert a[0].match_id != salt
+    b = run_local_match(harness, [0, 1], policies, seed=5, match_id=salt, mode="agent", signing_keys=keys)
+    assert b[0].match_id != a[0].match_id
+
+
+def test_run_matchmade_mode_none_is_byte_identical_to_the_direct_path():
+    # FM2: adding the mode param must not perturb the no-mode path. mode=None yields
+    # today's deterministic direct-seating result, replay hash incl., identical to the
+    # call with no mode argument at all.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    seed = 999
+    match_id = "44444444-2222-4333-8444-555555555555"
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    base = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id)
+    none = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id, mode=None)
+    assert none[0] == base[0]
+    assert none[0].replay_hash == base[0].replay_hash
+    assert none[0].match_id == match_id, "the direct path keeps the argv id, unlike the matchmade path"
+
+
+def test_run_matchmade_mixed_admits_a_casual_agent_alongside_a_human():
+    # FM3 (corrected): the Matchmaker never forms an all-one-kind Mixed match — it
+    # needs a human AND an agent (select_mixed/composition_ok). So the honest cross-play
+    # test is a token-less HUMAN seat (declared via human_seats) plus a token-less CASUAL
+    # agent: the casual seat is admitted (not forced to sign, not rejected) and the match
+    # forms. A ranked agent composes with a human the same way.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    casual = run_local_match(
+        harness, [0, 1], policies, seed=8, mode="mixed", human_seats=[0]
+    )
+    assert set(casual) == {0, 1}
+    assert 0 < casual[0].final_tick < 3600
+    assert len([o for o in casual[0].outcomes if o.alive_at_end]) == 1
+
+    ranked = run_local_match(
+        harness, [0, 1], policies, seed=8, mode="mixed", human_seats=[0], signing_keys={1: _DEV_KEY2}
+    )
+    assert set(ranked) == {0, 1}
+    assert 0 < ranked[0].final_tick < 3600
+
+
+def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
+    # FM1: a mode/composition the Matchmaker can never form must fail LOUD up front, not
+    # hang on a Welcome that never comes. These raise before the harness is spawned, so
+    # they need no toolchain and run everywhere. (A nonexistent harness path would error
+    # on spawn — that none does proves the guard precedes it.)
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    # Agent mode is ranked-only: an unkeyed seat would be Unauthenticated forever.
+    with pytest.raises(ValueError, match="ranked-only"):
+        run_local_match("/no/such/harness", [0, 1], policies, mode="agent")
+    with pytest.raises(ValueError, match="ranked-only"):
+        run_local_match("/no/such/harness", [0, 1], policies, mode="agent", signing_keys={0: _DEV_KEY})
+    # Mixed needs a human AND an agent: all-agent and all-human both refused.
+    with pytest.raises(ValueError, match="human"):
+        run_local_match("/no/such/harness", [0, 1], policies, mode="mixed")
+    with pytest.raises(ValueError, match="human"):
+        run_local_match("/no/such/harness", [0, 1], policies, mode="mixed", human_seats=[0, 1])
+
+
 def test_e2e_match_is_required_in_ci_not_skipped(monkeypatch):
     # FM1: with the harness absent but ARENA_E2E_REQUIRED set (CI / validate.sh),
     # the e2e match MUST be a hard failure, never a silent skip — else a broken A2A
