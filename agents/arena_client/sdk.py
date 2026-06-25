@@ -360,6 +360,8 @@ def run_local_match(
     match_id: str = "00000000-0000-4000-8000-000000000000",
     agent_ids: dict[int, str] | None = None,
     signing_keys: dict[int, bytes] | None = None,
+    mode: str | None = None,
+    human_seats: list[int] | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -372,22 +374,54 @@ def run_local_match(
     from the key and signs the challenge nonce, so the harness recovers the signer and
     admits the seat (the key overrides any `agent_ids` entry for that seat — the claim
     is always the address the key controls). Every other seat joins unranked under
-    `agent_ids` (default `agent-{s}`), so the no-key call is byte-identical to before."""
-    argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
+    `agent_ids` (default `agent-{s}`), so the no-key call is byte-identical to before.
+
+    `mode` ({"human","agent","mixed"}) routes formation through the harness's
+    arena-match Matchmaker (mode-gated, identity-verified) instead of seating the
+    roster directly; `mode=None` is the byte-identical direct path. Because the
+    Matchmaker forms only once the last seat joins, the harness withholds every Welcome
+    until all joins are in, so the matchmade path sends all joins first, then reads each
+    Welcome (a per-seat connect would deadlock). Agent mode is ranked-only — every seat
+    must be in `signing_keys` or its token-less join is Unauthenticated and no match
+    ever forms, so it is rejected up front. Mixed mode needs at least one `human_seats`
+    entry (a token-less human) AND at least one agent — the Matchmaker never forms an
+    all-one-kind Mixed match, so a human-less Mixed call is rejected up front."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
+    humans = human_seats or []
+    argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
+    if mode is not None:
+        argv += ["--mode", mode]
+        if mode == "agent":
+            unkeyed = [s for s in seats if s not in keys]
+            if unkeyed:
+                raise ValueError(f"agent mode is ranked-only; seats {unkeyed} need a signing key")
+        if mode == "mixed" and not (
+            any(s in humans for s in seats) and any(s not in humans for s in seats)
+        ):
+            raise ValueError("mixed mode forms a human+agent match; declare some (not all) seats human")
+        if humans:
+            argv += ["--human-seats", ",".join(str(s) for s in humans)]
     with SubprocessGateway(argv, timeout=timeout) as gateway:
         # The loopback harness blocks for one frame per seat per tick and enforces no
         # wall-clock, so the client must always answer — never drop a frame on a
-        # deadline (that is a real-transport behaviour and would deadlock here).
+        # deadline (that is a real-transport behaviour and would deadlock here). A seat
+        # declared human (Mixed) is token-less, so it joins unranked even if a stray key
+        # is present — the harness gates kind on --human-seats, not the signature.
         clients = {
             s: ArenaClient.ranked(SeatTransport(gateway, s), keys[s], enforce_deadline=False)
-            if s in keys
+            if s in keys and s not in humans
             else ArenaClient(SeatTransport(gateway, s), agent_id=ids[s], enforce_deadline=False)
             for s in seats
         }
-        for client in clients.values():
-            client.connect()
+        if mode is None:
+            for client in clients.values():
+                client.connect()
+        else:
+            for client in clients.values():
+                client.send_join()
+            for client in clients.values():
+                client.recv_welcome()
         results: dict[int, MatchResult] = {}
         while len(results) < len(seats):
             for seat, client in clients.items():
