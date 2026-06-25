@@ -57,6 +57,19 @@ from .proto import (
 Policy = Callable[[Observation], ActionIntent]
 
 
+class StatefulPolicy(Protocol):
+    """A `Policy` that also wants the match's STATIC map. `ArenaClient` calls
+    `on_match_start` exactly ONCE, after the handshake and before the first
+    `__call__`, with the cover + pickup layout — so a policy can plan around fixed
+    geometry the per-tick parity-bounded `Observation` deliberately omits. The hook is
+    OPTIONAL: a plain `Policy` callable without it runs unchanged, and the per-tick
+    decision still depends only on the `Observation` (the parity boundary is untouched —
+    `on_match_start` carries no live state, only the layout a human sees on the map)."""
+
+    def on_match_start(self, start: MatchStart) -> None: ...
+    def __call__(self, obs: Observation) -> ActionIntent: ...
+
+
 class Transport(Protocol):
     """One agent's connection to the Gateway: blocking recv of the next server
     frame and send of an agent frame, both as plain JSON-shaped dicts."""
@@ -134,6 +147,9 @@ class ArenaClient:
         self.result: MatchResult | None = None
         self.done = False
         self.connected = False
+        # Guards the one-shot on_match_start delivery: set on the first poll after
+        # connect so a map-aware policy is handed the static layout exactly once.
+        self._started = False
         self.rejections: list[str] = []
         self.forfeits = 0
 
@@ -225,6 +241,14 @@ class ArenaClient:
         marks the client done), else None. Connects lazily on first call."""
         if not self.connected:
             self.connect()
+        if not self._started:
+            # First frame after the handshake: hand a map-aware policy the static
+            # layout once, before any decision. A plain callable has no hook (degrade
+            # cleanly, never AttributeError) and is unaffected.
+            self._started = True
+            on_start = getattr(policy, "on_match_start", None)
+            if callable(on_start):
+                on_start(MatchStart(blockers=list(self.blockers), pickup_points=list(self.pickup_points)))
         msg = decode_gateway(self.transport.recv())
         if isinstance(msg, MatchResult):
             self.result = msg
