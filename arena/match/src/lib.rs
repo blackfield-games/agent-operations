@@ -262,6 +262,16 @@ pub struct MatchParams {
     /// out (unbounded — the exact pre-cap behaviour). Only the Agent (ranked) queue
     /// grows this map. Mirrors the mesh registration-bucket cap.
     pub max_pending_ranked: usize,
+    /// The server-authoritative combat [`Rules`] every formed match runs under — the
+    /// perception cone, memory window, weapon model, and the rest of the tuning the sim
+    /// clamps and resolves against. The matchmaker OWNS this (it is operator config set
+    /// at construction, never a joining seat's wire input), so a ranked/matchmade match
+    /// carries exactly the tuning a hand-seated direct match does. The default
+    /// [`Rules::default`] is the historical hardcoded ruleset, so an unconfigured
+    /// matchmaker forms matches byte-identical to the pre-rules-knob path; a deployment
+    /// that wants a perception-memory window (or an FOV cone, …) sets it here and every
+    /// formed match plays under it.
+    pub rules: Rules,
 }
 
 impl Default for MatchParams {
@@ -275,6 +285,7 @@ impl Default for MatchParams {
             arena: "",
             ranked_rating_tolerance: i32::MAX,
             max_pending_ranked: 4096,
+            rules: Rules::default(),
         }
     }
 }
@@ -654,10 +665,14 @@ impl<V: IdentityVerifier> Matchmaker<V> {
         // pickups) at formation; the empty/default key is byte-identical to the
         // pre-map-loading path, and an unknown key degrades to the empty arena.
         let map = arena_map(self.params.arena);
+        // Form under the matchmaker's configured Rules — the server-authoritative tuning
+        // carried on MatchParams — so a matchmade match runs the same perception cone,
+        // memory window, and weapon model a hand-seated direct match does. The default is
+        // Rules::default(), byte-identical to the formerly hardcoded ruleset.
         Match::new_with_pickups(
             match_id,
             config,
-            Rules::default(),
+            self.params.rules,
             seats,
             map.blockers,
             map.pickups,
@@ -2907,6 +2922,36 @@ mod tests {
         // panic, never a stray map.
         let replay = form_on("no-such-arena").into_replay();
         assert!(replay.blockers.is_empty() && replay.pickups.is_empty(), "an unknown arena is empty");
+    }
+
+    /// Form a 2-seat Human match under `rules` and hand back the built [`Match`] — the
+    /// rules twin of [`form_on`], for confirming the matchmaker forms under its configured
+    /// tuning rather than a hardcoded default.
+    fn form_under(rules: Rules) -> Match {
+        let mm = Matchmaker::new(StubIdentityVerifier::new(), MatchParams { rules, ..MatchParams::default() });
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        mm.join(MatchMode::Human, b"", JoinRequest::human("b")).unwrap().into_formed().unwrap()
+    }
+
+    #[test]
+    fn an_unconfigured_matchmaker_forms_under_default_rules() {
+        // FM1: the default MatchParams.rules is Rules::default(), so a matchmaker no one
+        // tuned forms a match byte-identical to the pre-rules-knob path — memory off,
+        // full-circle FOV, every combat constant at its historical default.
+        assert_eq!(form_under(Rules::default()).rules(), Rules::default());
+    }
+
+    #[test]
+    fn configured_matchparams_rules_reach_the_formed_match() {
+        // FM2: build() forms under self.params.rules, NOT a hardcoded Rules::default(), so a
+        // perception-memory window configured on the matchmaker reaches the sim the match
+        // runs — the seat memory an agent reads as an in_line_of_sight=false echo. This is
+        // what lets the --mode/ranked path carry the window the direct path already threads;
+        // the WHOLE ruleset crosses, not just the one field.
+        let rules = Rules { perception_memory_ticks: 30, ..Rules::default() };
+        let formed = form_under(rules);
+        assert_eq!(formed.rules().perception_memory_ticks, 30, "the configured window reached the formed match");
+        assert_eq!(formed.rules(), rules, "the WHOLE configured ruleset reached the match, not just one field");
     }
 
     #[test]
