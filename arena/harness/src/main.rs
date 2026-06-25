@@ -547,8 +547,8 @@ fn settle_finished(
 /// match plays like a hand-seated one. `seats_per_match == n` makes the match form
 /// exactly when the last seat joins, consuming the whole queue, so its roster is in seat
 /// (submission) order and the transport's envelope seat stays the match seat.
-fn matchmaker_params(args: &Args, n: u8) -> MatchParams {
-    MatchParams { seats_per_match: n, max_ticks: args.max_ticks, ..MatchParams::default() }
+fn matchmaker_params(n: u8, max_ticks: u64) -> MatchParams {
+    MatchParams { seats_per_match: n, max_ticks, ..MatchParams::default() }
 }
 
 /// Map a seat's Join (its claimed `agent_id` + `signature_hex`) to a matchmaker
@@ -625,7 +625,7 @@ fn handshake_matchmade(
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
 ) -> Match {
-    let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(args, n));
+    let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(n, args.max_ticks));
 
     for seat in 0..n {
         emit(out, seat, &GatewayMsg::Challenge { nonce: nonce_for(args.match_id, seat) });
@@ -1382,5 +1382,182 @@ mod tests {
             Some(Resolution::Win { winner: addr, reputation: None, replay_digest: replay.digest() }),
             "the verified ranked identity is credited, not the agent-1 roster label",
         );
+    }
+
+    // ===== arena-match Matchmaker entry (--mode) =====
+
+    use arena_match::JoinError;
+    use arena_proto::ControllerKind;
+
+    fn mode_args(seats: u8, mode: MatchMode, human_seats: Vec<SeatId>) -> Args {
+        Args { match_id: id(), seed: 0, seats, max_ticks: 4, settle_dev_mock: false, mode: Some(mode), human_seats }
+    }
+
+    /// A transport envelope carrying one seat's Join, exactly as the matchmade
+    /// handshake reads it off the pipe.
+    fn join_line(seat: SeatId, agent_id: &str, signature_hex: &str) -> String {
+        let frame = serde_json::to_value(AgentMsg::Join {
+            protocol_version: PROTOCOL_VERSION,
+            agent_id: agent_id.to_string(),
+            signature_hex: signature_hex.to_string(),
+        })
+        .unwrap();
+        serde_json::json!({ "seat": seat, "frame": frame }).to_string()
+    }
+
+    fn mm2() -> Matchmaker<SignatureVerifier> {
+        Matchmaker::new(SignatureVerifier, matchmaker_params(2, 4))
+    }
+
+    #[test]
+    fn parse_mode_maps_each_name() {
+        assert_eq!(parse_mode("human"), MatchMode::Human);
+        assert_eq!(parse_mode("agent"), MatchMode::Agent);
+        assert_eq!(parse_mode("mixed"), MatchMode::Mixed);
+    }
+
+    #[test]
+    fn matchmaker_params_mirror_the_direct_seating_config() {
+        // A matchmade match must play like a hand-seated one: same tick rate, bounds,
+        // free-for-all teams, empty arena — and seats_per_match == n so it forms exactly
+        // when the last seat joins (consuming the whole queue, rostered in seat order).
+        let p = matchmaker_params(3, 1234);
+        assert_eq!(p.seats_per_match, 3);
+        assert_eq!(p.max_ticks, 1234);
+        assert_eq!(p.tick_hz, 30);
+        assert_eq!(p.team_size, 1, "free-for-all, like the direct roster's team == seat");
+        assert_eq!(p.bounds, Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE });
+        assert_eq!(p.arena, "", "the empty arena, like the direct path's no-pickups match");
+    }
+
+    #[test]
+    fn join_request_for_infers_controller_kind_from_mode_and_signature() {
+        // Human mode: a token-less seat is a human; a SIGNED join is an agent intruder.
+        assert_eq!(join_request_for(MatchMode::Human, 0, &[], "h", "").kind, ControllerKind::Human);
+        let intruder = join_request_for(MatchMode::Human, 0, &[], "a", "deadbeef");
+        assert_eq!(intruder.kind, ControllerKind::Agent, "a signed join in human mode is the agent intruder");
+        // Agent mode: every seat is an agent — ranked iff a token is present.
+        let casual = join_request_for(MatchMode::Agent, 0, &[], "a", "");
+        assert_eq!((casual.kind, casual.token), (ControllerKind::Agent, None));
+        let ranked = join_request_for(MatchMode::Agent, 0, &[], "a", "ff");
+        assert_eq!(ranked.kind, ControllerKind::Agent);
+        assert_eq!(ranked.token.as_deref(), Some("ff"));
+        // Mixed: a declared human seat is human; any other is an agent (casual if token-less).
+        assert_eq!(join_request_for(MatchMode::Mixed, 0, &[0], "h", "").kind, ControllerKind::Human);
+        let casual_mixed = join_request_for(MatchMode::Mixed, 1, &[0], "a", "");
+        assert_eq!((casual_mixed.kind, casual_mixed.token), (ControllerKind::Agent, None));
+    }
+
+    #[test]
+    fn agent_mode_forms_an_authenticated_match_and_settles_to_the_verified_addresses() {
+        // FM1: the harness pumps the matchmaker's FORMED match — its own minted id, its
+        // verified-address roster IN SEAT ORDER — not a self-built Match on the challenge
+        // salt with agent-{i} labels. Two agents sign their seat's challenge;
+        // handshake_matchmade routes both through the Matchmaker and returns the formed
+        // match, which then pumps + settles.
+        let sk0 = join_key();
+        let sk1 = other_join_key();
+        let addr0 = address_from_verifying_key(sk0.verifying_key());
+        let addr1 = address_from_verifying_key(sk1.verifying_key());
+        let sig0 = sign_join_proof(&sk0, &addr0, nonce_for(id(), 0).as_bytes());
+        let sig1 = sign_join_proof(&sk1, &addr1, nonce_for(id(), 1).as_bytes());
+        let input = format!("{}\n{}\n", join_line(0, &addr0, &sig0), join_line(1, &addr1, &sig1));
+        let mut lines = io::BufReader::new(io::Cursor::new(input)).lines();
+        let mut out: Vec<u8> = Vec::new();
+        let args = mode_args(2, MatchMode::Agent, vec![]);
+
+        let mut m = handshake_matchmade(&args, MatchMode::Agent, 2, &None, &mut lines, &mut out);
+        let minted = m.match_id();
+        assert_ne!(minted, id(), "the formed match carries the matchmaker's minted id, not the challenge salt");
+        let stdout = String::from_utf8(out).unwrap();
+        assert!(stdout.contains(&minted.to_string()), "welcome/start announce the formed match id");
+
+        while m.phase() == MatchPhase::Live {
+            m.step(&BTreeMap::new());
+        }
+        let result = m.result().expect("ended").clone();
+        let replay = m.into_replay();
+        let controllers: Vec<&str> = replay.seats.iter().map(|s| s.controller.as_str()).collect();
+        assert_eq!(
+            controllers,
+            vec![addr0.as_str(), addr1.as_str()],
+            "the formed roster credits the verified addresses in seat order (seat i = the seat-i signer)",
+        );
+
+        let settler = MockSettler::default();
+        settle_match(&settler, &result, &replay, None).expect("a 2-seat match settles");
+        match settler.resolution(minted).expect("resolved") {
+            Resolution::Win { winner, .. } => {
+                assert!(winner == addr0 || winner == addr1, "the winner is a verified address: {winner}")
+            }
+            Resolution::Draw { .. } => {}
+            other => panic!("a played 1v1 settles Win or Draw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ranked_join_is_verified_against_the_seat_challenge_not_the_formed_id() {
+        // FM2: the matchmaker checks the signature against the per-connection CHALLENGE
+        // nonce passed to join() — the harness must hand it exactly the nonce it issued,
+        // never the id the matchmaker mints after admission. A signature over seat 0's
+        // nonce, presented under seat 1's, recovers a different address and is refused.
+        let sk = join_key();
+        let addr = address_from_verifying_key(sk.verifying_key());
+        let sig_over_seat0 = sign_join_proof(&sk, &addr, nonce_for(id(), 0).as_bytes());
+
+        let mm = mm2();
+        let matched = join_request_for(MatchMode::Agent, 0, &[], &addr, &sig_over_seat0);
+        assert!(
+            matches!(mm.join(MatchMode::Agent, nonce_for(id(), 0).as_bytes(), matched), Ok(JoinOutcome::Queued)),
+            "the signature over this seat's challenge is admitted",
+        );
+        let mismatched = join_request_for(MatchMode::Agent, 1, &[], &addr, &sig_over_seat0);
+        assert!(
+            matches!(
+                mm.join(MatchMode::Agent, nonce_for(id(), 1).as_bytes(), mismatched),
+                Err(JoinError::Unauthenticated { .. })
+            ),
+            "the same signature under a different challenge nonce is refused",
+        );
+    }
+
+    #[test]
+    fn human_mode_refuses_a_signed_agent_join() {
+        // FM3: a signed join in human-only mode is an agent presenting a ranked claim —
+        // refused WrongKindForMode, never seated, so a human match stays human.
+        let sk = join_key();
+        let addr = address_from_verifying_key(sk.verifying_key());
+        let sig = sign_join_proof(&sk, &addr, nonce_for(id(), 0).as_bytes());
+        let req = join_request_for(MatchMode::Human, 0, &[], &addr, &sig);
+        assert!(matches!(
+            mm2().join(MatchMode::Human, nonce_for(id(), 0).as_bytes(), req),
+            Err(JoinError::WrongKindForMode { kind: ControllerKind::Agent, mode: MatchMode::Human }),
+        ));
+    }
+
+    #[test]
+    fn agent_mode_refuses_a_token_less_join() {
+        // FM3: Agent mode is ranked-only — a token-less agent is unauthenticated and
+        // never reaches a ranked seat.
+        let req = join_request_for(MatchMode::Agent, 0, &[], "0xnobody", "");
+        assert!(matches!(
+            mm2().join(MatchMode::Agent, nonce_for(id(), 0).as_bytes(), req),
+            Err(JoinError::Unauthenticated { .. }),
+        ));
+    }
+
+    #[test]
+    fn mixed_mode_admits_a_token_less_agent_as_casual_and_forms_with_a_human() {
+        // FM3: a token-less agent in Mixed is admitted as a casual cross-play seat (not
+        // rejected), and a human + that casual agent forms a Mixed match.
+        let mm = mm2();
+        let human = join_request_for(MatchMode::Mixed, 0, &[0], "human-0", "");
+        assert!(
+            matches!(mm.join(MatchMode::Mixed, nonce_for(id(), 0).as_bytes(), human), Ok(JoinOutcome::Queued)),
+            "the human seat queues",
+        );
+        let casual = join_request_for(MatchMode::Mixed, 1, &[0], "agent-1", "");
+        let formed = mm.join(MatchMode::Mixed, nonce_for(id(), 1).as_bytes(), casual).expect("admitted casual");
+        assert!(formed.into_formed().is_some(), "a human + a casual agent forms a Mixed cross-play match");
     }
 }
