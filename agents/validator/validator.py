@@ -21,6 +21,7 @@ from pathlib import Path
 from common.types import WorldBrief, LayerSpec, ValidatorVerdict
 from prop import prop
 from biome import biome
+from lighting import lighting
 
 STYLE_SIM_THRESHOLD = 0.72
 
@@ -257,6 +258,17 @@ def _intent_attributions(
     off ``intent:factions`` and naming npc. It fires ONLY for a present archetype against a
     non-empty roster (an empty roster means npc legitimately fell back to its default, so
     the gate stays silent), preserving the FM1/FM2/FM3 contract above.
+
+    The lighting loop closes the fourth and last intent (``intent:beats``): lighting turns
+    the director's free-form mood line into atmospheric fog and, for every beat it MODELS,
+    emits a ``def Volume "Atmosphere"`` whose ``drivenBy`` lists those recognized tokens.
+    The gate recomputes the recognized set with lighting's OWN ``_recognized_beats`` (so it
+    can never demand an atmosphere for a beat lighting no longer models, nor miss one it
+    newly does) and rejects a well-formed lighting layer whose Atmosphere ``drivenBy`` does
+    not match it — a dropped volume or a desynced ``drivenBy`` — naming lighting off
+    ``intent:beats``. It fires ONLY when >=1 modeled beat is present (a beats line with no
+    modeled keyword imposes no atmosphere, so the pre-beats palette validates), holding the
+    same FM1/FM2/FM3 contract.
     """
     out: list[tuple[str, str]] = []
 
@@ -304,6 +316,36 @@ def _intent_attributions(
                     f"intent:factions unmet: npc spawned archetype "
                     f"{match.group(1)!r} not in the faction roster "
                     f"{sorted(set(roster))}; re-run npc",
+                ))
+
+    # The lighting loop closes the FOURTH and last intent (intent:beats): lighting turns the
+    # director's free-form mood line into atmospheric fog — the one director intent no other
+    # specialist consumes. When the line names >=1 beat lighting MODELS it emits a
+    # `def Volume "Atmosphere"` carrying `drivenBy = "<recognized tokens>"`; with no modeled
+    # beat it emits the bare pre-beats palette (no Atmosphere). So a non-empty recognized set
+    # demands an Atmosphere driven by exactly those tokens — a stale lighting layer (authored
+    # before beats drove fog) or a desynced/tampered drivenBy is the violation, named lighting.
+    # `recognized` is computed with lighting's OWN _recognized_beats so the gate tracks
+    # lighting's vocabulary in lock-step (a BEAT_FOG_DENSITY change can't desync it). beats is
+    # free-form, not a comma-list, so _director_intent's comma-split is rejoined into one line
+    # for the recognizer — lossless, since _recognized_beats re-tokenizes on every
+    # non-alphanumeric (comma included), so the split-then-join round-trips to the raw line.
+    recognized = lighting._recognized_beats(" ".join(_director_intent(layers, layers_root, "beats")))
+    if recognized:
+        lighting_text = _layer_text(layers, "lighting", layers_root)
+        if lighting_text is not None:
+            atmosphere = re.search(r'def Volume "Atmosphere"\s*\{(.*?)\}', lighting_text, re.DOTALL)
+            driven = re.search(r'drivenBy\s*=\s*"([^"]*)"', atmosphere.group(1)) if atmosphere else None
+            recorded = {t for t in driven.group(1).split(",") if t} if driven else set()
+            if recorded != set(recognized):
+                out.append((
+                    # Names lighting (route-back target) but no pipeline-earlier specialist,
+                    # keyed off intent:beats — the text-scan fallback agrees with the
+                    # structured attribution, mirroring the prop/biome/npc messages.
+                    "lighting",
+                    f"intent:beats unmet: lighting must drive an Atmosphere volume from "
+                    f"recognized beats {recognized} but its layer records drivenBy "
+                    f"{sorted(recorded)}; re-run lighting",
                 ))
     return out
 
