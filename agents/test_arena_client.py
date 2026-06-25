@@ -811,13 +811,20 @@ def test_downed_seat_answers_with_passive_hold():
 
 
 def _make_obs(x, y, ammo=30, alive=True, team=0, facing=0, visible=()):
+    # A visible entry is (eid, team, x, y) — in line of sight — or (eid, team, x, y, los)
+    # to pin a perception-memory echo (los=False), the last-known position of a lost enemy.
+    def _entry(item):
+        eid, t, ex, ey, *rest = item
+        los = rest[0] if rest else True
+        return {"entity_id": eid, "kind": "player", "team": t, "position": {"x": ex, "y": ey},
+                "z": 0, "facing": 0, "in_line_of_sight": los}
+
     return Observation.model_validate({
         "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 0,
         "phase": "live", "deadline_micros": 50_000,
         "own": {"seat": 0, "team": team, "position": {"x": x, "y": y}, "z": 0, "facing": facing,
                 "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": ammo, "cooldown": 0, "dash_cooldown": 0, "alive": alive},
-        "visible": [{"entity_id": eid, "kind": "player", "team": t, "position": {"x": ex, "y": ey},
-                     "z": 0, "facing": 0, "in_line_of_sight": True} for (eid, t, ex, ey) in visible],
+        "visible": [_entry(v) for v in visible],
     })
 
 
@@ -871,6 +878,39 @@ def test_baseline_ignores_allies():
     intent = BaselinePolicy()(obs)
     assert intent.buttons.fire is False
     assert intent.move_dir.x < 0  # toward centre, since no ENEMY is in sight
+
+
+def test_baseline_does_not_fire_at_a_remembered_ghost():
+    # FM2: the only enemy is a perception-memory echo (in_line_of_sight=False) due
+    # east — the last-known position of a lost enemy. The baseline moves to re-acquire
+    # it but never fires at the stale position (a shot there can't land, only burns ammo).
+    obs = _make_obs(0, 0, team=0, visible=[(1, 1, 5000, 0, False)])
+    intent = BaselinePolicy()(obs)
+    assert intent.buttons.fire is False  # no blind fire at a ghost
+    assert intent.aim == 0  # but advance to re-acquire (east, toward the last-known spot)
+    assert intent.move_dir == Vec2(x=1000, y=0)  # not a passive hold — close the distance
+
+
+def test_baseline_prefers_a_live_target_over_a_nearer_ghost():
+    # FM3: a closer ghost (north, out of sight) and a farther LIVE enemy (east, in
+    # sight). The baseline fires at the LIVE one even though the ghost is nearer —
+    # firing at the nearer echo would waste the shot.
+    obs = _make_obs(0, 0, team=0, visible=[(1, 1, 0, 1000, False), (2, 1, 5000, 0, True)])
+    intent = BaselinePolicy()(obs)
+    assert intent.buttons.fire is True
+    assert intent.aim == 0  # east, at the live enemy — not 16384 (north, the nearer ghost)
+    assert intent.move_dir.x > 0 and intent.move_dir.y == 0
+
+
+def test_baseline_default_play_is_byte_identical_when_all_in_sight():
+    # FM1: with perception memory off every enemy is in_line_of_sight=True, so the
+    # live branch alone decides and the decision matches the range-only baseline — a
+    # 4-tuple visible entry (los defaulting True) fires exactly as before.
+    obs = _make_obs(0, 0, team=0, visible=[(1, 1, 5000, 0), (2, 1, 0, 3000)])
+    intent = BaselinePolicy()(obs)
+    assert intent.aim == 16384  # north, the nearer enemy — unchanged from before
+    assert intent.buttons.fire is True
+    assert intent.move_dir.y > 0 and intent.move_dir.x == 0
 
 
 def test_baseline_move_is_always_legal_and_deterministic():
