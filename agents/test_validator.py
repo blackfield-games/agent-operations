@@ -20,6 +20,7 @@ from common.types import LayerSpec, RegionCoord, WorldBrief
 from lighting import lighting
 from npc import npc
 from optimization import optimization
+from prop import prop
 from runtime.supervisor import _failing_specialist, _route_back_target
 from terrain import terrain
 from validator import validator
@@ -978,16 +979,20 @@ def _lighting_body(driven_by: list[str] | None = None, density: float | None = N
     )
 
 
-def _prop_body(required_assets: list[str]) -> str:
+def _prop_body(required_assets: list[str], placement_count: int | None = None) -> str:
     """A prop layer placing one Required prim per asset (the `requiredAsset` marker the
-    gate keys on), beside the fill PointInstancer — mirroring prop._required_block."""
+    gate keys on), beside the fill PointInstancer (propAsset `barricade_01`) — mirroring
+    prop._required_block. `placementCount` is opt-in (omit ⇒ the triangle self-consistency
+    gate can't re-derive the metric and skips the layer, so the intent fixtures that don't
+    declare a count degrade-skip it); pass `placement_count` for the triangle fixtures."""
     prims = "".join(
         f'\ndef Xform "Required_{i}"\n{{\n    custom string requiredAsset = "{a}"\n}}\n'
         for i, a in enumerate(required_assets)
     )
+    count_line = f"\n    custom int placementCount = {placement_count}" if placement_count is not None else ""
     return (
         '#usda 1.0\n(\n    defaultPrim = "Props"\n)\n\n'
-        'def PointInstancer "Props"\n{\n    custom string propAsset = "barricade_01"\n}\n'
+        f'def PointInstancer "Props"\n{{\n    custom string propAsset = "barricade_01"{count_line}\n}}\n'
         + prims
     )
 
@@ -1738,3 +1743,118 @@ async def test_run_rejects_a_stale_npc_metric_and_routes_to_npc(tmp_path):
     assert "npc" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "npc"
     assert _route_back_target(verdict) == "npc"
+
+
+# ---- prop placement triangle self-consistency: the metric must match count*fill + Σ required ------
+#
+# The placement-emitter sibling of the terrain/biome/npc gates, but prop's metric is a fill TERM plus
+# a variable REQUIRED-ASSET SUM (count*_asset_tris(propAsset) + Σ _asset_tris(requiredAsset)). The
+# gate re-derives both from the body and rejects a mismatch, naming prop. The fixed fill is
+# barricade_01 (1500 tris); an asset absent from ASSET_TRIS is reported once (no _asset_tris raise).
+
+
+def _prop_spec(triangles: float) -> LayerSpec:
+    return LayerSpec(
+        specialist="prop", region_id=REGION, path=f"prop/{REGION}.usda",
+        summary="t", metrics={"triangles": triangles},
+    )
+
+
+def _prop_expected(count: int, required: list[str]) -> float:
+    return float(count * prop._asset_tris("barricade_01") + sum(prop._asset_tris(a) for a in required))
+
+
+def test_prop_triangle_consistency_accepts_a_metric_matching_its_placements():
+    # FM1 (no false reject): metric == count*fill + Σ required — both the scatter fill and the
+    # must-have heroes summed, nothing to report.
+    count, required = 8, ["comms_tower_01", "convoy_wreck_01"]
+    spec = _prop_spec(_prop_expected(count, required))
+    assert validator._prop_triangle_consistency(spec, _prop_body(required, placement_count=count)) == []
+
+
+def test_prop_triangle_consistency_rejects_a_metric_that_disagrees():
+    # FM2 (missed violation): a metric desynced from count*fill + Σ required (a stale count or a
+    # required set changed under a re-rostered director) is reported once, naming prop.
+    count, required = 8, ["comms_tower_01"]
+    bad = _prop_expected(count, required) - 3000.0
+    issues = validator._prop_triangle_consistency(_prop_spec(bad), _prop_body(required, placement_count=count))
+    assert len(issues) == 1 and "prop" in issues[0] and "triangles metric" in issues[0]
+
+
+def test_prop_triangle_consistency_skips_an_unverifiable_body():
+    # FM3 (degrade, silent): a body missing placementCount or propAsset, or with a negative/non-integer
+    # count, leaves the metric unverifiable — SKIP. The intent fixtures (no placementCount) ride this.
+    spec = _prop_spec(96000.0)
+    assert validator._prop_triangle_consistency(spec, _prop_body(["comms_tower_01"])) == []  # no count
+    assert validator._prop_triangle_consistency(spec, _prop_body(["comms_tower_01"], placement_count=-2)) == []
+    no_propasset = (
+        '#usda 1.0\n(\n    defaultPrim = "Props"\n)\n\n'
+        'def PointInstancer "Props"\n{\n    custom int placementCount = 5\n}\n'
+    )
+    assert validator._prop_triangle_consistency(spec, no_propasset) == []
+
+
+def test_prop_triangle_consistency_reports_an_unbudgetable_asset_once_without_raising():
+    # FM3 (unknown asset): a placed asset (here a required hero) not in ASSET_TRIS can't be budgeted —
+    # prop.run would have raised at emission. The gate REPORTS it once (membership checked BEFORE
+    # _asset_tris, so the helper's KeyError never escapes through run()), never skips or crashes.
+    assert "phantom_01" not in prop.ASSET_TRIS  # premise
+    issues = validator._prop_triangle_consistency(
+        _prop_spec(50000.0), _prop_body(["phantom_01"], placement_count=5)
+    )
+    assert len(issues) == 1 and "prop" in issues[0] and "ASSET_TRIS" in issues[0]
+
+
+def test_prop_triangle_consistency_tracks_the_per_asset_budget_in_lock_step():
+    # FM4 (vocabulary desync): the expectation recomputes via prop._asset_tris over BOTH the fill and
+    # the required sum, never a copied table — so a per-asset budget change flips the fixture in lock-
+    # step. A heavier required set at the same count meters more; the gate accepts each and rejects
+    # the crossed pair (a light metric against a heavier required body).
+    count = 4
+    light = _prop_spec(_prop_expected(count, ["ammo_crate_01"]))
+    heavy = _prop_spec(_prop_expected(count, ["comms_tower_01"]))
+    assert validator._prop_triangle_consistency(light, _prop_body(["ammo_crate_01"], placement_count=count)) == []
+    assert validator._prop_triangle_consistency(heavy, _prop_body(["comms_tower_01"], placement_count=count)) == []
+    assert validator._prop_triangle_consistency(light, _prop_body(["comms_tower_01"], placement_count=count)) != []
+
+
+def _prop_metric_set(root: Path, *, placement_count, required, prop_tris: float) -> list[LayerSpec]:
+    """A full well-formed set with prop declaring `placement_count` × the fill + `required` heroes and
+    metering `prop_tris`, the optimization body re-synced to the resulting summed geometry so the
+    budget gate stays silent — only the prop triangle self-consistency check is exercised."""
+    summed = 262144.0 + 100000.0 + 144000.0 + prop_tris  # terrain + biome + npc + prop metrics
+    out: list[LayerSpec] = []
+    for s in SPECIALISTS:
+        if s == "prop":
+            out.append(
+                _layer(root, "prop", body=_prop_body(required, placement_count=placement_count), metrics={"triangles": prop_tris})
+            )
+        elif s == "optimization":
+            body = _opt_body(authored=summed, observed=summed, over_budget=False)
+            out.append(_layer(root, "optimization", body=body, metrics={"over_budget": 0.0}))
+        else:
+            out.append(_layer(root, s))
+    return out
+
+
+async def test_run_accepts_a_prop_metric_consistent_with_its_placements(tmp_path):
+    # FM1 at run() level: a correct world (prop metric == count*fill + Σ required, optimizer re-synced)
+    # validates clean — the new gate adds no false rejection.
+    count, required = 8, ["comms_tower_01", "convoy_wreck_01"]
+    layers = _prop_metric_set(tmp_path, placement_count=count, required=required, prop_tris=_prop_expected(count, required))
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_rejects_a_stale_prop_metric_and_routes_to_prop(tmp_path):
+    # FM2 at run() level: prop's metric is stale/tampered, the optimizer body re-synced to it so the
+    # BUDGET gate stays silent — prop is the ONLY issue (no double-report) and route-back targets it.
+    count, required = 8, ["comms_tower_01"]
+    prop_tris = _prop_expected(count, required) + 4000.0
+    layers = _prop_metric_set(tmp_path, placement_count=count, required=required, prop_tris=prop_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("prop" in i and "triangles metric" in i for i in verdict.issues)
+    assert "prop" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "prop"
+    assert _route_back_target(verdict) == "prop"
