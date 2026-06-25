@@ -18,6 +18,7 @@ from pathlib import Path
 from biome import biome
 from common.types import LayerSpec, RegionCoord, WorldBrief
 from lighting import lighting
+from npc import npc
 from optimization import optimization
 from runtime.supervisor import _failing_specialist, _route_back_target
 from terrain import terrain
@@ -1623,3 +1624,117 @@ async def test_run_rejects_a_stale_biome_metric_and_routes_to_biome(tmp_path):
     assert "biome" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "biome"
     assert _route_back_target(verdict) == "biome"
+
+
+# ---- npc character triangle self-consistency: the metric must match spawnCount × _character_tris --
+#
+# The character-emitter sibling of the terrain/biome triangle gates: _budget_self_consistency SUMS
+# npc's `triangles` metric trusting it, so a stale/tampered npc metric corrupts the budget sum. The
+# gate re-derives spawnCount × npc._character_tris(archetype) from the body and rejects a mismatch,
+# naming npc. Unlike terrain/biome (one numeric field), npc needs BOTH spawnCount AND a budgetable
+# archetype — an unknown archetype is reported once (membership checked before _character_tris, so
+# its KeyError never escapes through run()).
+
+
+def _npc_spec(triangles: float) -> LayerSpec:
+    return LayerSpec(
+        specialist="npc", region_id=REGION, path=f"npc/{REGION}.usda",
+        summary="t", metrics={"triangles": triangles},
+    )
+
+
+def test_npc_triangle_consistency_accepts_a_metric_matching_its_spawn_and_archetype():
+    # FM1 (no false reject): metric == spawnCount × _character_tris(archetype) — nothing to report.
+    count, archetype = 8, "raider"
+    spec = _npc_spec(float(count * npc._character_tris(archetype)))
+    assert validator._npc_triangle_consistency(spec, _npc_body(archetype, spawn_count=count)) == []
+
+
+def test_npc_triangle_consistency_rejects_a_metric_that_disagrees():
+    # FM2 (missed violation): a metric desynced from spawnCount × _character_tris (a stale count, or
+    # a metric not updated when the archetype changed under a re-rostered director) is reported once,
+    # naming npc.
+    count, archetype = 8, "raider"
+    bad = float(count * npc._character_tris(archetype)) - 5000.0
+    issues = validator._npc_triangle_consistency(_npc_spec(bad), _npc_body(archetype, spawn_count=count))
+    assert len(issues) == 1 and "npc" in issues[0] and "triangles metric" in issues[0]
+
+
+def test_npc_triangle_consistency_skips_an_unverifiable_body():
+    # FM3 (degrade, silent): a body missing spawnCount or archetype, or with a negative/non-integer
+    # count, leaves the metric unverifiable — SKIP (field-presence is the schema gate's job), never
+    # crash. The factions-suite npc bodies (no spawnCount) ride this branch and stay green.
+    spec = _npc_spec(144000.0)
+    assert validator._npc_triangle_consistency(spec, _npc_body("raider")) == []  # no spawnCount
+    assert validator._npc_triangle_consistency(spec, _npc_body("raider", spawn_count=-3)) == []
+    no_archetype = (
+        '#usda 1.0\n(\n    defaultPrim = "NPCs"\n)\n\n'
+        'def Xform "NPCs"\n{\n    custom int spawnCount = 6\n}\n'
+    )
+    assert validator._npc_triangle_consistency(spec, no_archetype) == []
+
+
+def test_npc_triangle_consistency_reports_an_unbudgetable_archetype_once_without_raising():
+    # FM3 (unknown archetype): an archetype not in CHARACTER_TRIS can't be budgeted — npc.run would
+    # have raised at emission. The gate REPORTS it once (membership checked BEFORE _character_tris, so
+    # the helper's KeyError never escapes through run()), never skips or crashes.
+    assert "wraith" not in npc.CHARACTER_TRIS  # premise
+    issues = validator._npc_triangle_consistency(_npc_spec(50000.0), _npc_body("wraith", spawn_count=6))
+    assert len(issues) == 1 and "npc" in issues[0] and "CHARACTER_TRIS" in issues[0]
+
+
+def test_npc_triangle_consistency_tracks_the_per_archetype_budget_in_lock_step():
+    # FM4 (vocabulary desync): the expectation recomputes via npc._character_tris, never a copied
+    # table — so a per-archetype budget change flips the fixture in lock-step. A heavier archetype at
+    # the same count meters more triangles; the gate accepts each at its own budget and rejects the
+    # crossed pair (a light metric against a heavy archetype's body).
+    count = 6
+    light = _npc_spec(float(count * npc._character_tris("drone")))
+    heavy = _npc_spec(float(count * npc._character_tris("sentinel")))
+    assert validator._npc_triangle_consistency(light, _npc_body("drone", spawn_count=count)) == []
+    assert validator._npc_triangle_consistency(heavy, _npc_body("sentinel", spawn_count=count)) == []
+    assert validator._npc_triangle_consistency(light, _npc_body("sentinel", spawn_count=count)) != []
+
+
+def _npc_metric_set(root: Path, *, spawn_count, archetype, npc_tris: float) -> list[LayerSpec]:
+    """A full well-formed set with npc declaring `spawn_count` × `archetype` and metering `npc_tris`,
+    the optimization body re-synced to the resulting summed geometry so the budget gate stays silent
+    — only the npc triangle self-consistency check is exercised (no double-report)."""
+    summed = 262144.0 + 100000.0 + 96000.0 + npc_tris  # terrain + biome + prop + npc metrics
+    out: list[LayerSpec] = []
+    for s in SPECIALISTS:
+        if s == "npc":
+            out.append(
+                _layer(root, "npc", body=_npc_body(archetype, spawn_count=spawn_count), metrics={"triangles": npc_tris})
+            )
+        elif s == "optimization":
+            body = _opt_body(authored=summed, observed=summed, over_budget=False)
+            out.append(_layer(root, "optimization", body=body, metrics={"over_budget": 0.0}))
+        else:
+            out.append(_layer(root, s))
+    return out
+
+
+async def test_run_accepts_an_npc_metric_consistent_with_its_spawn_and_archetype(tmp_path):
+    # FM1 at run() level: a correct world (npc metric == spawnCount × _character_tris, optimizer body
+    # re-synced) validates clean — the new gate adds no false rejection.
+    count, archetype = 8, "raider"
+    npc_tris = float(count * npc._character_tris(archetype))
+    layers = _npc_metric_set(tmp_path, spawn_count=count, archetype=archetype, npc_tris=npc_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_rejects_a_stale_npc_metric_and_routes_to_npc(tmp_path):
+    # FM2 at run() level: npc's metric is stale/tampered (doesn't match its spawnCount × archetype),
+    # the optimizer body re-synced to that metric so the BUDGET gate stays silent — npc is the ONLY
+    # issue (no double-report) and route-back targets it.
+    count, archetype = 8, "raider"
+    npc_tris = float(count * npc._character_tris(archetype)) + 7000.0
+    layers = _npc_metric_set(tmp_path, spawn_count=count, archetype=archetype, npc_tris=npc_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("npc" in i and "triangles metric" in i for i in verdict.issues)
+    assert "npc" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "npc"
+    assert _route_back_target(verdict) == "npc"
