@@ -206,6 +206,19 @@ async def run(
             issues.append(message)
             failing.add("npc")
 
+    # Prop placement triangle self-consistency — the placement-emitter sibling of the terrain/biome/
+    # npc gates above. prop meters count*_asset_tris(propAsset) + sum(_asset_tris(a) for a in the
+    # requiredAsset markers); the budget gate SUMS that metric trusting it, so a stale/tampered prop
+    # metric corrupts the sum. Re-derive from the emitted placementCount + propAsset + requiredAssets
+    # and reject a mismatch, routing back to prop. Same trust preconditions as terrain/biome/npc; a
+    # body missing placementCount/propAsset is skipped, an unbudgetable asset is reported once.
+    prop_layer = next((layer for layer in layers if layer.specialist == "prop"), None)
+    if prop_layer is not None and metrics_ok and prop_layer in wellformed:
+        prop_text = (layers_root / prop_layer.path).read_text()
+        for message in _prop_triangle_consistency(prop_layer, prop_text):
+            issues.append(message)
+            failing.add("prop")
+
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
     # one defines, and the layers still open individually while the composed stage
@@ -697,6 +710,51 @@ def _npc_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
         f"npc layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} its body "
         f"declares ({int(count)} x {name} @ {npc._character_tris(name)} tris each) "
         f"— a stale or tampered npc metric; re-run npc"
+    ]
+
+
+def _prop_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
+    """Why prop's reported ``triangles`` metric disagrees with the placement geometry its body
+    declares, or [] when they agree — the placement-emitter sibling of the terrain/biome/npc
+    triangle gates over the same geometry trust boundary.
+
+    prop meters ``placementCount * _asset_tris(propAsset)`` (the hash-selected FILL asset placed
+    ``count`` times) PLUS ``sum(_asset_tris(a) for a in requiredAssets)`` (one of each director-
+    required hero, emitted as ``requiredAsset`` markers) — a fill term plus a variable required sum,
+    unlike the others' single term. ``_budget_self_consistency`` SUMS this metric in trusting it, so
+    a STALE (pre-route-back count/required-set) or tampered prop metric silently corrupts the budget
+    sum. Re-derive from the body's ``placementCount`` + ``propAsset`` + every ``requiredAsset`` marker
+    — reusing ``prop._asset_tris`` / ``prop.ASSET_TRIS`` so a per-asset budget change tracks in lock-
+    step — and reject a mismatch, naming prop so route-back targets it. Needs the fill fields to
+    verify: an absent/negative/non-integer ``placementCount`` or an absent ``propAsset`` leaves the
+    metric unverifiable and is SKIPPED (field-presence is the schema gate's concern; the real
+    ``prop.run`` always emits both, and an empty required set is legal — a region with no must-have).
+    Any placed asset (fill or required) absent from ``ASSET_TRIS`` cannot be budgeted — ``prop.run``
+    would have raised at emission — so it is REPORTED (once), membership checked BEFORE
+    ``_asset_tris`` so its ``KeyError`` never escapes through ``run()``. The reported metric is read
+    straight from ``layer.metrics`` (finite by the caller's metrics_ok precondition)."""
+    count = _opt_number(text, "placementCount")
+    fill = re.search(r'propAsset\s*=\s*"([^"]*)"', text)
+    if count is None or count < 0 or count != int(count) or fill is None:
+        return []
+    required = re.findall(r'requiredAsset\s*=\s*"([^"]*)"', text)
+    placed = [fill.group(1), *required]
+    unknown = [asset for asset in placed if asset not in prop.ASSET_TRIS]
+    if unknown:
+        return [
+            f"prop layer {layer.path} places asset(s) {unknown} with no triangle budget in "
+            f"ASSET_TRIS — unbudgetable props; re-run prop"
+        ]
+    reported = layer.metrics.get("triangles", 0.0)
+    expected = float(
+        int(count) * prop._asset_tris(fill.group(1)) + sum(prop._asset_tris(a) for a in required)
+    )
+    if math.isclose(reported, expected, rel_tol=1e-9, abs_tol=1e-6):
+        return []
+    return [
+        f"prop layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} its body "
+        f"declares ({int(count)} x {fill.group(1)} + must-have {required}) "
+        f"— a stale or tampered prop metric; re-run prop"
     ]
 
 
