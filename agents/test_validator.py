@@ -987,13 +987,18 @@ def _prop_body(required_assets: list[str]) -> str:
     )
 
 
-def _biome_body(*, capped: bool) -> str:
+def _biome_body(*, capped: bool, instance_count: int | None = None) -> str:
     """A biome layer that emits the vegetationCapped marker iff `capped` — mirroring
-    biome.run's cap_line."""
+    biome.run's cap_line. `instance_count`, when given, emits the `instanceCount` field
+    biome.run meters its triangle count off; omitted (the default) it models the
+    placeholder bodies the intent/composition tests use, which the triangle gate skips
+    (no count to re-derive from) exactly like terrain's no-gridResolution placeholders."""
     cap = "\n    custom bool vegetationCapped = true" if capped else ""
+    count = f"\n    custom int instanceCount = {instance_count}" if instance_count is not None else ""
     return (
         '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\n'
-        f'def PointInstancer "Scatter"\n{{\n    custom int instanceCount = 100{cap}\n}}\n'
+        f'def PointInstancer "Scatter"\n{{\n    custom string scatterRule = "post_conflict_sparse"'
+        f"{count}{cap}\n}}\n"
     )
 
 
