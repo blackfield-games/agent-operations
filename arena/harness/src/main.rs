@@ -27,8 +27,9 @@ use arena_core::{
     ranked_delta, ranked_field_delta, settlement, Match, Rules, SeatDelta, Settlement, DEFAULT_RATING,
 };
 use arena_proto::{
-    check_version, ActionIntent, AgentMsg, GatewayMsg, MatchConfig, MatchPhase, MatchResult,
-    ReplayRecord, SeatId, SeatInfo, Vec2, POSITION_SCALE, PROTOCOL_VERSION,
+    check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
+    MatchConfig, MatchPhase, MatchResult, ReplayRecord, SeatId, SeatInfo, Vec2, POSITION_SCALE,
+    PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -83,6 +84,20 @@ fn nonce_for(match_id: Uuid, seat: SeatId) -> String {
     let mut bytes = match_id.as_bytes().to_vec();
     bytes.push(seat);
     hex::encode(bytes)
+}
+
+/// The harness's ranked-admission gate — the loopback twin of `arena-match`'s
+/// production identity verifier and the networked Gateway. An EMPTY `signature_hex`
+/// is an unranked seat (the baseline's default — admitted with no proof); a
+/// non-empty one MUST recover to `agent_id` over `nonce` through the same
+/// [`verify_join_signature`] the contract-backed admission uses. So the loopback
+/// admits unranked play AND validly-signed ranked play, and refuses only a
+/// PRESENTED-but-invalid signature — it never silently seats a forged identity.
+fn admit_join(agent_id: &str, nonce: &[u8], signature_hex: &str) -> Result<(), JoinVerifyError> {
+    if signature_hex.is_empty() {
+        return Ok(());
+    }
+    verify_join_signature(PROTOCOL_VERSION, agent_id, nonce, signature_hex)
 }
 
 fn emit(out: &mut impl Write, seat: SeatId, msg: &GatewayMsg) {
@@ -425,7 +440,7 @@ fn main() {
     for _ in 0..n {
         let line = next_line(&mut lines);
         let (seat, msg) = read_agent(&line);
-        let AgentMsg::Join { protocol_version, .. } = msg else {
+        let AgentMsg::Join { protocol_version, agent_id, signature_hex } = msg else {
             panic!("expected a join during the handshake");
         };
         if check_version(protocol_version).is_err() {
@@ -444,6 +459,28 @@ fn main() {
                 // refund, no result committed — exactly MatchSettlement.cancelMatch.
                 eprintln!(
                     "[settle-dev-mock] {} cancel (handshake version mismatch): {:?}",
+                    m.match_id(),
+                    s.cancel(m.match_id())
+                );
+            }
+            std::process::exit(1);
+        }
+        // The agent signed join_digest over THIS seat's challenge nonce; recover it
+        // and refuse a presented-but-invalid ranked proof, mirroring the version arm.
+        // An empty signature is an unranked seat and admits unchanged.
+        let nonce = nonce_for(m.match_id(), seat);
+        if let Err(e) = admit_join(&agent_id, nonce.as_bytes(), &signature_hex) {
+            emit(
+                &mut out,
+                seat,
+                &GatewayMsg::Reject { reason: format!("join signature rejected: {e:?}") },
+            );
+            out.flush().expect("flush reject");
+            if let Some(s) = &settler {
+                // A presented-but-invalid ranked proof voids the opened match like a
+                // version mismatch — refund, no result committed — exactly cancelMatch.
+                eprintln!(
+                    "[settle-dev-mock] {} cancel (join signature rejected): {:?}",
                     m.match_id(),
                     s.cancel(m.match_id())
                 );
