@@ -458,10 +458,13 @@ fn settle_field_match(
     Ok(n)
 }
 
-/// The K-factor the `--settle-dev-mock` loopback uses for a multi-seat field settle. The
-/// loopback settles only an in-memory [`MockSettler`] (never a chain), so this sets the
-/// magnitude of the demonstrated deltas, not any production economic knob — the live
-/// driver passes the owner-set K. 32 matches the value the ranked unit tests use.
+/// The K-factor the loopback uses for ranked settlement — both the `--settle-dev-mock`
+/// multi-seat field settle and the matchmaker rating ladder ([`settle_ranked_ladder`]).
+/// The loopback moves only in-memory state (a [`MockSettler`] / the local ladder, never a
+/// chain), so this sets the magnitude of the demonstrated deltas, not any production
+/// economic knob — the live driver passes the owner-set K. 32 matches the value the
+/// ranked unit tests use; sharing one constant keeps the dev-mock and ladder deltas from
+/// silently diverging.
 const DEV_MOCK_K: i32 = 32;
 
 /// Pump a formed, live match to its end: each tick, observe every seat, read each
@@ -542,6 +545,30 @@ fn settle_finished(
     }
 }
 
+/// Settle a matchmade match's terminal `result` into the matchmaker's rating ladder.
+/// [`Matchmaker::build`] registered every Agent-mode match in its pending-ranked
+/// registry at formation, so the result must move the ladder AND consume that
+/// registration — else it leaks until the eviction cap reaps it. The arm is chosen by
+/// outcome seat count, mirroring [`settle_match`] vs [`settle_field_match`]: a 1v1 via
+/// [`Matchmaker::apply_ranked_result`], a 3+/team field via
+/// [`Matchmaker::apply_ranked_field_result`] (pushing a 3+ result through the 1v1 arm
+/// is a silent no-op that leaks the registration — FM1). A casual / human / Mixed match
+/// was never registered, so the apply is a clean no-op (`None`); likewise a replayed
+/// result whose registration the first apply already consumed, so a retry or duplicate
+/// End never moves the ladder twice (FM2). The K is the shared loopback `DEV_MOCK_K`
+/// (FM3). The delta is emitted for observability only — settling the ladder has no wire
+/// effect, and a no-op is not an error.
+fn settle_ranked_ladder(mm: &Matchmaker<SignatureVerifier>, result: &MatchResult) {
+    let match_id = result.match_id;
+    if result.outcomes.len() == 2 {
+        if let Some(d) = mm.apply_ranked_result(result, DEV_MOCK_K) {
+            eprintln!("[ladder] {match_id} ranked 1v1 delta a={:+} b={:+}", d.a, d.b);
+        }
+    } else if let Some(deltas) = mm.apply_ranked_field_result(result, DEV_MOCK_K) {
+        eprintln!("[ladder] {match_id} ranked field deltas {deltas:?}");
+    }
+}
+
 /// The match parameters a `--mode` run forms under — the direct path's config (30 Hz,
 /// the same square bounds, free-for-all teams, the empty arena) mirrored so a matchmade
 /// match plays like a hand-seated one. `seats_per_match == n` makes the match form
@@ -615,8 +642,10 @@ fn reject_and_exit(
 /// the agent signed over — NOT the formed match's id, which the matchmaker mints only
 /// after admission. A version mismatch, a wrong-kind-for-mode join, or an unauthenticated
 /// ranked claim emits a Reject (+ cancel settle) and exits; the match never forms.
-/// Returns the formed [`Match`] (whose roster already credits each verified ranked
-/// identity) after emitting Welcome+Start to every seat.
+/// Returns the [`Matchmaker`] alongside the formed [`Match`] (whose roster already
+/// credits each verified ranked identity) after emitting Welcome+Start to every seat —
+/// the matchmaker outlives the pump so the terminal result can settle into its ladder
+/// (it registered an Agent match in `pending_ranked` at formation).
 fn handshake_matchmade(
     args: &Args,
     mode: MatchMode,
@@ -624,7 +653,7 @@ fn handshake_matchmade(
     settler: &Option<MockSettler>,
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
-) -> Match {
+) -> (Matchmaker<SignatureVerifier>, Match) {
     let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(n, args.max_ticks));
 
     for seat in 0..n {
@@ -691,7 +720,7 @@ fn handshake_matchmade(
         );
     }
     out.flush().expect("flush welcome+start");
-    m
+    (mm, m)
 }
 
 fn main() {
@@ -712,9 +741,10 @@ fn main() {
     // authenticated). Its formed roster already credits each verified ranked identity,
     // so settlement overlays no recovered ids.
     if let Some(mode) = args.mode {
-        let mut m = handshake_matchmade(&args, mode, n, &settler, &mut lines, &mut out);
+        let (mm, mut m) = handshake_matchmade(&args, mode, n, &settler, &mut lines, &mut out);
         let result = pump_to_end(&mut m, n, &mut lines, &mut out);
         settle_finished(&settler, &result, m, &[]);
+        settle_ranked_ladder(&mm, &result);
         return;
     }
 
@@ -1466,7 +1496,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let args = mode_args(2, MatchMode::Agent, vec![]);
 
-        let mut m = handshake_matchmade(&args, MatchMode::Agent, 2, &None, &mut lines, &mut out);
+        let (_mm, mut m) = handshake_matchmade(&args, MatchMode::Agent, 2, &None, &mut lines, &mut out);
         let minted = m.match_id();
         assert_ne!(minted, id(), "the formed match carries the matchmaker's minted id, not the challenge salt");
         let stdout = String::from_utf8(out).unwrap();
