@@ -182,11 +182,26 @@ class ArenaClient:
         """Run the handshake: receive the connection challenge, send Join, and on a
         Welcome check the version and record the assigned seat + rules. Raises
         `HandshakeRejected`/`VersionMismatch` on refusal — before any match loop."""
+        self.send_join()
+        self.recv_welcome()
+        return self
+
+    def send_join(self) -> None:
+        """Handshake phase one: read the challenge and send the Join (a ranked seat
+        signs over the just-received nonce). Split from `recv_welcome` so a matchmade
+        driver can send EVERY seat's Join before any one blocks on its Welcome — the
+        Matchmaker forms only on the last join, so no Welcome is issued until all seats
+        are in, and a per-seat `connect()` would deadlock seat 0 against seat 1's Join."""
         first = decode_gateway(self.transport.recv())
         if not isinstance(first, Challenge):
             raise ProtocolError(f"expected challenge first, got {type(first).__name__}")
         self.nonce = first.nonce
         self.transport.send(join_frame(self.agent_id, self._join_signature()))
+
+    def recv_welcome(self) -> None:
+        """Handshake phase two: read the Welcome (or Reject) and the Start, recording
+        the assigned seat, version, rules, and geometry. Raises `HandshakeRejected` on
+        a Reject, `VersionMismatch` on a version skew."""
         reply = decode_gateway(self.transport.recv())
         if isinstance(reply, Reject):
             raise HandshakeRejected(reply.reason)
@@ -202,7 +217,6 @@ class ArenaClient:
         self.blockers = start.blockers
         self.pickup_points = start.pickup_points
         self.connected = True
-        return self
 
     def poll(self, policy: Policy) -> MatchResult | None:
         """Process exactly one inbound frame. Returns the MatchResult on End (and
