@@ -536,6 +536,20 @@ def test_explicit_mismatched_claim_recovers_a_different_address():
     assert recovered == _DEV_ADDR and recovered != "0xnottheaddress"
 
 
+def test_repr_never_leaks_the_ranked_signing_key():
+    # FM2: the secp256k1 private key is the whole security of a ranked seat, so it must
+    # never reach a log or repr — logging the client, or an error that interpolates one,
+    # renders it through __repr__/__str__. Pin that no rendering carries the key in any
+    # form (hex or raw bytes), and that the repr stays useful: the PUBLIC identity and
+    # connection state, never the secret.
+    from arena_client.sdk import ArenaClient
+    c = ArenaClient.ranked(MockTransport([]), _DEV_KEY)
+    for rendered in (repr(c), str(c), f"{c}", f"{c!r}"):
+        assert _DEV_KEY.hex() not in rendered
+        assert str(_DEV_KEY) not in rendered  # the raw b'...' bytes repr, too
+    assert _DEV_ADDR in repr(c) and "ranked=True" in repr(c)
+
+
 def test_start_carries_static_cover_blockers_and_defaults_empty():
     # Decode side: a Start with the static cover layout decodes into typed Blockers
     # an agent can path around; a Start WITHOUT the field (an older server, or a
