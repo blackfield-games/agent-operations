@@ -1185,6 +1185,35 @@ def test_run_matchmade_mixed_reads_none_even_for_the_ranked_seat():
     assert ratings == {0: None, 1: None}
 
 
+def test_gateway_ladder_fails_loud_on_a_drifted_emission_but_skips_a_foreign_match():
+    # FM1: the [ladder] readout is a structured contract, so a line that drifts from the
+    # exact {match_id, seats:[{seat,rating,delta}]} shape must fail LOUD — never be read
+    # as 'unranked' (None), which would mask an emission-format regression as a casual
+    # match. A well-formed line for a DIFFERENT match_id is a legitimate skip, not drift.
+    from arena_client.sdk import SubprocessGateway
+
+    def emit(line: str) -> SubprocessGateway:
+        # Portable stand-in for the harness: write one stderr line and exit, so close()
+        # joins the drain and the line is captured. No stdout frames, no cargo needed.
+        gw = SubprocessGateway(
+            [sys.executable, "-c", "import sys; sys.stderr.write(sys.argv[1])", line],
+            capture_stderr=True,
+        )
+        gw.close()
+        return gw
+
+    # Garbage after the prefix is not JSON: a hard error, never a silent None.
+    with pytest.raises(proto.ProtocolError, match="malformed"):
+        emit("[ladder] {not json}\n").ladder("m")
+    # Well-formed JSON for this match but a seat missing rating/delta: shape drift.
+    with pytest.raises(proto.ProtocolError, match="malformed"):
+        emit('[ladder] {"match_id": "m", "seats": [{"seat": 0}]}\n').ladder("m")
+    # Same shape but a foreign match_id is silently skipped, so the seat reads None — a
+    # concurrent match's line is never misread as this one's, nor raised on.
+    foreign = '[ladder] {"match_id": "other", "seats": [{"seat": 0, "rating": 9, "delta": 1}]}\n'
+    assert emit(foreign).ladder("m") == {}
+
+
 def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
     # FM1: a mode/composition the Matchmaker can never form must fail LOUD up front, not
     # hang on a Welcome that never comes. These raise before the harness is spawned, so
