@@ -272,6 +272,9 @@ def test_unranked_join_frame_carries_an_empty_signature():
 # domain/layout or PROTOCOL_VERSION ever changes (both sides bump in lock-step).
 _DEV_KEY = bytes.fromhex("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
 _DEV_ADDR = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"
+# A second distinct ranked key, so a 2-seat ranked e2e gives each seat its own
+# key-derived identity (ranked() recovers each address independently).
+_DEV_KEY2 = bytes.fromhex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 _DEV_NONCE = b"arena-challenge-nonce"
 _GOLDEN_DIGEST = "099de3d1b29be2ae5bf35f85b55f43711757cf609229be790d0acebe35f178dd"
 _GOLDEN_SIG = (
@@ -950,6 +953,97 @@ def test_baseline_vs_baseline_runs_a_real_decisive_deterministic_match():
     # (not a fixed script): the replay hash differs.
     other = run_local_match(harness, [0, 1], policies, seed=seed + 1, match_id=match_id)
     assert other[0].replay_hash != r0.replay_hash
+
+
+def test_run_local_match_forms_a_ranked_match():
+    # The agent-signs (arena-agent-join-signing) → harness-verifies
+    # (arena-harness-verifies-ranked-join) loop, end to end: two seats join with
+    # distinct signing keys, the harness recovers each signer and admits it ranked,
+    # and a real decisive match forms. If either ranked join were rejected, connect()
+    # would raise HandshakeRejected before the first tick — so "forms + settles" is
+    # itself the proof the harness admitted the signed joins.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    seed = 12345
+    match_id = "11111111-2222-4333-8444-555555555555"
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    results = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id, signing_keys=keys)
+
+    assert set(results) == {0, 1}
+    r0 = results[0]
+    assert r0 == results[1], "every seat sees the same canonical result"
+    assert r0.match_id == match_id
+    assert 0 < r0.final_tick < 3600
+    assert len([o for o in r0.outcomes if o.alive_at_end]) == 1
+    assert len(r0.replay_hash) == 64
+
+    # RFC6979 join signatures are deterministic, so the ranked match re-runs
+    # byte-for-byte on the same seed + keys.
+    again = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id, signing_keys=keys)
+    assert again[0] == r0
+    assert again[0].replay_hash == r0.replay_hash
+
+
+def test_run_local_match_mixes_a_ranked_and_unranked_seat():
+    # A partly-keyed seat map must still complete the round-robin handshake: seat 0
+    # joins ranked (signed), seat 1 unranked (empty signature). The harness admits
+    # both and the match forms — neither seat hangs waiting on the other's Welcome.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    results = run_local_match(
+        harness,
+        [0, 1],
+        policies,
+        seed=7,
+        match_id="22222222-2222-4333-8444-555555555555",
+        signing_keys={0: _DEV_KEY},
+    )
+    assert set(results) == {0, 1}
+    assert results[0] == results[1]
+    assert 0 < results[0].final_tick < 3600
+    assert len([o for o in results[0].outcomes if o.alive_at_end]) == 1
+
+
+def test_run_local_match_keyed_seat_overrides_a_conflicting_agent_id():
+    # FM1: a keyed seat derives its claimed id from the key (ranked()), IGNORING a
+    # conflicting agent_ids entry. Were run_local_match to claim the agent_ids id while
+    # signing with the key, the harness would recover a different address
+    # (AddressMismatch), reject the join, and the match would never form — so a clean
+    # formation despite agent_ids[0] proves the key wins.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    results = run_local_match(
+        harness,
+        [0, 1],
+        policies,
+        seed=3,
+        match_id="33333333-2222-4333-8444-555555555555",
+        agent_ids={0: "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"},
+        signing_keys={0: _DEV_KEY, 1: _DEV_KEY2},
+    )
+    assert set(results) == {0, 1}
+    assert 0 < results[0].final_tick < 3600
+
+
+def test_run_local_match_unranked_default_is_unchanged():
+    # FM3: threading signing_keys must not perturb the no-key path. An absent map and
+    # an empty map both yield today's deterministic unranked result, replay hash incl.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    seed = 999
+    match_id = "44444444-2222-4333-8444-555555555555"
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    base = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id)
+    empty = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id, signing_keys={})
+    assert empty[0] == base[0]
+    assert empty[0].replay_hash == base[0].replay_hash
 
 
 def test_e2e_match_is_required_in_ci_not_skipped(monkeypatch):
