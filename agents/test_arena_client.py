@@ -1117,6 +1117,74 @@ def test_run_matchmade_mixed_admits_a_casual_agent_alongside_a_human():
     assert 0 < ranked[0].final_tick < 3600
 
 
+def test_run_matchmade_agent_mode_reads_each_seat_moved_ladder_rating():
+    # The readout headline: after a ranked Agent-mode match, each seat reads its own
+    # post-match ladder standing through the structured [ladder] emission — the rating
+    # movement MatchResult alone never carries. Both seats are ranked, so neither is None.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import LadderStanding, run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    salt = "00000000-0000-4000-8000-000000000000"
+    ratings: dict[int, LadderStanding | None] = {}
+    results = run_local_match(
+        harness, [0, 1], policies, seed=5, match_id=salt, mode="agent", signing_keys=keys, ratings=ratings
+    )
+
+    assert set(ratings) == {0, 1}
+    assert all(isinstance(ratings[s], LadderStanding) for s in (0, 1))
+    s0, s1 = ratings[0], ratings[1]
+
+    # Zero-sum + decisive: equal pre-match ratings, so the deltas mirror and one seat
+    # gains exactly what the other loses (the ladder mints no rating). A draw (delta 0)
+    # would fail this, and the seat-order tie-break makes a symmetric duel decisive.
+    assert s0.delta == -s1.delta != 0
+    # Both started from the same default rating (rating - delta is the pre-match value),
+    # so a swapped or mis-keyed readout would break this equality.
+    assert s0.rating - s0.delta == s1.rating - s1.delta
+    # The standing tracks the match outcome: the surviving (placement-1) seat is the one
+    # whose rating rose, the other fell — a winner reading a negative delta is a mis-pair.
+    winner = next(o.seat for o in results[0].outcomes if o.placement == 1)
+    loser = next(o.seat for o in results[0].outcomes if o.placement != 1)
+    assert ratings[winner].delta > 0 and ratings[loser].delta < 0
+    assert ratings[winner].rating > ratings[loser].rating
+
+
+def test_run_local_match_unranked_seats_read_none_and_result_is_byte_identical():
+    # FM2 + FM3: a direct (unranked) match moves no ladder, so EVERY seat reads None —
+    # never a zeroed standing. And requesting the readout must not perturb the match: the
+    # MatchResult (replay hash included) is byte-identical to the call without ratings.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import LadderStanding, run_local_match
+
+    seed, match_id = 999, "44444444-2222-4333-8444-555555555555"
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    base = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id)
+
+    ratings: dict[int, LadderStanding | None] = {}
+    rated = run_local_match(harness, [0, 1], policies, seed=seed, match_id=match_id, ratings=ratings)
+    assert rated[0] == base[0]
+    assert rated[0].replay_hash == base[0].replay_hash
+    assert ratings == {0: None, 1: None}
+
+
+def test_run_matchmade_mixed_reads_none_even_for_the_ranked_seat():
+    # FM2 (cross-play): the Matchmaker registers ONLY Agent-mode matches in the ladder, so
+    # a Mixed match has no rating movement — even its signed agent seat reads None, not a
+    # standing. A non-None here would mean a casual/human/Mixed match leaked into the ladder.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import LadderStanding, run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    ratings: dict[int, LadderStanding | None] = {}
+    run_local_match(
+        harness, [0, 1], policies, seed=8, mode="mixed", human_seats=[0],
+        signing_keys={1: _DEV_KEY2}, ratings=ratings,
+    )
+    assert ratings == {0: None, 1: None}
+
+
 def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
     # FM1: a mode/composition the Matchmaker can never form must fail LOUD up front, not
     # hang on a Welcome that never comes. These raise before the harness is spawned, so
