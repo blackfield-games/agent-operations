@@ -13,7 +13,6 @@ import re
 
 import pytest
 
-from biome import biome
 from common.compose import compose_world
 from common.types import LayerSpec, RegionCoord, WorldBrief
 from optimization import optimization
@@ -231,24 +230,15 @@ async def test_resolved_layer_composes_and_validates(tmp_path, monkeypatch):
         got = await getattr(mod, spec).run(brief, layers)
         if got:
             layers.append(got)
-    # force an over-budget world so the optimizer actually sheds, then validate. The metric
-    # and the body's instanceCount derive from one count * TRIS_PER_INSTANCE so the layer is
-    # self-consistent — the validator's biome triangle gate re-derives it and would reject a
-    # mismatched stand-in.
-    heavy = 16_667
-    layers = [ly for ly in layers if ly.specialist != "biome"]
-    layers.append(
-        _layer("biome", float(heavy * biome.TRIS_PER_INSTANCE), rid=brief.region.region_id, path=f"biome/{brief.region.region_id}.usda")
-    )
-    # write the heavy biome layer to disk so well-formedness/composition can open it.
-    # It carries vegetationCapped because the real director seeds intent:must_not
-    # (dense_vegetation) for this region, so the real biome would cap — the synthetic
-    # stand-in must honor that too or the validator's director-intent gate rejects it.
-    (tmp_path / "layers" / "biome").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "layers" / f"biome/{brief.region.region_id}.usda").write_text(
-        '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\ndef PointInstancer "Scatter"\n{\n'
-        f"    custom int instanceCount = {heavy}\n    custom bool vegetationCapped = true\n}}\n"
-    )
+    # Force an over-budget world so the optimizer actually sheds, then validate — by LOWERING
+    # the budget under the REAL pipeline's geometry, not by swapping in a synthetic heavy biome.
+    # The director seeds intent:must_not=dense_vegetation for every region, so the real biome
+    # caps and VEGETATION_CAP_DENSITY bounds its count small; a heavy biome stand-in would now
+    # violate the validator's cap-magnitude gate. Keeping every real layer means each is
+    # self-consistent end-to-end (biome's count IS the cap-reduced scatter, prop honors
+    # must_have, npc honors factions). 1_000_000 is below the real ~1.56M total (so the world is
+    # over budget and sheds) but above terrain's ~855k floor (so it resolves, not terminally over).
+    monkeypatch.setenv("BLACKFIELD_TRIANGLE_BUDGET", "1000000")
     opt = await optimization.run(brief, layers)
     layers.append(opt)
     assert opt.metrics["over_budget"] == 0.0  # resolved
