@@ -468,6 +468,7 @@ def run_local_match(
     ratings: dict[int, LadderStanding | None] | None = None,
     arena: str | None = None,
     starts: dict[int, MatchStart] | None = None,
+    perception_memory: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -514,7 +515,14 @@ def run_local_match(
     unknown key aborts the harness loudly (surfacing as a `GatewayClosed`/timeout here, not
     a silent empty arena). Pass a `starts` dict to read back each seat's received geometry
     as a `MatchStart` (filled in place at connect), so a caller can confirm what arena the
-    match played under."""
+    match played under.
+
+    Pass `perception_memory` (ticks > 0) to turn on perception memory: a seat then
+    remembers a lost entity's last-known position for that many ticks, surfaced as a
+    `VisibleEntity` with `in_line_of_sight=False`. It is a DIRECT-path knob (the harness
+    applies it only when seating directly), so it requires `mode=None` — `perception_memory`
+    with a `mode` is rejected up front rather than silently ignored. Default `0` disables it,
+    byte-identical to before."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -523,11 +531,18 @@ def run_local_match(
             "ladder_file persists the matchmaker's ranked ladder, which only moves on the "
             "--mode path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
         )
+    if perception_memory and mode is not None:
+        raise ValueError(
+            "perception_memory is a direct-path knob (the harness applies it only when seating "
+            "directly); it has no effect under --mode — pass mode=None to enable memory"
+        )
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if arena is not None:
         # Unconditional, before the mode block: --map drives both the direct and --mode
         # paths in the harness, so the arena loads however the roster is formed.
         argv += ["--map", arena]
+    if perception_memory:
+        argv += ["--perception-memory", str(perception_memory)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
