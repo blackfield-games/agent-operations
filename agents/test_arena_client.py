@@ -471,6 +471,71 @@ def test_connect_completes_handshake():
     assert len(t.sent) == 1 and t.sent[0]["type"] == "join" and t.sent[0]["signature_hex"] == ""
 
 
+def test_ranked_client_derives_agent_id_from_the_key():
+    from arena_client.sdk import ArenaClient
+    c = ArenaClient.ranked(MockTransport([]), _DEV_KEY)
+    # The claimed identity IS the address the key recovers to, by construction — so a
+    # ranked() client can never present a claim the Gateway recovers a different key for.
+    assert c.agent_id == _DEV_ADDR
+    assert c.signing_key == _DEV_KEY
+
+
+def test_ranked_join_signs_over_the_connection_challenge_nonce():
+    from arena_client.sdk import ArenaClient
+    nonce = "9f3a1c00ff"  # the per-connection challenge token issued in the Challenge
+    t = MockTransport([_challenge_frame(nonce), _welcome_frame(), _start_frame()])
+    c = ArenaClient.ranked(t, _DEV_KEY).connect()
+    join = t.sent[0]
+    assert join["type"] == "join" and join["agent_id"] == _DEV_ADDR
+    # The signature is sign_join over the nonce just received (its utf-8 bytes), and it
+    # recovers to the claimed agent_id — exactly the round-trip the Gateway runs.
+    expected = proto.sign_join(_DEV_KEY, proto.PROTOCOL_VERSION, _DEV_ADDR, nonce.encode())
+    assert join["signature_hex"] == expected
+    recovered = proto.recover_join_signer(
+        proto.PROTOCOL_VERSION, _DEV_ADDR, nonce.encode(), join["signature_hex"]
+    )
+    assert recovered == _DEV_ADDR
+    assert c.connected
+
+
+def test_ranked_signature_binds_the_nonce_so_two_connections_differ():
+    # FM (cross-connection replay): a fresh challenge per connection yields a DIFFERENT
+    # signature, so a Join sniffed off one connection is worthless on another — its sig
+    # recovers the wrong address against that connection's nonce.
+    from arena_client.sdk import ArenaClient
+    sigs = []
+    for nonce in ("aaaa1111", "bbbb2222"):
+        t = MockTransport([_challenge_frame(nonce), _welcome_frame(), _start_frame()])
+        ArenaClient.ranked(t, _DEV_KEY).connect()
+        sigs.append(t.sent[0]["signature_hex"])
+    assert sigs[0] != sigs[1]
+
+
+def test_unranked_client_sends_empty_signature_unchanged():
+    # The no-key path is untouched: an unranked seat still sends an empty signature_hex
+    # and never invokes the crypto stack.
+    from arena_client.sdk import ArenaClient
+    t = MockTransport([_challenge_frame("abcd"), _welcome_frame(), _start_frame()])
+    ArenaClient(t, agent_id="agent-x").connect()
+    assert t.sent[0]["signature_hex"] == ""
+
+
+def test_explicit_mismatched_claim_recovers_a_different_address():
+    # The constructor still allows an explicit agent_id alongside a key. If the claim
+    # isn't the key's address, the signature recovers a DIFFERENT address — the
+    # Gateway's AddressMismatch. ranked() is the safe default precisely because it
+    # forecloses this; this pins that the seam is honest when bypassed.
+    from arena_client.sdk import ArenaClient
+    t = MockTransport([_challenge_frame("abcd"), _welcome_frame(), _start_frame()])
+    ArenaClient(t, agent_id="0xnottheaddress", signing_key=_DEV_KEY).connect()
+    join = t.sent[0]
+    assert join["agent_id"] == "0xnottheaddress"
+    recovered = proto.recover_join_signer(
+        proto.PROTOCOL_VERSION, "0xnottheaddress", b"abcd", join["signature_hex"]
+    )
+    assert recovered == _DEV_ADDR and recovered != "0xnottheaddress"
+
+
 def test_start_carries_static_cover_blockers_and_defaults_empty():
     # Decode side: a Start with the static cover layout decodes into typed Blockers
     # an agent can path around; a Start WITHOUT the field (an older server, or a
