@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 arena-proto = { workspace = true }
 arena-core = { path = "../core" }
+arena-match = { path = "../match" }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
