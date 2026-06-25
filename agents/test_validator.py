@@ -1006,14 +1006,19 @@ def _biome_body(*, capped: bool, instance_count: int | None = None) -> str:
     )
 
 
-def _npc_body(archetype: str) -> str:
+def _npc_body(archetype: str, spawn_count: int | None = None) -> str:
     """An npc layer emitting one `archetype` marker in its Spawns block — mirroring
-    npc.run, the field the intent gate keys on."""
+    npc.run, the field the intent gate keys on. `spawnCount` is opt-in (omit ⇒ the
+    triangle self-consistency gate can't re-derive the metric and skips the layer, so the
+    factions fixtures that don't declare a count degrade-skip it — the same placeholder
+    discipline biome's no-instanceCount bodies follow); pass `spawn_count` for the
+    triangle fixtures."""
+    count_line = f"        custom int spawnCount = {spawn_count}\n" if spawn_count is not None else ""
     return (
         '#usda 1.0\n(\n    defaultPrim = "NPCs"\n)\n\n'
         'def Xform "NPCs"\n{\n    def Xform "Spawns"\n    {\n'
         f'        custom string archetype = "{archetype}"\n'
-        "        custom int spawnCount = 6\n    }\n}\n"
+        f"{count_line}    }}\n}}\n"
     )
 
 
