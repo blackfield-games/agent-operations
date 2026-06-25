@@ -23,6 +23,7 @@ from prop import prop
 from biome import biome
 from lighting import lighting
 from terrain import terrain
+from npc import npc
 
 STYLE_SIM_THRESHOLD = 0.72
 
@@ -189,6 +190,21 @@ async def run(
         for message in _biome_triangle_consistency(biome_layer, biome_text):
             issues.append(message)
             failing.add("biome")
+
+    # NPC character triangle self-consistency — the character-emitter sibling of the terrain/biome
+    # gates above. npc meters spawnCount * _character_tris(archetype); the budget gate SUMS that
+    # metric trusting it, so a stale/tampered npc metric (a count not updated when the archetype
+    # changed under a re-rostered director) corrupts the sum just as a terrain/biome one does.
+    # Re-derive from the emitted spawnCount + archetype and reject a mismatch, routing back to npc.
+    # Same trust preconditions as terrain/biome (metrics clean + npc's layer well-formed, both
+    # already attributed above); a body missing either field is skipped, an unbudgetable archetype
+    # is reported once (never raised through run()).
+    npc_layer = next((layer for layer in layers if layer.specialist == "npc"), None)
+    if npc_layer is not None and metrics_ok and npc_layer in wellformed:
+        npc_text = (layers_root / npc_layer.path).read_text()
+        for message in _npc_triangle_consistency(npc_layer, npc_text):
+            issues.append(message)
+            failing.add("npc")
 
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
@@ -640,6 +656,47 @@ def _biome_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
         f"biome layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} "
         f"its body declares ({int(count)} instances * {biome.TRIS_PER_INSTANCE} tris each) "
         f"— a stale or tampered biome metric; re-run biome"
+    ]
+
+
+def _npc_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
+    """Why npc's reported ``triangles`` metric disagrees with the character geometry its body
+    declares, or [] when they agree — the character-emitter sibling of
+    ``_terrain_triangle_consistency`` / ``_biome_triangle_consistency`` over the same geometry
+    trust boundary.
+
+    npc meters ``spawnCount * _character_tris(archetype)``; ``_budget_self_consistency`` SUMS this
+    metric in trusting it, so a STALE (pre-route-back count, or a metric not updated when the
+    archetype changed under a re-rostered director) or tampered npc metric silently corrupts the
+    budget sum. Re-derive from the body's ``spawnCount`` + ``archetype`` — reusing
+    ``npc._character_tris`` / ``npc.CHARACTER_TRIS`` so a per-archetype budget change tracks in
+    lock-step — and reject a mismatch, naming npc so route-back targets it. Verifying needs BOTH
+    fields: a ``spawnCount`` that is absent, negative, or non-integer, or an absent ``archetype``,
+    leaves the metric unverifiable and is SKIPPED (field-presence is the schema gate's concern;
+    the real ``npc.run`` always emits both). An ``archetype`` PRESENT but absent from
+    ``CHARACTER_TRIS`` cannot be budgeted — ``npc.run`` would have raised at emission — so it is
+    REPORTED (once), the membership checked BEFORE calling ``_character_tris`` so the helper's
+    ``KeyError`` never escapes through ``run()`` (FM3). The reported metric is read straight from
+    ``layer.metrics`` (the caller runs this only when the metrics schema is clean, so it is a
+    finite number)."""
+    count = _opt_number(text, "spawnCount")
+    archetype = re.search(r'archetype\s*=\s*"([^"]*)"', text)
+    if count is None or count < 0 or count != int(count) or archetype is None:
+        return []
+    name = archetype.group(1)
+    if name not in npc.CHARACTER_TRIS:
+        return [
+            f"npc layer {layer.path} declares archetype {name!r} which has no triangle budget "
+            f"in CHARACTER_TRIS — an unbudgetable character; re-run npc"
+        ]
+    reported = layer.metrics.get("triangles", 0.0)
+    expected = float(int(count) * npc._character_tris(name))
+    if math.isclose(reported, expected, rel_tol=1e-9, abs_tol=1e-6):
+        return []
+    return [
+        f"npc layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} its body "
+        f"declares ({int(count)} x {name} @ {npc._character_tris(name)} tris each) "
+        f"— a stale or tampered npc metric; re-run npc"
     ]
 
 
