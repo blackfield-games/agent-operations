@@ -135,6 +135,17 @@ class ArenaClient:
         self.rejections: list[str] = []
         self.forfeits = 0
 
+    def __repr__(self) -> str:
+        # A ranked client holds a secp256k1 private key whose secrecy IS the seat's
+        # security — it must never reach a log or repr. Render the PUBLIC identity and
+        # connection state only; `ranked` is a bool, never the key bytes. Logging a
+        # client (or an error that interpolates it) goes through here, so the key has
+        # no path to the wire, a log line, or a crash report.
+        return (
+            f"ArenaClient(agent_id={self.agent_id!r}, ranked={self.signing_key is not None}, "
+            f"seat={self.seat}, connected={self.connected}, done={self.done})"
+        )
+
     @classmethod
     def ranked(
         cls,
