@@ -345,21 +345,31 @@ def run_local_match(
     seed: int = 0,
     match_id: str = "00000000-0000-4000-8000-000000000000",
     agent_ids: dict[int, str] | None = None,
+    signing_keys: dict[int, bytes] | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
     per seat over a shared transport, then pump observe→act round-robin until every
     seat reaches End. Single-threaded — the demux buffers whichever seat's frame
     arrives first — so it is deterministic and deadlock-free. Returns each seat's
-    MatchResult (all seats receive the same canonical result)."""
+    MatchResult (all seats receive the same canonical result).
+
+    A seat in `signing_keys` joins RANKED: `ArenaClient.ranked` derives its agent_id
+    from the key and signs the challenge nonce, so the harness recovers the signer and
+    admits the seat (the key overrides any `agent_ids` entry for that seat — the claim
+    is always the address the key controls). Every other seat joins unranked under
+    `agent_ids` (default `agent-{s}`), so the no-key call is byte-identical to before."""
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
+    keys = signing_keys or {}
     with SubprocessGateway(argv, timeout=timeout) as gateway:
         # The loopback harness blocks for one frame per seat per tick and enforces no
         # wall-clock, so the client must always answer — never drop a frame on a
         # deadline (that is a real-transport behaviour and would deadlock here).
         clients = {
-            s: ArenaClient(SeatTransport(gateway, s), agent_id=ids[s], enforce_deadline=False)
+            s: ArenaClient.ranked(SeatTransport(gateway, s), keys[s], enforce_deadline=False)
+            if s in keys
+            else ArenaClient(SeatTransport(gateway, s), agent_id=ids[s], enforce_deadline=False)
             for s in seats
         }
         for client in clients.values():
