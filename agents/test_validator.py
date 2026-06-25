@@ -1083,6 +1083,120 @@ async def test_run_rejects_an_uncapped_biome_under_a_capping_director(tmp_path):
     assert _route_back_target(verdict) == "biome"
 
 
+# ---- biome cap MAGNITUDE: the marker present AND the instanceCount cap-reduced ----
+#
+# The presence check above catches a missing vegetationCapped marker; these pin that the
+# validator also verifies the capped COUNT — the biome twin of lighting's density check over
+# its drivenBy-correct branch. A marker slapped over the uncapped scatter (cap not actually
+# applied) is rejected; a count consistent with the cap-reduced scatter is accepted; the
+# check fires only on the marker-present branch and skips an absent count. The set builder
+# carries the count as BOTH the body's instanceCount and a matching triangles metric (and
+# re-syncs the optimizer to the summed geometry), so the biome triangle + budget gates stay
+# silent and ONLY the cap-magnitude check varies — no double-report.
+
+_CAPPED_COUNT = biome._scatter_count(_brief().biome, REGION, biome.VEGETATION_CAP_DENSITY)
+_UNCAPPED_COUNT = biome._scatter_count(_brief().biome, REGION, None)
+
+
+def _capped_biome_set(
+    root: Path, *, count: int | None, capped: bool = True, caps: bool = True
+) -> list[LayerSpec]:
+    """A full set under a director that caps vegetation iff `caps`, whose biome layer emits the
+    vegetationCapped marker iff `capped` and (when `count` is given) `count` as BOTH its
+    instanceCount body field and a matching triangles metric — the optimizer body re-synced to
+    the summed geometry so the biome triangle + budget gates stay silent and only the
+    cap-magnitude check varies. `count=None` models the no-instanceCount placeholder body (the
+    triangle gate skips it), keeping biome's default metric."""
+    biome_tris = 100000.0 if count is None else float(count * biome.TRIS_PER_INSTANCE)
+    summed = biome_tris + 262144.0 + 96000.0 + 144000.0  # terrain + prop + npc default metrics
+    out: list[LayerSpec] = []
+    for s in SPECIALISTS:
+        if s == "director":
+            director = _director_body(must_not="dense_vegetation" if caps else None)
+            out.append(_layer(root, "director", body=director))
+        elif s == "biome":
+            out.append(_layer(
+                root, "biome",
+                body=_biome_body(capped=capped, instance_count=count),
+                metrics={"triangles": biome_tris},
+            ))
+        elif s == "optimization":
+            body = _opt_body(authored=summed, observed=summed, over_budget=False)
+            out.append(_layer(root, "optimization", body=body, metrics={"over_budget": 0.0}))
+        else:
+            out.append(_layer(root, s))
+    return out
+
+
+async def test_run_accepts_a_capped_biome_whose_count_matches_the_cap(tmp_path):
+    # FM1: biome caps AND emits the cap-reduced instanceCount the brief's region yields — a
+    # correctly-capped world. The gate re-derives the same count and accepts. The cap genuinely
+    # bites here (scorched_grassland's grassland base 2000 > the 800 cap), so the capped count is
+    # strictly below the uncapped one — a real reduction, not a no-op marker.
+    assert _CAPPED_COUNT < _UNCAPPED_COUNT
+    verdict = await validator.run(
+        _brief(), _capped_biome_set(tmp_path, count=_CAPPED_COUNT), layers_root=tmp_path
+    )
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_rejects_a_capped_biome_carrying_the_uncapped_count(tmp_path):
+    # FM2 (false accept): biome emits the vegetationCapped marker but the UNCAPPED count under it
+    # — the cap was never applied to the geometry. Rejected, routed back to biome, the message
+    # keyed off intent:must_not and naming the magnitude (not just the marker).
+    verdict = await validator.run(
+        _brief(), _capped_biome_set(tmp_path, count=_UNCAPPED_COUNT), layers_root=tmp_path
+    )
+    assert not verdict.accepted
+    assert any(
+        "intent:must_not" in i and "instanceCount" in i and str(_UNCAPPED_COUNT) in i
+        for i in verdict.issues
+    )
+    assert "biome" in verdict.failing_specialists
+    # names no pipeline-earlier specialist, so the text-scan fallback agrees and routes to biome.
+    assert _failing_specialist(verdict.issues) == "biome"
+    assert _route_back_target(verdict) == "biome"
+
+
+async def test_run_capped_biome_magnitude_not_checked_when_the_marker_is_absent(tmp_path):
+    # FM3 (no double-route): a capping director, but biome emits NO marker AND a wrong (uncapped)
+    # count. The magnitude check is gated behind the marker, so this is the SINGLE presence
+    # violation — never also a magnitude complaint about the same layer.
+    verdict = await validator.run(
+        _brief(),
+        _capped_biome_set(tmp_path, count=_UNCAPPED_COUNT, capped=False),
+        layers_root=tmp_path,
+    )
+    assert not verdict.accepted
+    must_not_issues = [i for i in verdict.issues if "intent:must_not" in i]
+    assert len(must_not_issues) == 1
+    assert "vegetationCapped" in must_not_issues[0] and "instanceCount" not in must_not_issues[0]
+
+
+async def test_run_skips_a_capped_biome_with_no_instance_count(tmp_path):
+    # FM3 (degrade): the marker is present but the body declares no instanceCount — the placeholder
+    # shape other gates' fixtures use. Field-presence is the well-formedness gate's concern, so the
+    # magnitude check skips and the world validates.
+    verdict = await validator.run(
+        _brief(), _capped_biome_set(tmp_path, count=None), layers_root=tmp_path
+    )
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_capped_biome_magnitude_tracks_the_cap_in_lock_step(tmp_path):
+    # FM4 (vocabulary/algorithm desync): the expectation IS biome._scatter_count's output — the
+    # exact capped count accepts, that count off-by-one rejects. A copied cap value or a
+    # re-implemented jitter would drift from biome and either false-reject or miss the desync.
+    ok = await validator.run(
+        _brief(), _capped_biome_set(tmp_path, count=_CAPPED_COUNT), layers_root=tmp_path
+    )
+    assert ok.accepted, ok.issues
+    off = await validator.run(
+        _brief(), _capped_biome_set(tmp_path, count=_CAPPED_COUNT + 1), layers_root=tmp_path
+    )
+    assert not off.accepted
+
+
 async def test_run_does_not_false_reject_an_unmappable_must_have_token(tmp_path):
     # FM1 (the worst failure — an infinite revision loop): the director names a token
     # with NO MUST_HAVE_ASSET mapping. prop skips it (places nothing), so the gate must
