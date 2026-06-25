@@ -1481,6 +1481,74 @@ def test_run_local_match_unknown_arena_fails_loud_not_silent_empty():
         )
 
 
+def test_run_local_match_forwards_perception_memory_and_omits_it_by_default(monkeypatch):
+    # perception_memory>0 forwards --perception-memory <ticks> as one argv token; omitted
+    # (0) adds no flag, byte-identical argv. Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--perception-memory" not in captured["argv"]
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, perception_memory=45)
+    argv = captured["argv"]
+    assert argv[argv.index("--perception-memory") + 1] == "45"
+
+
+def test_run_local_match_perception_memory_requires_the_direct_path():
+    # perception_memory is a direct-path knob (the harness ignores it under --mode), so it
+    # is rejected up front with a mode rather than silently doing nothing. Raises before any
+    # spawn, so a nonexistent harness path proves the guard precedes it.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    with pytest.raises(ValueError, match="direct-path"):
+        run_local_match(
+            "/no/such/harness", [0, 1], policies, mode="agent",
+            signing_keys={0: _DEV_KEY, 1: _DEV_KEY2}, perception_memory=30,
+        )
+
+
+def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
+    # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
+    # seat that loses sight of its enemy still receives its last-known position as a
+    # VisibleEntity with in_line_of_sight=False. Deterministic at this seed — the recording
+    # policy observes at least one echo, proving the knob turns memory on AND the echo
+    # reaches the agent (the channel arena-baseline-fires-only-in-sight consumes).
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    class _EchoWatch:
+        def __init__(self):
+            self.echoes = 0
+            self._b = BaselinePolicy()
+
+        def __call__(self, obs):
+            self.echoes += sum(1 for e in obs.visible if not e.in_line_of_sight)
+            return self._b(obs)
+
+    watch = {0: _EchoWatch(), 1: _EchoWatch()}
+    run_local_match(
+        harness, [0, 1], watch, seed=2, match_id="66666666-2222-4333-8444-555555555555",
+        arena="reference", perception_memory=30,
+    )
+    assert watch[0].echoes + watch[1].echoes > 0, "a lost enemy surfaced as an out-of-sight echo"
+
+
 def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
     # FM1: a mode/composition the Matchmaker can never form must fail LOUD up front, not
     # hang on a Welcome that never comes. These raise before the harness is spawned, so
