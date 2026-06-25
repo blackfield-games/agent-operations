@@ -15,6 +15,7 @@ Run from the agents/ dir:
 
 from pathlib import Path
 
+from biome import biome
 from common.types import LayerSpec, RegionCoord, WorldBrief
 from lighting import lighting
 from optimization import optimization
@@ -1413,3 +1414,115 @@ async def test_run_rejects_a_stale_terrain_metric_and_routes_to_terrain(tmp_path
     assert "terrain" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "terrain"
     assert _route_back_target(verdict) == "terrain"
+
+
+# ---- biome scatter triangle self-consistency: the metric must match the declared instanceCount ----
+#
+# The scatter-emitter sibling of the terrain gate above: _budget_self_consistency SUMS biome's
+# `triangles` metric trusting it, so a stale/tampered biome metric corrupts the budget sum. These
+# pin that the validator re-derives count * biome.TRIS_PER_INSTANCE from the body's instanceCount
+# and rejects a metric that disagrees (routed back to biome), skips a body with no/negative/non-
+# integer count, VERIFIES a 0 count (the boundary that differs from terrain's >=1 grid), and tracks
+# biome's own per-instance cost in lock-step.
+
+
+def _biome_spec(triangles: float) -> LayerSpec:
+    return LayerSpec(
+        specialist="biome", region_id=REGION, path=f"biome/{REGION}.usda",
+        summary="t", metrics={"triangles": triangles},
+    )
+
+
+def test_biome_triangle_consistency_accepts_a_metric_matching_its_count():
+    # FM1 (no false reject): metric == count * TRIS_PER_INSTANCE — nothing to report. The count is
+    # non-trivial so a hardcoded figure couldn't accidentally satisfy it.
+    count = 500
+    spec = _biome_spec(float(count * biome.TRIS_PER_INSTANCE))
+    assert validator._biome_triangle_consistency(spec, _biome_body(capped=False, instance_count=count)) == []
+
+
+def test_biome_triangle_consistency_rejects_a_metric_that_disagrees_with_its_count():
+    # FM2 (false accept): a biome metric that drifts from its declared instanceCount. One issue,
+    # naming biome and no pipeline-later specialist, so the text-scan fallback routes back to biome.
+    count = 500
+    bad = float(count * biome.TRIS_PER_INSTANCE) - 1000.0
+    issues = validator._biome_triangle_consistency(_biome_spec(bad), _biome_body(capped=False, instance_count=count))
+    assert len(issues) == 1
+    assert "biome" in issues[0] and "triangles metric" in issues[0]
+    assert _failing_specialist(issues) == "biome"
+
+
+def test_biome_triangle_consistency_skips_an_unverifiable_body():
+    # FM3 (degrade, no false reject): a body with no instanceCount (the VALID_BODY placeholder the
+    # _full_set tests use), a negative count, or a non-integer count is unverifiable — SKIP.
+    spec = _biome_spec(999.0)
+    assert validator._biome_triangle_consistency(spec, VALID_BODY) == []
+    assert validator._biome_triangle_consistency(spec, _biome_body(capped=False, instance_count=-5)) == []
+    noninteger = (
+        '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\n'
+        'def PointInstancer "Scatter"\n{\n    custom int instanceCount = 240.5\n}\n'
+    )
+    assert validator._biome_triangle_consistency(spec, noninteger) == []
+
+
+def test_biome_triangle_consistency_verifies_a_zero_count_empty_scatter():
+    # The boundary that differs from terrain (grid >= 1): a count of 0 is a VALID empty-scatter
+    # region metering 0 triangles, so it is VERIFIED not skipped — a 0-metric body accepts, and a
+    # tampered instanceCount = 0 over a nonzero metric is REJECTED, never hidden behind a degrade.
+    assert validator._biome_triangle_consistency(_biome_spec(0.0), _biome_body(capped=False, instance_count=0)) == []
+    issues = validator._biome_triangle_consistency(_biome_spec(5000.0), _biome_body(capped=False, instance_count=0))
+    assert len(issues) == 1
+    assert _failing_specialist(issues) == "biome"
+
+
+def test_biome_triangle_consistency_tracks_the_per_instance_cost_in_lock_step():
+    # FM4 (formula desync): the expectation is recomputed via biome.TRIS_PER_INSTANCE, never a
+    # hardcoded count — a metric correct for one count is rejected against a different count, so a
+    # future change to the per-instance triangle cost flips the gate's verdict in lock-step.
+    c1, c2 = 400, 800
+    spec = _biome_spec(float(c1 * biome.TRIS_PER_INSTANCE))
+    assert validator._biome_triangle_consistency(spec, _biome_body(capped=False, instance_count=c1)) == []
+    assert validator._biome_triangle_consistency(spec, _biome_body(capped=False, instance_count=c2)) != []
+
+
+def _biome_metric_set(root: Path, *, count, biome_tris: float) -> list[LayerSpec]:
+    """A full well-formed set with biome declaring `count` instances and metering `biome_tris`, the
+    optimization body re-synced to the resulting summed geometry so the budget gate stays silent —
+    only the biome triangle self-consistency check is exercised (no double-report)."""
+    summed = biome_tris + 262144.0 + 96000.0 + 144000.0  # terrain + prop + npc default metrics
+    out: list[LayerSpec] = []
+    for s in SPECIALISTS:
+        if s == "biome":
+            out.append(
+                _layer(root, "biome", body=_biome_body(capped=False, instance_count=count), metrics={"triangles": biome_tris})
+            )
+        elif s == "optimization":
+            body = _opt_body(authored=summed, observed=summed, over_budget=False)
+            out.append(_layer(root, "optimization", body=body, metrics={"over_budget": 0.0}))
+        else:
+            out.append(_layer(root, s))
+    return out
+
+
+async def test_run_accepts_a_biome_metric_consistent_with_its_count(tmp_path):
+    # FM1 at run() level: a correct world (biome metric == its count's scatter, optimizer body
+    # re-synced) validates clean — the new gate adds no false rejection.
+    count = 500
+    layers = _biome_metric_set(tmp_path, count=count, biome_tris=float(count * biome.TRIS_PER_INSTANCE))
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_rejects_a_stale_biome_metric_and_routes_to_biome(tmp_path):
+    # FM2 at run() level: biome's metric is stale/tampered (doesn't match its instanceCount), with
+    # the optimizer body re-synced to that metric so the BUDGET gate stays silent — biome is the
+    # ONLY issue (no double-report) and route-back targets it.
+    count = 500
+    biome_tris = float(count * biome.TRIS_PER_INSTANCE) + 999.0
+    layers = _biome_metric_set(tmp_path, count=count, biome_tris=biome_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("biome" in i and "triangles metric" in i for i in verdict.issues)
+    assert "biome" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "biome"
+    assert _route_back_target(verdict) == "biome"
