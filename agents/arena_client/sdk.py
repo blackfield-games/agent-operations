@@ -29,6 +29,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from .proto import (
@@ -428,6 +429,7 @@ def run_local_match(
     signing_keys: dict[int, bytes] | None = None,
     mode: str | None = None,
     human_seats: list[int] | None = None,
+    ladder_file: str | Path | None = None,
     ratings: dict[int, LadderStanding | None] | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
@@ -458,10 +460,22 @@ def run_local_match(
     filled in place with `seat -> LadderStanding(rating, delta)` for a ranked (Agent-mode)
     seat and `seat -> None` for an unranked one (casual / human / Mixed / direct), so an
     A2A author can see how the match moved their rating. Omitting it is byte-identical to
-    before — the MatchResult return is unchanged and stderr is not even captured."""
+    before — the MatchResult return is unchanged and stderr is not even captured.
+
+    Pass a `ladder_file` to persist the matchmaker's ranked ladder across calls: the
+    harness seeds the ladder from it at startup and writes the post-match ladder back, so
+    two sequential ranked matches sharing one path accumulate a seat's rating (read it via
+    `ratings`). The ladder only MOVES on the `--mode` path, so `ladder_file` with `mode=None`
+    is rejected up front (the direct path would silently ignore it); a human/Mixed run loads
+    and rewrites the file with no movement. Omitting it adds no flag — byte-identical to before."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
+    if ladder_file is not None and mode is None:
+        raise ValueError(
+            "ladder_file persists the matchmaker's ranked ladder, which only moves on the "
+            "--mode path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
+        )
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
@@ -477,6 +491,8 @@ def run_local_match(
             raise ValueError("mixed mode forms a human+agent match; declare some (not all) seats human")
         if humans:
             argv += ["--human-seats", ",".join(str(s) for s in humans)]
+        if ladder_file is not None:
+            argv += ["--ladder-file", str(ladder_file)]
     with SubprocessGateway(argv, timeout=timeout, capture_stderr=ratings is not None) as gateway:
         # The loopback harness blocks for one frame per seat per tick and enforces no
         # wall-clock, so the client must always answer — never drop a frame on a
