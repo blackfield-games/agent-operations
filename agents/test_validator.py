@@ -953,16 +953,19 @@ def _director_body(
     return "\n".join(lines) + "\n"
 
 
-def _lighting_body(driven_by: list[str] | None = None) -> str:
+def _lighting_body(driven_by: list[str] | None = None, density: float | None = None) -> str:
     """A lighting layer mirroring lighting.run: the locked overcast+inferno-rim palette,
     plus a `def Volume "Atmosphere"` whose `drivenBy` lists `driven_by` iff it is given
     (None ⇒ the pre-beats palette with no Atmosphere — the back-compat floor the gate must
-    accept when no beat is recognized)."""
+    accept when no beat is recognized). `inputs:density` defaults to the consistent
+    lighting._fog_density(driven_by) lighting.run emits; pass `density` to author a
+    drivenBy-correct-but-density-wrong layer (the density-self-consistency reject fixture)."""
     atmosphere = ""
     if driven_by is not None:
+        fog = lighting._fog_density(driven_by) if density is None else density
         atmosphere = (
             '\n    def Volume "Atmosphere"\n    {\n'
-            "        float inputs:density = 0.30\n"
+            f"        float inputs:density = {fog:.2f}\n"
             f'        custom string drivenBy = "{",".join(driven_by)}"\n'
             '        custom string mood = "haze"\n    }'
         )
