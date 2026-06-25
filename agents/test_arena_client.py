@@ -609,6 +609,57 @@ def test_connect_exposes_the_static_blockers():
     assert c2.blockers == []
 
 
+def test_policy_receives_the_static_map_once_before_the_first_decision():
+    # A map-aware policy is handed the static layout via on_match_start exactly ONCE,
+    # after connect and BEFORE the first decision — so it can plan around fixed cover the
+    # per-tick Observation omits. Two ticks are scripted, so a per-tick (wrong) firing
+    # would surface as more than one start. Driven with a MockTransport, no harness.
+    from arena_client.sdk import ArenaClient, MatchStart
+
+    start = {
+        "type": "start", "match_id": FIXED_MATCH,
+        "config": {"tick_hz": 30, "max_ticks": 3600, "bounds": {"x": 50_000, "y": 50_000}, "seats": 2},
+        "blockers": [{"min": {"x": 0, "y": 0}, "max": {"x": 500, "y": 500}}],
+        "pickup_points": [{"x": 1000, "y": 0}, {"x": -1000, "y": 0}],
+    }
+
+    class _Recorder:
+        def __init__(self):
+            self.order: list[str] = []
+            self.received: list[MatchStart] = []
+
+        def on_match_start(self, ms):
+            self.order.append("start")
+            self.received.append(ms)
+
+        def __call__(self, _obs):
+            self.order.append("decide")
+            return _intent(0, 0)
+
+    pol = _Recorder()
+    inbound = [_challenge_frame(), _welcome_frame(), start,
+               _observe_frame(tick=0), _observe_frame(tick=1), _end_frame()]
+    ArenaClient(MockTransport(inbound), agent_id="a", clock=FakeClock([0.0] * 6)).run(pol)
+
+    assert len(pol.received) == 1, "on_match_start fires exactly once, not per tick"
+    assert pol.order[0] == "start", "before any decision"
+    assert pol.order.index("start") < pol.order.index("decide")
+    got = pol.received[0]
+    assert got.blockers == [Blocker(min=Vec2(x=0, y=0), max=Vec2(x=500, y=500))]
+    assert got.pickup_points == [Vec2(x=1000, y=0), Vec2(x=-1000, y=0)]
+
+
+def test_hookless_policy_runs_unchanged():
+    # A plain callable with no on_match_start runs a full match with no AttributeError —
+    # the hook is getattr-guarded, so the per-tick Policy contract is unchanged.
+    from arena_client.sdk import ArenaClient
+
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(), _observe_frame(), _end_frame()])
+    result = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 0.0])).run(_fixed_policy)
+    assert result is not None
+    assert any(f["type"] == "act" for f in t.sent)  # it still made its decision
+
+
 def test_static_geometry_never_rides_the_parity_bounded_observation():
     # FM1 (parity): the static map is surfaced ONCE at Start, never on the per-tick
     # Observation — the security boundary. A blockers field on an Observation is
