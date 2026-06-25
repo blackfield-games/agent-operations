@@ -236,7 +236,7 @@ async def run(
     # the WELL-FORMED layers only: a missing/malformed director, prop, or biome layer is
     # already rejected + attributed by the gates above, so the intent check simply skips
     # it (no double-report, no crash) rather than re-deriving that failure (FM3).
-    for specialist, message in _intent_attributions(wellformed, layers_root):
+    for specialist, message in _intent_attributions(brief, wellformed, layers_root):
         issues.append(message)
         failing.add(specialist)
 
@@ -290,7 +290,7 @@ def _layer_text(layers: list[LayerSpec], specialist: str, layers_root: Path) -> 
 
 
 def _intent_attributions(
-    layers: list[LayerSpec], layers_root: Path
+    brief: WorldBrief, layers: list[LayerSpec], layers_root: Path
 ) -> list[tuple[str, str]]:
     """Director-intent violations as ``(specialist, message)`` pairs over the well-formed
     layers — the VERIFY half of declare → honor → verify.
@@ -309,6 +309,19 @@ def _intent_attributions(
     "director") so the supervisor's text-scan fallback agrees with the structured
     attribution. No director intent, or a missing/malformed (hence not-well-formed) prop
     or biome layer, yields no pairs — the world validates exactly as before (FM3).
+
+    The biome branch then verifies the cap MAGNITUDE, not just the marker's presence — the
+    biome twin of lighting's density check over its drivenBy-correct branch. When the
+    ``vegetationCapped`` marker IS present (the cap is confirmed applied), a stale or tampered
+    ``instanceCount`` — the UNCAPPED scatter count slapped under the marker — still ships
+    accepted, the gap a presence-only check structurally can't see. The gate re-derives the
+    count biome should have emitted via biome's OWN ``_scatter_count`` + ``VEGETATION_CAP_DENSITY``
+    (lock-step, off the same ``brief`` biome.run consumed — the validator already holds it) and
+    rejects a present ``instanceCount`` that disagrees, keyed off ``intent:must_not`` and naming
+    biome. Checked ONLY on the marker-present branch (a missing marker stays the single
+    violation, no density-style double-route) and ONLY for a present non-negative integer count
+    (an absent/garbage count degrades to the well-formedness gate, mirroring lighting density's
+    missing-field hole).
 
     The npc loop mirrors these for ``intent:factions``: npc draws its single emitted
     ``archetype`` from the director's faction roster (``npc._select_archetype`` over the
@@ -351,13 +364,44 @@ def _intent_attributions(
 
     if biome._caps_vegetation(_director_intent(layers, layers_root, "must_not")):
         biome_text = _layer_text(layers, "biome", layers_root)
-        if biome_text is not None and not re.search(r"vegetationCapped\s*=\s*true", biome_text):
-            out.append((
-                "biome",
-                "intent:must_not unmet: biome must cap vegetation density "
-                "(intent:must_not forbids dense vegetation) but its layer carries no "
-                "vegetationCapped marker",
-            ))
+        if biome_text is not None:
+            if not re.search(r"vegetationCapped\s*=\s*true", biome_text):
+                out.append((
+                    "biome",
+                    "intent:must_not unmet: biome must cap vegetation density "
+                    "(intent:must_not forbids dense vegetation) but its layer carries no "
+                    "vegetationCapped marker",
+                ))
+            else:
+                # The cap marker is present (the cap is confirmed applied), so the SET/presence
+                # half passes — now verify the MAGNITUDE, the biome twin of lighting's density
+                # check over its drivenBy-correct branch. The presence check can't see a marker
+                # slapped over a stale (pre-cap) or tampered instanceCount — the UNCAPPED scatter
+                # count under a vegetationCapped=true line — which ships an over-scattered region
+                # accepted. Re-derive the count biome SHOULD have emitted via biome's OWN
+                # _scatter_count + VEGETATION_CAP_DENSITY (lock-step: a cap/jitter/density change
+                # flips the expectation automatically), off the brief the validator already holds
+                # (the same brief biome.run consumed — biome.run called _scatter_count(brief.biome,
+                # brief.region.region_id, cap)), and reject a present count that disagrees. A body
+                # with no parseable instanceCount degrades (skips): biome always co-emits it with
+                # the marker, and field-presence is the well-formedness gate's concern — the
+                # asymmetric gap to the present-marker check (mirroring lighting density's missing-
+                # field hole). The guard is terrain/biome's: skip an absent/negative/non-integer
+                # count, but a present 0 still verifies (a capped region never scatters 0, so a
+                # tampered 0 under the marker is caught, not degraded past).
+                count = _opt_number(biome_text, "instanceCount")
+                if count is not None and count >= 0 and count == int(count):
+                    expected = biome._scatter_count(
+                        brief.biome, brief.region.region_id, biome.VEGETATION_CAP_DENSITY
+                    )
+                    if int(count) != expected:
+                        out.append((
+                            "biome",
+                            f"intent:must_not unmet: biome's capped instanceCount {int(count)} != "
+                            f"the {expected} a cap-reduced scatter yields (cap "
+                            f"{biome.VEGETATION_CAP_DENSITY}) — a stale or tampered count under the "
+                            f"vegetationCapped marker; re-run biome",
+                        ))
 
     # The npc loop: npc draws its single emitted `archetype` from the director's faction
     # roster (intent:factions), so a present archetype that is NOT a roster member is a
