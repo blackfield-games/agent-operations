@@ -1306,6 +1306,95 @@ async def test_run_lighting_intent_gate_tracks_recognized_beats_vocabulary(tmp_p
     assert _route_back_target(verdict) == "lighting"
 
 
+# ---- lighting fog-DENSITY self-consistency: the Atmosphere's inputs:density must match the fog
+# its recognized beats sum to via lighting._fog_density. Closes lighting-beats FM2 — the drivenBy
+# SET check confirms the right beats but not the MAGNITUDE they accumulate to, so a stale/tampered
+# density desynced from that sum (while drivenBy still looks right) shipped accepted. Density is
+# verified ONLY on the drivenBy-correct branch (a wrong drivenBy is the single violation).
+
+
+async def test_run_accepts_lighting_density_consistent_with_recognized_beats(tmp_path):
+    # FM1 (no false reject): drivenBy == recognized AND inputs:density == _fog_density(recognized).
+    # _fog_density([scorched, ash]) is a float-imprecise 0.35 (0.15 + 0.20 == 0.35000000000000003),
+    # emitted "0.35", so the abs_tol=5e-3 must absorb the rounded-string-vs-float-sum gap — an exact
+    # compare would false-reject this correct layer and loop the revision.
+    beats = "scorched earth. drifting ash."
+    recognized = lighting._recognized_beats(beats)
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=recognized),  # density defaults to _fog_density
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert verdict.issues == []
+
+
+async def test_run_rejects_a_stale_lighting_density_and_routes_to_lighting(tmp_path):
+    # FM2 (false accept): the right drivenBy but a density desynced from what the beats sum to (a
+    # stale/tampered fog magnitude). The gate must catch it, name lighting, and key the message off
+    # intent:beats (never a pipeline-earlier specialist) so the text-scan fallback agrees with the
+    # structured attribution and routes back to lighting.
+    beats = "drifting ash. recent conflict."
+    recognized = lighting._recognized_beats(beats)
+    wrong = lighting._fog_density(recognized) + 0.15  # 0.45 -> 0.60, far beyond abs_tol
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=recognized, density=wrong),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:beats" in i and "lighting" in i and "density" in i for i in verdict.issues)
+    assert "lighting" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "lighting"
+    assert _route_back_target(verdict) == "lighting"
+
+
+async def test_run_lighting_density_not_reported_when_drivenby_already_wrong(tmp_path):
+    # FM3 (no double-report): a desynced drivenBy is the ONE violation — density is verified only on
+    # the drivenBy-correct branch, so a layer with BOTH a stale drivenBy and a wrong density yields a
+    # single lighting issue (the drivenBy one), never also a density complaint that double-routes the
+    # same root cause.
+    beats = "scorched earth. drifting ash. recent conflict."
+    recognized = lighting._recognized_beats(beats)
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=recognized[:-1], density=0.99),  # drivenBy AND density wrong
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    lighting_issues = [i for i in verdict.issues if "intent:beats" in i and "lighting" in i]
+    assert len(lighting_issues) == 1
+    assert "drivenBy" in lighting_issues[0] and "density" not in lighting_issues[0]
+    assert _route_back_target(verdict) == "lighting"
+
+
+async def test_run_lighting_density_tracks_the_fog_table_in_lock_step(tmp_path):
+    # FM4 (vocabulary desync): the expected density is re-derived via lighting's OWN _fog_density,
+    # never a re-summed BEAT_FOG_DENSITY copy — a layer emitting exactly _fog_density(recognized) is
+    # accepted while one off by a hundredth (> abs_tol) is rejected, both recomputed via the helper
+    # so a future fog-table change flips the fixture's expectation in lock-step.
+    beats = "drifting ash. choking dust. distant storm."
+    recognized = lighting._recognized_beats(beats)
+    expected = lighting._fog_density(recognized)
+    assert len(recognized) >= 2  # premise: a non-trivial accumulated sum
+
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=recognized, density=expected),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=recognized, density=expected + 0.01),  # > abs_tol 5e-3
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:beats" in i and "lighting" in i and "density" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "lighting"
+
+
 # ---- terrain triangle self-consistency: the metric must match the declared heightfield ----
 #
 # Defense-in-depth across the terrain trust boundary, the geometry-emitter twin of the budget
