@@ -22,6 +22,7 @@ from common.types import WorldBrief, LayerSpec, ValidatorVerdict
 from prop import prop
 from biome import biome
 from lighting import lighting
+from terrain import terrain
 
 STYLE_SIM_THRESHOLD = 0.72
 
@@ -159,6 +160,21 @@ async def run(
         for message in _budget_self_consistency(opt, opt_text, _summed_prior_triangles(layers)):
             issues.append(message)
             failing.add("optimization")
+
+    # Terrain triangle self-consistency — defense-in-depth across the terrain trust boundary,
+    # the geometry-emitter twin of the budget gate above. _budget_self_consistency re-derives
+    # the optimizer's verdict but SUMS terrain's `triangles` metric trusting it; a stale or
+    # tampered terrain metric corrupts that sum and ships an over/under-counted world. Re-derive
+    # the count from the emitted gridResolution and reject a mismatch, routing back to terrain.
+    # Runs only when the metric is trustworthy to read (every metric clean) and terrain's layer
+    # is well-formed — both already rejected + attributed above, so re-deriving on top would
+    # only double-report; a body with no positive-integer gridResolution is skipped, not blamed.
+    terrain_layer = next((layer for layer in layers if layer.specialist == "terrain"), None)
+    if terrain_layer is not None and metrics_ok and terrain_layer in wellformed:
+        terrain_text = (layers_root / terrain_layer.path).read_text()
+        for message in _terrain_triangle_consistency(terrain_layer, terrain_text):
+            issues.append(message)
+            failing.add("terrain")
 
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
@@ -520,6 +536,38 @@ def _budget_self_consistency(opt: LayerSpec, text: str, prior_triangles: float) 
             f"changed after optimization last ran; re-run optimization"
         )
     return out
+
+
+def _terrain_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
+    """Why terrain's reported ``triangles`` metric disagrees with the heightfield its body
+    declares, or [] when they agree — defense-in-depth across the terrain trust boundary,
+    the geometry-emitter twin of ``_budget_self_consistency`` over the optimizer.
+
+    terrain meters ``_heightfield_triangles(gridResolution)``; ``_budget_self_consistency``
+    re-derives the optimizer's verdict but SUMS this metric in trusting it, so a STALE
+    (pre-route-back grid) or tampered terrain metric silently corrupts that budget sum and
+    ships an over/under-counted world. Re-derive the count from the body's gridResolution —
+    reusing ``terrain._heightfield_triangles`` so a change to the triangulation tracks in
+    lock-step (the very coupling terrain's own helper docstring promises) — and reject a
+    mismatch, naming terrain so route-back targets it. A gridResolution that is absent or not
+    a positive integer leaves the metric unverifiable: SKIP (return []) rather than report it
+    — field-presence is the schema gate's concern and the real ``terrain.run`` always emits a
+    sane grid, so the VALID_BODY placeholder terrain layers other gates' tests use (no
+    gridResolution) are never false-rejected (FM3). The reported metric is read straight from
+    ``layer.metrics`` (the caller runs this only when the metrics schema is clean, so it is a
+    finite number)."""
+    grid = _opt_number(text, "gridResolution")
+    if grid is None or grid < 1 or grid != int(grid):
+        return []
+    reported = layer.metrics.get("triangles", 0.0)
+    expected = float(terrain._heightfield_triangles(int(grid)))
+    if math.isclose(reported, expected, rel_tol=1e-9, abs_tol=1e-6):
+        return []
+    return [
+        f"terrain layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} "
+        f"its body declares (a {int(grid)}x{int(grid)} heightfield triangulates to "
+        f"2*({int(grid)}-1)^2 triangles) — a stale or tampered terrain metric; re-run terrain"
+    ]
 
 
 def _layer_wellformedness(path: Path) -> str | None:
