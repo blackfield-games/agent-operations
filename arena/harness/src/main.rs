@@ -93,11 +93,34 @@ fn nonce_for(match_id: Uuid, seat: SeatId) -> String {
 /// [`verify_join_signature`] the contract-backed admission uses. So the loopback
 /// admits unranked play AND validly-signed ranked play, and refuses only a
 /// PRESENTED-but-invalid signature — it never silently seats a forged identity.
-fn admit_join(agent_id: &str, nonce: &[u8], signature_hex: &str) -> Result<(), JoinVerifyError> {
+///
+/// Returns the RECOVERED identity the seat proved possession of: `Some(agent_id)` for
+/// an admitted ranked seat — `verify_join_signature` succeeds only when the recovered
+/// signer's address equals the claim, so the claim IS the verified identity — and
+/// `None` for an unranked seat (no key, nothing to recover). The caller seats a ranked
+/// seat under this address so settlement credits the real identity, not the roster label.
+fn admit_join(agent_id: &str, nonce: &[u8], signature_hex: &str) -> Result<Option<String>, JoinVerifyError> {
     if signature_hex.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    verify_join_signature(PROTOCOL_VERSION, agent_id, nonce, signature_hex)
+    verify_join_signature(PROTOCOL_VERSION, agent_id, nonce, signature_hex)?;
+    Ok(Some(agent_id.to_owned()))
+}
+
+/// Overlay the handshake-recovered ranked identities onto the seated roster so a match
+/// settles to the address each ranked seat PROVED it controls, not the pre-built
+/// `agent-{i}` stand-in. Each `(seat, address)` came from [`admit_join`] returning
+/// `Some` for a verified signature; an unranked seat has no entry and keeps its roster
+/// label. Only the `controller` LABEL changes — `seat` and `team` stay index-driven, so
+/// seat order, team assignment, and reproducibility are untouched; the only effect is
+/// that [`settle_match`]/[`settle_field_match`], which credit `SeatInfo.controller`,
+/// resolve the verified identity.
+fn seat_recovered_identities(seats: &mut [SeatInfo], recovered: &[(SeatId, String)]) {
+    for (seat, address) in recovered {
+        if let Some(s) = seats.iter_mut().find(|s| s.seat == *seat) {
+            s.controller = address.clone();
+        }
+    }
 }
 
 fn emit(out: &mut impl Write, seat: SeatId, msg: &GatewayMsg) {
@@ -437,6 +460,7 @@ fn main() {
     // wait on another seat's Join, or a client that connects sequentially and
     // blocks on its own Welcome would deadlock against a harness waiting for the
     // next Join.
+    let mut recovered: Vec<(SeatId, String)> = Vec::new();
     for _ in 0..n {
         let line = next_line(&mut lines);
         let (seat, msg) = read_agent(&line);
@@ -469,23 +493,29 @@ fn main() {
         // and refuse a presented-but-invalid ranked proof, mirroring the version arm.
         // An empty signature is an unranked seat and admits unchanged.
         let nonce = nonce_for(m.match_id(), seat);
-        if let Err(e) = admit_join(&agent_id, nonce.as_bytes(), &signature_hex) {
-            emit(
-                &mut out,
-                seat,
-                &GatewayMsg::Reject { reason: format!("join signature rejected: {e:?}") },
-            );
-            out.flush().expect("flush reject");
-            if let Some(s) = &settler {
-                // A presented-but-invalid ranked proof voids the opened match like a
-                // version mismatch — refund, no result committed — exactly cancelMatch.
-                eprintln!(
-                    "[settle-dev-mock] {} cancel (join signature rejected): {:?}",
-                    m.match_id(),
-                    s.cancel(m.match_id())
+        match admit_join(&agent_id, nonce.as_bytes(), &signature_hex) {
+            Err(e) => {
+                emit(
+                    &mut out,
+                    seat,
+                    &GatewayMsg::Reject { reason: format!("join signature rejected: {e:?}") },
                 );
+                out.flush().expect("flush reject");
+                if let Some(s) = &settler {
+                    // A presented-but-invalid ranked proof voids the opened match like a
+                    // version mismatch — refund, no result committed — exactly cancelMatch.
+                    eprintln!(
+                        "[settle-dev-mock] {} cancel (join signature rejected): {:?}",
+                        m.match_id(),
+                        s.cancel(m.match_id())
+                    );
+                }
+                std::process::exit(1);
             }
-            std::process::exit(1);
+            // A verified ranked seat is seated under the address it proved (the recovered
+            // signer verify_join_signature accepted as the claim); unranked keeps its label.
+            Ok(Some(address)) => recovered.push((seat, address)),
+            Ok(None) => {}
         }
         emit(
             &mut out,
@@ -538,7 +568,11 @@ fn main() {
 
     if let Some(s) = &settler {
         let match_id = m.match_id();
-        let replay = m.into_replay();
+        let mut replay = m.into_replay();
+        // Seat each verified ranked identity under the address it proved during the
+        // handshake, so settlement (and the digest it commits) credit the real identity
+        // rather than the pre-built agent-{i} label. Unranked seats keep their label.
+        seat_recovered_identities(&mut replay.seats, &recovered);
         // Loopback agents are unrated, so each reads as DEFAULT_RATING — exactly what the
         // live ladder returns for an unseen agent. A 1v1 then defers to the contract's
         // fixed delta (None, byte-identical to pre-ladder); a 3+ field, which has no
@@ -1010,7 +1044,9 @@ mod tests {
         let addr = address_from_verifying_key(sk.verifying_key());
         let nonce = nonce_for(id(), 0);
         let sig = sign_join_proof(&sk, &addr, nonce.as_bytes());
-        assert_eq!(admit_join(&addr, nonce.as_bytes(), &sig), Ok(()));
+        // Admitted AND the recovered identity is the claimed address — the seat is later
+        // seated under it, not the roster label.
+        assert_eq!(admit_join(&addr, nonce.as_bytes(), &sig), Ok(Some(addr.clone())));
     }
 
     #[test]
@@ -1018,7 +1054,8 @@ mod tests {
         // The baseline's default: no signature is an unranked seat, admitted with no
         // proof — the loopback is not ranked-only, so unranked play is untouched.
         let nonce = nonce_for(id(), 0);
-        assert_eq!(admit_join("0xanyone", nonce.as_bytes(), ""), Ok(()));
+        // Admitted with NO recovered identity — an unranked seat keeps its roster label.
+        assert_eq!(admit_join("0xanyone", nonce.as_bytes(), ""), Ok(None));
     }
 
     #[test]
