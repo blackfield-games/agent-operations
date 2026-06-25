@@ -264,6 +264,83 @@ def test_unranked_join_frame_carries_an_empty_signature():
     }
 
 
+# Cross-language known-answer vectors: arena_proto's OWN join_digest / sign_join over
+# the canonical secp256k1 dev key + challenge from the Rust suite. Pinning the EXACT
+# bytes proves the Python digest construction and the RFC6979-deterministic signature
+# are byte-identical to the Gateway's — so a signature this SDK emits is the one
+# verify_join_signature recovers and admits. Regenerate from arena_proto if the digest
+# domain/layout or PROTOCOL_VERSION ever changes (both sides bump in lock-step).
+_DEV_KEY = bytes.fromhex("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+_DEV_ADDR = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23"
+_DEV_NONCE = b"arena-challenge-nonce"
+_GOLDEN_DIGEST = "099de3d1b29be2ae5bf35f85b55f43711757cf609229be790d0acebe35f178dd"
+_GOLDEN_SIG = (
+    "3916c5207f17a13677b955c5179113ffbf054b56ad9953f47c187d5f58e11673"
+    "634419a9a57b018ff14c85bda46716b1706d318fa1411b84f2c33989eb55493101"
+)
+_SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
+def test_address_from_private_key_matches_the_rust_derivation():
+    # The agent_id a ranked seat claims is the lowercase 0x address the key recovers
+    # to — the same derivation arena_proto::address_from_verifying_key uses, so one
+    # session key spans arena + mesh.
+    assert proto.address_from_private_key(_DEV_KEY) == _DEV_ADDR
+
+
+def test_join_digest_is_byte_identical_to_arena_proto():
+    # KAT: the keccak256 commitment must equal the Rust join_digest byte-for-byte, or
+    # the Gateway hashes different bytes and never recovers the signer.
+    got = proto.join_digest(proto.PROTOCOL_VERSION, _DEV_ADDR, _DEV_NONCE)
+    assert got.hex() == _GOLDEN_DIGEST
+
+
+def test_sign_join_reproduces_the_rust_signature():
+    # KAT (the strongest wire-compat proof): RFC6979 is deterministic, so the agent's
+    # signature must equal the one the Rust signer (k256 sign_prehash_recoverable)
+    # produces — same r, s, v — the exact 65 bytes the Gateway admits.
+    assert proto.sign_join(_DEV_KEY, proto.PROTOCOL_VERSION, _DEV_ADDR, _DEV_NONCE) == _GOLDEN_SIG
+
+
+def test_sign_join_is_canonical_low_s_65_bytes_raw_recid():
+    # The Gateway rejects high-S (NonCanonicalSignature) and anything but 65 [r||s||v]
+    # bytes with v the raw recovery id. Pin the structural invariants its EIP-2 gate
+    # enforces — a backend that emitted high-S or the 27/28 offset would be admitted
+    # here but refused by verify_join_signature.
+    raw = bytes.fromhex(proto.sign_join(_DEV_KEY, proto.PROTOCOL_VERSION, _DEV_ADDR, _DEV_NONCE))
+    assert len(raw) == 65
+    assert int.from_bytes(raw[32:64], "big") <= _SECP256K1_N // 2, "must be low-S"
+    assert raw[64] in (0, 1), "v is the raw recovery id, not the 27/28 offset"
+
+
+def test_signed_join_recovers_to_the_claimed_agent_id():
+    # The round-trip the Gateway runs: recover the signer from the signature over the
+    # digest and assert it equals the claimed agent_id — the agent's self-check before
+    # it sends the Join.
+    sig = proto.sign_join(_DEV_KEY, proto.PROTOCOL_VERSION, _DEV_ADDR, _DEV_NONCE)
+    assert proto.recover_join_signer(proto.PROTOCOL_VERSION, _DEV_ADDR, _DEV_NONCE, sig) == _DEV_ADDR
+
+
+def test_signature_does_not_recover_to_claim_under_a_different_nonce():
+    # FM (replay): the nonce is folded into the digest, so a signature captured for one
+    # challenge recovers a DIFFERENT address against a fresh challenge — exactly the
+    # AddressMismatch that makes a captured Join un-replayable on another connection.
+    sig = proto.sign_join(_DEV_KEY, proto.PROTOCOL_VERSION, _DEV_ADDR, _DEV_NONCE)
+    under_other = proto.recover_join_signer(
+        proto.PROTOCOL_VERSION, _DEV_ADDR, b"a-different-challenge", sig
+    )
+    assert under_other != _DEV_ADDR
+
+
+def test_recover_join_signer_rejects_malformed_signatures():
+    # The BadSignatureEncoding / Unrecoverable arms: non-hex, wrong length, and a
+    # 65-byte blob with an out-of-range v all degrade to None — never raise.
+    d = proto.PROTOCOL_VERSION
+    assert proto.recover_join_signer(d, _DEV_ADDR, _DEV_NONCE, "nothexatall") is None
+    assert proto.recover_join_signer(d, _DEV_ADDR, _DEV_NONCE, "00") is None
+    assert proto.recover_join_signer(d, _DEV_ADDR, _DEV_NONCE, "ff" * 65) is None
+
+
 def _intent(x: int, y: int) -> ActionIntent:
     return ActionIntent(
         move_dir=Vec2(x=x, y=y), aim=0,
