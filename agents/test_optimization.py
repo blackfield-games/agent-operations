@@ -13,6 +13,7 @@ import re
 
 import pytest
 
+from biome import biome
 from common.compose import compose_world
 from common.types import LayerSpec, RegionCoord, WorldBrief
 from optimization import optimization
@@ -230,9 +231,15 @@ async def test_resolved_layer_composes_and_validates(tmp_path, monkeypatch):
         got = await getattr(mod, spec).run(brief, layers)
         if got:
             layers.append(got)
-    # force an over-budget world so the optimizer actually sheds, then validate
+    # force an over-budget world so the optimizer actually sheds, then validate. The metric
+    # and the body's instanceCount derive from one count * TRIS_PER_INSTANCE so the layer is
+    # self-consistent — the validator's biome triangle gate re-derives it and would reject a
+    # mismatched stand-in.
+    heavy = 16_667
     layers = [ly for ly in layers if ly.specialist != "biome"]
-    layers.append(_layer("biome", 4_000_000, rid=brief.region.region_id, path=f"biome/{brief.region.region_id}.usda"))
+    layers.append(
+        _layer("biome", float(heavy * biome.TRIS_PER_INSTANCE), rid=brief.region.region_id, path=f"biome/{brief.region.region_id}.usda")
+    )
     # write the heavy biome layer to disk so well-formedness/composition can open it.
     # It carries vegetationCapped because the real director seeds intent:must_not
     # (dense_vegetation) for this region, so the real biome would cap — the synthetic
@@ -240,7 +247,7 @@ async def test_resolved_layer_composes_and_validates(tmp_path, monkeypatch):
     (tmp_path / "layers" / "biome").mkdir(parents=True, exist_ok=True)
     (tmp_path / "layers" / f"biome/{brief.region.region_id}.usda").write_text(
         '#usda 1.0\n(\n    defaultPrim = "Biome"\n)\n\ndef PointInstancer "Scatter"\n{\n'
-        "    custom int instanceCount = 16667\n    custom bool vegetationCapped = true\n}\n"
+        f"    custom int instanceCount = {heavy}\n    custom bool vegetationCapped = true\n}}\n"
     )
     opt = await optimization.run(brief, layers)
     layers.append(opt)

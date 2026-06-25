@@ -176,6 +176,20 @@ async def run(
             issues.append(message)
             failing.add("terrain")
 
+    # Biome scatter triangle self-consistency — the scatter-emitter sibling of the terrain
+    # gate above. biome meters instanceCount * TRIS_PER_INSTANCE; the budget gate SUMS that
+    # metric trusting it, so a stale/tampered biome metric corrupts the sum just as a terrain
+    # one does. Re-derive from the emitted instanceCount and reject a mismatch, routing back
+    # to biome. Same trust preconditions as terrain (metrics clean + biome's layer
+    # well-formed, both already attributed above so re-deriving here only double-reports); a
+    # body with no instanceCount is skipped, not blamed.
+    biome_layer = next((layer for layer in layers if layer.specialist == "biome"), None)
+    if biome_layer is not None and metrics_ok and biome_layer in wellformed:
+        biome_text = (layers_root / biome_layer.path).read_text()
+        for message in _biome_triangle_consistency(biome_layer, biome_text):
+            issues.append(message)
+            failing.add("biome")
+
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
     # one defines, and the layers still open individually while the composed stage
@@ -567,6 +581,36 @@ def _terrain_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
         f"terrain layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} "
         f"its body declares (a {int(grid)}x{int(grid)} heightfield triangulates to "
         f"2*({int(grid)}-1)^2 triangles) — a stale or tampered terrain metric; re-run terrain"
+    ]
+
+
+def _biome_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
+    """Why biome's reported ``triangles`` metric disagrees with the instanceCount its
+    body declares, or [] when they agree — the scatter-emitter sibling of
+    ``_terrain_triangle_consistency`` over the same geometry trust boundary.
+
+    biome meters ``instanceCount * TRIS_PER_INSTANCE``; ``_budget_self_consistency`` SUMS
+    this metric in trusting it, so a STALE (pre-route-back count) or tampered biome metric
+    silently corrupts the budget sum and ships an over/under-counted world. Re-derive the
+    count from the body's instanceCount — reusing ``biome.TRIS_PER_INSTANCE`` so a change to
+    the per-instance triangle cost tracks in lock-step — and reject a mismatch, naming biome
+    so route-back targets it. Unlike terrain's grid (a heightfield needs >=1), a biome count
+    of 0 is a VALID empty-scatter region metering 0 triangles, so SKIP only a count that is
+    absent, negative, or non-integer — a 0 still VERIFIES (a tampered ``instanceCount = 0``
+    over a nonzero metric is a real violation to catch, not an unverifiable body to degrade
+    on). The reported metric is read straight from ``layer.metrics`` (the caller runs this
+    only when the metrics schema is clean, so it is a finite number)."""
+    count = _opt_number(text, "instanceCount")
+    if count is None or count < 0 or count != int(count):
+        return []
+    reported = layer.metrics.get("triangles", 0.0)
+    expected = float(int(count) * biome.TRIS_PER_INSTANCE)
+    if math.isclose(reported, expected, rel_tol=1e-9, abs_tol=1e-6):
+        return []
+    return [
+        f"biome layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} "
+        f"its body declares ({int(count)} instances * {biome.TRIS_PER_INSTANCE} tris each) "
+        f"— a stale or tampered biome metric; re-run biome"
     ]
 
 
