@@ -887,9 +887,14 @@ def _arena_harness() -> str | None:
     """The built arena-harness binary, or None (skip) when cargo / the arena
     workspace is unavailable. Builds on demand if cargo is present so a plain
     `pytest` is self-sufficient; under validate.sh the arena build already produced
-    it, so this just locates it."""
+    it, so this just locates it.
+
+    Prefers the DEBUG profile because that is the one CI (`cargo build -p
+    arena-harness`) and validate.sh build right before the e2e run — so a stale
+    `target/release/` binary left over from a dev build never shadows the freshly
+    compiled debug one (which would silently run the e2e match against old code)."""
     arena = Path(__file__).resolve().parent.parent / "arena"
-    for profile in ("release", "debug"):
+    for profile in ("debug", "release"):
         candidate = arena / "target" / profile / "arena-harness"
         if candidate.exists():
             return str(candidate)
