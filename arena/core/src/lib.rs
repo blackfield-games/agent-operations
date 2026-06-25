@@ -1264,6 +1264,14 @@ impl Match {
         self.config
     }
 
+    /// The [`Rules`] this match runs under (a `Copy`). Read-only — the tuning is fixed
+    /// at construction and folds into the replay digest, so this is the seat for a
+    /// harness/operator to confirm a configured knob (FOV cone, perception memory, …)
+    /// actually reached the sim it built.
+    pub fn rules(&self) -> Rules {
+        self.rules
+    }
+
     /// The static vision/cover blockers this match runs under, in declared order —
     /// the same set sent to agents at `GatewayMsg::Start` so an `AgentController` can
     /// path around physical cover. Read-only; the companion to [`config`](Self::config).
