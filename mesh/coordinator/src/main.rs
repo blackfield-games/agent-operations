@@ -13269,7 +13269,13 @@ mod tests {
         store.enqueue(&queued).unwrap();
         store.enqueue(&inflight).unwrap();
         store.take_next(|j| j.id == inflight.id).unwrap().unwrap();
-        let anchor = store.job_created_at(&queued.id).unwrap().unwrap();
+        // Pin both creation times to one anchor: now_secs() is whole-second, so two
+        // back-to-back enqueues can straddle a boundary and land 1s apart, sparing the
+        // later job at the exact TTL edge — a flake under load. The reap window the test
+        // probes (±1 around anchor+ttl) is meaningful only when both share an anchor.
+        let anchor = 1_000_000;
+        store.set_created_at(&queued.id, anchor).unwrap();
+        store.set_created_at(&inflight.id, anchor).unwrap();
         let ttl = 60 * TEST_TTL_MULTIPLE as i64;
 
         // Both within window: nothing reaped, statuses intact.
