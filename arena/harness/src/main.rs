@@ -79,6 +79,13 @@ struct Args {
     /// reaches the named arena's cover + pickups (and an agent SDK receives them in
     /// [`GatewayMsg::Start`]) however the roster is formed.
     arena: &'static str,
+    /// Perception-memory window in ticks (`Rules::perception_memory_ticks`): how long a
+    /// seat remembers a lost entity's last-known position (surfaced as a `VisibleEntity`
+    /// with `in_line_of_sight == false`). Set by `--perception-memory`; the default `0`
+    /// disables memory, byte-identical to the pre-this-flag harness. Direct path only —
+    /// the matchmaker builds its own `Rules`, so a `--mode` run ignores it until
+    /// `MatchParams` carries a perception knob.
+    perception_memory: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -110,6 +117,7 @@ fn parse_args() -> Args {
     let mut human_seats: Vec<SeatId> = Vec::new();
     let mut ladder_file: Option<PathBuf> = None;
     let mut arena: &'static str = "";
+    let mut perception_memory: u16 = 0;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -131,6 +139,13 @@ fn parse_args() -> Args {
             }
             "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
             "--map" => arena = parse_arena(&it.next().expect("--map needs a value")),
+            "--perception-memory" => {
+                perception_memory = it
+                    .next()
+                    .expect("--perception-memory needs a value")
+                    .parse()
+                    .expect("perception-memory is a u16 (ticks)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -144,6 +159,7 @@ fn parse_args() -> Args {
         human_seats,
         ladder_file,
         arena,
+        perception_memory,
     }
 }
 
@@ -889,10 +905,11 @@ fn build_direct_match(args: &Args, n: u8) -> Match {
         seats: n,
     };
     let map = arena_map(args.arena);
+    let rules = Rules { perception_memory_ticks: args.perception_memory, ..Rules::default() };
     Match::new_with_pickups(
         args.match_id,
         config,
-        Rules::default(),
+        rules,
         roster,
         map.blockers,
         map.pickups,
@@ -1615,6 +1632,7 @@ mod tests {
             human_seats,
             ladder_file: None,
             arena: "",
+            perception_memory: 0,
         }
     }
 
@@ -1662,7 +1680,7 @@ mod tests {
 
     // ===== --map arena selection =====
 
-    fn direct_args(seats: u8, arena: &'static str) -> Args {
+    fn direct_args(seats: u8, arena: &'static str, perception_memory: u16) -> Args {
         Args {
             match_id: id(),
             seed: 0,
@@ -1673,6 +1691,7 @@ mod tests {
             human_seats: vec![],
             ladder_file: None,
             arena,
+            perception_memory,
         }
     }
 
@@ -1707,18 +1726,37 @@ mod tests {
     fn direct_match_default_arena_is_empty() {
         // FM1: no --map (arena == "") yields empty geometry — exactly Match::new's
         // no-blockers/no-pickups match, so the no-flag run stays byte-identical.
-        let m = build_direct_match(&direct_args(2, ""), 2);
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
         assert!(m.blockers().is_empty(), "the default arena has no cover");
         assert!(m.pickup_spawns().is_empty(), "the default arena has no items");
+        assert_eq!(m.rules().perception_memory_ticks, 0, "no --perception-memory: memory off");
     }
 
     #[test]
     fn direct_match_named_arena_loads_cover_and_pickups() {
         // FM3/FM4: --map reference reaches the DIRECT path — the formed match carries the
         // reference arena's occluder + two health pickups.
-        let m = build_direct_match(&direct_args(2, "reference"), 2);
+        let m = build_direct_match(&direct_args(2, "reference", 0), 2);
         assert!(!m.blockers().is_empty(), "the reference arena has a vision occluder");
         assert_eq!(m.pickup_spawns().len(), 2, "the reference arena has two health pickups");
+    }
+
+    #[test]
+    fn direct_match_threads_the_perception_memory_window_into_rules() {
+        // FM1/FM3: --perception-memory reaches the sim's Rules (the seat memory.rs reads),
+        // so the knob actually turns the core feature on; default 0 stays off. The memory
+        // BEHAVIOR (a lost enemy surfaces in_line_of_sight=false) is arena-core's own test;
+        // here we pin the wiring deterministically via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().perception_memory_ticks,
+            0,
+            "the default window is off (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&direct_args(2, "reference", 45), 2).rules().perception_memory_ticks,
+            45,
+            "--perception-memory 45 threads into Rules (alongside an arena, independently)"
+        );
     }
 
     #[test]
