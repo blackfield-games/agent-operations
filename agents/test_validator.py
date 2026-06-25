@@ -16,6 +16,7 @@ Run from the agents/ dir:
 from pathlib import Path
 
 from common.types import LayerSpec, RegionCoord, WorldBrief
+from lighting import lighting
 from optimization import optimization
 from runtime.supervisor import _failing_specialist, _route_back_target
 from validator import validator
@@ -931,10 +932,15 @@ def _director_body(
     must_have: str | None = None,
     must_not: str | None = None,
     factions: str | None = None,
+    beats: str | None = None,
 ) -> str:
     """A well-formed director layer seeding the given intent. An omitted field emits no
-    attribute (the director predates it / seeded nothing) so the gate stays silent."""
+    attribute (the director predates it / seeded nothing) so the gate stays silent. `beats`
+    is the director's free-form mood line (prose, no commas) — the real director joins its
+    per-region beat phrases into one such line."""
     lines = ["#usda 1.0", "(", '    defaultPrim = "Director"', ")", "", 'def Scope "Director"', "{"]
+    if beats is not None:
+        lines.append(f'    custom string intent:beats = "{beats}"')
     if must_have is not None:
         lines.append(f'    custom string intent:must_have = "{must_have}"')
     if must_not is not None:
@@ -943,6 +949,27 @@ def _director_body(
         lines.append(f'    custom string intent:factions = "{factions}"')
     lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+def _lighting_body(driven_by: list[str] | None = None) -> str:
+    """A lighting layer mirroring lighting.run: the locked overcast+inferno-rim palette,
+    plus a `def Volume "Atmosphere"` whose `drivenBy` lists `driven_by` iff it is given
+    (None ⇒ the pre-beats palette with no Atmosphere — the back-compat floor the gate must
+    accept when no beat is recognized)."""
+    atmosphere = ""
+    if driven_by is not None:
+        atmosphere = (
+            '\n    def Volume "Atmosphere"\n    {\n'
+            "        float inputs:density = 0.30\n"
+            f'        custom string drivenBy = "{",".join(driven_by)}"\n'
+            '        custom string mood = "haze"\n    }'
+        )
+    return (
+        '#usda 1.0\n(\n    defaultPrim = "Lighting"\n)\n\n'
+        'def Xform "Lighting"\n{\n'
+        '    def DomeLight "Sky"\n    {\n        custom string mood = "overcast"\n    }'
+        f"{atmosphere}\n}}\n"
+    )
 
 
 def _prop_body(required_assets: list[str]) -> str:
@@ -1172,3 +1199,98 @@ async def test_run_npc_intent_gate_does_not_special_case_the_fallback_archetype(
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert verdict.accepted, verdict.issues
+
+
+# ---- lighting loop: the Atmosphere must be driven by the director's recognized beats ----
+#
+# The director DECLARES intent:beats (a free-form mood line) and lighting HONORS it by
+# emitting a `def Volume "Atmosphere"` driven by the beats it MODELS; these pin that the
+# validator VERIFIES it — accepting a layer driven by exactly the recognized beats,
+# rejecting one that dropped the atmosphere (routed back to lighting), staying silent when
+# no modeled beat is present, degrading when the layer is missing, and tracking lighting's
+# vocabulary via _recognized_beats rather than a hardcoded keyword set.
+
+
+async def test_run_accepts_lighting_atmosphere_driven_by_recognized_beats(tmp_path):
+    # FM1 (no false reject): the director names beats lighting models and lighting emits the
+    # Atmosphere driven by exactly those recognized tokens — nothing unmet, byte-clean.
+    beats = "scorched earth. drifting ash. recent conflict."
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=lighting._recognized_beats(beats)),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert verdict.issues == []
+
+
+async def test_run_rejects_a_dropped_atmosphere_and_routes_to_lighting(tmp_path):
+    # FM2 (false accept): the director names recognized beats but lighting's layer carries no
+    # Atmosphere (a stale layer authored before beats drove fog). The gate must catch it,
+    # name lighting, and key the message off intent:beats (never "director", pipeline-earlier)
+    # so the text-scan fallback agrees with the structured attribution and routes to lighting.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats="scorched earth. drifting ash. recent conflict."),
+        "lighting": _lighting_body(driven_by=None),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:beats" in i and "lighting" in i for i in verdict.issues)
+    assert "lighting" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "lighting"
+    assert _route_back_target(verdict) == "lighting"
+
+
+async def test_run_lighting_intent_gate_silent_for_unmodeled_only_beats(tmp_path):
+    # FM1/FM3 (no false reject): a beats line naming NO beat lighting models imposes no
+    # atmosphere — lighting correctly emits its pre-beats palette (no Atmosphere) and the
+    # gate must stay silent (no recognized beat ⇒ nothing to verify).
+    beats = "quiet meadow. gentle breeze."
+    assert not lighting._recognized_beats(beats)  # premise: this line models nothing
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=None),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_lighting_intent_gate_degrades_on_a_missing_lighting_layer(tmp_path):
+    # FM3 (missing-layer degrade): the director names recognized beats but lighting's FILE is
+    # gone. The intent gate must skip the unreadable layer (never crash the final gate); the
+    # missing-layer/well-formedness gate rejects and routes back to lighting.
+    bodies = {"director": _director_body(beats="scorched earth. drifting ash.")}
+    verdict = await validator.run(
+        _brief(), _set_with_missing(tmp_path, bodies, missing="lighting"), layers_root=tmp_path
+    )
+    assert not verdict.accepted
+    assert "lighting" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "lighting"
+
+
+async def test_run_lighting_intent_gate_tracks_recognized_beats_vocabulary(tmp_path):
+    # FM4 (vocabulary desync): the gate recognizes beats via lighting's OWN _recognized_beats,
+    # so its expectation is exactly that helper's output — never a hardcoded keyword set.
+    # Recompute the recognized tokens from the helper: a layer driven by them is accepted; one
+    # driven by a STRICT SUBSET (a stale layer that lost a beat the director still names) is
+    # rejected and routed back to lighting. Both halves recompute via the helper, so a future
+    # BEAT_FOG_DENSITY change flips the fixture's expectation in lock-step.
+    beats = "scorched earth. drifting ash. choking dust."
+    recognized = lighting._recognized_beats(beats)
+    assert len(recognized) >= 2  # need a token to drop for the reject half
+
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=recognized),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=beats),
+        "lighting": _lighting_body(driven_by=recognized[:-1]),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:beats" in i and "lighting" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "lighting"
