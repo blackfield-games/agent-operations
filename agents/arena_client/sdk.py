@@ -293,6 +293,17 @@ class LadderStanding:
     delta: int
 
 
+@dataclass(frozen=True, slots=True)
+class MatchStart:
+    """The static map a seat received at Start: the cover `blockers` and the pickup
+    spawn `pickup_points`. Read it back from `run_local_match` (via `starts=`) to see
+    what arena the match actually played under — both lists are empty for the default
+    (no `arena=`) empty arena."""
+
+    blockers: list[Blocker]
+    pickup_points: list[Vec2]
+
+
 _LADDER_PREFIX = "[ladder] "
 
 
@@ -431,6 +442,8 @@ def run_local_match(
     human_seats: list[int] | None = None,
     ladder_file: str | Path | None = None,
     ratings: dict[int, LadderStanding | None] | None = None,
+    arena: str | None = None,
+    starts: dict[int, MatchStart] | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -467,7 +480,17 @@ def run_local_match(
     two sequential ranked matches sharing one path accumulate a seat's rating (read it via
     `ratings`). The ladder only MOVES on the `--mode` path, so `ladder_file` with `mode=None`
     is rejected up front (the direct path would silently ignore it); a human/Mixed run loads
-    and rewrites the file with no movement. Omitting it adds no flag — byte-identical to before."""
+    and rewrites the file with no movement. Omitting it adds no flag — byte-identical to before.
+
+    Pass an `arena` (a builtin map key, e.g. `"reference"`) to play the match under that
+    arena's static geometry — its vision blockers and pickup spawns, forwarded to the
+    harness as `--map`. It applies to BOTH the direct (`mode=None`) and `--mode` paths, so
+    an agent receives the cover + pickups in its Start frame however the roster is formed.
+    Omitting it (`arena=None`) adds no flag — the empty arena, byte-identical to before; an
+    unknown key aborts the harness loudly (surfacing as a `GatewayClosed`/timeout here, not
+    a silent empty arena). Pass a `starts` dict to read back each seat's received geometry
+    as a `MatchStart` (filled in place at connect), so a caller can confirm what arena the
+    match played under."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -477,6 +500,10 @@ def run_local_match(
             "--mode path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
         )
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
+    if arena is not None:
+        # Unconditional, before the mode block: --map drives both the direct and --mode
+        # paths in the harness, so the arena loads however the roster is formed.
+        argv += ["--map", arena]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
@@ -513,6 +540,13 @@ def run_local_match(
                 client.send_join()
             for client in clients.values():
                 client.recv_welcome()
+        if starts is not None:
+            # Every client has its Start now (connected above), so record the static map
+            # each seat received — the cover + pickups the chosen arena loaded.
+            for s, client in clients.items():
+                starts[s] = MatchStart(
+                    blockers=list(client.blockers), pickup_points=list(client.pickup_points)
+                )
         results: dict[int, MatchResult] = {}
         while len(results) < len(seats):
             for seat, client in clients.items():
