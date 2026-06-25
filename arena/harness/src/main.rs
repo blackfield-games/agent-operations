@@ -26,7 +26,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use arena_core::{
-    ranked_delta, ranked_field_delta, settlement, Match, Rules, SeatDelta, Settlement, DEFAULT_RATING,
+    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, Match, Rules, SeatDelta,
+    Settlement, DEFAULT_RATING,
 };
 use arena_match::{
     JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker, SignatureVerifier, SnapshotError,
@@ -71,6 +72,13 @@ struct Args {
     /// back atomically after the match. Only a `--mode` run moves a ladder, so the flag
     /// is consulted on that path; `None` keeps the in-memory-only behaviour.
     ladder_file: Option<PathBuf>,
+    /// The builtin arena whose static geometry — vision blockers + world pickups — the
+    /// match plays under, resolved through [`arena_map`]. Set by `--map <key>`; the
+    /// default `""` is the empty arena (no occlusion, no items), byte-identical to the
+    /// pre-this-flag harness. Applies to BOTH the direct and `--mode` paths, so a match
+    /// reaches the named arena's cover + pickups (and an agent SDK receives them in
+    /// [`GatewayMsg::Start`]) however the roster is formed.
+    arena: &'static str,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -84,6 +92,14 @@ fn parse_mode(value: &str) -> MatchMode {
     }
 }
 
+/// Resolve a `--map` value to a builtin arena's canonical `'static` key, aborting on
+/// an unknown one (mirroring [`parse_mode`]). The reject is loud and deliberate: an
+/// unrecognised key would otherwise degrade through [`arena_map`] to the empty arena,
+/// silently playing no-cover instead of the map the operator asked for.
+fn parse_arena(value: &str) -> &'static str {
+    named_arena(value).unwrap_or_else(|| panic!("--map names an unknown arena: {value:?}"))
+}
+
 fn parse_args() -> Args {
     let mut match_id = DEFAULT_MATCH_ID.to_string();
     let mut seed: u64 = 0;
@@ -93,6 +109,7 @@ fn parse_args() -> Args {
     let mut mode: Option<MatchMode> = None;
     let mut human_seats: Vec<SeatId> = Vec::new();
     let mut ladder_file: Option<PathBuf> = None;
+    let mut arena: &'static str = "";
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -113,6 +130,7 @@ fn parse_args() -> Args {
                     .collect();
             }
             "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
+            "--map" => arena = parse_arena(&it.next().expect("--map needs a value")),
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -125,6 +143,7 @@ fn parse_args() -> Args {
         mode,
         human_seats,
         ladder_file,
+        arena,
     }
 }
 
@@ -615,8 +634,8 @@ fn settle_ranked_ladder(mm: &Matchmaker<SignatureVerifier>, result: &MatchResult
 /// match plays like a hand-seated one. `seats_per_match == n` makes the match form
 /// exactly when the last seat joins, consuming the whole queue, so its roster is in seat
 /// (submission) order and the transport's envelope seat stays the match seat.
-fn matchmaker_params(n: u8, max_ticks: u64) -> MatchParams {
-    MatchParams { seats_per_match: n, max_ticks, ..MatchParams::default() }
+fn matchmaker_params(n: u8, max_ticks: u64, arena: &'static str) -> MatchParams {
+    MatchParams { seats_per_match: n, max_ticks, arena, ..MatchParams::default() }
 }
 
 /// Why a `--ladder-file` could not be trusted. A MISSING or empty file is NOT an error
@@ -694,7 +713,7 @@ fn abort_ladder(path: &Path, err: &LadderFileError) -> ! {
 /// to the pre-persistence harness. A present but corrupt or wrong-schema file aborts the
 /// run via [`abort_ladder`] rather than silently resetting standings.
 fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<SignatureVerifier> {
-    let params = matchmaker_params(n, args.max_ticks);
+    let params = matchmaker_params(n, args.max_ticks, args.arena);
     let Some(path) = &args.ladder_file else {
         return Matchmaker::new(SignatureVerifier, params);
     };
@@ -851,6 +870,36 @@ fn handshake_matchmade(
     (mm, m)
 }
 
+/// Build the direct-path (no `--mode`) match: a fixed `agent-{i}` free-for-all roster
+/// under the configured arena geometry. The matchmade path forms its own match through
+/// the [`Matchmaker`] ([`build_matchmaker`]); this is the hand-seated twin.
+///
+/// Both paths resolve geometry through [`arena_map`], so `--map` reaches the direct
+/// path too. The default empty arena (`args.arena == ""`) yields empty blockers +
+/// pickups, which is exactly what [`Match::new`] produces (it is `new_with_pickups`
+/// with no pickups) — so a no-flag run is byte-identical to the pre-map harness.
+fn build_direct_match(args: &Args, n: u8) -> Match {
+    let roster: Vec<SeatInfo> = (0..n)
+        .map(|i| SeatInfo { seat: i, team: u16::from(i), controller: format!("agent-{i}") })
+        .collect();
+    let config = MatchConfig {
+        tick_hz: 30,
+        max_ticks: args.max_ticks,
+        bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+        seats: n,
+    };
+    let map = arena_map(args.arena);
+    Match::new_with_pickups(
+        args.match_id,
+        config,
+        Rules::default(),
+        roster,
+        map.blockers,
+        map.pickups,
+        args.seed,
+    )
+}
+
 fn main() {
     let args = parse_args();
     let n = args.seats;
@@ -889,16 +938,7 @@ fn main() {
 
     // Direct-seating path (no --mode): seat a fixed agent-{i} roster, byte-identical to
     // the pre-matchmaker harness.
-    let roster: Vec<SeatInfo> = (0..n)
-        .map(|i| SeatInfo { seat: i, team: u16::from(i), controller: format!("agent-{i}") })
-        .collect();
-    let config = MatchConfig {
-        tick_hz: 30,
-        max_ticks: args.max_ticks,
-        bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
-        seats: n,
-    };
-    let mut m = Match::new(args.match_id, config, Rules::default(), roster, Vec::new(), args.seed);
+    let mut m = build_direct_match(&args, n);
 
     for seat in 0..n {
         emit(&mut out, seat, &GatewayMsg::Challenge { nonce: nonce_for(m.match_id(), seat) });
@@ -1574,6 +1614,7 @@ mod tests {
             mode: Some(mode),
             human_seats,
             ladder_file: None,
+            arena: "",
         }
     }
 
@@ -1590,7 +1631,7 @@ mod tests {
     }
 
     fn mm2() -> Matchmaker<SignatureVerifier> {
-        Matchmaker::new(SignatureVerifier, matchmaker_params(2, 4))
+        Matchmaker::new(SignatureVerifier, matchmaker_params(2, 4, ""))
     }
 
     #[test]
@@ -1605,13 +1646,108 @@ mod tests {
         // A matchmade match must play like a hand-seated one: same tick rate, bounds,
         // free-for-all teams, empty arena — and seats_per_match == n so it forms exactly
         // when the last seat joins (consuming the whole queue, rostered in seat order).
-        let p = matchmaker_params(3, 1234);
+        let p = matchmaker_params(3, 1234, "");
         assert_eq!(p.seats_per_match, 3);
         assert_eq!(p.max_ticks, 1234);
         assert_eq!(p.tick_hz, 30);
         assert_eq!(p.team_size, 1, "free-for-all, like the direct roster's team == seat");
         assert_eq!(p.bounds, Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE });
         assert_eq!(p.arena, "", "the empty arena, like the direct path's no-pickups match");
+        assert_eq!(
+            matchmaker_params(3, 1234, "reference").arena,
+            "reference",
+            "a named arena threads through to the matchmaker, so --map reaches the matchmade path"
+        );
+    }
+
+    // ===== --map arena selection =====
+
+    fn direct_args(seats: u8, arena: &'static str) -> Args {
+        Args {
+            match_id: id(),
+            seed: 0,
+            seats,
+            max_ticks: 4,
+            settle_dev_mock: false,
+            mode: None,
+            human_seats: vec![],
+            ladder_file: None,
+            arena,
+        }
+    }
+
+    /// The first [`GatewayMsg::Start`] decoded out of the harness's emitted stdout
+    /// envelopes — what an agent actually receives, proving the geometry crosses the wire
+    /// and isn't merely held on the in-memory `Match`.
+    fn first_start(stdout: &str) -> GatewayMsg {
+        stdout
+            .lines()
+            .find_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                let msg: GatewayMsg = serde_json::from_value(v.get("frame")?.clone()).ok()?;
+                matches!(msg, GatewayMsg::Start { .. }).then_some(msg)
+            })
+            .expect("a Start frame is emitted")
+    }
+
+    #[test]
+    fn parse_arena_resolves_a_known_key() {
+        assert_eq!(parse_arena("reference"), "reference");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown arena")]
+    fn parse_arena_rejects_an_unknown_key() {
+        // FM2: a typo must abort loudly, NOT degrade through arena_map to the empty arena
+        // (which would silently play no-cover instead of the map the operator asked for).
+        parse_arena("does-not-exist");
+    }
+
+    #[test]
+    fn direct_match_default_arena_is_empty() {
+        // FM1: no --map (arena == "") yields empty geometry — exactly Match::new's
+        // no-blockers/no-pickups match, so the no-flag run stays byte-identical.
+        let m = build_direct_match(&direct_args(2, ""), 2);
+        assert!(m.blockers().is_empty(), "the default arena has no cover");
+        assert!(m.pickup_spawns().is_empty(), "the default arena has no items");
+    }
+
+    #[test]
+    fn direct_match_named_arena_loads_cover_and_pickups() {
+        // FM3/FM4: --map reference reaches the DIRECT path — the formed match carries the
+        // reference arena's occluder + two health pickups.
+        let m = build_direct_match(&direct_args(2, "reference"), 2);
+        assert!(!m.blockers().is_empty(), "the reference arena has a vision occluder");
+        assert_eq!(m.pickup_spawns().len(), 2, "the reference arena has two health pickups");
+    }
+
+    #[test]
+    fn matchmade_named_arena_reaches_the_start_frame() {
+        // FM4: --map reference reaches the MATCHMADE path too, and the geometry crosses the
+        // wire — the Start frame an agent receives carries the cover + pickups, not just the
+        // in-memory Match. Two agents sign their seat's challenge and form an Agent match.
+        let sk0 = join_key();
+        let sk1 = other_join_key();
+        let addr0 = address_from_verifying_key(sk0.verifying_key());
+        let addr1 = address_from_verifying_key(sk1.verifying_key());
+        let sig0 = sign_join_proof(&sk0, &addr0, nonce_for(id(), 0).as_bytes());
+        let sig1 = sign_join_proof(&sk1, &addr1, nonce_for(id(), 1).as_bytes());
+        let input = format!("{}\n{}\n", join_line(0, &addr0, &sig0), join_line(1, &addr1, &sig1));
+        let mut lines = io::BufReader::new(io::Cursor::new(input)).lines();
+        let mut out: Vec<u8> = Vec::new();
+        let mut args = mode_args(2, MatchMode::Agent, vec![]);
+        args.arena = "reference";
+
+        let (_mm, m) = handshake_matchmade(&args, MatchMode::Agent, 2, &None, &mut lines, &mut out);
+        assert!(!m.blockers().is_empty(), "the formed match plays under the reference arena's cover");
+        assert_eq!(m.pickup_spawns().len(), 2, "and its two health pickups");
+
+        let stdout = String::from_utf8(out).unwrap();
+        let GatewayMsg::Start { blockers, pickup_points, .. } = first_start(&stdout) else {
+            unreachable!("first_start returns a Start variant")
+        };
+        assert!(!blockers.is_empty(), "the agent's Start frame carries the cover");
+        assert_eq!(pickup_points.len(), 2, "the agent's Start frame carries the two pickup points");
     }
 
     #[test]
@@ -1750,7 +1886,7 @@ mod tests {
     /// ladder + the pending_ranked registration live) and the formed match, so a test can
     /// settle the match's terminal result back into the ladder.
     fn formed_ranked_match(keys: &[SigningKey]) -> (Matchmaker<SignatureVerifier>, Match) {
-        let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(keys.len() as u8, 4));
+        let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(keys.len() as u8, 4, ""));
         let mut formed = None;
         for (seat, sk) in keys.iter().enumerate() {
             let seat = seat as SeatId;
@@ -1886,7 +2022,7 @@ mod tests {
         let mut args = mode_args(2, MatchMode::Agent, vec![]);
         args.ladder_file = Some(path);
         let from_missing = build_matchmaker(&args, 2);
-        let no_file = Matchmaker::new(SignatureVerifier, matchmaker_params(2, 4));
+        let no_file = Matchmaker::new(SignatureVerifier, matchmaker_params(2, 4, ""));
         assert_eq!(from_missing.snapshot(), no_file.snapshot(), "a missing file yields the fresh in-memory ladder");
     }
 
@@ -1920,7 +2056,7 @@ mod tests {
         let parsed = read_ladder_file(&path).expect("valid JSON parses").expect("non-empty file");
         assert!(
             matches!(
-                Matchmaker::from_snapshot(SignatureVerifier, matchmaker_params(2, 4), parsed),
+                Matchmaker::from_snapshot(SignatureVerifier, matchmaker_params(2, 4, ""), parsed),
                 Err(SnapshotError::Version { .. })
             ),
             "a stale-schema snapshot is rejected on restore, not silently loaded",
