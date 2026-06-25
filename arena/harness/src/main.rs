@@ -82,9 +82,10 @@ struct Args {
     /// Perception-memory window in ticks (`Rules::perception_memory_ticks`): how long a
     /// seat remembers a lost entity's last-known position (surfaced as a `VisibleEntity`
     /// with `in_line_of_sight == false`). Set by `--perception-memory`; the default `0`
-    /// disables memory, byte-identical to the pre-this-flag harness. Direct path only —
-    /// the matchmaker builds its own `Rules`, so a `--mode` run ignores it until
-    /// `MatchParams` carries a perception knob.
+    /// disables memory, byte-identical to the pre-this-flag harness. Applies to BOTH the
+    /// direct and `--mode` paths through [`rules_from`]: the matchmaker carries it on
+    /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same window a
+    /// hand-seated one does.
     perception_memory: u16,
 }
 
@@ -729,7 +730,10 @@ fn abort_ladder(path: &Path, err: &LadderFileError) -> ! {
 /// to the pre-persistence harness. A present but corrupt or wrong-schema file aborts the
 /// run via [`abort_ladder`] rather than silently resetting standings.
 fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<SignatureVerifier> {
-    let params = matchmaker_params(n, args.max_ticks, args.arena);
+    // Carry the same Rules the direct path forms under (rules_from), so a matchmade match
+    // plays under exactly the tuning a hand-seated one does — this is what threads
+    // --perception-memory through the --mode/ranked path the matchmaker owns.
+    let params = MatchParams { rules: rules_from(args), ..matchmaker_params(n, args.max_ticks, args.arena) };
     let Some(path) = &args.ladder_file else {
         return Matchmaker::new(SignatureVerifier, params);
     };
@@ -886,6 +890,16 @@ fn handshake_matchmade(
     (mm, m)
 }
 
+/// The combat [`Rules`] both seating paths form under, derived from the harness flags so
+/// a matchmade (`--mode`) match and a hand-seated direct match play under the SAME tuning.
+/// The matchmaker carries it via [`MatchParams::rules`] ([`build_matchmaker`]); the direct
+/// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). Today
+/// only the perception-memory window is dialable (`--perception-memory`); every other field
+/// stays at [`Rules::default`], so a no-flag run is byte-identical to the pre-knob harness.
+fn rules_from(args: &Args) -> Rules {
+    Rules { perception_memory_ticks: args.perception_memory, ..Rules::default() }
+}
+
 /// Build the direct-path (no `--mode`) match: a fixed `agent-{i}` free-for-all roster
 /// under the configured arena geometry. The matchmade path forms its own match through
 /// the [`Matchmaker`] ([`build_matchmaker`]); this is the hand-seated twin.
@@ -905,7 +919,7 @@ fn build_direct_match(args: &Args, n: u8) -> Match {
         seats: n,
     };
     let map = arena_map(args.arena);
-    let rules = Rules { perception_memory_ticks: args.perception_memory, ..Rules::default() };
+    let rules = rules_from(args);
     Match::new_with_pickups(
         args.match_id,
         config,
@@ -1757,6 +1771,38 @@ mod tests {
             45,
             "--perception-memory 45 threads into Rules (alongside an arena, independently)"
         );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_the_perception_window_into_a_matchmade_match() {
+        // The frontier this slice closes: --perception-memory now reaches the --mode path.
+        // build_matchmaker carries the window via MatchParams.rules, so a match the
+        // MATCHMAKER forms runs under it — not the Rules::default() the matchmaker hardcoded
+        // before. Proven by forming a 2-seat match through the built matchmaker (Human seats
+        // are token-less, so no signing) and reading rules() back, the accessor the
+        // direct-path twin above uses — so matchmade and hand-seated agree on the window.
+        let mm = build_matchmaker(&direct_args(2, "", 45), 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().perception_memory_ticks,
+            45,
+            "the matchmaker forms under the --perception-memory window (matchmade == hand-seated)"
+        );
+
+        // No flag still forms memory-off — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(off.rules().perception_memory_ticks, 0, "no --perception-memory: the matchmaker forms memory-off");
     }
 
     #[test]
