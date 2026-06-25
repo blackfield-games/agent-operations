@@ -1219,6 +1219,95 @@ def test_gateway_ladder_fails_loud_on_a_drifted_emission_but_skips_a_foreign_mat
     assert emit(foreign).ladder("m") == {}
 
 
+def test_run_matchmade_ladder_file_accumulates_a_seat_rating_across_two_runs(tmp_path):
+    # The headline: a --ladder-file makes the ranked ladder DURABLE across SDK calls. Run a
+    # ranked match twice sharing one file; run 2 seeds from run 1's written ladder, so each
+    # seat's pre-match rating in run 2 is EXACTLY its post-match rating from run 1 — the
+    # standing accumulates instead of resetting to the default every call. The spaced
+    # filename also proves the path reaches the harness as one argv token (not shell-split).
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import LadderStanding, run_local_match
+
+    ladder = tmp_path / "rated ladder.json"
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    salt = "00000000-0000-4000-8000-000000000000"
+
+    r1: dict[int, LadderStanding | None] = {}
+    run_local_match(
+        harness, [0, 1], policies, seed=5, match_id=salt, mode="agent",
+        signing_keys=keys, ladder_file=ladder, ratings=r1,
+    )
+    assert ladder.exists(), "run 1 persisted the ladder to the exact (spaced) path"
+    assert r1[0] is not None and r1[1] is not None, "both ranked seats have a run-1 standing"
+
+    r2: dict[int, LadderStanding | None] = {}
+    run_local_match(
+        harness, [0, 1], policies, seed=5, match_id=salt, mode="agent",
+        signing_keys=keys, ladder_file=ladder, ratings=r2,
+    )
+    assert r2[0] is not None and r2[1] is not None
+
+    # Both seats start run 1 at the same default (equal pre-ratings, zero-sum), so the
+    # default is recoverable without hardcoding it; run 1 actually moved the ladder.
+    default = r1[0].rating - r1[0].delta
+    assert r1[1].rating - r1[1].delta == default, "run 1 starts both seats at the default"
+    assert any(r1[s].rating != default for s in (0, 1)), "run 1 actually moved the ladder"
+
+    # Run 2 resumed each seat's run-1 POST-match standing from the file (per seat, robust to
+    # which seat won either non-deterministic run): a fresh start would make run 2's pre ==
+    # default, not run 1's moved value.
+    for s in (0, 1):
+        assert r2[s].rating - r2[s].delta == r1[s].rating, f"seat {s} resumed its run-1 rating in run 2"
+    assert any(r2[s].rating - r2[s].delta != default for s in (0, 1)), "run 2 did NOT silently start fresh"
+
+
+def test_ladder_file_without_a_ranked_mode_is_rejected_before_spawning():
+    # FM1: the harness only persists the ladder on the --mode path, so a ladder_file with
+    # mode=None (the direct path) is a silent no-op. Reject it up front — fail loud, never
+    # quietly drop the persistence the caller asked for. Raises before any spawn, so the
+    # nonexistent harness path is never reached.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    with pytest.raises(ValueError, match="ladder_file"):
+        run_local_match("/no/such/harness", [0, 1], policies, ladder_file="/tmp/ladder.json")
+
+
+def test_run_local_match_forwards_ladder_file_as_one_argv_token_and_omits_it_by_default(monkeypatch):
+    # FM2 (quoting) + FM3 (additive): when set, the EXACT path is forwarded as a SINGLE argv
+    # token (run_local_match builds an argv list, not a shell string, so spaces survive
+    # verbatim); when omitted, no --ladder-file appears at all, so an existing caller's argv
+    # is byte-identical. Captured without a harness by stubbing the gateway before it spawns.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+
+    # Omitted: not a single --ladder-file token (additive — byte-identical argv).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys)
+    assert "--ladder-file" not in captured["argv"]
+
+    # Set: the exact path is the one argv token after the flag — spaces intact, never split.
+    spaced = "/tmp/a b/rated ladder.json"
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, ladder_file=spaced)
+    argv = captured["argv"]
+    assert argv[argv.index("--ladder-file") + 1] == spaced
+
+
 def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
     # FM1: a mode/composition the Matchmaker can never form must fail LOUD up front, not
     # hang on a Welcome that never comes. These raise before the harness is spawned, so
