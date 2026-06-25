@@ -18,6 +18,7 @@ name = "arena-harness"
 version = "0.0.1"
 dependencies = [
  "arena-core",
+ "arena-match",
  "arena-proto",
  "hex",
  "k256",
