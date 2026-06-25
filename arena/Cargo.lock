@@ -20,6 +20,7 @@ dependencies = [
  "arena-core",
  "arena-proto",
  "hex",
+ "k256",
  "serde_json",
  "uuid",
 ]

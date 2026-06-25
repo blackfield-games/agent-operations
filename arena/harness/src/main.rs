@@ -561,7 +561,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena_proto::SeatOutcome;
+    use arena_proto::{address_from_verifying_key, join_digest, SeatOutcome};
+    use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -977,5 +978,88 @@ mod tests {
             Err(SettleError::NotRankedField),
         ));
         assert_eq!(settler.resolution(id()), None, "nothing recorded across the refusals");
+    }
+
+    fn join_key() -> SigningKey {
+        let bytes =
+            hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318").unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    fn other_join_key() -> SigningKey {
+        let bytes =
+            hex::decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
+    /// Sign join_digest exactly as the agent SDK does — `[r||s||v]` hex, low-S, raw
+    /// recovery id — so these tests exercise admit_join over a real agent proof.
+    fn sign_join_proof(sk: &SigningKey, agent_id: &str, nonce: &[u8]) -> String {
+        let digest = join_digest(PROTOCOL_VERSION, agent_id, nonce);
+        let (sig, recid): (Signature, RecoveryId) = sk.sign_prehash_recoverable(&digest).unwrap();
+        let mut raw = sig.to_bytes().to_vec();
+        raw.push(recid.to_byte());
+        hex::encode(raw)
+    }
+
+    #[test]
+    fn admit_join_admits_a_valid_ranked_signature() {
+        // The agent signs join_digest over its seat's challenge nonce with its session
+        // key; admit_join recovers the signer and accepts the identity it claims.
+        let sk = join_key();
+        let addr = address_from_verifying_key(sk.verifying_key());
+        let nonce = nonce_for(id(), 0);
+        let sig = sign_join_proof(&sk, &addr, nonce.as_bytes());
+        assert_eq!(admit_join(&addr, nonce.as_bytes(), &sig), Ok(()));
+    }
+
+    #[test]
+    fn admit_join_admits_an_empty_signature_as_unranked() {
+        // The baseline's default: no signature is an unranked seat, admitted with no
+        // proof — the loopback is not ranked-only, so unranked play is untouched.
+        let nonce = nonce_for(id(), 0);
+        assert_eq!(admit_join("0xanyone", nonce.as_bytes(), ""), Ok(()));
+    }
+
+    #[test]
+    fn admit_join_rejects_a_forged_claim_to_another_identity() {
+        // A seat signs with its OWN key but claims a different agent_id (here the other
+        // key's address): the recovered signer is not the claim, so the seat is refused
+        // — a forger cannot present an identity whose key it does not hold.
+        let sk = join_key();
+        let nonce = nonce_for(id(), 0);
+        let claimed = address_from_verifying_key(other_join_key().verifying_key());
+        let sig = sign_join_proof(&sk, &claimed, nonce.as_bytes());
+        assert_eq!(admit_join(&claimed, nonce.as_bytes(), &sig), Err(JoinVerifyError::AddressMismatch));
+    }
+
+    #[test]
+    fn admit_join_rejects_a_signature_replayed_under_a_different_nonce() {
+        // A Join captured on one seat's connection (nonce A) is worthless on another
+        // (nonce B): the nonce is folded into the digest, so the signature recovers a
+        // different address against B and is refused — cross-connection replay closed.
+        let sk = join_key();
+        let addr = address_from_verifying_key(sk.verifying_key());
+        let sig = sign_join_proof(&sk, &addr, nonce_for(id(), 0).as_bytes());
+        let other_nonce = nonce_for(id(), 1);
+        assert_eq!(
+            admit_join(&addr, other_nonce.as_bytes(), &sig),
+            Err(JoinVerifyError::AddressMismatch)
+        );
+    }
+
+    #[test]
+    fn admit_join_rejects_a_malformed_signature() {
+        // A PRESENTED but non-hex / wrong-length signature is a bad encoding, not waved
+        // through: a ranked claim with a junk proof is refused, never silently seated.
+        let nonce = nonce_for(id(), 0);
+        assert_eq!(
+            admit_join("0xclaim", nonce.as_bytes(), "not-hex"),
+            Err(JoinVerifyError::BadSignatureEncoding)
+        );
+        assert_eq!(
+            admit_join("0xclaim", nonce.as_bytes(), "00"),
+            Err(JoinVerifyError::BadSignatureEncoding)
+        );
     }
 }
