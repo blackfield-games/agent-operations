@@ -26,10 +26,11 @@ use std::io::{self, BufRead, Write};
 use arena_core::{
     ranked_delta, ranked_field_delta, settlement, Match, Rules, SeatDelta, Settlement, DEFAULT_RATING,
 };
+use arena_match::{JoinOutcome, JoinRequest, MatchParams, Matchmaker, SignatureVerifier};
 use arena_proto::{
     check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
-    MatchConfig, MatchPhase, MatchResult, ReplayRecord, SeatId, SeatInfo, Vec2, POSITION_SCALE,
-    PROTOCOL_VERSION,
+    MatchConfig, MatchMode, MatchPhase, MatchResult, ReplayRecord, SeatId, SeatInfo, Vec2,
+    POSITION_SCALE, PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -47,6 +48,29 @@ struct Args {
     /// default so the loopback's stdout — and its replay determinism — is
     /// byte-identical; the live Base settler is operator-gated.
     settle_dev_mock: bool,
+    /// When set, form the match through the `arena-match` [`Matchmaker`] under this
+    /// [`MatchMode`] instead of seating the roster directly — so the Human/Agent/Mixed
+    /// gating and authenticated ranked admission are exercised end to end. `None` (no
+    /// `--mode`) is the pre-this-flag direct-seating path, byte-identical.
+    mode: Option<MatchMode>,
+    /// Seats that join as humans in `--mode mixed` (comma-separated). Only Mixed needs
+    /// the hint: the arena-01 `Join` carries no controller kind, so a token-less join
+    /// is otherwise a casual agent, and a Mixed match requires at least one of each. In
+    /// `human` mode every seat is a human (a signed join is the agent intruder Mixed
+    /// would admit), and in `agent` mode every seat is a ranked agent, so the list is
+    /// consulted for Mixed only. Empty by default.
+    human_seats: Vec<SeatId>,
+}
+
+/// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
+/// `arena-match` modes by their lowercase names.
+fn parse_mode(value: &str) -> MatchMode {
+    match value {
+        "human" => MatchMode::Human,
+        "agent" => MatchMode::Agent,
+        "mixed" => MatchMode::Mixed,
+        other => panic!("--mode is one of human|agent|mixed, got {other:?}"),
+    }
 }
 
 fn parse_args() -> Args {
@@ -55,6 +79,8 @@ fn parse_args() -> Args {
     let mut seats: u8 = 2;
     let mut max_ticks: u64 = 3600;
     let mut settle_dev_mock = false;
+    let mut mode: Option<MatchMode> = None;
+    let mut human_seats: Vec<SeatId> = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -65,6 +91,15 @@ fn parse_args() -> Args {
                 max_ticks = it.next().expect("--max-ticks needs a value").parse().expect("max-ticks is a u64")
             }
             "--settle-dev-mock" => settle_dev_mock = true,
+            "--mode" => mode = Some(parse_mode(&it.next().expect("--mode needs a value"))),
+            "--human-seats" => {
+                let v = it.next().expect("--human-seats needs a value");
+                human_seats = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse().expect("each --human-seats entry is a u8"))
+                    .collect();
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -74,6 +109,8 @@ fn parse_args() -> Args {
         seats,
         max_ticks,
         settle_dev_mock,
+        mode,
+        human_seats,
     }
 }
 
@@ -427,19 +464,239 @@ fn settle_field_match(
 /// driver passes the owner-set K. 32 matches the value the ranked unit tests use.
 const DEV_MOCK_K: i32 = 32;
 
+/// Pump a formed, live match to its end: each tick, observe every seat, read each
+/// seat's Act (the server-authoritative `ingest` forfeits a rejected action), step,
+/// then emit the terminal result to every seat. The single gameplay loop both the
+/// direct and matchmade paths share — every rule still lives in `arena-core`; this is
+/// transport only. Returns the canonical [`MatchResult`].
+fn pump_to_end(
+    m: &mut Match,
+    n: u8,
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    out: &mut impl Write,
+) -> MatchResult {
+    while m.phase() == MatchPhase::Live {
+        for seat in 0..n {
+            emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
+        }
+        out.flush().expect("flush observations");
+
+        let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+        for _ in 0..n {
+            let line = next_line(lines);
+            let (seat, msg) = read_agent(&line);
+            match msg {
+                // ingest is the server-authoritative gate; a rejected action (wrong
+                // tick/seat, downed, version) simply forfeits the tick.
+                AgentMsg::Act(action) => {
+                    if let Ok(intent) = m.ingest(seat, &action) {
+                        intents.insert(seat, intent);
+                    }
+                }
+                AgentMsg::Leave { .. } => {}
+                AgentMsg::Join { .. } => panic!("unexpected join during the match"),
+            }
+        }
+        m.step(&intents);
+    }
+
+    let result = m.result().expect("an ended match has a result").clone();
+    for seat in 0..n {
+        emit(out, seat, &GatewayMsg::End(result.clone()));
+    }
+    out.flush().expect("flush results");
+    result
+}
+
+/// Settle a finished match through the optional mock settler. Overlays any
+/// handshake-recovered ranked identities onto the roster first — `recovered` is the
+/// direct path's verified `(seat, address)` pairs, and EMPTY for a matchmade match,
+/// whose formed roster already carries each verified address as its seat controller.
+/// A 1v1 (or degenerate) result settles through [`settle_match`] (deferring to the
+/// contract's fixed reputation delta); a 3+ field through [`settle_field_match`].
+fn settle_finished(
+    settler: &Option<MockSettler>,
+    result: &MatchResult,
+    m: Match,
+    recovered: &[(SeatId, String)],
+) {
+    let Some(s) = settler else { return };
+    let match_id = m.match_id();
+    let mut replay = m.into_replay();
+    seat_recovered_identities(&mut replay.seats, recovered);
+    // Loopback agents are unrated, so each reads as DEFAULT_RATING — exactly what the
+    // live ladder returns for an unseen agent. A 1v1 then defers to the contract's
+    // fixed delta (None, byte-identical to pre-ladder); a 3+ field, which has no
+    // fixed-delta form, settles its zero-sum placement vector. The live driver passes
+    // real ladder ratings and the owner-set K in place of these.
+    let seats = result.outcomes.len();
+    let report = if seats > 2 {
+        let field = FieldContext { ratings: vec![DEFAULT_RATING; seats], k: DEV_MOCK_K };
+        settle_field_match(s, result, &replay, field).map(|n| format!("field of {n} seats"))
+    } else {
+        settle_match(s, result, &replay, None).map(|o| format!("{o:?}"))
+    };
+    match report {
+        Ok(desc) => eprintln!("[settle-dev-mock] {match_id} settled as {desc}: {:?}", s.resolution(match_id)),
+        Err(e) => eprintln!("[settle-dev-mock] {match_id} settle failed: {e:?}"),
+    }
+}
+
+/// The match parameters a `--mode` run forms under — the direct path's config (30 Hz,
+/// the same square bounds, free-for-all teams, the empty arena) mirrored so a matchmade
+/// match plays like a hand-seated one. `seats_per_match == n` makes the match form
+/// exactly when the last seat joins, consuming the whole queue, so its roster is in seat
+/// (submission) order and the transport's envelope seat stays the match seat.
+fn matchmaker_params(args: &Args, n: u8) -> MatchParams {
+    MatchParams { seats_per_match: n, max_ticks: args.max_ticks, ..MatchParams::default() }
+}
+
+/// Map a seat's Join (its claimed `agent_id` + `signature_hex`) to a matchmaker
+/// [`JoinRequest`] for `mode`. The arena-01 Join carries no controller kind, so it is
+/// inferred from the mode and whether a signature is present:
+/// - `human`: a token-less seat is a human; a SIGNED join is an agent presenting a
+///   ranked claim into a human-only match — built as a ranked agent so the matchmaker
+///   refuses it `WrongKindForMode`.
+/// - `agent`: every seat is an agent — ranked when signed, casual when token-less (and
+///   a casual seat is refused `Unauthenticated`, since Agent mode is ranked-only).
+/// - `mixed`: a seat listed in `human_seats` is a human; any other is an agent — ranked
+///   when signed, casual cross-play when token-less.
+fn join_request_for(
+    mode: MatchMode,
+    seat: SeatId,
+    human_seats: &[SeatId],
+    agent_id: &str,
+    signature_hex: &str,
+) -> JoinRequest {
+    let is_human = match mode {
+        MatchMode::Human => signature_hex.is_empty(),
+        MatchMode::Agent => false,
+        MatchMode::Mixed => human_seats.contains(&seat),
+    };
+    if is_human {
+        JoinRequest::human(agent_id)
+    } else if signature_hex.is_empty() {
+        JoinRequest::casual_agent(agent_id)
+    } else {
+        JoinRequest::ranked_agent(agent_id, signature_hex)
+    }
+}
+
+/// Emit a Reject for `seat` and terminate: a handshake refusal (version, wrong kind for
+/// the mode, or an unauthenticated ranked claim) voids the opened match as a cancel
+/// (refund, no result committed — exactly `MatchSettlement.cancelMatch`), then exits,
+/// mirroring the direct path's reject arms. The match never forms.
+fn reject_and_exit(
+    out: &mut impl Write,
+    settler: &Option<MockSettler>,
+    match_id: Uuid,
+    seat: SeatId,
+    reason: String,
+    cause: &str,
+) -> ! {
+    emit(out, seat, &GatewayMsg::Reject { reason });
+    out.flush().expect("flush reject");
+    if let Some(s) = settler {
+        eprintln!("[settle-dev-mock] {match_id} cancel ({cause}): {:?}", s.cancel(match_id));
+    }
+    std::process::exit(1);
+}
+
+/// Form the match through the `arena-match` [`Matchmaker`] under `mode`, instead of
+/// seating a fixed roster. Issues a per-seat challenge, then COLLECTS every Join before
+/// replying: the matchmaker forms the match only on the last seat, so — unlike the
+/// direct path — no Welcome can be sent until every seat is in (a driver must send all
+/// Joins before blocking on its Welcome). Each seat is then routed through
+/// [`Matchmaker::join`] in seat order; because a match that consumes the whole queue is
+/// rostered in submission (FIFO) order, the formed seat i is transport seat i, so the
+/// multiplexed envelope seat stays the match seat.
+///
+/// The nonce handed to the matchmaker is exactly the challenge issued to that seat — what
+/// the agent signed over — NOT the formed match's id, which the matchmaker mints only
+/// after admission. A version mismatch, a wrong-kind-for-mode join, or an unauthenticated
+/// ranked claim emits a Reject (+ cancel settle) and exits; the match never forms.
+/// Returns the formed [`Match`] (whose roster already credits each verified ranked
+/// identity) after emitting Welcome+Start to every seat.
+fn handshake_matchmade(
+    args: &Args,
+    mode: MatchMode,
+    n: u8,
+    settler: &Option<MockSettler>,
+    lines: &mut impl Iterator<Item = io::Result<String>>,
+    out: &mut impl Write,
+) -> Match {
+    let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(args, n));
+
+    for seat in 0..n {
+        emit(out, seat, &GatewayMsg::Challenge { nonce: nonce_for(args.match_id, seat) });
+    }
+    out.flush().expect("flush challenges");
+
+    // Collect every Join first — the matchmaker forms on the LAST seat, so no Welcome can
+    // be issued until all are in. Version is the protocol gate checked here; kind +
+    // identity are the matchmaker's, checked as each seat is routed below.
+    let mut joins: BTreeMap<SeatId, (String, String)> = BTreeMap::new();
+    for _ in 0..n {
+        let line = next_line(lines);
+        let (seat, msg) = read_agent(&line);
+        let AgentMsg::Join { protocol_version, agent_id, signature_hex } = msg else {
+            panic!("expected a join during the handshake");
+        };
+        if check_version(protocol_version).is_err() {
+            reject_and_exit(
+                out,
+                settler,
+                args.match_id,
+                seat,
+                format!("protocol version mismatch: ours={PROTOCOL_VERSION}, theirs={protocol_version}"),
+                "handshake version mismatch",
+            );
+        }
+        joins.insert(seat, (agent_id, signature_hex));
+    }
+    assert_eq!(joins.len(), usize::from(n), "expected exactly one join per seat during the handshake");
+
+    // Route each seat through the matchmaker IN SEAT ORDER so the formed roster's seats
+    // line up with the transport. The match consumes the whole queue, so it forms on the
+    // last seat; earlier seats queue.
+    let mut formed: Option<Match> = None;
+    for seat in 0..n {
+        let (agent_id, signature_hex) = &joins[&seat];
+        let req = join_request_for(mode, seat, &args.human_seats, agent_id, signature_hex);
+        match mm.join(mode, nonce_for(args.match_id, seat).as_bytes(), req) {
+            Ok(JoinOutcome::Queued) => {}
+            Ok(outcome) => formed = outcome.into_formed(),
+            Err(e) => {
+                reject_and_exit(out, settler, args.match_id, seat, format!("join rejected: {e}"), "join rejected")
+            }
+        }
+    }
+    let m = formed.expect("the last seat forms the match (a Mixed match needs at least one --human-seats)");
+
+    for seat in 0..n {
+        emit(
+            out,
+            seat,
+            &GatewayMsg::Welcome { protocol_version: PROTOCOL_VERSION, match_id: m.match_id(), seat },
+        );
+        emit(
+            out,
+            seat,
+            &GatewayMsg::Start {
+                match_id: m.match_id(),
+                config: m.config(),
+                blockers: m.blockers().to_vec(),
+                pickup_points: m.pickup_spawns().iter().map(|p| p.position).collect(),
+            },
+        );
+    }
+    out.flush().expect("flush welcome+start");
+    m
+}
+
 fn main() {
     let args = parse_args();
     let n = args.seats;
-    let roster: Vec<SeatInfo> = (0..n)
-        .map(|i| SeatInfo { seat: i, team: u16::from(i), controller: format!("agent-{i}") })
-        .collect();
-    let config = MatchConfig {
-        tick_hz: 30,
-        max_ticks: args.max_ticks,
-        bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
-        seats: n,
-    };
-    let mut m = Match::new(args.match_id, config, Rules::default(), roster, Vec::new(), args.seed);
 
     // The off-chain settlement seam: a finished match (or a pre-play abort) maps to
     // a MatchSettlement resolution through this settler. Mock-only and opt-in here;
@@ -450,6 +707,29 @@ fn main() {
     let mut lines = stdin.lock().lines();
     let stdout = io::stdout();
     let mut out = stdout.lock();
+
+    // --mode routes formation through the arena-match Matchmaker (mode-gated,
+    // authenticated). Its formed roster already credits each verified ranked identity,
+    // so settlement overlays no recovered ids.
+    if let Some(mode) = args.mode {
+        let mut m = handshake_matchmade(&args, mode, n, &settler, &mut lines, &mut out);
+        let result = pump_to_end(&mut m, n, &mut lines, &mut out);
+        settle_finished(&settler, &result, m, &[]);
+        return;
+    }
+
+    // Direct-seating path (no --mode): seat a fixed agent-{i} roster, byte-identical to
+    // the pre-matchmaker harness.
+    let roster: Vec<SeatInfo> = (0..n)
+        .map(|i| SeatInfo { seat: i, team: u16::from(i), controller: format!("agent-{i}") })
+        .collect();
+    let config = MatchConfig {
+        tick_hz: 30,
+        max_ticks: args.max_ticks,
+        bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+        seats: n,
+    };
+    let mut m = Match::new(args.match_id, config, Rules::default(), roster, Vec::new(), args.seed);
 
     for seat in 0..n {
         emit(&mut out, seat, &GatewayMsg::Challenge { nonce: nonce_for(m.match_id(), seat) });
@@ -535,61 +815,8 @@ fn main() {
         out.flush().expect("flush welcome+start");
     }
 
-    while m.phase() == MatchPhase::Live {
-        for seat in 0..n {
-            emit(&mut out, seat, &GatewayMsg::Observe(m.observe(seat)));
-        }
-        out.flush().expect("flush observations");
-
-        let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
-        for _ in 0..n {
-            let line = next_line(&mut lines);
-            let (seat, msg) = read_agent(&line);
-            match msg {
-                // ingest is the server-authoritative gate; a rejected action (wrong
-                // tick/seat, downed, version) simply forfeits the tick.
-                AgentMsg::Act(action) => {
-                    if let Ok(intent) = m.ingest(seat, &action) {
-                        intents.insert(seat, intent);
-                    }
-                }
-                AgentMsg::Leave { .. } => {}
-                AgentMsg::Join { .. } => panic!("unexpected join during the match"),
-            }
-        }
-        m.step(&intents);
-    }
-
-    let result = m.result().expect("an ended match has a result").clone();
-    for seat in 0..n {
-        emit(&mut out, seat, &GatewayMsg::End(result.clone()));
-    }
-    out.flush().expect("flush results");
-
-    if let Some(s) = &settler {
-        let match_id = m.match_id();
-        let mut replay = m.into_replay();
-        // Seat each verified ranked identity under the address it proved during the
-        // handshake, so settlement (and the digest it commits) credit the real identity
-        // rather than the pre-built agent-{i} label. Unranked seats keep their label.
-        seat_recovered_identities(&mut replay.seats, &recovered);
-        // Loopback agents are unrated, so each reads as DEFAULT_RATING — exactly what the
-        // live ladder returns for an unseen agent. A 1v1 then defers to the contract's
-        // fixed delta (None, byte-identical to pre-ladder); a 3+ field, which has no
-        // fixed-delta form, settles its zero-sum placement vector. The live driver passes
-        // real ladder ratings and the owner-set K in place of these.
-        let seats = result.outcomes.len();
-        let report = if seats > 2 {
-            let field = FieldContext { ratings: vec![DEFAULT_RATING; seats], k: DEV_MOCK_K };
-            settle_field_match(s, &result, &replay, field).map(|n| format!("field of {n} seats"))
-        } else {
-            settle_match(s, &result, &replay, None).map(|o| format!("{o:?}"))
-        };
-        match report {
-            Ok(desc) => eprintln!("[settle-dev-mock] {match_id} settled as {desc}: {:?}", s.resolution(match_id)),
-            Err(e) => eprintln!("[settle-dev-mock] {match_id} settle failed: {e:?}"),
-        }
-    }
+    let result = pump_to_end(&mut m, n, &mut lines, &mut out);
+    settle_finished(&settler, &result, m, &recovered);
 }
 
 #[cfg(test)]
