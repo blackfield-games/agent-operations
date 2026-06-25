@@ -1348,6 +1348,88 @@ def test_run_local_match_forwards_ladder_file_as_one_argv_token_and_omits_it_by_
     assert argv[argv.index("--ladder-file") + 1] == spaced
 
 
+def test_run_local_match_forwards_map_as_one_argv_token_and_omits_it_by_default(monkeypatch):
+    # arena= forwards --map <key> as a single argv token; omitted, no --map appears, so an
+    # existing caller's argv is byte-identical. Captured without a harness by stubbing the
+    # gateway before it spawns.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--map" not in captured["argv"]  # omitted: byte-identical argv
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, arena="reference")
+    argv = captured["argv"]
+    assert argv[argv.index("--map") + 1] == "reference"  # set: the key is the one next token
+
+
+def test_run_local_match_selects_a_named_arena_and_surfaces_its_geometry():
+    # arena="reference" plays the match under the reference arena: each seat's Start frame
+    # carries the central occluder + the two health pickups, read back via starts=. The
+    # default (no arena=) surfaces the empty arena — proof the flag, not a harness default,
+    # drives the geometry.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    mid = "33333333-2222-4333-8444-555555555555"
+    named: dict = {}
+    run_local_match(harness, [0, 1], policies, seed=3, match_id=mid, arena="reference", starts=named)
+    assert set(named) == {0, 1}
+    for seat in (0, 1):
+        assert named[seat].blockers, f"seat {seat} received the reference cover"
+        assert len(named[seat].pickup_points) == 2, f"seat {seat} received the two pickups"
+
+    empty: dict = {}
+    run_local_match(harness, [0, 1], policies, seed=3, match_id=mid, starts=empty)
+    assert empty[0].blockers == [] and empty[0].pickup_points == []
+
+
+def test_run_matchmade_named_arena_surfaces_geometry_on_the_agent_path():
+    # --map reaches the --mode (matchmaker) path too: an Agent-mode match under the
+    # reference arena surfaces the same cover + pickups to each ranked seat.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    starts: dict = {}
+    run_local_match(
+        harness, [0, 1], policies, seed=5, match_id="44444444-2222-4333-8444-555555555555",
+        mode="agent", signing_keys=keys, arena="reference", starts=starts,
+    )
+    for seat in (0, 1):
+        assert starts[seat].blockers and len(starts[seat].pickup_points) == 2
+
+
+def test_run_local_match_unknown_arena_fails_loud_not_silent_empty():
+    # An unknown --map key aborts the harness at parse (mirroring --mode), so the stream
+    # closes (GatewayClosed) — never a silent fall-through to an empty arena.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import GatewayClosed, run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    with pytest.raises(GatewayClosed):
+        run_local_match(
+            harness, [0, 1], policies, seed=1,
+            match_id="55555555-2222-4333-8444-555555555555", arena="does-not-exist",
+        )
+
+
 def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
     # FM1: a mode/composition the Matchmaker can never form must fail LOUD up front, not
     # hang on a Welcome that never comes. These raise before the harness is spawned, so
