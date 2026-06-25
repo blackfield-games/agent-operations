@@ -2,10 +2,11 @@
 
 Given a parity-bounded Observation it returns a legal ActionIntent with no float
 and no randomness, so a baseline-vs-baseline match is fully determined by the
-match seed. It closes on the nearest visible enemy, aims to the octant the core
-resolves hits against (so a coarse 8-way aim still lands), and fires while it has
-ammo; with no enemy in sight it advances on the arena centre to find one, and
-reloads when empty.
+match seed. It closes on the nearest LIVE enemy (one in line of sight), aims to the
+octant the core resolves hits against (so a coarse 8-way aim still lands), and fires
+while it has ammo; a remembered enemy (a perception-memory echo, out of sight) it
+moves to re-acquire without firing at the stale position; with nothing perceived it
+advances on the arena centre to find a fight, and reloads when empty.
 
 The aim is the octant whose Q12 unit vector best points at the target — the same
 eight octants arena-core snaps facing to — picked by integer dot product, so the
@@ -74,22 +75,41 @@ class BaselinePolicy:
             return _hold(me.facing)
         if me.ammo == 0:
             return _hold(me.facing, reload=True)
-        target = self._nearest_enemy(obs)
-        if target is None:
-            # No enemy perceived: close on the arena centre to find one. Holding
-            # would risk a scoreless stalemate when seats spawn out of sight.
-            cx, cy = -me.position.x, -me.position.y
-            if cx == 0 and cy == 0:
-                return _hold(me.facing)
-            return _toward(cx, cy, fire=False)
-        dx = target.position.x - me.position.x
-        dy = target.position.y - me.position.y
-        return _toward(dx, dy, fire=True)
+        live = self._nearest_enemy(obs, in_sight=True)
+        if live is not None:
+            dx = live.position.x - me.position.x
+            dy = live.position.y - me.position.y
+            return _toward(dx, dy, fire=True)
+        # No LIVE enemy. A remembered entry (in_line_of_sight == false) is a
+        # perception-memory echo — the last-known position of an enemy the seat has
+        # lost sight of. Move to re-acquire it, but never fire blind at where it WAS:
+        # the core resolves hits against live positions, so a shot at the echo can
+        # never land and only burns ammo (and a human wouldn't shoot an empty corner).
+        remembered = self._nearest_enemy(obs, in_sight=False)
+        if remembered is not None:
+            dx = remembered.position.x - me.position.x
+            dy = remembered.position.y - me.position.y
+            return _toward(dx, dy, fire=False)
+        # Nothing perceived at all: close on the arena centre to find a fight. Holding
+        # would risk a scoreless stalemate when seats spawn out of sight.
+        cx, cy = -me.position.x, -me.position.y
+        if cx == 0 and cy == 0:
+            return _hold(me.facing)
+        return _toward(cx, cy, fire=False)
 
     @staticmethod
-    def _nearest_enemy(obs: Observation) -> VisibleEntity | None:
+    def _nearest_enemy(obs: Observation, in_sight: bool) -> VisibleEntity | None:
+        """The nearest enemy whose `in_line_of_sight` matches `in_sight` — live
+        targets (`True`) for firing, remembered echoes (`False`) for re-acquisition.
+        With perception memory off every visible entry is in sight, so the `in_sight`
+        set is the whole enemy list and the remembered set is empty — the live branch
+        alone decides, byte-identical to the range-only baseline."""
         me = obs.own
-        enemies = [e for e in obs.visible if e.kind == "player" and e.team != me.team]
+        enemies = [
+            e
+            for e in obs.visible
+            if e.kind == "player" and e.team != me.team and e.in_line_of_sight == in_sight
+        ]
         if not enemies:
             return None
         return min(
