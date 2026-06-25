@@ -28,6 +28,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from .proto import (
@@ -280,20 +281,81 @@ class GatewayClosed(ProtocolError):
     """The harness stream ended before the match did."""
 
 
+@dataclass(frozen=True, slots=True)
+class LadderStanding:
+    """A ranked seat's post-match ladder position: its `rating` after the settle and
+    the signed `delta` that move applied. An unranked seat — a casual / human / Mixed
+    match, or any run that moved no ladder — has no standing and reads None, never a
+    zeroed one: 'no rating' is distinct from 'a rating of zero'."""
+
+    rating: int
+    delta: int
+
+
+_LADDER_PREFIX = "[ladder] "
+
+
 class SubprocessGateway:
     """Spawns a gateway harness and multiplexes the seat-tagged transport frames it
     speaks (`{"seat": u8, "frame": <arena-01>}`) into per-seat queues, so several
     ArenaClients can share one stdio pipe. A real networked gateway is one
     connection per seat; this is the local loopback twin used to run a match
     against the reference core. A watchdog kills a silent harness so a hang fails
-    the caller loudly instead of blocking forever."""
+    the caller loudly instead of blocking forever.
 
-    def __init__(self, argv: list[str], timeout: float = 30.0) -> None:
+    With `capture_stderr`, the harness's stderr is drained on a background thread so a
+    post-match `[ladder]` line can be read back via `ladder()` without ever blocking the
+    stdout frame pump; without it, stderr inherits the parent's (today's behaviour, so a
+    panic backtrace still surfaces to the console)."""
+
+    def __init__(self, argv: list[str], timeout: float = 30.0, *, capture_stderr: bool = False) -> None:
         self._proc = subprocess.Popen(
-            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if capture_stderr else None,
+            text=True,
+            bufsize=1,
         )
         self._queues: dict[int, deque[dict]] = defaultdict(deque)
         self._timeout = timeout
+        # Drain stderr on its own thread so a full stderr pipe can never deadlock the
+        # stdout read the match loop blocks on (e.g. a mid-match panic backtrace).
+        self._stderr_lines: list[str] = []
+        self._stderr_thread: threading.Thread | None = None
+        if capture_stderr:
+            self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+            self._stderr_thread.start()
+
+    def _drain_stderr(self) -> None:
+        assert self._proc.stderr is not None
+        for line in self._proc.stderr:
+            self._stderr_lines.append(line)
+
+    def ladder(self, match_id: str) -> dict[int, LadderStanding]:
+        """The per-seat ladder standing the harness settled for `match_id`, parsed from
+        the structured `[ladder]` stderr line (captured only under `capture_stderr`).
+        Returns seat -> LadderStanding for a ranked (Agent-mode) match; an EMPTY map when
+        nothing settled (casual / human / Mixed / direct), so each seat reads None. A
+        `[ladder]` line that is present but not the exact
+        `{match_id, seats:[{seat,rating,delta}]}` shape is a hard error, never a silent
+        drop — an emission drift must fail loud, not masquerade as 'unranked'."""
+        out: dict[int, LadderStanding] = {}
+        for line in self._stderr_lines:
+            if not line.startswith(_LADDER_PREFIX):
+                continue
+            payload = line[len(_LADDER_PREFIX) :].strip()
+            try:
+                frame = json.loads(payload)
+                if frame["match_id"] != match_id:
+                    continue
+                for seat in frame["seats"]:
+                    out[int(seat["seat"])] = LadderStanding(
+                        rating=int(seat["rating"]), delta=int(seat["delta"])
+                    )
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+                raise ProtocolError(f"malformed [ladder] emission: {payload!r}") from e
+        return out
 
     def _readline(self) -> str:
         timer = threading.Timer(self._timeout, self._proc.kill)
@@ -329,6 +391,10 @@ class SubprocessGateway:
         except subprocess.TimeoutExpired:
             self._proc.kill()
             self._proc.wait()
+        # The process is down, so stderr has hit EOF; join the drain so every captured
+        # line (the [ladder] readout included) is visible before close() returns.
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=5)
 
     def __enter__(self) -> SubprocessGateway:
         return self
@@ -362,6 +428,7 @@ def run_local_match(
     signing_keys: dict[int, bytes] | None = None,
     mode: str | None = None,
     human_seats: list[int] | None = None,
+    ratings: dict[int, LadderStanding | None] | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -385,7 +452,13 @@ def run_local_match(
     must be in `signing_keys` or its token-less join is Unauthenticated and no match
     ever forms, so it is rejected up front. Mixed mode needs at least one `human_seats`
     entry (a token-less human) AND at least one agent — the Matchmaker never forms an
-    all-one-kind Mixed match, so a human-less Mixed call is rejected up front."""
+    all-one-kind Mixed match, so a human-less Mixed call is rejected up front.
+
+    Pass a `ratings` dict to read back each seat's post-match ladder standing: it is
+    filled in place with `seat -> LadderStanding(rating, delta)` for a ranked (Agent-mode)
+    seat and `seat -> None` for an unranked one (casual / human / Mixed / direct), so an
+    A2A author can see how the match moved their rating. Omitting it is byte-identical to
+    before — the MatchResult return is unchanged and stderr is not even captured."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -404,7 +477,7 @@ def run_local_match(
             raise ValueError("mixed mode forms a human+agent match; declare some (not all) seats human")
         if humans:
             argv += ["--human-seats", ",".join(str(s) for s in humans)]
-    with SubprocessGateway(argv, timeout=timeout) as gateway:
+    with SubprocessGateway(argv, timeout=timeout, capture_stderr=ratings is not None) as gateway:
         # The loopback harness blocks for one frame per seat per tick and enforces no
         # wall-clock, so the client must always answer — never drop a frame on a
         # deadline (that is a real-transport behaviour and would deadlock here). A seat
@@ -432,4 +505,11 @@ def run_local_match(
                 outcome = client.poll(policies[seat])
                 if outcome is not None:
                     results[seat] = outcome
-        return results
+    if ratings is not None:
+        # The gateway has closed (stderr fully drained), so the [ladder] line — keyed by
+        # the match's own id (the minted one in matchmade mode, the argv id direct) — is
+        # readable now. A seat the harness never settled (unranked) maps to None.
+        standings = gateway.ladder(next(iter(results.values())).match_id)
+        for s in seats:
+            ratings[s] = standings.get(s)
+    return results
