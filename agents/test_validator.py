@@ -19,6 +19,7 @@ from common.types import LayerSpec, RegionCoord, WorldBrief
 from lighting import lighting
 from optimization import optimization
 from runtime.supervisor import _failing_specialist, _route_back_target
+from terrain import terrain
 from validator import validator
 
 SPECIALISTS = ["director", "terrain", "biome", "prop", "lighting", "npc", "optimization"]
@@ -1294,3 +1295,116 @@ async def test_run_lighting_intent_gate_tracks_recognized_beats_vocabulary(tmp_p
     assert not verdict.accepted
     assert any("intent:beats" in i and "lighting" in i for i in verdict.issues)
     assert _route_back_target(verdict) == "lighting"
+
+
+# ---- terrain triangle self-consistency: the metric must match the declared heightfield ----
+#
+# Defense-in-depth across the terrain trust boundary, the geometry-emitter twin of the budget
+# self-consistency gate: _budget_self_consistency re-derives the optimizer's verdict but SUMS
+# terrain's `triangles` metric trusting it, so a stale/tampered terrain metric corrupts the
+# budget sum. These pin that the validator re-derives terrain._heightfield_triangles from the
+# body's gridResolution and rejects a metric that disagrees (routed back to terrain), skips a
+# body with no positive-integer gridResolution, and tracks terrain's own formula in lock-step.
+
+
+def _terrain_body(grid) -> str:
+    """A terrain layer declaring a `grid`x`grid` heightfield — mirroring terrain.run, the
+    gridResolution the triangle self-consistency gate re-derives the metric from. `grid` is
+    formatted verbatim so a test can model a non-integer / non-positive value the gate skips."""
+    return (
+        '#usda 1.0\n(\n    defaultPrim = "Terrain"\n)\n\n'
+        'def Mesh "Terrain" (\n    kind = "component"\n)\n{\n'
+        '    custom string biome = "scorched"\n'
+        f"    custom int gridResolution = {grid}\n"
+        '    custom string heightfieldSource = "placeholder"\n}\n'
+    )
+
+
+def _terrain_spec(triangles: float) -> LayerSpec:
+    return LayerSpec(
+        specialist="terrain", region_id=REGION, path=f"terrain/{REGION}.usda",
+        summary="t", metrics={"triangles": triangles},
+    )
+
+
+def test_terrain_triangle_consistency_accepts_a_metric_matching_its_grid():
+    # FM1 (no false reject): metric == _heightfield_triangles(grid) — nothing to report. The
+    # grid is non-trivial so a hardcoded count couldn't accidentally satisfy it.
+    grid = 600
+    spec = _terrain_spec(float(terrain._heightfield_triangles(grid)))
+    assert validator._terrain_triangle_consistency(spec, _terrain_body(grid)) == []
+
+
+def test_terrain_triangle_consistency_rejects_a_metric_that_disagrees_with_its_grid():
+    # FM2 (false accept): a terrain metric that drifts from its declared grid — exactly the
+    # hardcoded-262144-regardless-of-the-declared-512 bug terrain's own helper docstring warns
+    # of. One issue, naming terrain and no pipeline-later specialist, so the text-scan fallback
+    # routes back to terrain.
+    grid = 600
+    assert terrain._heightfield_triangles(grid) != 262144  # premise: the grid implies another count
+    issues = validator._terrain_triangle_consistency(_terrain_spec(262144.0), _terrain_body(grid))
+    assert len(issues) == 1
+    assert "terrain" in issues[0] and "triangles metric" in issues[0]
+    assert _failing_specialist(issues) == "terrain"
+
+
+def test_terrain_triangle_consistency_skips_an_unverifiable_body():
+    # FM3 (degrade, no false reject): a body with no gridResolution (the VALID_BODY placeholder
+    # the _full_set tests use) is unverifiable — SKIP, never reject. A non-positive or
+    # non-integer grid is likewise unverifiable, not a false rejection.
+    spec = _terrain_spec(999.0)
+    assert validator._terrain_triangle_consistency(spec, VALID_BODY) == []
+    assert validator._terrain_triangle_consistency(spec, _terrain_body(0)) == []
+    assert validator._terrain_triangle_consistency(spec, _terrain_body("512.5")) == []
+
+
+def test_terrain_triangle_consistency_tracks_the_heightfield_formula_in_lock_step():
+    # FM4 (formula desync): the expectation is recomputed via terrain._heightfield_triangles,
+    # never a hardcoded count — a metric correct for one grid is rejected against a different
+    # grid, so a future change to the triangulation flips the gate's verdict in lock-step.
+    g1, g2 = 400, 800
+    spec = _terrain_spec(float(terrain._heightfield_triangles(g1)))
+    assert validator._terrain_triangle_consistency(spec, _terrain_body(g1)) == []
+    assert validator._terrain_triangle_consistency(spec, _terrain_body(g2)) != []
+
+
+def _terrain_metric_set(root: Path, *, grid, terrain_tris: float) -> list[LayerSpec]:
+    """A full well-formed set with terrain declaring `grid` and metering `terrain_tris`, and the
+    optimization body re-synced to the resulting summed geometry so the budget gate stays silent
+    — only the terrain triangle self-consistency check is exercised (no double-report)."""
+    summed = terrain_tris + 100000.0 + 96000.0 + 144000.0  # biome + prop + npc default metrics
+    out: list[LayerSpec] = []
+    for s in SPECIALISTS:
+        if s == "terrain":
+            out.append(_layer(root, "terrain", body=_terrain_body(grid), metrics={"triangles": terrain_tris}))
+        elif s == "optimization":
+            body = _opt_body(authored=summed, observed=summed, over_budget=False)
+            out.append(_layer(root, "optimization", body=body, metrics={"over_budget": 0.0}))
+        else:
+            out.append(_layer(root, s))
+    return out
+
+
+async def test_run_accepts_a_terrain_metric_consistent_with_its_grid(tmp_path):
+    # FM1 at run() level: a correct world (terrain metric == its grid's heightfield, optimizer
+    # body re-synced) validates clean — the new gate adds no false rejection.
+    grid = 600
+    layers = _terrain_metric_set(tmp_path, grid=grid, terrain_tris=float(terrain._heightfield_triangles(grid)))
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_rejects_a_stale_terrain_metric_and_routes_to_terrain(tmp_path):
+    # FM2 at run() level: terrain's metric is stale/tampered (doesn't match its gridResolution),
+    # with the optimizer body re-synced to that metric so the BUDGET gate stays silent — terrain
+    # is the ONLY issue (no double-report) and route-back targets it.
+    grid = 600
+    terrain_tris = 262144.0
+    assert terrain._heightfield_triangles(grid) != terrain_tris
+    layers = _terrain_metric_set(tmp_path, grid=grid, terrain_tris=terrain_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("terrain" in i and "triangles metric" in i for i in verdict.issues)
+    assert "terrain" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "terrain"
+    assert _route_back_target(verdict) == "terrain"
