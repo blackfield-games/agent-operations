@@ -46,8 +46,10 @@ from .proto import (
     Vec2,
     Welcome,
     act_frame,
+    address_from_private_key,
     decode_gateway,
     join_frame,
+    sign_join,
 )
 
 Policy = Callable[[Observation], ActionIntent]
@@ -97,9 +99,17 @@ class ArenaClient:
         signature_hex: str = "",
         clock: Callable[[], float] = time.monotonic,
         enforce_deadline: bool = True,
+        *,
+        signing_key: bytes | None = None,
     ) -> None:
         self.transport = transport
         self.agent_id = agent_id
+        # A ranked seat: sign join_digest over THIS connection's challenge nonce (set
+        # in connect(), once it is known). A static signature_hex can't bind the
+        # per-connection challenge, so a key takes precedence over it when present.
+        # agent_id must be address_from_private_key(signing_key) or the Gateway
+        # recovers a different address and refuses the seat — `ranked()` guarantees it.
+        self.signing_key = signing_key
         self.signature_hex = signature_hex
         self._clock = clock
         # A real transport has a server-side wall-clock deadline, so dropping a late
@@ -125,6 +135,38 @@ class ArenaClient:
         self.rejections: list[str] = []
         self.forfeits = 0
 
+    @classmethod
+    def ranked(
+        cls,
+        transport: Transport,
+        signing_key: bytes,
+        clock: Callable[[], float] = time.monotonic,
+        enforce_deadline: bool = True,
+    ) -> ArenaClient:
+        """A ranked-seat client whose `agent_id` is DERIVED from `signing_key`, so the
+        claimed identity is always the address the Gateway recovers — the
+        AddressMismatch footgun (claiming an id the key doesn't control) can't happen.
+        The signature itself is computed per-connection in `connect()` from the
+        challenge nonce."""
+        return cls(
+            transport,
+            agent_id=address_from_private_key(signing_key),
+            clock=clock,
+            enforce_deadline=enforce_deadline,
+            signing_key=signing_key,
+        )
+
+    def _join_signature(self) -> str:
+        """The Join's `signature_hex`. With a `signing_key`, sign `join_digest` over
+        THIS connection's challenge nonce (a ranked seat) — the nonce is folded in
+        here, after the Challenge, so the proof binds the freshly-issued challenge and
+        a captured Join can't be replayed on another connection. Without a key, the
+        static `signature_hex` passed at construction (empty = unranked)."""
+        if self.signing_key is None:
+            return self.signature_hex
+        assert self.nonce is not None
+        return sign_join(self.signing_key, PROTOCOL_VERSION, self.agent_id, self.nonce.encode())
+
     def connect(self) -> ArenaClient:
         """Run the handshake: receive the connection challenge, send Join, and on a
         Welcome check the version and record the assigned seat + rules. Raises
@@ -133,7 +175,7 @@ class ArenaClient:
         if not isinstance(first, Challenge):
             raise ProtocolError(f"expected challenge first, got {type(first).__name__}")
         self.nonce = first.nonce
-        self.transport.send(join_frame(self.agent_id, self.signature_hex))
+        self.transport.send(join_frame(self.agent_id, self._join_signature()))
         reply = decode_gateway(self.transport.recv())
         if isinstance(reply, Reject):
             raise HandshakeRejected(reply.reason)
