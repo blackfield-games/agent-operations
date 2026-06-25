@@ -1099,4 +1099,61 @@ mod tests {
             Err(JoinVerifyError::BadSignatureEncoding)
         );
     }
+
+    #[test]
+    fn seat_recovered_identities_seats_ranked_addresses_and_keeps_unranked_labels() {
+        // FM1 + FM4: a Mixed roster — seat 0 is verified ranked, seat 1 is unranked. The
+        // ranked seat adopts the address it proved during the handshake; the unranked seat
+        // (no entry in the recovered set) keeps its agent-1 roster label.
+        let mut seats = roster(2);
+        let addr = "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23".to_string();
+        seat_recovered_identities(&mut seats, &[(0, addr.clone())]);
+        assert_eq!(seats[0].controller, addr, "the ranked seat adopts the recovered address");
+        assert_eq!(seats[1].controller, "agent-1", "the unranked seat keeps its roster label");
+    }
+
+    #[test]
+    fn seat_recovered_identities_changes_only_the_label_not_seat_or_team() {
+        // FM3: the identity overlay touches the controller LABEL only — seat and team stay
+        // index-driven, so seat order, team assignment, and the match's reproducibility are
+        // untouched even when every seat is ranked.
+        let mut seats = roster(2);
+        seat_recovered_identities(&mut seats, &[(0, "0xaaa".into()), (1, "0xbbb".into())]);
+        assert_eq!(
+            (seats[0].seat, seats[0].team, seats[1].seat, seats[1].team),
+            (0, 0, 1, 1),
+            "seat and team are untouched by the identity overlay",
+        );
+    }
+
+    #[test]
+    fn seat_recovered_identities_with_no_ranked_seats_keeps_every_roster_label() {
+        // FM1: an all-unranked match (empty recovered set) is byte-identical to before —
+        // every seat keeps agent-{i}, so unranked play is never perturbed by the overlay.
+        let mut seats = roster(3);
+        let before = seats.clone();
+        seat_recovered_identities(&mut seats, &[]);
+        assert_eq!(seats, before, "no recovered identities ⇒ the roster is unchanged");
+    }
+
+    #[test]
+    fn a_ranked_win_settles_the_recovered_address_not_the_roster_label() {
+        // FM2 end to end: seat 1 wins a 1v1 after being seated under the address it proved
+        // ranked, so settle_match must credit THAT address, not agent-1. Were the recovered
+        // identity not overlaid onto the seat settle_match reads, the winner would settle as
+        // the agent-1 roster label — so crediting the real address is the discriminating proof.
+        let sk = join_key();
+        let addr = address_from_verifying_key(sk.verifying_key());
+        let mut replay = replay_for(roster(2));
+        seat_recovered_identities(&mut replay.seats, &[(1, addr.clone())]);
+        let result = result_for(vec![outcome(0, 2, 1, false), outcome(1, 1, 5, true)]);
+        let settler = MockSettler::default();
+
+        settle_match(&settler, &result, &replay, None).expect("settles");
+        assert_eq!(
+            settler.resolution(id()),
+            Some(Resolution::Win { winner: addr, reputation: None, replay_digest: replay.digest() }),
+            "the verified ranked identity is credited, not the agent-1 roster label",
+        );
+    }
 }
