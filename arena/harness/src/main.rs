@@ -21,12 +21,16 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use arena_core::{
     ranked_delta, ranked_field_delta, settlement, Match, Rules, SeatDelta, Settlement, DEFAULT_RATING,
 };
-use arena_match::{JoinOutcome, JoinRequest, MatchParams, Matchmaker, SignatureVerifier};
+use arena_match::{
+    JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker, SignatureVerifier, SnapshotError,
+};
 use arena_proto::{
     check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
     MatchConfig, MatchMode, MatchPhase, MatchResult, ReplayRecord, SeatId, SeatInfo, Vec2,
@@ -60,6 +64,13 @@ struct Args {
     /// would admit), and in `agent` mode every seat is a ranked agent, so the list is
     /// consulted for Mixed only. Empty by default.
     human_seats: Vec<SeatId>,
+    /// Persist and restore the matchmaker's ranked rating ladder across runs. When set,
+    /// the ladder is SEEDED from this file at startup (a missing or empty file starts
+    /// fresh — byte-identical to today; a present-but-corrupt one aborts the run loudly
+    /// rather than silently resetting standings) and the POST-settle ladder is written
+    /// back atomically after the match. Only a `--mode` run moves a ladder, so the flag
+    /// is consulted on that path; `None` keeps the in-memory-only behaviour.
+    ladder_file: Option<PathBuf>,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -81,6 +92,7 @@ fn parse_args() -> Args {
     let mut settle_dev_mock = false;
     let mut mode: Option<MatchMode> = None;
     let mut human_seats: Vec<SeatId> = Vec::new();
+    let mut ladder_file: Option<PathBuf> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -100,6 +112,7 @@ fn parse_args() -> Args {
                     .map(|s| s.parse().expect("each --human-seats entry is a u8"))
                     .collect();
             }
+            "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -111,6 +124,7 @@ fn parse_args() -> Args {
         settle_dev_mock,
         mode,
         human_seats,
+        ladder_file,
     }
 }
 
@@ -605,6 +619,93 @@ fn matchmaker_params(n: u8, max_ticks: u64) -> MatchParams {
     MatchParams { seats_per_match: n, max_ticks, ..MatchParams::default() }
 }
 
+/// Why a `--ladder-file` could not be trusted. A MISSING or empty file is NOT an error
+/// (it is the legal "start fresh" path — [`read_ladder_file`] returns `Ok(None)`); these
+/// are the cases where a file EXISTS with content the harness refuses to misread, so it
+/// aborts loudly rather than silently resetting accumulated standings to `DEFAULT_RATING`.
+#[derive(Debug)]
+enum LadderFileError {
+    Read(io::Error),
+    Parse(serde_json::Error),
+    Restore(SnapshotError),
+}
+
+impl std::fmt::Display for LadderFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LadderFileError::Read(e) => write!(f, "unreadable ladder file: {e}"),
+            LadderFileError::Parse(e) => write!(f, "malformed ladder file: {e}"),
+            LadderFileError::Restore(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Read a persisted ladder snapshot from `path`. A MISSING or empty (all-whitespace)
+/// file is the ONLY legal "start fresh" signal and returns `Ok(None)` — a fresh ladder
+/// is byte-identical to a run with no `--ladder-file`. A present, non-empty file that is
+/// not valid [`LadderSnapshot`] JSON is a loud `Err`, never a silent fresh start (which
+/// would erase real standings); the schema-version check lives in
+/// [`Matchmaker::from_snapshot`], reported here as [`LadderFileError::Restore`].
+fn read_ladder_file(path: &Path) -> Result<Option<LadderSnapshot>, LadderFileError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(LadderFileError::Read(e)),
+    };
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice(&bytes).map(Some).map_err(LadderFileError::Parse)
+}
+
+/// The sibling temp path a ladder write stages to before its atomic rename: same
+/// directory as `path` (so the rename stays on one filesystem and so is atomic) and
+/// process-unique (so a concurrent run, or a leftover temp from a crashed one, can't
+/// collide on it).
+fn ladder_tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map_or_else(|| OsString::from("ladder"), |n| n.to_os_string());
+    name.push(format!(".tmp.{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Persist `snapshot` to `path` durably: serialize as JSON to a sibling temp file, then
+/// atomic-rename it over `path`. A crash mid-write leaves the TEMP (not `path`) partial,
+/// so the previous good snapshot is never truncated in place — an interrupted persist
+/// loses the new write, never corrupts the old one.
+fn write_ladder(path: &Path, snapshot: &LadderSnapshot) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(snapshot).expect("a LadderSnapshot always serializes");
+    let tmp = ladder_tmp_path(path);
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Refuse to start a run whose `--ladder-file` can't be trusted: a corrupt or
+/// stale-schema ladder is reported and the process exits non-zero, NEVER silently reset
+/// to `DEFAULT_RATING` (which would erase real standings under a transient read glitch
+/// or a forgotten schema bump).
+fn abort_ladder(path: &Path, err: &LadderFileError) -> ! {
+    eprintln!("[ladder] refusing to start from {}: {err}", path.display());
+    std::process::exit(1);
+}
+
+/// Construct the matchmaker for a `--mode` run, seeding its rating ladder from
+/// `--ladder-file` when one is given and present so standings accumulate across runs. No
+/// flag, or a missing / empty file, starts a fresh `DEFAULT_RATING` ladder — byte-identical
+/// to the pre-persistence harness. A present but corrupt or wrong-schema file aborts the
+/// run via [`abort_ladder`] rather than silently resetting standings.
+fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<SignatureVerifier> {
+    let params = matchmaker_params(n, args.max_ticks);
+    let Some(path) = &args.ladder_file else {
+        return Matchmaker::new(SignatureVerifier, params);
+    };
+    match read_ladder_file(path) {
+        Ok(None) => Matchmaker::new(SignatureVerifier, params),
+        Ok(Some(snapshot)) => Matchmaker::from_snapshot(SignatureVerifier, params, snapshot)
+            .unwrap_or_else(|e| abort_ladder(path, &LadderFileError::Restore(e))),
+        Err(e) => abort_ladder(path, &e),
+    }
+}
+
 /// Map a seat's Join (its claimed `agent_id` + `signature_hex`) to a matchmaker
 /// [`JoinRequest`] for `mode`. The arena-01 Join carries no controller kind, so it is
 /// inferred from the mode and whether a signature is present:
@@ -681,7 +782,7 @@ fn handshake_matchmade(
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
 ) -> (Matchmaker<SignatureVerifier>, Match) {
-    let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(n, args.max_ticks));
+    let mm = build_matchmaker(args, n);
 
     for seat in 0..n {
         emit(out, seat, &GatewayMsg::Challenge { nonce: nonce_for(args.match_id, seat) });
@@ -774,6 +875,15 @@ fn main() {
         // the rating readout); `settle_finished` then consumes the match.
         settle_ranked_ladder(&mm, &result, m.seats());
         settle_finished(&settler, &result, m, &[]);
+        if let Some(path) = &args.ladder_file {
+            // Persist the POST-settle ladder (the settle above moved it) so the next run
+            // resumes these standings; atomic temp-then-rename keeps a crash mid-write
+            // from corrupting the prior good snapshot.
+            write_ladder(path, &mm.snapshot()).unwrap_or_else(|e| {
+                eprintln!("[ladder] failed to persist to {}: {e}", path.display());
+                std::process::exit(1);
+            });
+        }
         return;
     }
 
@@ -1455,7 +1565,16 @@ mod tests {
     use arena_proto::ControllerKind;
 
     fn mode_args(seats: u8, mode: MatchMode, human_seats: Vec<SeatId>) -> Args {
-        Args { match_id: id(), seed: 0, seats, max_ticks: 4, settle_dev_mock: false, mode: Some(mode), human_seats }
+        Args {
+            match_id: id(),
+            seed: 0,
+            seats,
+            max_ticks: 4,
+            settle_dev_mock: false,
+            mode: Some(mode),
+            human_seats,
+            ladder_file: None,
+        }
     }
 
     /// A transport envelope carrying one seat's Join, exactly as the matchmade
