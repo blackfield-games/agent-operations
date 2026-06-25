@@ -556,17 +556,44 @@ fn settle_finished(
 /// was never registered, so the apply is a clean no-op (`None`); likewise a replayed
 /// result whose registration the first apply already consumed, so a retry or duplicate
 /// End never moves the ladder twice (FM2). The K is the shared loopback `DEV_MOCK_K`
-/// (FM3). The delta is emitted for observability only — settling the ladder has no wire
-/// effect, and a no-op is not an error.
-fn settle_ranked_ladder(mm: &Matchmaker<SignatureVerifier>, result: &MatchResult) {
-    let match_id = result.match_id;
-    if result.outcomes.len() == 2 {
-        if let Some(d) = mm.apply_ranked_result(result, DEV_MOCK_K) {
-            eprintln!("[ladder] {match_id} ranked 1v1 delta a={:+} b={:+}", d.a, d.b);
+/// (FM3). Each settled seat's post-match rating + signed delta is emitted as ONE
+/// structured `[ladder]` JSON line — `{"match_id","seats":[{"seat","rating","delta"}]}`,
+/// the rating resolved through the roster's seat→`controller` map — so the Python SDK
+/// can parse a machine-readable frame (never the old human-formatted delta line) to
+/// surface an A2A author's ladder standing. A no-op (casual / human / Mixed / replay)
+/// emits nothing and is not an error; the emission has no wire effect on the match.
+fn settle_ranked_ladder(mm: &Matchmaker<SignatureVerifier>, result: &MatchResult, seats: &[SeatInfo]) {
+    // Fold both settle arms into one (seat, delta) list: the 1v1 delta lands `.a` on the
+    // first outcome seat and `.b` on the second (canonical order); the field carries its
+    // own seats. A no-op arm (never registered / already settled) bails before any emit.
+    let moved: Vec<(SeatId, i32)> = if result.outcomes.len() == 2 {
+        match mm.apply_ranked_result(result, DEV_MOCK_K) {
+            Some(d) => vec![(result.outcomes[0].seat, d.a), (result.outcomes[1].seat, d.b)],
+            None => return,
         }
-    } else if let Some(deltas) = mm.apply_ranked_field_result(result, DEV_MOCK_K) {
-        eprintln!("[ladder] {match_id} ranked field deltas {deltas:?}");
-    }
+    } else {
+        match mm.apply_ranked_field_result(result, DEV_MOCK_K) {
+            Some(deltas) => deltas.iter().map(|d| (d.seat, d.delta)).collect(),
+            None => return,
+        }
+    };
+    // Pair each settled seat to its controller's POST-settle ladder rating (the apply
+    // above already wrote it), keyed by seat for the SDK. An out-of-roster seat can't
+    // occur — the apply validated every outcome seat against the roster — so the lookup
+    // is total; DEFAULT_RATING is an inert fallback that never fires here.
+    let entries: Vec<serde_json::Value> = moved
+        .into_iter()
+        .map(|(seat, delta)| {
+            let rating = seats
+                .iter()
+                .find(|s| s.seat == seat)
+                .and_then(|s| mm.rating(&s.controller))
+                .unwrap_or(DEFAULT_RATING);
+            serde_json::json!({ "seat": seat, "rating": rating, "delta": delta })
+        })
+        .collect();
+    let line = serde_json::json!({ "match_id": result.match_id.to_string(), "seats": entries });
+    eprintln!("[ladder] {line}");
 }
 
 /// The match parameters a `--mode` run forms under — the direct path's config (30 Hz,
@@ -743,8 +770,10 @@ fn main() {
     if let Some(mode) = args.mode {
         let (mm, mut m) = handshake_matchmade(&args, mode, n, &settler, &mut lines, &mut out);
         let result = pump_to_end(&mut m, n, &mut lines, &mut out);
+        // Settle the ladder while the roster is still alive (it maps seat→controller for
+        // the rating readout); `settle_finished` then consumes the match.
+        settle_ranked_ladder(&mm, &result, m.seats());
         settle_finished(&settler, &result, m, &[]);
-        settle_ranked_ladder(&mm, &result);
         return;
     }
 
@@ -1638,7 +1667,7 @@ mod tests {
 
         let result = ranked_result(m.match_id(), vec![outcome(0, 1, 10, true), outcome(1, 2, 0, false)]);
         let expected = ranked_delta(&result, DEFAULT_RATING, DEFAULT_RATING, DEV_MOCK_K).unwrap();
-        settle_ranked_ladder(&mm, &result);
+        settle_ranked_ladder(&mm, &result, m.seats());
 
         assert!(expected.a > 0 && expected.a == -expected.b, "a decisive win is a positive, zero-sum move");
         assert_eq!(mm.rating(&addr0), Some(DEFAULT_RATING + expected.a), "winner moves by +delta at the configured K");
@@ -1656,10 +1685,10 @@ mod tests {
         let (mm, m) = formed_ranked_match(&keys);
         let result = ranked_result(m.match_id(), vec![outcome(0, 1, 10, true), outcome(1, 2, 0, false)]);
 
-        settle_ranked_ladder(&mm, &result);
+        settle_ranked_ladder(&mm, &result, m.seats());
         let after_first = mm.rating(&addr0);
         assert_eq!(mm.unsettled_ranked(), 0);
-        settle_ranked_ladder(&mm, &result);
+        settle_ranked_ladder(&mm, &result, m.seats());
         assert_eq!(mm.rating(&addr0), after_first, "a replayed result does not move the ladder again");
         assert_eq!(mm.unsettled_ranked(), 0, "still consumed, not re-registered");
     }
@@ -1680,7 +1709,7 @@ mod tests {
             vec![outcome(0, 1, 9, true), outcome(1, 2, 5, true), outcome(2, 3, 1, false)],
         );
         let expected = ranked_field_delta(&result, &[DEFAULT_RATING; 3], DEV_MOCK_K).unwrap();
-        settle_ranked_ladder(&mm, &result);
+        settle_ranked_ladder(&mm, &result, m.seats());
 
         assert!(expected[0].delta > 0 && expected[2].delta < 0, "1st gains, last loses");
         assert_eq!(expected.iter().map(|d| i64::from(d.delta)).sum::<i64>(), 0, "the field is zero-sum");
