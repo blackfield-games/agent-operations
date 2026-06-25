@@ -1032,6 +1032,16 @@ impl std::fmt::Display for ArenaMapError {
     }
 }
 
+/// A selectable builtin arena: its canonical key and the loader that builds it.
+type NamedArena = (&'static str, fn() -> ArenaMap);
+
+/// The builtin NON-empty arenas. [`arena_map`] and [`named_arena`] both resolve
+/// through this slice, so the set of selectable arenas has ONE definition: adding an
+/// arena here makes it both loadable and CLI-/config-selectable at once, with no
+/// second list to keep in sync. The empty arena is deliberately absent — it is the
+/// implicit default, not a named entry.
+const NAMED_ARENAS: &[NamedArena] = &[("reference", reference_arena)];
+
 /// Resolve a builtin arena key to its [`ArenaMap`]. The empty/default key (`""`)
 /// and any UNKNOWN key both resolve to [`ArenaMap::empty`] — an unrecognised arena
 /// degrades safe to no geometry, never panicking or guessing — so the default
@@ -1042,10 +1052,20 @@ impl std::fmt::Display for ArenaMapError {
 /// loading path end-to-end; real arena layouts are authored content (operator
 /// level-design), not hardcoded here.
 pub fn arena_map(key: &str) -> ArenaMap {
-    match key {
-        "reference" => reference_arena(),
-        _ => ArenaMap::empty(),
-    }
+    NAMED_ARENAS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or_else(ArenaMap::empty, |(_, load)| load())
+}
+
+/// Resolve a user-supplied arena key to its canonical `'static` id, or `None` when it
+/// names no builtin arena. The empty/default arena is intentionally NOT a named entry,
+/// so this returns `None` for `""` and for a typo alike — the distinction
+/// [`arena_map`] erases (it degrades both to empty). A CLI/config that lets an operator
+/// SELECT an arena uses this to reject an unknown key loudly while still resolving a
+/// known one to the `&'static str` a matchmaker's `arena` field requires.
+pub fn named_arena(key: &str) -> Option<&'static str> {
+    NAMED_ARENAS.iter().find(|(k, _)| *k == key).map(|(k, _)| *k)
 }
 
 /// A minimal, symmetric reference arena: one central square vision occluder and
@@ -9847,6 +9867,21 @@ mod tests {
         let a = arena_map("reference");
         assert!(!a.blockers.is_empty() && !a.pickups.is_empty(), "the reference arena has geometry");
         assert_eq!(a, arena_map("reference"), "arena_map must be deterministic for a key");
+    }
+
+    #[test]
+    fn named_arena_agrees_with_arena_map_and_excludes_the_default() {
+        // The CLI/config resolver and the loader share NAMED_ARENAS, so they can never
+        // disagree on the selectable set: every key named_arena resolves loads a
+        // NON-empty arena, the canonical id round-trips, and the empty/default + a typo
+        // both resolve to None (the distinction arena_map erases — both degrade to empty).
+        assert_eq!(named_arena("reference"), Some("reference"), "a known key resolves to its static id");
+        assert!(
+            !arena_map(named_arena("reference").unwrap()).blockers.is_empty(),
+            "a named arena always loads real geometry"
+        );
+        assert_eq!(named_arena(""), None, "the empty/default arena is not a named entry");
+        assert_eq!(named_arena("does-not-exist"), None, "an unknown key is unresolved, not empty-by-degrade");
     }
 
     #[test]
