@@ -296,9 +296,14 @@ def _intent_attributions(
     can never demand an atmosphere for a beat lighting no longer models, nor miss one it
     newly does) and rejects a well-formed lighting layer whose Atmosphere ``drivenBy`` does
     not match it — a dropped volume or a desynced ``drivenBy`` — naming lighting off
-    ``intent:beats``. It fires ONLY when >=1 modeled beat is present (a beats line with no
-    modeled keyword imposes no atmosphere, so the pre-beats palette validates), holding the
-    same FM1/FM2/FM3 contract.
+    ``intent:beats``. When ``drivenBy`` DOES match (the beats are the right set), it then
+    verifies the fog MAGNITUDE: lighting emits ``inputs:density = _fog_density(recognized)``,
+    so a density desynced from that sum (stale from a pre-route beat set, or tampered in
+    isolation while ``drivenBy`` still looks right) is rejected too, re-derived via lighting's
+    OWN ``_fog_density`` for lock-step. It fires ONLY when >=1 modeled beat is present (a beats
+    line with no modeled keyword imposes no atmosphere, so the pre-beats palette validates),
+    and density is checked ONLY on the ``drivenBy``-correct branch (a wrong ``drivenBy`` is the
+    single violation, never also a density complaint), holding the same FM1/FM2/FM3 contract.
     """
     out: list[tuple[str, str]] = []
 
@@ -377,6 +382,30 @@ def _intent_attributions(
                     f"recognized beats {recognized} but its layer records drivenBy "
                     f"{sorted(recorded)}; re-run lighting",
                 ))
+            elif atmosphere is not None:
+                # drivenBy is confirmed right, so the beats are the correct SET — now verify the
+                # fog MAGNITUDE they accumulate to. lighting emits `inputs:density` =
+                # _fog_density(recognized); a density frozen from a pre-route-back beat set, or one
+                # tampered in isolation, desyncs from that sum while drivenBy still looks right (the
+                # gap the drivenBy SET check structurally can't see). Re-derive via lighting's OWN
+                # _fog_density so a BEAT_FOG_DENSITY change tracks in lock-step; abs_tol absorbs the
+                # 2-decimal `{density:.2f}` emission (the float sum is imprecise vs its rounded
+                # string — a tighter tol false-rejects a correct layer). Density is checked ONLY on
+                # the drivenBy-correct branch, so a wrong drivenBy is the single violation, never
+                # also a density complaint (no double-route of one root cause). A body with no
+                # parseable density degrades to the well-formedness gate's concern — lighting always
+                # co-emits density with drivenBy, so this skips only a deeper malformation.
+                density = re.search(r"inputs:density\s*=\s*([0-9]*\.?[0-9]+)", atmosphere.group(1))
+                expected = lighting._fog_density(recognized)
+                if density is not None and not math.isclose(
+                    float(density.group(1)), expected, abs_tol=5e-3
+                ):
+                    out.append((
+                        "lighting",
+                        f"intent:beats unmet: lighting's Atmosphere density {density.group(1)} != "
+                        f"the {expected:.2f} its recognized beats {recognized} sum to "
+                        f"(a stale or tampered fog magnitude); re-run lighting",
+                    ))
     return out
 
 
