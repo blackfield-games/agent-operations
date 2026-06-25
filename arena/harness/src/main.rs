@@ -1283,6 +1283,12 @@ mod tests {
         SigningKey::from_slice(&bytes).unwrap()
     }
 
+    fn third_join_key() -> SigningKey {
+        let bytes =
+            hex::decode("7777777777777777777777777777777777777777777777777777777777777777").unwrap();
+        SigningKey::from_slice(&bytes).unwrap()
+    }
+
     /// Sign join_digest exactly as the agent SDK does — `[r||s||v]` hex, low-S, raw
     /// recovery id — so these tests exercise admit_join over a real agent proof.
     fn sign_join_proof(sk: &SigningKey, agent_id: &str, nonce: &[u8]) -> String {
@@ -1589,5 +1595,98 @@ mod tests {
         let casual = join_request_for(MatchMode::Mixed, 1, &[0], "agent-1", "");
         let formed = mm.join(MatchMode::Mixed, nonce_for(id(), 1).as_bytes(), casual).expect("admitted casual");
         assert!(formed.into_formed().is_some(), "a human + a casual agent forms a Mixed cross-play match");
+    }
+
+    /// Form a ranked Agent match of `keys.len()` seats through a fresh matchmaker — each
+    /// seat signs its challenge so the verifier admits it. Returns the matchmaker (its
+    /// ladder + the pending_ranked registration live) and the formed match, so a test can
+    /// settle the match's terminal result back into the ladder.
+    fn formed_ranked_match(keys: &[SigningKey]) -> (Matchmaker<SignatureVerifier>, Match) {
+        let mm = Matchmaker::new(SignatureVerifier, matchmaker_params(keys.len() as u8, 4));
+        let mut formed = None;
+        for (seat, sk) in keys.iter().enumerate() {
+            let seat = seat as SeatId;
+            let addr = address_from_verifying_key(sk.verifying_key());
+            let nonce = nonce_for(id(), seat);
+            let req = join_request_for(MatchMode::Agent, seat, &[], &addr, &sign_join_proof(sk, &addr, nonce.as_bytes()));
+            if let Some(m) = mm.join(MatchMode::Agent, nonce.as_bytes(), req).expect("admitted").into_formed() {
+                formed = Some(m);
+            }
+        }
+        (mm, formed.expect("the last seat forms the match"))
+    }
+
+    /// A synthetic terminal result for `match_id` with the given placement `outcomes`.
+    /// The id is the matchmaker's MINTED id (not the fixed test id), so the ladder settle
+    /// resolves the registration `build()` keyed under it.
+    fn ranked_result(match_id: Uuid, outcomes: Vec<SeatOutcome>) -> MatchResult {
+        MatchResult { protocol_version: PROTOCOL_VERSION, match_id, final_tick: 1, outcomes, replay_hash: "00".repeat(32) }
+    }
+
+    #[test]
+    fn settle_ranked_ladder_moves_a_1v1_winner_up_and_loser_down_by_the_configured_k() {
+        // A formed Agent 1v1 settled into the ladder: seat 0 wins, so its agent gains and
+        // seat 1's loses by the EXACT zero-sum ranked_delta the core computes at DEV_MOCK_K
+        // from the two DEFAULT_RATING pre-ratings, and the pending_ranked entry is consumed.
+        // A bare-literal K would move a different magnitude; an unmoved ladder or a still
+        // -pending entry would mean the result never settled.
+        let keys = [join_key(), other_join_key()];
+        let addr0 = address_from_verifying_key(keys[0].verifying_key());
+        let addr1 = address_from_verifying_key(keys[1].verifying_key());
+        let (mm, m) = formed_ranked_match(&keys);
+        assert_eq!(mm.unsettled_ranked(), 1, "the formed Agent match registered one pending result");
+
+        let result = ranked_result(m.match_id(), vec![outcome(0, 1, 10, true), outcome(1, 2, 0, false)]);
+        let expected = ranked_delta(&result, DEFAULT_RATING, DEFAULT_RATING, DEV_MOCK_K).unwrap();
+        settle_ranked_ladder(&mm, &result);
+
+        assert!(expected.a > 0 && expected.a == -expected.b, "a decisive win is a positive, zero-sum move");
+        assert_eq!(mm.rating(&addr0), Some(DEFAULT_RATING + expected.a), "winner moves by +delta at the configured K");
+        assert_eq!(mm.rating(&addr1), Some(DEFAULT_RATING + expected.b), "loser moves by -delta");
+        assert_eq!(mm.unsettled_ranked(), 0, "the registration is consumed");
+    }
+
+    #[test]
+    fn settle_ranked_ladder_is_idempotent_on_a_replayed_result() {
+        // FM2: applying the same terminal result twice (a retry / duplicate End) must not
+        // move ratings twice — the registration is consumed on the first settle, so the
+        // second is a no-op.
+        let keys = [join_key(), other_join_key()];
+        let addr0 = address_from_verifying_key(keys[0].verifying_key());
+        let (mm, m) = formed_ranked_match(&keys);
+        let result = ranked_result(m.match_id(), vec![outcome(0, 1, 10, true), outcome(1, 2, 0, false)]);
+
+        settle_ranked_ladder(&mm, &result);
+        let after_first = mm.rating(&addr0);
+        assert_eq!(mm.unsettled_ranked(), 0);
+        settle_ranked_ladder(&mm, &result);
+        assert_eq!(mm.rating(&addr0), after_first, "a replayed result does not move the ladder again");
+        assert_eq!(mm.unsettled_ranked(), 0, "still consumed, not re-registered");
+    }
+
+    #[test]
+    fn settle_ranked_ladder_settles_a_3_seat_field_through_the_field_arm() {
+        // FM1: a 3-seat result MUST settle through apply_ranked_field_result, moving every
+        // seat by its placement delta and consuming the registration. Routed (wrongly)
+        // through the 1v1 arm it is a silent no-op — ladder unmoved, registration leaked —
+        // so a moved 3-seat ladder proves the arm is chosen by outcome count.
+        let keys = [join_key(), other_join_key(), third_join_key()];
+        let addrs: Vec<String> = keys.iter().map(|k| address_from_verifying_key(k.verifying_key())).collect();
+        let (mm, m) = formed_ranked_match(&keys);
+        assert_eq!(mm.unsettled_ranked(), 1);
+
+        let result = ranked_result(
+            m.match_id(),
+            vec![outcome(0, 1, 9, true), outcome(1, 2, 5, true), outcome(2, 3, 1, false)],
+        );
+        let expected = ranked_field_delta(&result, &[DEFAULT_RATING; 3], DEV_MOCK_K).unwrap();
+        settle_ranked_ladder(&mm, &result);
+
+        assert!(expected[0].delta > 0 && expected[2].delta < 0, "1st gains, last loses");
+        assert_eq!(expected.iter().map(|d| i64::from(d.delta)).sum::<i64>(), 0, "the field is zero-sum");
+        for (i, d) in expected.iter().enumerate() {
+            assert_eq!(mm.rating(&addrs[i]), Some(DEFAULT_RATING + d.delta), "seat {i} moves by its field delta");
+        }
+        assert_eq!(mm.unsettled_ranked(), 0, "the field registration is consumed");
     }
 }
