@@ -285,10 +285,103 @@ def decode_gateway(frame: dict) -> GatewayMsg:
             raise ProtocolError(f"unknown gateway frame type {tag!r}")
 
 
+_JOIN_DOMAIN = b"blackfield/arena/join/v1"
+
+
+def _crypto():
+    """secp256k1 + keccak256, imported lazily so unranked play (no signature) carries
+    no crypto dependency. Ranked seats need `eth-keys` + `eth-hash[pycryptodome]` —
+    pure Python, so unlike `coincurve` they build on 3.14; a missing extra fails here
+    with a clear pointer rather than an opaque ImportError at module load."""
+    try:
+        from eth_hash.auto import keccak
+        from eth_keys import keys
+    except ImportError as e:  # pragma: no cover - both are declared dependencies
+        raise RuntimeError(
+            "ranked arena play needs eth-keys + eth-hash[pycryptodome] (declared "
+            "dependencies) — reinstall the agents package"
+        ) from e
+    return keccak, keys
+
+
+def join_digest(protocol_version: int, agent_id: str, nonce: bytes) -> bytes:
+    """The 32-byte keccak256 commitment an agent signs to prove control of `agent_id`,
+    byte-identical to `arena_proto::join_digest` so the Rust Gateway recovers the
+    signer. Bytes = `keccak256( DOMAIN || protocol_version_be || len(agent_id) ||
+    agent_id || len(nonce) || nonce )`, every `len` a big-endian u32. The DOMAIN tag
+    separates it from the replay digest and mesh's hello digest (no signature crosses
+    protocols); the length prefixes make the field boundaries unambiguous; the
+    server-issued challenge `nonce` is folded IN (not merely sent alongside) so a
+    captured Join can't be replayed against a fresh challenge. `nonce` is the raw bytes
+    of the `Challenge.nonce` token (`Challenge.nonce.encode()`) — the Gateway verifies
+    over the same `nonce.as_bytes()`, so the token stays opaque to both sides. Both
+    MUST build it identically."""
+    keccak, _ = _crypto()
+    aid = agent_id.encode("utf-8")
+    return keccak(
+        _JOIN_DOMAIN
+        + protocol_version.to_bytes(4, "big")
+        + len(aid).to_bytes(4, "big")
+        + aid
+        + len(nonce).to_bytes(4, "big")
+        + nonce
+    )
+
+
+def address_from_private_key(private_key: bytes) -> str:
+    """The lowercase 0x agent address a secp256k1 key recovers to: `0x` +
+    keccak256(uncompressed_pubkey[1:])[12:] — the same derivation
+    `arena_proto::address_from_verifying_key` and mesh use, so one session key spans
+    both subsystems. This is the `agent_id` a ranked seat must claim."""
+    _, keys = _crypto()
+    return keys.PrivateKey(private_key).public_key.to_address()
+
+
+def sign_join(private_key: bytes, protocol_version: int, agent_id: str, nonce: bytes) -> str:
+    """Sign `join_digest` with `private_key`; return the recoverable secp256k1
+    `[r||s||v]` as hex (65 bytes) — the `Join.signature_hex` the Gateway verifies. `v`
+    is the raw recovery id (0/1, NOT the 27/28 Ethereum offset) and eth-keys emits
+    canonical low-S, both matching `verify_join_signature`'s gate exactly. `agent_id`
+    MUST be `address_from_private_key(private_key)` (it is folded into the digest AND
+    is the recovery target), else the Gateway recovers a different address and refuses
+    the ranked seat."""
+    _, keys = _crypto()
+    digest = join_digest(protocol_version, agent_id, nonce)
+    sig = keys.PrivateKey(private_key).sign_msg_hash(digest)
+    return (sig.r.to_bytes(32, "big") + sig.s.to_bytes(32, "big") + bytes([sig.v])).hex()
+
+
+def recover_join_signer(
+    protocol_version: int, agent_id: str, nonce: bytes, signature_hex: str
+) -> str | None:
+    """The lowercase 0x address that signed `join_digest` under `signature_hex`, or
+    `None` if it is not 65 valid `[r||s||v]` bytes / nothing recovers. The agent's
+    self-check that its signature recovers to the address it claims before sending
+    (the Gateway is authoritative — `arena_proto::verify_join_signature` also rejects
+    high-S, which this recovery step does not)."""
+    _, keys = _crypto()
+    from eth_keys.exceptions import BadSignature, ValidationError
+
+    try:
+        raw = bytes.fromhex(signature_hex.removeprefix("0x"))
+    except ValueError:
+        return None
+    if len(raw) != 65:
+        return None
+    digest = join_digest(protocol_version, agent_id, nonce)
+    try:
+        sig = keys.Signature(
+            vrs=(raw[64], int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:64], "big"))
+        )
+        return sig.recover_public_key_from_msg_hash(digest).to_address()
+    except (BadSignature, ValidationError):  # bad v/r/s, or no point recovers
+        return None
+
+
 def join_frame(agent_id: str, signature_hex: str = "") -> dict:
     """An `AgentMsg::Join` frame. An empty `signature_hex` is an unranked seat —
-    matchmaking decides whether that is allowed; a ranked seat signs the
-    `join_digest` (a keccak/secp256k1 follow-up, deferred with on-chain identity)."""
+    matchmaking decides whether that is allowed; a ranked seat carries a `sign_join`
+    over this connection's challenge nonce, which the Gateway recovers to `agent_id`."""
     return {
         "type": "join",
         "protocol_version": PROTOCOL_VERSION,

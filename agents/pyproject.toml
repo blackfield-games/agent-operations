@@ -13,6 +13,8 @@ dependencies = [
     "anyio>=4.6",
     "structlog>=24.4",
     "httpx>=0.28",
+    "eth-keys>=0.6",
+    "eth-hash[pycryptodome]>=0.7",
 ]
 
 [project.optional-dependencies]
