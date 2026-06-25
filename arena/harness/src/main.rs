@@ -1837,4 +1837,123 @@ mod tests {
         }
         assert_eq!(mm.unsettled_ranked(), 0, "the field registration is consumed");
     }
+
+    /// A process-unique temp path per test (tests run in parallel threads), tagged so two
+    /// ladder tests never share a file.
+    fn temp_ladder_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("arena-ladder-test-{}-{tag}.json", std::process::id()))
+    }
+
+    #[test]
+    fn a_ladder_file_persists_ratings_across_two_sequential_runs() {
+        // The headline: run 1 moves the ladder and writes the file; run 2 SEEDS from it, so
+        // the moved standings survive a fresh process instead of resetting to DEFAULT_RATING.
+        let path = temp_ladder_path("persist");
+        let _ = std::fs::remove_file(&path);
+
+        // Run 1: form + settle a ranked 1v1, then persist the moved ladder.
+        let keys = [join_key(), other_join_key()];
+        let addr0 = address_from_verifying_key(keys[0].verifying_key());
+        let addr1 = address_from_verifying_key(keys[1].verifying_key());
+        let (mm1, m) = formed_ranked_match(&keys);
+        let result = ranked_result(m.match_id(), vec![outcome(0, 1, 10, true), outcome(1, 2, 0, false)]);
+        settle_ranked_ladder(&mm1, &result, m.seats());
+        let moved0 = mm1.rating(&addr0).expect("seat 0 has a moved rating");
+        let moved1 = mm1.rating(&addr1).expect("seat 1 has a moved rating");
+        assert_ne!(moved0, DEFAULT_RATING, "the winner actually moved off the default");
+        write_ladder(&path, &mm1.snapshot()).expect("persist the moved ladder");
+
+        // Run 2: a fresh matchmaker built from the same --ladder-file resumes those ratings.
+        let mut args = mode_args(2, MatchMode::Agent, vec![]);
+        args.ladder_file = Some(path.clone());
+        let mm2 = build_matchmaker(&args, 2);
+        assert_eq!(mm2.rating(&addr0), Some(moved0), "run 2 resumes the winner's standing exactly");
+        assert_eq!(mm2.rating(&addr1), Some(moved1), "run 2 resumes the loser's standing exactly");
+        assert_eq!(mm2.unsettled_ranked(), 0, "a restore starts with no pending registrations");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_ladder_file_starts_a_fresh_ladder_identical_to_no_file() {
+        // A --ladder-file that does not exist is the legal "start fresh" path: the built
+        // matchmaker is byte-identical to one with no flag (an empty DEFAULT_RATING ladder),
+        // so a first run against a not-yet-written file behaves exactly like today.
+        let path = temp_ladder_path("missing");
+        let _ = std::fs::remove_file(&path);
+        assert!(read_ladder_file(&path).expect("a missing file is not an error").is_none(), "missing reads as start-fresh");
+
+        let mut args = mode_args(2, MatchMode::Agent, vec![]);
+        args.ladder_file = Some(path);
+        let from_missing = build_matchmaker(&args, 2);
+        let no_file = Matchmaker::new(SignatureVerifier, matchmaker_params(2, 4));
+        assert_eq!(from_missing.snapshot(), no_file.snapshot(), "a missing file yields the fresh in-memory ladder");
+    }
+
+    #[test]
+    fn an_empty_ladder_file_starts_fresh_not_an_error() {
+        // A 0-byte (or whitespace-only) file — e.g. a freshly `touch`ed path — is also the
+        // start-fresh signal, distinct from a present snapshot, so it never errors.
+        let path = temp_ladder_path("empty");
+        std::fs::write(&path, b"   \n").expect("write an empty file");
+        assert!(read_ladder_file(&path).expect("an empty file is not an error").is_none(), "empty reads as start-fresh");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_corrupt_or_stale_schema_ladder_file_is_a_loud_error_not_a_silent_reset() {
+        // FM2: a present, non-empty file the harness can't trust must surface an Err (the run
+        // aborts), NEVER a silent fresh ladder that would erase real standings.
+        let path = temp_ladder_path("corrupt");
+
+        // Non-JSON garbage: a hard parse error, not Ok(None).
+        std::fs::write(&path, b"not a snapshot {{{").expect("write garbage");
+        assert!(matches!(read_ladder_file(&path), Err(LadderFileError::Parse(_))), "garbage is a loud parse Err");
+
+        // Valid JSON but a stale schema version: read parses it, but from_snapshot rejects it,
+        // so build_matchmaker would abort rather than restore wrong ratings.
+        let stale = LadderSnapshot {
+            version: arena_match::LADDER_SNAPSHOT_VERSION + 1,
+            ratings: BTreeMap::from([("0xabc".to_string(), 1800)]),
+        };
+        write_ladder(&path, &stale).expect("write a stale-schema snapshot");
+        let parsed = read_ladder_file(&path).expect("valid JSON parses").expect("non-empty file");
+        assert!(
+            matches!(
+                Matchmaker::from_snapshot(SignatureVerifier, matchmaker_params(2, 4), parsed),
+                Err(SnapshotError::Version { .. })
+            ),
+            "a stale-schema snapshot is rejected on restore, not silently loaded",
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_ladder_stages_through_a_temp_and_never_corrupts_the_prior_snapshot() {
+        // FM3: the write stages to a sibling temp then atomic-renames, so an interrupted
+        // persist (one that never reached the rename) leaves the PRIOR good snapshot intact.
+        let path = temp_ladder_path("atomic");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(ladder_tmp_path(&path));
+
+        let a = LadderSnapshot { version: arena_match::LADDER_SNAPSHOT_VERSION, ratings: BTreeMap::from([("0xa".to_string(), 1700)]) };
+        write_ladder(&path, &a).expect("write A");
+        assert!(!ladder_tmp_path(&path).exists(), "the staging temp is renamed away, never left behind");
+        assert_eq!(read_ladder_file(&path).unwrap(), Some(a.clone()), "the live file reads back as A");
+        assert_eq!(ladder_tmp_path(&path).parent(), path.parent(), "the temp is a same-directory sibling (atomic rename)");
+
+        // A garbage half-write to the temp path (a persist interrupted before the rename) must
+        // NOT touch the live file: it still reads as the prior good A.
+        std::fs::write(ladder_tmp_path(&path), b"half written {").expect("stage garbage on the temp");
+        assert_eq!(read_ladder_file(&path).unwrap(), Some(a), "an unfinished temp leaves the prior snapshot intact");
+
+        // A completed overwrite swaps the live file to B atomically (consuming the temp).
+        let b = LadderSnapshot { version: arena_match::LADDER_SNAPSHOT_VERSION, ratings: BTreeMap::from([("0xb".to_string(), 1500)]) };
+        write_ladder(&path, &b).expect("write B");
+        assert_eq!(read_ladder_file(&path).unwrap(), Some(b), "the live file is now B, never a half-write");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(ladder_tmp_path(&path));
+    }
 }
