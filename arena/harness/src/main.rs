@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use arena_core::{
     arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, Match, Rules,
-    SeatDelta, Settlement, DEFAULT_RATING,
+    SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
 };
 use arena_match::{
     JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker, SignatureVerifier, SnapshotError,
@@ -124,6 +124,15 @@ struct Args {
     /// its own gravity leaves combat planar (outcome-identical): it unblocks the z-combat family
     /// for a configured deployment, but is not a HIT determinant until `vertical_hit_tolerance > 0`.
     gravity: i32,
+    /// How a fire press resolves (`Rules::weapon_mode`): `hitscan` is an instant beam that lands
+    /// the tick it is fired (the default), `projectile` spawns a traveling shot that hits only
+    /// when its swept path crosses a body on a later (or point-blank) tick, and `melee` is a
+    /// close-quarters cleave striking every enemy in `melee_range` + the frontal arc. Set by
+    /// `--weapon-mode`; the default `hitscan` is byte-identical to the pre-flag harness (and the
+    /// replay digest). Applies to BOTH the direct and `--mode` paths through [`rules_from`] via
+    /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same weapon a
+    /// hand-seated one does.
+    weapon_mode: WeaponMode,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -177,6 +186,19 @@ fn parse_gravity(value: &str) -> i32 {
     i32::try_from(magnitude).expect("--gravity exceeds the i32 range")
 }
 
+/// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
+/// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
+/// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
+/// silently default to `hitscan` and resolve a different weapon than the operator asked for.
+fn parse_weapon_mode(value: &str) -> WeaponMode {
+    match value {
+        "hitscan" => WeaponMode::Hitscan,
+        "projectile" => WeaponMode::Projectile,
+        "melee" => WeaponMode::Melee,
+        other => panic!("--weapon-mode is one of hitscan|projectile|melee, got {other:?}"),
+    }
+}
+
 fn parse_args() -> Args {
     parse_args_from(std::env::args().skip(1))
 }
@@ -200,6 +222,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut aim_mode = AimMode::Octant;
     let mut friendly_fire = false;
     let mut gravity: i32 = 0;
+    let mut weapon_mode = WeaponMode::Hitscan;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -232,6 +255,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--aim-mode" => aim_mode = parse_aim_mode(&it.next().expect("--aim-mode needs a value")),
             "--friendly-fire" => friendly_fire = true,
             "--gravity" => gravity = parse_gravity(&it.next().expect("--gravity needs a value")),
+            "--weapon-mode" => {
+                weapon_mode = parse_weapon_mode(&it.next().expect("--weapon-mode needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -250,6 +276,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         aim_mode,
         friendly_fire,
         gravity,
+        weapon_mode,
     }
 }
 
@@ -984,9 +1011,10 @@ fn handshake_matchmade(
 /// The matchmaker carries it via [`MatchParams::rules`] ([`build_matchmaker`]); the direct
 /// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). The
 /// perception-memory window (`--perception-memory`), the FOV cone (`--fov`), the aim
-/// resolution (`--aim-mode`), allied damage (`--friendly-fire`), and gravity (`--gravity`)
-/// are dialable; every other field stays at [`Rules::default`], and each knob defaults to
-/// its `Rules::default` value, so a no-flag run is byte-identical to the pre-knob harness.
+/// resolution (`--aim-mode`), allied damage (`--friendly-fire`), gravity (`--gravity`), and
+/// the weapon mode (`--weapon-mode`) are dialable; every other field stays at [`Rules::default`],
+/// and each knob defaults to its `Rules::default` value, so a no-flag run is byte-identical to
+/// the pre-knob harness.
 fn rules_from(args: &Args) -> Rules {
     Rules {
         perception_memory_ticks: args.perception_memory,
@@ -994,6 +1022,7 @@ fn rules_from(args: &Args) -> Rules {
         aim_mode: args.aim_mode,
         friendly_fire: args.friendly_fire,
         gravity: args.gravity,
+        weapon_mode: args.weapon_mode,
         ..Rules::default()
     }
 }
@@ -1749,6 +1778,7 @@ mod tests {
             aim_mode: AimMode::Octant,
             friendly_fire: false,
             gravity: 0,
+            weapon_mode: WeaponMode::Hitscan,
         }
     }
 
@@ -1812,6 +1842,7 @@ mod tests {
             aim_mode: AimMode::Octant,
             friendly_fire: false,
             gravity: 0,
+            weapon_mode: WeaponMode::Hitscan,
         }
     }
 
