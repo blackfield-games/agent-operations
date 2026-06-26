@@ -472,6 +472,7 @@ def run_local_match(
     fov: int = 4,
     aim_mode: str = "octant",
     friendly_fire: bool = False,
+    gravity: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -550,7 +551,15 @@ def run_local_match(
     in this roster: `run_local_match` seats every agent on its own team (free-for-all), and
     `friendly_fire` only diverges hit resolution for same-team bodies, so it changes nothing here
     until a teamed roster exists — the flag's reachability is the contract, its behavioural effect
-    is a separate teamed slice."""
+    is a separate teamed slice.
+
+    Pass `gravity` (a downward magnitude, `0`..=`2**31-1`) to turn on vertical physics: core gates
+    jumps/`z` trajectory on `gravity > 0`, so `0` (the default) is the 2D match. Forwarded as
+    `--gravity <n>` (value-flag, like `fov`) on BOTH paths via `MatchParams.rules`, only when
+    nonzero. A negative or `> i32::MAX` value raises before any spawn (both would read as off in
+    core — a silent footgun — so they are rejected loudly, mirroring the harness fence). Default `0`
+    adds no token — byte-identical argv. Gravity alone changes only the observable `z` arc, not a
+    hit outcome, until the separate `vertical_hit_tolerance` knob couples `z` into combat."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -563,6 +572,11 @@ def run_local_match(
         raise ValueError(f"fov is an octant spread in 0..=4 (4 = full circle); got {fov}")
     if aim_mode not in ("octant", "fine"):
         raise ValueError(f"aim_mode is 'octant' or 'fine'; got {aim_mode!r}")
+    if not 0 <= gravity <= 2**31 - 1:
+        # Core gates vertical physics on gravity > 0, so a negative would silently run a 2D match
+        # (off) and a value past i32::MAX would wrap the fall integration negative (also off) —
+        # reject both loudly here, mirroring the harness's u32-then-i32 parse_gravity fence.
+        raise ValueError(f"gravity is a downward magnitude in 0..=2**31-1 (0 = off); got {gravity}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if arena is not None:
         # Unconditional, before the mode block: --map drives both the direct and --mode
@@ -584,6 +598,10 @@ def run_local_match(
         # paths (the matchmaker carries it via MatchParams.rules). Default False adds no token —
         # byte-identical argv.
         argv += ["--friendly-fire"]
+    if gravity:
+        # Same shape as --fov: a value-flag magnitude on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (physics off) adds no token — byte-identical argv.
+        argv += ["--gravity", str(gravity)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
