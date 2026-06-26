@@ -1543,6 +1543,62 @@ def test_run_local_match_forwards_perception_memory_under_mode(monkeypatch):
     assert "--perception-memory" not in captured["argv"]
 
 
+def test_run_local_match_forwards_fov_and_omits_it_at_the_default(monkeypatch):
+    # A non-default fov forwards --fov <spread> as one argv token, mode-independently (before
+    # the mode block, like --map/--perception-memory); the default 4 (full circle) adds no
+    # flag — byte-identical argv. fov=0 is non-default, so it MUST still forward. Captured
+    # without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--fov" not in captured["argv"], "the default full circle adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, fov=2)
+    argv = captured["argv"]
+    assert argv[argv.index("--fov") + 1] == "2"
+
+    # fov=0 (facing octant alone) is non-default — it must forward, not be mistaken for "off".
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, fov=0)
+    argv = captured["argv"]
+    assert argv[argv.index("--fov") + 1] == "0"
+
+    # Threads under --mode too (mode-independent forward): --fov and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, fov=1)
+    argv = captured["argv"]
+    assert argv[argv.index("--fov") + 1] == "1"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_fov():
+    # The cone is an octant spread in 0..=4; an out-of-range value raises before any spawn
+    # (mirroring the ladder_file/mode preflights) rather than letting the harness saturate a
+    # spread >4 to a full circle. A bogus harness path proves the guard precedes the spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, 5, 100):
+        with pytest.raises(ValueError, match="0..=4"):
+            run_local_match("/no/such/harness", [0, 1], policies, fov=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
@@ -1567,6 +1623,42 @@ def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
         arena="reference", perception_memory=30,
     )
     assert watch[0].echoes + watch[1].echoes > 0, "a lost enemy surfaced as an out-of-sight echo"
+
+
+def test_run_local_match_fov_cone_narrows_what_a_policy_perceives():
+    # The end-to-end payoff: a narrow forward cone (fov=0, the facing octant alone) gates
+    # perception by ANGLE, so a seat perceives an in-range enemy only while facing it. Proven
+    # by running the SAME deterministic match (direct path, fixed seed) under the full circle
+    # vs the narrow cone and counting in-sight observations: the full circle perceives the
+    # in-range enemy nearly every tick (both seats), the narrow cone a tiny fraction — if --fov
+    # were dropped the two runs would be byte-identical, so the gap is the flag reaching the sim.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    class _SightCount:
+        def __init__(self):
+            self.seen = 0
+            self._b = BaselinePolicy()
+
+        def __call__(self, obs):
+            self.seen += sum(1 for e in obs.visible if e.in_line_of_sight)
+            return self._b(obs)
+
+    def sightings(fov):
+        w = {0: _SightCount(), 1: _SightCount()}
+        run_local_match(
+            harness, [0, 1], w, seed=2, match_id="77777777-3333-4444-8555-666666666666",
+            arena="reference", fov=fov,
+        )
+        return w[0].seen, w[1].seen
+
+    full = sightings(4)
+    narrow = sightings(0)
+    assert full[0] > 0 and full[1] > 0, "the full circle perceives the in-range enemy (else the gap proves nothing)"
+    assert sum(narrow) * 10 < sum(full), (
+        f"the facing-octant cone perceives the enemy a tiny fraction of the full circle "
+        f"(full={full}, narrow={narrow}) — the cone gates perception by angle end to end"
+    )
 
 
 def test_perception_memory_does_not_bypass_the_mode_preflights():
