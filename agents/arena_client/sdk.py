@@ -471,6 +471,7 @@ def run_local_match(
     perception_memory: int = 0,
     fov: int = 4,
     aim_mode: str = "octant",
+    friendly_fire: bool = False,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -540,7 +541,16 @@ def run_local_match(
     set (an unknown value raises before any spawn, like `mode`/`fov`) rather than forwarded blindly
     to abort the harness. It carries through BOTH paths via `--aim-mode` (the harness threads it via
     `MatchParams.rules`), so it applies under any `mode`. Default `"octant"` adds no flag —
-    byte-identical to before."""
+    byte-identical to before.
+
+    Set `friendly_fire=True` to allow allied damage (`Rules.friendly_fire`): a fire crossing a
+    same-team body damages it but never scores a kill for the shooter. Unlike `aim_mode`/`fov` this
+    is a BARE presence flag (`--friendly-fire`, no value) carried through BOTH paths via
+    `MatchParams.rules`. Default `False` adds no token — byte-identical argv. It is wired but DARK
+    in this roster: `run_local_match` seats every agent on its own team (free-for-all), and
+    `friendly_fire` only diverges hit resolution for same-team bodies, so it changes nothing here
+    until a teamed roster exists — the flag's reachability is the contract, its behavioural effect
+    is a separate teamed slice."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -569,6 +579,11 @@ def run_local_match(
         # Same shape as --fov: select fine aim on both paths (the matchmaker carries it via
         # MatchParams.rules). Default "octant" adds no token — byte-identical argv.
         argv += ["--aim-mode", aim_mode]
+    if friendly_fire:
+        # A BARE presence flag (no value, unlike --fov/--aim-mode): enable allied damage on both
+        # paths (the matchmaker carries it via MatchParams.rules). Default False adds no token —
+        # byte-identical argv.
+        argv += ["--friendly-fire"]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
