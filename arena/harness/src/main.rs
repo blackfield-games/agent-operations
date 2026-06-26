@@ -1956,6 +1956,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_vertical_hit_tolerance_maps_a_non_negative_band() {
+        assert_eq!(parse_vertical_hit_tolerance("0"), 0);
+        assert_eq!(parse_vertical_hit_tolerance("100"), 100);
+        assert_eq!(
+            parse_vertical_hit_tolerance(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid band"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_vertical_hit_tolerance_rejects_a_negative() {
+        // A negative band would invert the |shooter_z - target_z| <= tol comparison in core, so a
+        // forwarded negative would silently flip hit resolution — reject it loudly at the CLI. The
+        // u32 parse fails the leading '-'.
+        parse_vertical_hit_tolerance("-100");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_vertical_hit_tolerance_rejects_an_overflow() {
+        // A band past i32::MAX must abort, NOT wrap into a negative (which would then invert the
+        // comparison). 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_vertical_hit_tolerance("3000000000");
+    }
+
+    #[test]
     fn parse_weapon_mode_maps_each_name() {
         assert_eq!(parse_weapon_mode("hitscan"), WeaponMode::Hitscan);
         assert_eq!(parse_weapon_mode("projectile"), WeaponMode::Projectile);
@@ -2246,6 +2274,58 @@ mod tests {
             .into_formed()
             .expect("forms");
         assert_eq!(off.rules().gravity, 0, "no --gravity: the matchmaker forms vertical physics off");
+    }
+
+    #[test]
+    fn direct_match_threads_vertical_hit_tolerance_into_rules() {
+        // FM1 (default drift): no --vertical-hit-tolerance is 0 — combat planar, z ignored in hit
+        // resolution, byte-identical to the pre-flag harness (and its replay digest). The z-coupled
+        // HIT behavior is arena-core's own test; here we pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().vertical_hit_tolerance,
+            0,
+            "no --vertical-hit-tolerance is 0 (combat planar, byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { vertical_hit_tolerance: 100, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .vertical_hit_tolerance,
+            100,
+            "--vertical-hit-tolerance 100 threads the band into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_vertical_hit_tolerance_into_a_matchmade_match() {
+        // FM3 (path skew): --vertical-hit-tolerance must reach the --mode path too, not just the
+        // direct one. build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms
+        // under the same band a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { vertical_hit_tolerance: 100, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().vertical_hit_tolerance,
+            100,
+            "the matchmaker forms under --vertical-hit-tolerance 100 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms tolerance 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().vertical_hit_tolerance,
+            0,
+            "no --vertical-hit-tolerance: the matchmaker forms combat planar"
+        );
     }
 
     #[test]
