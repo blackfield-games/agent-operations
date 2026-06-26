@@ -103,6 +103,17 @@ struct Args {
     /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same aim resolution
     /// a hand-seated one does.
     aim_mode: AimMode,
+    /// Allow allied damage (`Rules::friendly_fire`): when set, a fire (beam, projectile, or
+    /// melee swing) that crosses a same-team body damages it instead of passing through — the
+    /// hit lands but never scores a kill for the shooter. A presence flag (`--friendly-fire`,
+    /// no value, like `--settle-dev-mock`); the default `false` spares allies, byte-identical
+    /// to the pre-flag harness (and the replay digest). Applies to BOTH the direct and `--mode`
+    /// paths through [`rules_from`]: the matchmaker carries it on [`MatchParams::rules`], so a
+    /// matchmade/ranked match forms under the same allied-damage rule a hand-seated one does.
+    /// The effect surfaces only with teamed rosters — today's harness seats a free-for-all
+    /// (every seat its own team), so the rule is dark until a teamed deployment configures it —
+    /// but `friendly_fire` is a real `Rules` determinant folded into the digest.
+    friendly_fire: bool,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -160,6 +171,7 @@ fn parse_args() -> Args {
     let mut perception_memory: u16 = 0;
     let mut fov: u8 = 4;
     let mut aim_mode = AimMode::Octant;
+    let mut friendly_fire = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -190,6 +202,7 @@ fn parse_args() -> Args {
             }
             "--fov" => fov = parse_fov(&it.next().expect("--fov needs a value")),
             "--aim-mode" => aim_mode = parse_aim_mode(&it.next().expect("--aim-mode needs a value")),
+            "--friendly-fire" => friendly_fire = true,
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -206,6 +219,7 @@ fn parse_args() -> Args {
         perception_memory,
         fov,
         aim_mode,
+        friendly_fire,
     }
 }
 
@@ -939,15 +953,16 @@ fn handshake_matchmade(
 /// a matchmade (`--mode`) match and a hand-seated direct match play under the SAME tuning.
 /// The matchmaker carries it via [`MatchParams::rules`] ([`build_matchmaker`]); the direct
 /// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). The
-/// perception-memory window (`--perception-memory`), the FOV cone (`--fov`), and the aim
-/// resolution (`--aim-mode`) are dialable; every other field stays at [`Rules::default`],
-/// and each knob defaults to its `Rules::default` value, so a no-flag run is byte-identical
-/// to the pre-knob harness.
+/// perception-memory window (`--perception-memory`), the FOV cone (`--fov`), the aim
+/// resolution (`--aim-mode`), and allied damage (`--friendly-fire`) are dialable; every
+/// other field stays at [`Rules::default`], and each knob defaults to its `Rules::default`
+/// value, so a no-flag run is byte-identical to the pre-knob harness.
 fn rules_from(args: &Args) -> Rules {
     Rules {
         perception_memory_ticks: args.perception_memory,
         fov_octant_spread: args.fov,
         aim_mode: args.aim_mode,
+        friendly_fire: args.friendly_fire,
         ..Rules::default()
     }
 }
@@ -1701,6 +1716,7 @@ mod tests {
             perception_memory: 0,
             fov: 4,
             aim_mode: AimMode::Octant,
+            friendly_fire: false,
         }
     }
 
@@ -1762,6 +1778,7 @@ mod tests {
             perception_memory,
             fov: 4,
             aim_mode: AimMode::Octant,
+            friendly_fire: false,
         }
     }
 
