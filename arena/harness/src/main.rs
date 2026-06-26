@@ -1766,6 +1766,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_fov_accepts_the_whole_domain() {
+        // 0 (facing octant alone) through 4 (full circle) are the sim's valid spreads.
+        assert_eq!((0..=4).map(|s| parse_fov(&s.to_string())).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "0..=4")]
+    fn parse_fov_rejects_an_out_of_range_spread() {
+        // FM1: a spread >4 must abort loudly, NOT saturate to the full circle in the sim
+        // (which would silently play omnidirectional instead of the cone asked for).
+        parse_fov("7");
+    }
+
+    #[test]
     fn direct_match_default_arena_is_empty() {
         // FM1: no --map (arena == "") yields empty geometry — exactly Match::new's
         // no-blockers/no-pickups match, so the no-flag run stays byte-identical.
@@ -1832,6 +1846,55 @@ mod tests {
             .into_formed()
             .expect("forms");
         assert_eq!(off.rules().perception_memory_ticks, 0, "no --perception-memory: the matchmaker forms memory-off");
+    }
+
+    #[test]
+    fn direct_match_threads_the_fov_cone_into_rules() {
+        // FM2: --fov reaches the sim's Rules (the in_fov perception cone); default 4 = full
+        // circle so a no-flag run is byte-identical (and its replay digest unchanged). The
+        // cone BEHAVIOR (an out-of-cone enemy is not perceived) is arena-core's own test;
+        // here we pin the wiring deterministically via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().fov_octant_spread,
+            4,
+            "no --fov is the full circle (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { fov: 1, ..direct_args(2, "reference", 0) }, 2).rules().fov_octant_spread,
+            1,
+            "--fov 1 threads the narrow cone into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_the_fov_cone_into_a_matchmade_match() {
+        // FM3 (path skew): --fov must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries the cone via MatchParams.rules, so a MATCHMADE match
+        // forms under it — proven by forming a 2-seat Human match through the built
+        // matchmaker and reading rules() back, the accessor the direct twin uses (so
+        // matchmade and hand-seated agree on the cone).
+        let mm = build_matchmaker(&Args { fov: 1, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().fov_octant_spread,
+            1,
+            "the matchmaker forms under the --fov cone (matchmade == hand-seated)"
+        );
+
+        // No flag still forms full-circle — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(off.rules().fov_octant_spread, 4, "no --fov: the matchmaker forms omnidirectional");
     }
 
     #[test]
