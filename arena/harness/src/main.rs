@@ -114,6 +114,16 @@ struct Args {
     /// (every seat its own team), so the rule is dark until a teamed deployment configures it —
     /// but `friendly_fire` is a real `Rules` determinant folded into the digest.
     friendly_fire: bool,
+    /// Downward gravity magnitude (`Rules::gravity`): `0` (the default) keeps vertical physics
+    /// OFF — jumps are inert, every pawn `z` stays `0`, byte-identical to a 2D match (and its
+    /// replay digest). A positive value turns jumping on (a grounded jump launches at the fixed
+    /// `JUMP_VELOCITY` and this gravity pulls it back; higher ⇒ a lower, shorter arc). Set by
+    /// `--gravity` as a non-negative magnitude — a negative is rejected at parse, since core
+    /// gates vertical physics on `gravity > 0` so a negative is an inert footgun. Applies to
+    /// BOTH the direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`]. On
+    /// its own gravity leaves combat planar (outcome-identical): it unblocks the z-combat family
+    /// for a configured deployment, but is not a HIT determinant until `vertical_hit_tolerance > 0`.
+    gravity: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -158,6 +168,15 @@ fn parse_aim_mode(value: &str) -> AimMode {
     }
 }
 
+/// Parse a `--gravity` value into the downward magnitude [`Rules::gravity`] carries. Taken
+/// as a `u32` then narrowed to `i32`: a negative is rejected at the CLI — arena-core gates
+/// vertical physics on `gravity > 0`, so a negative would silently behave as `0` (off), a
+/// footgun — and a magnitude past `i32::MAX` aborts rather than wrapping the fall integration.
+fn parse_gravity(value: &str) -> i32 {
+    let magnitude: u32 = value.parse().expect("--gravity is a non-negative integer (downward magnitude)");
+    i32::try_from(magnitude).expect("--gravity exceeds the i32 range")
+}
+
 fn parse_args() -> Args {
     parse_args_from(std::env::args().skip(1))
 }
@@ -180,6 +199,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut fov: u8 = 4;
     let mut aim_mode = AimMode::Octant;
     let mut friendly_fire = false;
+    let mut gravity: i32 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -211,6 +231,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--fov" => fov = parse_fov(&it.next().expect("--fov needs a value")),
             "--aim-mode" => aim_mode = parse_aim_mode(&it.next().expect("--aim-mode needs a value")),
             "--friendly-fire" => friendly_fire = true,
+            "--gravity" => gravity = parse_gravity(&it.next().expect("--gravity needs a value")),
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -228,6 +249,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         fov,
         aim_mode,
         friendly_fire,
+        gravity,
     }
 }
 
@@ -962,15 +984,16 @@ fn handshake_matchmade(
 /// The matchmaker carries it via [`MatchParams::rules`] ([`build_matchmaker`]); the direct
 /// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). The
 /// perception-memory window (`--perception-memory`), the FOV cone (`--fov`), the aim
-/// resolution (`--aim-mode`), and allied damage (`--friendly-fire`) are dialable; every
-/// other field stays at [`Rules::default`], and each knob defaults to its `Rules::default`
-/// value, so a no-flag run is byte-identical to the pre-knob harness.
+/// resolution (`--aim-mode`), allied damage (`--friendly-fire`), and gravity (`--gravity`)
+/// are dialable; every other field stays at [`Rules::default`], and each knob defaults to
+/// its `Rules::default` value, so a no-flag run is byte-identical to the pre-knob harness.
 fn rules_from(args: &Args) -> Rules {
     Rules {
         perception_memory_ticks: args.perception_memory,
         fov_octant_spread: args.fov,
         aim_mode: args.aim_mode,
         friendly_fire: args.friendly_fire,
+        gravity: args.gravity,
         ..Rules::default()
     }
 }
@@ -1725,6 +1748,7 @@ mod tests {
             fov: 4,
             aim_mode: AimMode::Octant,
             friendly_fire: false,
+            gravity: 0,
         }
     }
 
@@ -1787,6 +1811,7 @@ mod tests {
             fov: 4,
             aim_mode: AimMode::Octant,
             friendly_fire: false,
+            gravity: 0,
         }
     }
 
