@@ -474,6 +474,7 @@ def run_local_match(
     friendly_fire: bool = False,
     gravity: int = 0,
     weapon_mode: str = "hitscan",
+    vertical_hit_tolerance: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -569,7 +570,17 @@ def run_local_match(
     unknown value raises before any spawn, like `aim_mode`) and forwarded as `--weapon-mode <value>`
     on BOTH paths via `MatchParams.rules`, only when non-default. Unlike the other three this has an
     IMMEDIATE combat effect even in the free-for-all roster (it changes core fire resolution and the
-    replay digest the moment it is set). Default `"hitscan"` adds no token — byte-identical argv."""
+    replay digest the moment it is set). Default `"hitscan"` adds no token — byte-identical argv.
+
+    Pass `vertical_hit_tolerance` (an elevation band, `0`..=`2**31-1`) to couple `z` into combat: a
+    fire connects only when `|shooter_z - target_z| <= vertical_hit_tolerance`, so `0` (the default)
+    is the planar match where `z` is ignored in hit resolution. Forwarded as `--vertical-hit-tolerance
+    <n>` (value-flag, like `gravity`) on BOTH paths via `MatchParams.rules`, only when nonzero. A
+    negative or `> i32::MAX` value raises before any spawn (both read as off/inverted in core — a
+    silent footgun — so they are rejected loudly, mirroring the harness fence). Default `0` adds no
+    token — byte-identical argv. It is the combat companion to `gravity`: tolerance only changes a hit
+    once `gravity > 0` has moved pawns in `z`, so on the default flat field it is observable at the
+    argv layer alone (a gravity+tolerance replay divergence is a coupled follow-up)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -587,6 +598,13 @@ def run_local_match(
         # (off) and a value past i32::MAX would wrap the fall integration negative (also off) —
         # reject both loudly here, mirroring the harness's u32-then-i32 parse_gravity fence.
         raise ValueError(f"gravity is a downward magnitude in 0..=2**31-1 (0 = off); got {gravity}")
+    if not 0 <= vertical_hit_tolerance <= 2**31 - 1:
+        # Core gates z-coupled hits on vertical_hit_tolerance > 0, so a negative reads as off (planar)
+        # and a value past i32::MAX wraps the band negative (also off) — reject both loudly here,
+        # mirroring the harness's u32-then-i32 parse_vertical_hit_tolerance fence.
+        raise ValueError(
+            f"vertical_hit_tolerance is an elevation band in 0..=2**31-1 (0 = off); got {vertical_hit_tolerance}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -618,6 +636,10 @@ def run_local_match(
         # Same shape as --aim-mode: a named-enum value-flag on both paths (the matchmaker carries
         # it via MatchParams.rules). Default "hitscan" adds no token — byte-identical argv.
         argv += ["--weapon-mode", weapon_mode]
+    if vertical_hit_tolerance:
+        # Same shape as --gravity: a value-flag band on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (combat planar) adds no token — byte-identical argv.
+        argv += ["--vertical-hit-tolerance", str(vertical_hit_tolerance)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
