@@ -1816,6 +1816,64 @@ def test_run_local_match_rejects_an_unknown_weapon_mode():
             run_local_match("/no/such/harness", [0, 1], policies, weapon_mode=bad)
 
 
+def test_run_local_match_forwards_vertical_hit_tolerance_and_omits_it_at_the_default(monkeypatch):
+    # vertical_hit_tolerance>0 forwards --vertical-hit-tolerance <n> as one value token,
+    # mode-independently (before the mode block, like --gravity); the default 0 (combat planar) adds
+    # no flag — byte-identical argv. Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--vertical-hit-tolerance" not in captured["argv"], "the default 0 adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, vertical_hit_tolerance=500)
+    argv = captured["argv"]
+    assert argv[argv.index("--vertical-hit-tolerance") + 1] == "500"
+
+    # Explicit 0 is the default — it must NOT forward (byte-identical argv to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, vertical_hit_tolerance=0)
+    assert "--vertical-hit-tolerance" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match(
+            "h", [0, 1], policies, mode="agent", signing_keys=keys, vertical_hit_tolerance=500
+        )
+    argv = captured["argv"]
+    assert argv[argv.index("--vertical-hit-tolerance") + 1] == "500"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_vertical_hit_tolerance():
+    # vertical_hit_tolerance is a non-negative band in 0..=i32::MAX; a negative (silently OFF in core,
+    # which gates z-coupled hits on tolerance > 0) or an overflow (wraps the band negative = also off)
+    # raises before any spawn, mirroring the harness's u32-then-i32 parse_vertical_hit_tolerance fence
+    # rather than forwarding a value that runs a planar match the caller did not ask for. A bogus
+    # harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -500, 2**31, 2**40):
+        with pytest.raises(ValueError, match="vertical_hit_tolerance"):
+            run_local_match("/no/such/harness", [0, 1], policies, vertical_hit_tolerance=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
