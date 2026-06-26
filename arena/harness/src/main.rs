@@ -1806,6 +1806,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_aim_mode_maps_each_name() {
+        assert_eq!(parse_aim_mode("octant"), AimMode::Octant);
+        assert_eq!(parse_aim_mode("fine"), AimMode::Fine);
+    }
+
+    #[test]
+    #[should_panic(expected = "octant|fine")]
+    fn parse_aim_mode_rejects_an_unknown_name() {
+        // FM2: an unrecognized aim name must abort loudly, NOT default to Octant — aim_mode
+        // is a hit-resolution determinant, so a silent default would mis-resolve combat and
+        // commit a replay that disagrees with what the operator asked for.
+        parse_aim_mode("coarse");
+    }
+
+    #[test]
     fn direct_match_default_arena_is_empty() {
         // FM1: no --map (arena == "") yields empty geometry — exactly Match::new's
         // no-blockers/no-pickups match, so the no-flag run stays byte-identical.
@@ -1921,6 +1936,55 @@ mod tests {
             .into_formed()
             .expect("forms");
         assert_eq!(off.rules().fov_octant_spread, 4, "no --fov: the matchmaker forms omnidirectional");
+    }
+
+    #[test]
+    fn direct_match_threads_the_aim_mode_into_rules() {
+        // FM1 (default drift): no --aim-mode is Octant — the 8-way snap, byte-identical to the
+        // pre-flag harness (and its replay digest). The aim BEHAVIOR (a sub-octant lead lands
+        // under Fine) is arena-core's own test; here we pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().aim_mode,
+            AimMode::Octant,
+            "no --aim-mode is Octant (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { aim_mode: AimMode::Fine, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .aim_mode,
+            AimMode::Fine,
+            "--aim-mode fine threads Fine into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_the_aim_mode_into_a_matchmade_match() {
+        // FM3 (path skew): --aim-mode must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries the mode via MatchParams.rules, so a MATCHMADE match forms
+        // under it — proven by forming a 2-seat Human match and reading rules() back (the same
+        // accessor the direct twin uses, so matchmade and hand-seated agree on the aim).
+        let mm = build_matchmaker(&Args { aim_mode: AimMode::Fine, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().aim_mode,
+            AimMode::Fine,
+            "the matchmaker forms under --aim-mode fine (matchmade == hand-seated)"
+        );
+
+        // No flag still forms Octant — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(off.rules().aim_mode, AimMode::Octant, "no --aim-mode: the matchmaker forms Octant");
     }
 
     #[test]
