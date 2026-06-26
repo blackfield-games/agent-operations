@@ -473,6 +473,7 @@ def run_local_match(
     aim_mode: str = "octant",
     friendly_fire: bool = False,
     gravity: int = 0,
+    weapon_mode: str = "hitscan",
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -559,7 +560,16 @@ def run_local_match(
     nonzero. A negative or `> i32::MAX` value raises before any spawn (both would read as off in
     core — a silent footgun — so they are rejected loudly, mirroring the harness fence). Default `0`
     adds no token — byte-identical argv. Gravity alone changes only the observable `z` arc, not a
-    hit outcome, until the separate `vertical_hit_tolerance` knob couples `z` into combat."""
+    hit outcome, until the separate `vertical_hit_tolerance` knob couples `z` into combat.
+
+    Pass `weapon_mode` (`"hitscan"`, `"projectile"`, or `"melee"`) to pick how a fire resolves:
+    `"hitscan"` (the default) is the instant beam, `"projectile"` spawns a travelling shot that
+    hits when its swept path crosses a body on a later/point-blank tick, `"melee"` strikes every
+    enemy in `melee_range` + the frontal arc. Validated SDK-side against that literal set (an
+    unknown value raises before any spawn, like `aim_mode`) and forwarded as `--weapon-mode <value>`
+    on BOTH paths via `MatchParams.rules`, only when non-default. Unlike the other three this has an
+    IMMEDIATE combat effect even in the free-for-all roster (it changes core fire resolution and the
+    replay digest the moment it is set). Default `"hitscan"` adds no token — byte-identical argv."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -577,6 +587,8 @@ def run_local_match(
         # (off) and a value past i32::MAX would wrap the fall integration negative (also off) —
         # reject both loudly here, mirroring the harness's u32-then-i32 parse_gravity fence.
         raise ValueError(f"gravity is a downward magnitude in 0..=2**31-1 (0 = off); got {gravity}")
+    if weapon_mode not in ("hitscan", "projectile", "melee"):
+        raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if arena is not None:
         # Unconditional, before the mode block: --map drives both the direct and --mode
@@ -602,6 +614,10 @@ def run_local_match(
         # Same shape as --fov: a value-flag magnitude on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (physics off) adds no token — byte-identical argv.
         argv += ["--gravity", str(gravity)]
+    if weapon_mode != "hitscan":
+        # Same shape as --aim-mode: a named-enum value-flag on both paths (the matchmaker carries
+        # it via MatchParams.rules). Default "hitscan" adds no token — byte-identical argv.
+        argv += ["--weapon-mode", weapon_mode]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
