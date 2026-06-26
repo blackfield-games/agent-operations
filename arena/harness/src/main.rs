@@ -1928,6 +1928,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_weapon_mode_maps_each_name() {
+        assert_eq!(parse_weapon_mode("hitscan"), WeaponMode::Hitscan);
+        assert_eq!(parse_weapon_mode("projectile"), WeaponMode::Projectile);
+        assert_eq!(parse_weapon_mode("melee"), WeaponMode::Melee);
+    }
+
+    #[test]
+    #[should_panic(expected = "hitscan|projectile|melee")]
+    fn parse_weapon_mode_rejects_an_unknown_name() {
+        // FM2: an unrecognized weapon name must abort loudly, NOT default to Hitscan — weapon_mode
+        // decides how a fire resolves (instant beam / traveling projectile / melee cleave), so a
+        // silent default would run a different weapon than asked and commit a disagreeing replay.
+        parse_weapon_mode("railgun");
+    }
+
+    #[test]
     fn direct_match_default_arena_is_empty() {
         // FM1: no --map (arena == "") yields empty geometry — exactly Match::new's
         // no-blockers/no-pickups match, so the no-flag run stays byte-identical.
@@ -2202,6 +2218,63 @@ mod tests {
             .into_formed()
             .expect("forms");
         assert_eq!(off.rules().gravity, 0, "no --gravity: the matchmaker forms vertical physics off");
+    }
+
+    #[test]
+    fn direct_match_threads_the_weapon_mode_into_rules() {
+        // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
+        // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
+        // melee cleaves) is arena-core's own test; here we pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().weapon_mode,
+            WeaponMode::Hitscan,
+            "no --weapon-mode is Hitscan (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(
+                &Args { weapon_mode: WeaponMode::Projectile, ..direct_args(2, "reference", 0) },
+                2
+            )
+            .rules()
+            .weapon_mode,
+            WeaponMode::Projectile,
+            "--weapon-mode projectile threads Projectile into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_the_weapon_mode_into_a_matchmade_match() {
+        // FM3 (path skew): --weapon-mode must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under it —
+        // proven by forming a 2-seat Human match and reading rules() back (the same accessor the
+        // direct twin uses, so matchmade and hand-seated agree on the weapon).
+        let mm =
+            build_matchmaker(&Args { weapon_mode: WeaponMode::Projectile, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().weapon_mode,
+            WeaponMode::Projectile,
+            "the matchmaker forms under --weapon-mode projectile (matchmade == hand-seated)"
+        );
+
+        // No flag still forms Hitscan — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().weapon_mode,
+            WeaponMode::Hitscan,
+            "no --weapon-mode: the matchmaker forms Hitscan"
+        );
     }
 
     #[test]
