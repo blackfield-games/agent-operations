@@ -470,6 +470,7 @@ def run_local_match(
     starts: dict[int, MatchStart] | None = None,
     perception_memory: int = 0,
     fov: int = 4,
+    aim_mode: str = "octant",
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -531,7 +532,15 @@ def run_local_match(
     alone (~45°). Like `perception_memory` it carries through BOTH paths via `MatchParams.rules`,
     so it applies under any `mode` and to every seat. An out-of-range value raises before any
     spawn (the harness would otherwise saturate a spread >4 to the full circle). Default `4`
-    adds no flag — byte-identical to before."""
+    adds no flag — byte-identical to before.
+
+    Pass `aim_mode` (`"octant"` or `"fine"`) to pick how a seat's facing resolves: `"octant"`
+    (the default) snaps aim to the 8 compass directions, `"fine"` selects the 64-way half-step
+    table, changing which shots land at a sub-octant lead. Validated SDK-side against that literal
+    set (an unknown value raises before any spawn, like `mode`/`fov`) rather than forwarded blindly
+    to abort the harness. It carries through BOTH paths via `--aim-mode` (the harness threads it via
+    `MatchParams.rules`), so it applies under any `mode`. Default `"octant"` adds no flag —
+    byte-identical to before."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -542,6 +551,8 @@ def run_local_match(
         )
     if not 0 <= fov <= 4:
         raise ValueError(f"fov is an octant spread in 0..=4 (4 = full circle); got {fov}")
+    if aim_mode not in ("octant", "fine"):
+        raise ValueError(f"aim_mode is 'octant' or 'fine'; got {aim_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if arena is not None:
         # Unconditional, before the mode block: --map drives both the direct and --mode
@@ -554,6 +565,10 @@ def run_local_match(
         # --mode paths (the matchmaker carries it via MatchParams.rules). Default 4 (full
         # circle) adds no token — byte-identical argv to the pre-flag SDK.
         argv += ["--fov", str(fov)]
+    if aim_mode != "octant":
+        # Same shape as --fov: select fine aim on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default "octant" adds no token — byte-identical argv.
+        argv += ["--aim-mode", aim_mode]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
