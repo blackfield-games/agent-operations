@@ -1760,6 +1760,62 @@ def test_run_local_match_rejects_an_out_of_range_gravity():
             run_local_match("/no/such/harness", [0, 1], policies, gravity=bad)
 
 
+def test_run_local_match_forwards_weapon_mode_and_omits_it_at_the_default(monkeypatch):
+    # A non-default weapon_mode forwards --weapon-mode <value> as one token, mode-independently
+    # (before the mode block, like --aim-mode); the default "hitscan" adds no flag — byte-identical
+    # argv. Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--weapon-mode" not in captured["argv"], "the default hitscan adds no flag"
+
+    for weapon in ("projectile", "melee"):
+        with pytest.raises(_Stop):
+            sdk.run_local_match("h", [0, 1], policies, weapon_mode=weapon)
+        argv = captured["argv"]
+        assert argv[argv.index("--weapon-mode") + 1] == weapon
+
+    # Explicit "hitscan" is the default — it must NOT forward (byte-identical argv to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, weapon_mode="hitscan")
+    assert "--weapon-mode" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): --weapon-mode and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, weapon_mode="melee")
+    argv = captured["argv"]
+    assert argv[argv.index("--weapon-mode") + 1] == "melee"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_unknown_weapon_mode():
+    # weapon_mode is the literal set {hitscan, projectile, melee}; an unknown value raises before
+    # any spawn (mirroring the aim_mode/fov preflights) rather than forwarding a bad token that
+    # aborts the harness into an opaque GatewayClosed. Case-sensitive: "Hitscan"/"HITSCAN" are not
+    # the canonical name. A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in ("Hitscan", "bow", "", "HITSCAN", " melee"):
+        with pytest.raises(ValueError, match="hitscan.*projectile.*melee"):
+            run_local_match("/no/such/harness", [0, 1], policies, weapon_mode=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
