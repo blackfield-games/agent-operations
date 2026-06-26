@@ -87,6 +87,14 @@ struct Args {
     /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same window a
     /// hand-seated one does.
     perception_memory: u16,
+    /// Forward field-of-view cone as an octant spread (`Rules::fov_octant_spread`,
+    /// `0..=4`): a seat perceives an in-range enemy only when its bearing is within this
+    /// many octants of the seat's facing. Set by `--fov`; the default `4` is the full
+    /// circle — omnidirectional, byte-identical to the pre-flag harness (and the replay
+    /// digest). Applies to BOTH the direct and `--mode` paths through [`rules_from`]: the
+    /// matchmaker carries it on [`MatchParams::rules`], so a matchmade/ranked match forms
+    /// under the same cone a hand-seated one does.
+    fov: u8,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -108,6 +116,17 @@ fn parse_arena(value: &str) -> &'static str {
     named_arena(value).unwrap_or_else(|| panic!("--map names an unknown arena: {value:?}"))
 }
 
+/// Parse a `--fov` value to a forward-cone octant spread, rejecting anything outside the
+/// sim's `0..=4` domain loudly (mirroring [`parse_mode`]/[`parse_arena`]). A spread `>4`
+/// would saturate to the full circle in the sim — silently playing omnidirectional
+/// perception instead of the cone the operator asked for — so the harness refuses it
+/// rather than clamp.
+fn parse_fov(value: &str) -> u8 {
+    let spread: u8 = value.parse().expect("--fov is an octant spread (0..=4)");
+    assert!(spread <= 4, "--fov is an octant spread in 0..=4 (4 = full circle), got {spread}");
+    spread
+}
+
 fn parse_args() -> Args {
     let mut match_id = DEFAULT_MATCH_ID.to_string();
     let mut seed: u64 = 0;
@@ -119,6 +138,7 @@ fn parse_args() -> Args {
     let mut ladder_file: Option<PathBuf> = None;
     let mut arena: &'static str = "";
     let mut perception_memory: u16 = 0;
+    let mut fov: u8 = 4;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -147,6 +167,7 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("perception-memory is a u16 (ticks)")
             }
+            "--fov" => fov = parse_fov(&it.next().expect("--fov needs a value")),
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -161,6 +182,7 @@ fn parse_args() -> Args {
         ladder_file,
         arena,
         perception_memory,
+        fov,
     }
 }
 
@@ -893,11 +915,16 @@ fn handshake_matchmade(
 /// The combat [`Rules`] both seating paths form under, derived from the harness flags so
 /// a matchmade (`--mode`) match and a hand-seated direct match play under the SAME tuning.
 /// The matchmaker carries it via [`MatchParams::rules`] ([`build_matchmaker`]); the direct
-/// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). Today
-/// only the perception-memory window is dialable (`--perception-memory`); every other field
-/// stays at [`Rules::default`], so a no-flag run is byte-identical to the pre-knob harness.
+/// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). The
+/// perception-memory window (`--perception-memory`) and the FOV cone (`--fov`) are dialable;
+/// every other field stays at [`Rules::default`], and both knobs default to their
+/// `Rules::default` value, so a no-flag run is byte-identical to the pre-knob harness.
 fn rules_from(args: &Args) -> Rules {
-    Rules { perception_memory_ticks: args.perception_memory, ..Rules::default() }
+    Rules {
+        perception_memory_ticks: args.perception_memory,
+        fov_octant_spread: args.fov,
+        ..Rules::default()
+    }
 }
 
 /// Build the direct-path (no `--mode`) match: a fixed `agent-{i}` free-for-all roster
@@ -1647,6 +1674,7 @@ mod tests {
             ladder_file: None,
             arena: "",
             perception_memory: 0,
+            fov: 4,
         }
     }
 
@@ -1706,6 +1734,7 @@ mod tests {
             ladder_file: None,
             arena,
             perception_memory,
+            fov: 4,
         }
     }
 
