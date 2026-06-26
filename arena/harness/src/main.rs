@@ -159,6 +159,14 @@ fn parse_aim_mode(value: &str) -> AimMode {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// The argv parse loop over the post-`argv[0]` tokens, taken as an iterator so it is
+/// unit-testable with a synthetic stream (`parse_args` feeds it the real env args). A
+/// presence flag (`--settle-dev-mock`, `--friendly-fire`) flips its bool WITHOUT consuming
+/// the next token; a value flag pulls exactly one `it.next()`.
+fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut match_id = DEFAULT_MATCH_ID.to_string();
     let mut seed: u64 = 0;
     let mut seats: u8 = 2;
@@ -172,7 +180,7 @@ fn parse_args() -> Args {
     let mut fov: u8 = 4;
     let mut aim_mode = AimMode::Octant;
     let mut friendly_fire = false;
-    let mut it = std::env::args().skip(1);
+    let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--match-id" => match_id = it.next().expect("--match-id needs a value"),
