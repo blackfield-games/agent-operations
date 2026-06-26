@@ -519,10 +519,10 @@ def run_local_match(
 
     Pass `perception_memory` (ticks > 0) to turn on perception memory: a seat then
     remembers a lost entity's last-known position for that many ticks, surfaced as a
-    `VisibleEntity` with `in_line_of_sight=False`. It is a DIRECT-path knob (the harness
-    applies it only when seating directly), so it requires `mode=None` — `perception_memory`
-    with a `mode` is rejected up front rather than silently ignored. Default `0` disables it,
-    byte-identical to before."""
+    `VisibleEntity` with `in_line_of_sight=False`. The harness carries it through BOTH the
+    direct and the matchmaker (`--mode`) paths — a matchmade/ranked match forms under it via
+    `MatchParams.rules` — so it applies under any `mode` and to every seat, including a human
+    seat in a Mixed match. Default `0` disables it, byte-identical to before."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -530,11 +530,6 @@ def run_local_match(
         raise ValueError(
             "ladder_file persists the matchmaker's ranked ladder, which only moves on the "
             "--mode path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
-        )
-    if perception_memory and mode is not None:
-        raise ValueError(
-            "perception_memory is a direct-path knob (the harness applies it only when seating "
-            "directly); it has no effect under --mode — pass mode=None to enable memory"
         )
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if arena is not None:

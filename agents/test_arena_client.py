@@ -1509,18 +1509,34 @@ def test_run_local_match_forwards_perception_memory_and_omits_it_by_default(monk
     assert argv[argv.index("--perception-memory") + 1] == "45"
 
 
-def test_run_local_match_perception_memory_requires_the_direct_path():
-    # perception_memory is a direct-path knob (the harness ignores it under --mode), so it
-    # is rejected up front with a mode rather than silently doing nothing. Raises before any
-    # spawn, so a nonexistent harness path proves the guard precedes it.
-    from arena_client.sdk import run_local_match
+def test_run_local_match_forwards_perception_memory_under_mode(monkeypatch):
+    # arena-matchparams-rules-knob threaded --perception-memory through the matchmaker too
+    # (MatchParams.rules), so a ranked/matchmade run now carries the window — the old
+    # "direct-path only" rejection is gone. The forward sits before the mode block, so --mode
+    # and --perception-memory both reach argv. Spawn is stubbed, so this needs no toolchain.
+    from arena_client import sdk
 
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
     policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
-    with pytest.raises(ValueError, match="direct-path"):
-        run_local_match(
-            "/no/such/harness", [0, 1], policies, mode="agent",
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match(
+            "h", [0, 1], policies, mode="agent",
             signing_keys={0: _DEV_KEY, 1: _DEV_KEY2}, perception_memory=30,
         )
+    argv = captured["argv"]
+    assert argv[argv.index("--perception-memory") + 1] == "30"
+    assert argv[argv.index("--mode") + 1] == "agent"
 
 
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
