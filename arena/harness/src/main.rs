@@ -133,6 +133,14 @@ struct Args {
     /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same weapon a
     /// hand-seated one does.
     weapon_mode: WeaponMode,
+    /// The vertical band (`Rules::vertical_hit_tolerance`) within which a shot connects: a hit
+    /// lands only when `|shooter_z - target_z| <= vertical_hit_tolerance`, gating beam, projectile,
+    /// AND melee resolution alike. `0` (the default) DISABLES z-coupling — combat stays planar,
+    /// byte-identical to the pre-flag harness (and the replay digest). A non-negative `i32` set by
+    /// `--vertical-hit-tolerance`; it is the combat companion to `--gravity` (gravity arcs pawns in
+    /// `z`, this decides whether that `z` gap matters to a shot). Applies to BOTH the direct and
+    /// `--mode` paths through [`rules_from`] via [`MatchParams::rules`].
+    vertical_hit_tolerance: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -186,6 +194,16 @@ fn parse_gravity(value: &str) -> i32 {
     i32::try_from(magnitude).expect("--gravity exceeds the i32 range")
 }
 
+/// Parse a `--vertical-hit-tolerance` value to the non-negative `z` band that gates a hit, the
+/// same u32-then-i32 fence as [`parse_gravity`]: a negative would invert the `|z|` comparison and a
+/// value past `i32::MAX` would wrap the band, so both abort before any spawn.
+fn parse_vertical_hit_tolerance(value: &str) -> i32 {
+    let band: u32 = value
+        .parse()
+        .expect("--vertical-hit-tolerance is a non-negative integer (elevation band)");
+    i32::try_from(band).expect("--vertical-hit-tolerance exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -223,6 +241,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut friendly_fire = false;
     let mut gravity: i32 = 0;
     let mut weapon_mode = WeaponMode::Hitscan;
+    let mut vertical_hit_tolerance: i32 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -258,6 +277,11 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--weapon-mode" => {
                 weapon_mode = parse_weapon_mode(&it.next().expect("--weapon-mode needs a value"))
             }
+            "--vertical-hit-tolerance" => {
+                vertical_hit_tolerance = parse_vertical_hit_tolerance(
+                    &it.next().expect("--vertical-hit-tolerance needs a value"),
+                )
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -277,6 +301,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         friendly_fire,
         gravity,
         weapon_mode,
+        vertical_hit_tolerance,
     }
 }
 
@@ -1023,6 +1048,7 @@ fn rules_from(args: &Args) -> Rules {
         friendly_fire: args.friendly_fire,
         gravity: args.gravity,
         weapon_mode: args.weapon_mode,
+        vertical_hit_tolerance: args.vertical_hit_tolerance,
         ..Rules::default()
     }
 }
@@ -1779,6 +1805,7 @@ mod tests {
             friendly_fire: false,
             gravity: 0,
             weapon_mode: WeaponMode::Hitscan,
+            vertical_hit_tolerance: 0,
         }
     }
 
@@ -1843,6 +1870,7 @@ mod tests {
             friendly_fire: false,
             gravity: 0,
             weapon_mode: WeaponMode::Hitscan,
+            vertical_hit_tolerance: 0,
         }
     }
 
