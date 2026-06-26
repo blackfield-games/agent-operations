@@ -1529,14 +1529,18 @@ def test_run_local_match_forwards_perception_memory_under_mode(monkeypatch):
     monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
     policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
 
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
     with pytest.raises(_Stop):
-        sdk.run_local_match(
-            "h", [0, 1], policies, mode="agent",
-            signing_keys={0: _DEV_KEY, 1: _DEV_KEY2}, perception_memory=30,
-        )
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, perception_memory=30)
     argv = captured["argv"]
     assert argv[argv.index("--perception-memory") + 1] == "30"
     assert argv[argv.index("--mode") + 1] == "agent"
+
+    # FM3: omitted (0) adds no flag under --mode either — byte-identical to the pre-knob
+    # matchmade argv. The forward is mode-independent (before the mode block), so it stays off.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys)
+    assert "--perception-memory" not in captured["argv"]
 
 
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
