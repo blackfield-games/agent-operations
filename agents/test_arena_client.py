@@ -1565,6 +1565,59 @@ def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     assert watch[0].echoes + watch[1].echoes > 0, "a lost enemy surfaced as an out-of-sight echo"
 
 
+def test_perception_memory_does_not_bypass_the_mode_preflights():
+    # FM2: lifting the perception_memory mode guard must leave its neighbours intact —
+    # perception_memory must not smuggle an unsigned seat into ranked, nor a ladder_file past
+    # its --mode requirement. Both raise before any spawn, so a bogus harness path proves the
+    # guard precedes it.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    with pytest.raises(ValueError, match="signing key"):
+        run_local_match("/no/such/harness", [0, 1], policies, mode="agent", perception_memory=30)
+    with pytest.raises(ValueError, match="ladder"):
+        run_local_match("/no/such/harness", [0, 1], policies, ladder_file="x.json", perception_memory=30)
+
+
+def test_run_matchmade_surfaces_a_perception_memory_echo_to_a_policy():
+    # The matchmade-path payoff: a --mode agent (ranked) match under --map reference + a
+    # memory window surfaces a lost enemy as an in_line_of_sight=False echo, exactly as the
+    # direct path does — proving --perception-memory reaches the sim through the matchmaker
+    # (MatchParams.rules), not just that the SDK no longer raises.
+    #
+    # Unlike the direct-path echo test we CANNOT fix a seed: the matchmaker mints a fresh
+    # server-authoritative match_id per formation and derives the spawn seed from it, so the
+    # match is non-deterministic by design (the harness's --seed/--match-id drive only the
+    # direct path). A reference match surfaces an echo more often than not (~60% at authoring
+    # — a no-echo match needs both agents to engage without ever breaking the central
+    # occluder's sightline), so we retry formations until one echoes; the cap makes a
+    # spurious failure negligible (<1e-6) while the early break keeps the typical run to ~2
+    # matches.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    class _EchoWatch:
+        def __init__(self):
+            self.echoes = 0
+            self._b = BaselinePolicy()
+
+        def __call__(self, obs):
+            self.echoes += sum(1 for e in obs.visible if not e.in_line_of_sight)
+            return self._b(obs)
+
+    formations = 24
+    for _ in range(formations):
+        watch = {0: _EchoWatch(), 1: _EchoWatch()}
+        run_local_match(
+            harness, [0, 1], watch, arena="reference", perception_memory=30, mode="agent",
+            signing_keys={0: _DEV_KEY, 1: _DEV_KEY2},
+        )
+        if watch[0].echoes + watch[1].echoes > 0:
+            break
+    else:
+        pytest.fail(f"no out-of-sight echo across {formations} matchmade reference matches")
+
+
 def test_run_matchmade_rejects_a_degenerate_mode_before_spawning():
     # FM1: a mode/composition the Matchmaker can never form must fail LOUD up front, not
     # hang on a Welcome that never comes. These raise before the harness is spawned, so
