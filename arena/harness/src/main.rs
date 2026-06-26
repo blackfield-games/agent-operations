@@ -2014,6 +2014,67 @@ mod tests {
     }
 
     #[test]
+    fn direct_match_threads_friendly_fire_into_rules() {
+        // FM1 (default drift): no --friendly-fire spares allies (Rules::friendly_fire == false),
+        // byte-identical to the pre-flag harness (and its replay digest). The allied-damage
+        // BEHAVIOR is arena-core's own test; here we pin the wiring via the rules() accessor.
+        assert!(
+            !build_direct_match(&direct_args(2, "", 0), 2).rules().friendly_fire,
+            "no --friendly-fire spares allies (byte-identical to the pre-flag harness)"
+        );
+        assert!(
+            build_direct_match(&Args { friendly_fire: true, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .friendly_fire,
+            "--friendly-fire threads allied damage into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_friendly_fire_into_a_matchmade_match() {
+        // FM3 (path skew): --friendly-fire must reach the --mode path too, not just the direct
+        // one. build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms
+        // under it — proven by forming a 2-seat Human match and reading rules() back (the same
+        // accessor the direct twin uses, so matchmade and hand-seated agree on allied damage).
+        let mm = build_matchmaker(&Args { friendly_fire: true, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert!(
+            formed.rules().friendly_fire,
+            "the matchmaker forms under --friendly-fire (matchmade == hand-seated)"
+        );
+
+        // No flag still spares allies — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert!(!off.rules().friendly_fire, "no --friendly-fire: the matchmaker spares allies");
+    }
+
+    #[test]
+    fn friendly_fire_flag_consumes_no_following_token() {
+        // FM2 (flag-with-value confusion): --friendly-fire is a PRESENCE flag — it flips the bool
+        // WITHOUT swallowing the next token. If the arm wrongly called it.next(), it would eat the
+        // following --seats and that token's "3" would abort as an unknown argument. Pin that a
+        // --friendly-fire IMMEDIATELY before --seats 3 parses BOTH: the flag on, seats == 3.
+        let parsed = parse_args_from(["--friendly-fire", "--seats", "3"].into_iter().map(String::from));
+        assert!(parsed.friendly_fire, "--friendly-fire flips the flag");
+        assert_eq!(parsed.seats, 3, "--friendly-fire consumed no token, so --seats 3 still parsed");
+
+        // Absent, the parse loop defaults it off (the parse-level twin of the threading FM1).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert!(!none.friendly_fire, "no --friendly-fire defaults off");
+    }
+
+    #[test]
     fn matchmade_named_arena_reaches_the_start_frame() {
         // FM4: --map reference reaches the MATCHMADE path too, and the geometry crosses the
         // wire — the Start frame an agent receives carries the cover + pickups, not just the
