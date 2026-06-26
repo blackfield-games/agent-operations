@@ -1599,6 +1599,60 @@ def test_run_local_match_rejects_an_out_of_range_fov():
             run_local_match("/no/such/harness", [0, 1], policies, fov=bad)
 
 
+def test_run_local_match_forwards_aim_mode_and_omits_it_at_the_default(monkeypatch):
+    # A non-default aim_mode forwards --aim-mode <value> as one argv token, mode-independently
+    # (before the mode block, like --fov); the default "octant" adds no flag — byte-identical
+    # argv. Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--aim-mode" not in captured["argv"], "the default octant adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, aim_mode="fine")
+    argv = captured["argv"]
+    assert argv[argv.index("--aim-mode") + 1] == "fine"
+
+    # Explicit "octant" is the default — it must NOT forward (byte-identical argv to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, aim_mode="octant")
+    assert "--aim-mode" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): --aim-mode and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, aim_mode="fine")
+    argv = captured["argv"]
+    assert argv[argv.index("--aim-mode") + 1] == "fine"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_unknown_aim_mode():
+    # aim_mode is the literal set {octant, fine}; an unknown value raises before any spawn
+    # (mirroring the fov/mode preflights) rather than forwarding a bad token that aborts the
+    # harness into an opaque GatewayClosed. A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in ("Fine", "fancy", "", "8"):
+        with pytest.raises(ValueError, match="octant.*fine"):
+            run_local_match("/no/such/harness", [0, 1], policies, aim_mode=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
@@ -1659,6 +1713,38 @@ def test_run_local_match_fov_cone_narrows_what_a_policy_perceives():
         f"the facing-octant cone perceives the enemy a tiny fraction of the full circle "
         f"(full={full}, narrow={narrow}) — the cone gates perception by angle end to end"
     )
+
+
+def test_run_local_match_fine_aim_diverges_from_octant_at_a_discriminating_seed():
+    # The end-to-end payoff: aim_mode="fine" selects the 64-way half-step table over the 8-way
+    # octant snap, so a sub-octant lead resolves a shot differently. Proven by running the SAME
+    # deterministic match (direct path, fixed seed) under octant vs fine and asserting the replay
+    # hash — the canonical record of every shot's outcome — diverges. Seed 2 is discriminating
+    # (FM3: many seeds are aim-invariant); if --aim-mode were dropped the two runs would be
+    # byte-identical, so the gap is the flag reaching hit resolution.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    seed = 2
+    match_id = "22222222-3333-4444-8555-666666666666"
+
+    def run(**kw):
+        return run_local_match(
+            harness, [0, 1], {0: BaselinePolicy(), 1: BaselinePolicy()},
+            seed=seed, match_id=match_id, **kw,
+        )
+
+    octant = run()
+    fine = run(aim_mode="fine")
+    assert fine[0].replay_hash != octant[0].replay_hash, (
+        "fine aim resolves a shot differently than the octant snap at this seed — the replay "
+        "hash, the canonical record of every shot, must diverge"
+    )
+    # Each mode re-runs byte-for-byte, so the divergence is the aim table, not nondeterminism;
+    # explicit "octant" matches the default (no flag).
+    assert run()[0].replay_hash == octant[0].replay_hash
+    assert run(aim_mode="fine")[0].replay_hash == fine[0].replay_hash
+    assert run(aim_mode="octant")[0].replay_hash == octant[0].replay_hash
 
 
 def test_perception_memory_does_not_bypass_the_mode_preflights():
