@@ -469,6 +469,7 @@ def run_local_match(
     arena: str | None = None,
     starts: dict[int, MatchStart] | None = None,
     perception_memory: int = 0,
+    fov: int = 4,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -522,7 +523,15 @@ def run_local_match(
     `VisibleEntity` with `in_line_of_sight=False`. The harness carries it through BOTH the
     direct and the matchmaker (`--mode`) paths — a matchmade/ranked match forms under it via
     `MatchParams.rules` — so it applies under any `mode` and to every seat, including a human
-    seat in a Mixed match. Default `0` disables it, byte-identical to before."""
+    seat in a Mixed match. Default `0` disables it, byte-identical to before.
+
+    Pass `fov` (an octant spread in `0..=4`) to narrow each seat's forward perception cone: a
+    seat then perceives an in-range enemy only when its bearing is within `fov` octants of its
+    facing — `4` (the default) is the full circle (omnidirectional), `0` the facing octant
+    alone (~45°). Like `perception_memory` it carries through BOTH paths via `MatchParams.rules`,
+    so it applies under any `mode` and to every seat. An out-of-range value raises before any
+    spawn (the harness would otherwise saturate a spread >4 to the full circle). Default `4`
+    adds no flag — byte-identical to before."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -531,6 +540,8 @@ def run_local_match(
             "ladder_file persists the matchmaker's ranked ladder, which only moves on the "
             "--mode path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
         )
+    if not 0 <= fov <= 4:
+        raise ValueError(f"fov is an octant spread in 0..=4 (4 = full circle); got {fov}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if arena is not None:
         # Unconditional, before the mode block: --map drives both the direct and --mode
@@ -538,6 +549,11 @@ def run_local_match(
         argv += ["--map", arena]
     if perception_memory:
         argv += ["--perception-memory", str(perception_memory)]
+    if fov != 4:
+        # Unconditional, before the mode block: --fov narrows the cone on both the direct and
+        # --mode paths (the matchmaker carries it via MatchParams.rules). Default 4 (full
+        # circle) adds no token — byte-identical argv to the pre-flag SDK.
+        argv += ["--fov", str(fov)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
