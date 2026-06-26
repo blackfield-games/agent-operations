@@ -1872,6 +1872,31 @@ mod tests {
     }
 
     #[test]
+    fn parse_gravity_maps_a_non_negative_magnitude() {
+        assert_eq!(parse_gravity("0"), 0);
+        assert_eq!(parse_gravity("500"), 500);
+        assert_eq!(parse_gravity(&i32::MAX.to_string()), i32::MAX, "the whole non-negative i32 range is valid");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_gravity_rejects_a_negative() {
+        // FM2: a negative behaves as 0 (off) in core (vertical physics is gated on gravity > 0),
+        // so forwarding it would silently run a 2D match the operator did not ask for — reject it
+        // loudly at the CLI instead. Parsing the value as u32 fails a leading '-'.
+        parse_gravity("-500");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_gravity_rejects_an_overflow() {
+        // FM2: a magnitude past i32::MAX must abort, NOT wrap the integer fall integration into a
+        // negative (which would then read as off). 3_000_000_000 fits a u32 but not an i32, so the
+        // i32::try_from narrowing catches it.
+        parse_gravity("3000000000");
+    }
+
+    #[test]
     fn direct_match_default_arena_is_empty() {
         // FM1: no --map (arena == "") yields empty geometry — exactly Match::new's
         // no-blockers/no-pickups match, so the no-flag run stays byte-identical.
@@ -2097,6 +2122,55 @@ mod tests {
         // Absent, the parse loop defaults it off (the parse-level twin of the threading FM1).
         let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
         assert!(!none.friendly_fire, "no --friendly-fire defaults off");
+    }
+
+    #[test]
+    fn direct_match_threads_gravity_into_rules() {
+        // FM1 (default drift): no --gravity is 0 — vertical physics off, every pawn z stays 0,
+        // byte-identical to the pre-flag 2D harness (and its replay digest). The jump/z BEHAVIOR
+        // is arena-core's own test; here we pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().gravity,
+            0,
+            "no --gravity is 0 (vertical physics off, byte-identical to the 2D harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { gravity: 500, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .gravity,
+            500,
+            "--gravity 500 threads the magnitude into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_gravity_into_a_matchmade_match() {
+        // FM3 (path skew): --gravity must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under it —
+        // proven by forming a 2-seat Human match and reading rules() back (the same accessor the
+        // direct twin uses, so matchmade and hand-seated agree on the gravity).
+        let mm = build_matchmaker(&Args { gravity: 500, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().gravity,
+            500,
+            "the matchmaker forms under --gravity 500 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms gravity 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(off.rules().gravity, 0, "no --gravity: the matchmaker forms vertical physics off");
     }
 
     #[test]
