@@ -1653,6 +1653,57 @@ def test_run_local_match_rejects_an_unknown_aim_mode():
             run_local_match("/no/such/harness", [0, 1], policies, aim_mode=bad)
 
 
+def test_run_local_match_forwards_friendly_fire_as_one_bare_flag_and_omits_it_by_default(monkeypatch):
+    # friendly_fire=True forwards EXACTLY one BARE --friendly-fire token (no value, unlike
+    # --fov/--aim-mode), before the mode block so both paths get it; the default False adds no
+    # flag — byte-identical argv. Captured without a harness via the spy gateway. No behavioral
+    # e2e: run_local_match's free-for-all roster (each seat its own team) gives friendly_fire no
+    # allied body to hit, so the contract here is reachability, not an outcome divergence.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    base = captured["argv"]
+    assert "--friendly-fire" not in base, "the default adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, friendly_fire=True)
+    on = captured["argv"]
+    assert on.count("--friendly-fire") == 1
+    # It is a PRESENCE flag: dropping the single inserted token yields the EXACT default argv —
+    # so no stray value rides along (a ['--friendly-fire', value] forward would add two tokens,
+    # the second of which the harness reads as an unknown argument and panics on).
+    assert [t for t in on if t != "--friendly-fire"] == base
+
+    # Explicit False is the default — no flag (byte-identical to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, friendly_fire=False)
+    assert "--friendly-fire" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): --friendly-fire and --mode both reach
+    # argv, and --friendly-fire stays bare — the token after it is --mode (a flag), not a value.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, friendly_fire=True)
+    argv = captured["argv"]
+    assert argv.count("--friendly-fire") == 1
+    assert argv[argv.index("--friendly-fire") + 1].startswith("--")
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
