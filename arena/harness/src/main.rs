@@ -26,8 +26,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use arena_core::{
-    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, Match, Rules, SeatDelta,
-    Settlement, DEFAULT_RATING,
+    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, Match, Rules,
+    SeatDelta, Settlement, DEFAULT_RATING,
 };
 use arena_match::{
     JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker, SignatureVerifier, SnapshotError,
@@ -95,6 +95,14 @@ struct Args {
     /// matchmaker carries it on [`MatchParams::rules`], so a matchmade/ranked match forms
     /// under the same cone a hand-seated one does.
     fov: u8,
+    /// Fire-beam aim resolution (`Rules::aim_mode`): `octant` snaps the beam to the nearest of
+    /// eight 45° octants, `fine` resolves it on the 64-way (5.625°) table so a sub-octant lead
+    /// lands a shot the octant snap would miss. Set by `--aim-mode`; the default `octant` is
+    /// byte-identical to the pre-flag harness (and the replay digest). Applies to BOTH the
+    /// direct and `--mode` paths through [`rules_from`]: the matchmaker carries it on
+    /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same aim resolution
+    /// a hand-seated one does.
+    aim_mode: AimMode,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -127,6 +135,18 @@ fn parse_fov(value: &str) -> u8 {
     spread
 }
 
+/// Parse an `--aim-mode` value to a fire-beam resolution, rejecting an unknown name loudly
+/// (mirroring [`parse_mode`]/[`parse_arena`]). `aim_mode` is a hit-resolution determinant —
+/// it changes which shots connect — so a typo must abort, never silently default to `octant`
+/// and mis-resolve combat.
+fn parse_aim_mode(value: &str) -> AimMode {
+    match value {
+        "octant" => AimMode::Octant,
+        "fine" => AimMode::Fine,
+        other => panic!("--aim-mode is one of octant|fine, got {other:?}"),
+    }
+}
+
 fn parse_args() -> Args {
     let mut match_id = DEFAULT_MATCH_ID.to_string();
     let mut seed: u64 = 0;
@@ -139,6 +159,7 @@ fn parse_args() -> Args {
     let mut arena: &'static str = "";
     let mut perception_memory: u16 = 0;
     let mut fov: u8 = 4;
+    let mut aim_mode = AimMode::Octant;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -168,6 +189,7 @@ fn parse_args() -> Args {
                     .expect("perception-memory is a u16 (ticks)")
             }
             "--fov" => fov = parse_fov(&it.next().expect("--fov needs a value")),
+            "--aim-mode" => aim_mode = parse_aim_mode(&it.next().expect("--aim-mode needs a value")),
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -183,6 +205,7 @@ fn parse_args() -> Args {
         arena,
         perception_memory,
         fov,
+        aim_mode,
     }
 }
 
@@ -923,6 +946,7 @@ fn rules_from(args: &Args) -> Rules {
     Rules {
         perception_memory_ticks: args.perception_memory,
         fov_octant_spread: args.fov,
+        aim_mode: args.aim_mode,
         ..Rules::default()
     }
 }
@@ -1675,6 +1699,7 @@ mod tests {
             arena: "",
             perception_memory: 0,
             fov: 4,
+            aim_mode: AimMode::Octant,
         }
     }
 
@@ -1735,6 +1760,7 @@ mod tests {
             arena,
             perception_memory,
             fov: 4,
+            aim_mode: AimMode::Octant,
         }
     }
 
