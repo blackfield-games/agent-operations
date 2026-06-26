@@ -939,9 +939,10 @@ fn handshake_matchmade(
 /// a matchmade (`--mode`) match and a hand-seated direct match play under the SAME tuning.
 /// The matchmaker carries it via [`MatchParams::rules`] ([`build_matchmaker`]); the direct
 /// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). The
-/// perception-memory window (`--perception-memory`) and the FOV cone (`--fov`) are dialable;
-/// every other field stays at [`Rules::default`], and both knobs default to their
-/// `Rules::default` value, so a no-flag run is byte-identical to the pre-knob harness.
+/// perception-memory window (`--perception-memory`), the FOV cone (`--fov`), and the aim
+/// resolution (`--aim-mode`) are dialable; every other field stays at [`Rules::default`],
+/// and each knob defaults to its `Rules::default` value, so a no-flag run is byte-identical
+/// to the pre-knob harness.
 fn rules_from(args: &Args) -> Rules {
     Rules {
         perception_memory_ticks: args.perception_memory,
