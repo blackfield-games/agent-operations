@@ -1986,6 +1986,56 @@ def test_run_local_match_rejects_an_out_of_range_knockback_velocity():
             run_local_match("/no/such/harness", [0, 1], policies, knockback_velocity=bad)
 
 
+def test_run_local_match_forwards_wall_slide_as_one_bare_flag_and_omits_it_by_default(monkeypatch):
+    # wall_slide=True forwards EXACTLY one BARE --wall-slide token (no value, like --friendly-fire),
+    # before the mode block so both paths get it; the default False adds no flag — byte-identical argv.
+    # Captured without a harness via the spy gateway. No behavioral e2e: the default empty arena has no
+    # blocker to graze, so the contract here is reachability, not a movement divergence.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    base = captured["argv"]
+    assert "--wall-slide" not in base, "the default adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, wall_slide=True)
+    on = captured["argv"]
+    assert on.count("--wall-slide") == 1
+    # It is a PRESENCE flag: dropping the single inserted token yields the EXACT default argv — so no
+    # stray value rides along (a ['--wall-slide', value] forward would add two tokens, the second of
+    # which the harness reads as an unknown argument and panics on).
+    assert [t for t in on if t != "--wall-slide"] == base
+
+    # Explicit False is the default — no flag (byte-identical to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, wall_slide=False)
+    assert "--wall-slide" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): --wall-slide and --mode both reach argv, and
+    # --wall-slide stays bare — the token after it is --mode (a flag), not a value.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, wall_slide=True)
+    argv = captured["argv"]
+    assert argv.count("--wall-slide") == 1
+    assert argv[argv.index("--wall-slide") + 1].startswith("--")
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
