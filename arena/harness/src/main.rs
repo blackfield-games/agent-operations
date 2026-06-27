@@ -4452,6 +4452,106 @@ mod tests {
     }
 
     #[test]
+    fn parse_melee_range_maps_a_non_negative_reach() {
+        assert_eq!(parse_melee_range("0"), 0);
+        assert_eq!(parse_melee_range("8000"), 8000);
+        assert_eq!(
+            parse_melee_range(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid cleave reach"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_melee_range_rejects_a_negative() {
+        // A cleave reach is non-negative; a negative is meaningless (it would cleave nothing). Reject it
+        // loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_melee_range("-8000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_melee_range_rejects_an_overflow() {
+        // A reach past i32::MAX must abort, NOT wrap into a negative (which would then cleave nothing).
+        // 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_melee_range("3000000000");
+    }
+
+    #[test]
+    fn melee_range_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --melee-range pulls exactly one token (through
+        // parse_melee_range) and consumes no following flag. A --melee-range 8000 right before --seats 3
+        // must parse BOTH.
+        let parsed =
+            parse_args_from(["--melee-range", "8000", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.melee_range, 8000, "--melee-range 8000 parses the reach");
+        assert_eq!(parsed.seats, 3, "--melee-range consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --melee-range is NOT 0 — it is
+        // the Rules default (a 0 reach cleaves only an enemy exactly on the shooter, a harmless melee pawn,
+        // not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.melee_range,
+            Rules::default().melee_range,
+            "no --melee-range defaults to the Rules default reach, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_melee_range_into_rules() {
+        // FM1 (default drift): no --melee-range is the Rules DEFAULT reach — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). This is the base-balance distinction from the
+        // feature-toggle knobs (which default 0/off); pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().melee_range,
+            Rules::default().melee_range,
+            "no --melee-range is the Rules default reach (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { melee_range: 8000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .melee_range,
+            8000,
+            "--melee-range 8000 threads the reach into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_melee_range_into_a_matchmade_match() {
+        // FM3 (path skew): --melee-range must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same
+        // reach a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { melee_range: 8000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().melee_range,
+            8000,
+            "the matchmaker forms under --melee-range 8000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default reach — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().melee_range,
+            Rules::default().melee_range,
+            "no --melee-range: the matchmaker forms the Rules default reach"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
