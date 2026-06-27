@@ -486,6 +486,7 @@ def run_local_match(
     max_shield: int = 0,
     start_health: int | None = None,
     damage: int | None = None,
+    fire_cooldown: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -712,7 +713,19 @@ def run_local_match(
     (value-flag) on BOTH paths via `MatchParams.rules`. A non-None negative or `> 65535` value raises before
     any spawn (core takes it as a `u16`, so an out-of-range forward would wrap into a per-shot HP the caller
     never asked for — e.g. `65536 -> 0`, a shot that can never down a pawn — rejected loudly, mirroring the
-    harness's `u16` parse)."""
+    harness's `u16` parse).
+
+    Pass `fire_cooldown` (a `u16` tick count, `0`..=`65535`) to set the ticks BETWEEN ranged shots — the
+    rate of fire (lower is a faster cadence, more shots/sec), orthogonal to `damage`/`start_health` (it sets
+    how FAST a pawn shoots, not how hard or how long it survives). Like `damage` it is a base-balance value
+    with a NON-ZERO core default (`6` — five shots/sec at 30 Hz), so it uses a `None` sentinel: omit it (the
+    default `None`) to add no token and let the harness apply its own default — byte-identical argv. A value
+    (even one equal to the core default, AND an explicit `0`) forwards `--fire-cooldown <ticks>` (value-flag)
+    on BOTH paths via `MatchParams.rules`. The `0` case is sharper than for `damage`: a `0`-cooldown pawn can
+    fire EVERY tick (the unbounded-projectile-spawn degenerate, backstopped only by the core's live-projectile
+    cap), not the default cadence — so an explicit `0` must forward, never be swallowed. A non-None negative
+    or `> 65535` value raises before any spawn (core takes it as a `u16`, so an out-of-range forward would
+    wrap into a cadence the caller never asked for — rejected loudly, mirroring the harness's `u16` parse)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -793,6 +806,11 @@ def run_local_match(
         # value must be in range, else an out-of-range forward would wrap into a per-shot HP the caller never
         # asked for (65536 -> 0, a shot that can never down a pawn) — reject loudly, mirroring the harness u16.
         raise ValueError(f"damage is per-shot HP in 0..=65535 (None = harness default); got {damage}")
+    if fire_cooldown is not None and not 0 <= fire_cooldown <= 65535:
+        # Core takes fire_cooldown as a u16. None means "let the harness apply its default" (no token); a
+        # given value must be in range, else an out-of-range forward would wrap into a cadence the caller
+        # never asked for (65536 -> 0, a fire-every-tick pawn) — reject loudly, mirroring the harness u16.
+        raise ValueError(f"fire_cooldown is a tick count in 0..=65535 (None = harness default); got {fire_cooldown}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -873,6 +891,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--damage", str(damage)]
+    if fire_cooldown is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--fire-cooldown", str(fire_cooldown)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
