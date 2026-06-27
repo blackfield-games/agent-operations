@@ -332,6 +332,15 @@ struct Args {
     /// direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match
     /// swings at the same cadence a hand-seated one does.
     melee_cooldown: u16,
+    /// Damage one [`WeaponMode::Melee`] swing deals to each enemy it cleaves (`Rules::melee_damage`), clamped to
+    /// the target's health (only read in [`WeaponMode::Melee`]). Set by `--melee-damage`; UNLIKE the
+    /// feature-toggle knobs (which default `0` = off) this is a base-balance value, so its default is
+    /// `Rules::default().melee_damage` (`default_melee_damage()` = 50, two swings down a full pawn) — an absent
+    /// flag is byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT damage, NOT at `0`
+    /// (a `0`-damage swing never harms, a harmless melee pawn). A `u16` (the plain `.parse()` rejects a negative
+    /// and bounds the value), applied to BOTH the direct and `--mode` paths through [`rules_from`] via
+    /// [`MatchParams::rules`], so a matchmade/ranked match swings for the same damage a hand-seated one does.
+    melee_damage: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -568,6 +577,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 melee_cooldown swings
     // every tick (a continuous cleave), NOT the pre-flag harness.
     let mut melee_cooldown: u16 = Rules::default().melee_cooldown;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 melee_damage swing
+    // never harms (a harmless melee pawn), NOT the pre-flag harness.
+    let mut melee_damage: u16 = Rules::default().melee_damage;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -697,6 +709,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("melee-cooldown is a u16 (ticks between swings)")
             }
+            "--melee-damage" => {
+                melee_damage = it
+                    .next()
+                    .expect("--melee-damage needs a value")
+                    .parse()
+                    .expect("melee-damage is a u16 (damage per swing)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -735,6 +754,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         weapon_range,
         hit_radius,
         melee_cooldown,
+        melee_damage,
     }
 }
 
@@ -1500,6 +1520,7 @@ fn rules_from(args: &Args) -> Rules {
         weapon_range: args.weapon_range,
         hit_radius: args.hit_radius,
         melee_cooldown: args.melee_cooldown,
+        melee_damage: args.melee_damage,
         ..Rules::default()
     }
 }
@@ -2275,6 +2296,7 @@ mod tests {
             weapon_range: Rules::default().weapon_range,
             hit_radius: Rules::default().hit_radius,
             melee_cooldown: Rules::default().melee_cooldown,
+            melee_damage: Rules::default().melee_damage,
         }
     }
 
@@ -2358,6 +2380,7 @@ mod tests {
             weapon_range: Rules::default().weapon_range,
             hit_radius: Rules::default().hit_radius,
             melee_cooldown: Rules::default().melee_cooldown,
+            melee_damage: Rules::default().melee_damage,
         }
     }
 
