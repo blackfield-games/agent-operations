@@ -1929,6 +1929,63 @@ def test_run_local_match_rejects_an_out_of_range_fall_damage():
             run_local_match("/no/such/harness", [0, 1], policies, fall_damage=bad)
 
 
+def test_run_local_match_forwards_knockback_velocity_and_omits_it_at_the_default(monkeypatch):
+    # knockback_velocity>0 forwards --knockback-velocity <n> as one value token, mode-independently
+    # (before the mode block, like --gravity); the default 0 (no impulse) adds no flag — byte-identical
+    # argv. Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--knockback-velocity" not in captured["argv"], "the default 0 adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, knockback_velocity=800)
+    argv = captured["argv"]
+    assert argv[argv.index("--knockback-velocity") + 1] == "800"
+
+    # Explicit 0 is the default — it must NOT forward (byte-identical argv to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, knockback_velocity=0)
+    assert "--knockback-velocity" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match(
+            "h", [0, 1], policies, mode="agent", signing_keys=keys, knockback_velocity=800
+        )
+    argv = captured["argv"]
+    assert argv[argv.index("--knockback-velocity") + 1] == "800"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_knockback_velocity():
+    # knockback_velocity is a non-negative i32 (0..=2**31-1); a negative would launch the hit target
+    # DOWNWARD into the floor and an overflow would wrap the impulse, so it raises before any spawn,
+    # mirroring the harness's u32-then-i32 parse_knockback_velocity fence rather than forwarding a
+    # value the harness aborts on. A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -800, 2**31, 2**40):
+        with pytest.raises(ValueError, match="knockback_velocity"):
+            run_local_match("/no/such/harness", [0, 1], policies, knockback_velocity=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
