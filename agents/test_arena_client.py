@@ -1986,6 +1986,63 @@ def test_run_local_match_rejects_an_out_of_range_knockback_velocity():
             run_local_match("/no/such/harness", [0, 1], policies, knockback_velocity=bad)
 
 
+def test_run_local_match_forwards_fall_damage_threshold_and_omits_it_at_the_default(monkeypatch):
+    # fall_damage_threshold>0 forwards --fall-damage-threshold <n> as one value token, mode-independently
+    # (before the mode block, like --gravity); the default 0 (gate open) adds no flag — byte-identical
+    # argv. Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--fall-damage-threshold" not in captured["argv"], "the default 0 adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, fall_damage_threshold=3000)
+    argv = captured["argv"]
+    assert argv[argv.index("--fall-damage-threshold") + 1] == "3000"
+
+    # Explicit 0 is the default — it must NOT forward (byte-identical argv to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, fall_damage_threshold=0)
+    assert "--fall-damage-threshold" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match(
+            "h", [0, 1], policies, mode="agent", signing_keys=keys, fall_damage_threshold=3000
+        )
+    argv = captured["argv"]
+    assert argv[argv.index("--fall-damage-threshold") + 1] == "3000"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_fall_damage_threshold():
+    # fall_damage_threshold is a non-negative i32 (0..=2**31-1); a negative makes core's `impact >
+    # threshold` true for EVERY landing (the inverse of raising the bar) and an overflow wraps, so it
+    # raises before any spawn, mirroring the harness's u32-then-i32 parse_fall_damage_threshold fence
+    # rather than forwarding a value the harness aborts on. A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -3000, 2**31, 2**40):
+        with pytest.raises(ValueError, match="fall_damage_threshold"):
+            run_local_match("/no/such/harness", [0, 1], policies, fall_damage_threshold=bad)
+
+
 def test_run_local_match_forwards_wall_slide_as_one_bare_flag_and_omits_it_by_default(monkeypatch):
     # wall_slide=True forwards EXACTLY one BARE --wall-slide token (no value, like --friendly-fire),
     # before the mode block so both paths get it; the default False adds no flag — byte-identical argv.
