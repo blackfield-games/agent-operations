@@ -242,6 +242,16 @@ struct Args {
     /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same health
     /// pool a hand-seated one does. Lower health ⇒ a faster time-to-kill (fewer shots down a pawn).
     start_health: u16,
+    /// Damage one landed shot deals (`Rules::damage`): the HP a single connecting shot subtracts from a
+    /// pawn. Set by `--damage`; UNLIKE the feature-toggle knobs above (which default `0` = off) this is a
+    /// base-balance value, so its default is `Rules::default().damage` (25 — four shots down a full-health
+    /// pawn) — an absent flag is byte-identical to the pre-flag harness (and the replay digest) at the
+    /// DEFAULT damage, NOT at `0` (a `0`-damage shot can never down a pawn). A `u16` (the parse is the
+    /// fence: a negative or `> 65535` aborts). Applies to BOTH the direct and `--mode` paths through
+    /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same per-shot
+    /// damage a hand-seated one does. Lower damage ⇒ a slower time-to-kill (more shots to down a pawn). The
+    /// HP-pool companion `start_health` (how many such shots a pawn survives) is a separate knob.
+    damage: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -410,6 +420,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 here would spawn
     // every pawn already-downed, NOT reproduce the pre-flag harness.
     let mut start_health: u16 = Rules::default().start_health;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-damage shot could
+    // never down a pawn, NOT reproduce the pre-flag harness.
+    let mut damage: u16 = Rules::default().damage;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -498,6 +511,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("start-health is a u16 (hp)")
             }
+            "--damage" => {
+                damage = it
+                    .next()
+                    .expect("--damage needs a value")
+                    .parse()
+                    .expect("damage is a u16 (hp)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -528,6 +548,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         pawn_height,
         max_shield,
         start_health,
+        damage,
     }
 }
 
@@ -1285,6 +1306,7 @@ fn rules_from(args: &Args) -> Rules {
         pawn_height: args.pawn_height,
         max_shield: args.max_shield,
         start_health: args.start_health,
+        damage: args.damage,
         ..Rules::default()
     }
 }
@@ -2052,6 +2074,7 @@ mod tests {
             pawn_height: 0,
             max_shield: 0,
             start_health: Rules::default().start_health,
+            damage: Rules::default().damage,
         }
     }
 
@@ -2127,6 +2150,7 @@ mod tests {
             pawn_height: 0,
             max_shield: 0,
             start_health: Rules::default().start_health,
+            damage: Rules::default().damage,
         }
     }
 
