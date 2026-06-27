@@ -2186,6 +2186,7 @@ mod tests {
             fire_cooldown: Rules::default().fire_cooldown,
             mag_size: Rules::default().mag_size,
             max_speed: Rules::default().max_speed,
+            perception_range: Rules::default().perception_range,
         }
     }
 
@@ -2265,6 +2266,7 @@ mod tests {
             fire_cooldown: Rules::default().fire_cooldown,
             mag_size: Rules::default().mag_size,
             max_speed: Rules::default().max_speed,
+            perception_range: Rules::default().perception_range,
         }
     }
 
@@ -3828,6 +3830,105 @@ mod tests {
             off.rules().max_speed,
             Rules::default().max_speed,
             "no --max-speed: the matchmaker forms the Rules default pace"
+        );
+    }
+
+    #[test]
+    fn parse_perception_range_maps_a_non_negative_radius() {
+        assert_eq!(parse_perception_range("0"), 0);
+        assert_eq!(parse_perception_range("20000"), 20000);
+        assert_eq!(
+            parse_perception_range(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid perception radius"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_perception_range_rejects_a_negative() {
+        // A perception radius is non-negative; a negative is meaningless (it would perceive nothing).
+        // Reject it loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_perception_range("-20000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_perception_range_rejects_an_overflow() {
+        // A radius past i32::MAX must abort, NOT wrap into a negative (which would then blind every seat).
+        // 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_perception_range("3000000000");
+    }
+
+    #[test]
+    fn perception_range_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --perception-range pulls exactly one token (through
+        // parse_perception_range) and consumes no following flag. A --perception-range 20000 right before
+        // --seats 3 must parse BOTH.
+        let parsed =
+            parse_args_from(["--perception-range", "20000", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.perception_range, 20000, "--perception-range 20000 parses the radius");
+        assert_eq!(parsed.seats, 3, "--perception-range consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --perception-range is NOT 0 — it
+        // is the Rules default (a 0-range seat is blind, not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.perception_range,
+            Rules::default().perception_range,
+            "no --perception-range defaults to the Rules default radius, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_perception_range_into_rules() {
+        // FM1 (default drift): no --perception-range is the Rules DEFAULT radius — NOT 0 — byte-identical to
+        // the pre-flag harness (and its replay digest). This is the base-balance distinction from the
+        // feature-toggle knobs (which default 0/off); pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().perception_range,
+            Rules::default().perception_range,
+            "no --perception-range is the Rules default radius (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { perception_range: 20000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .perception_range,
+            20000,
+            "--perception-range 20000 threads the radius into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_perception_range_into_a_matchmade_match() {
+        // FM3 (path skew): --perception-range must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same
+        // radius a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { perception_range: 20000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().perception_range,
+            20000,
+            "the matchmaker forms under --perception-range 20000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default radius — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().perception_range,
+            Rules::default().perception_range,
+            "no --perception-range: the matchmaker forms the Rules default radius"
         );
     }
 
