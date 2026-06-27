@@ -309,6 +309,18 @@ struct Args {
     /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same weapon reach a hand-seated one
     /// does.
     weapon_range: i32,
+    /// Lateral half-width of the hitscan beam, in position units (`Rules::hit_radius`): the aim tolerance that
+    /// lets the coarse 8-way facing still land a shot, and in [`WeaponMode::Projectile`] the pawn-body
+    /// half-width a swept shot must reach to hit, so a wider radius is more forgiving aim (more shots connect)
+    /// and a tighter one demands sharper facing. Set by `--hit-radius`; UNLIKE the feature-toggle knobs above
+    /// (which default `0` = off) this is a base-balance value, so its default is `Rules::default().hit_radius`
+    /// (1500, a 1.5 m beam radius) — an absent flag is byte-identical to the pre-flag harness (and the replay
+    /// digest) at the DEFAULT radius, NOT at `0` (a `0` radius is a needle-thin beam that lands only on a
+    /// dead-centre target). A non-negative `i32` (the u32-then-`i32` fence in [`parse_hit_radius`]: a negative
+    /// — meaningless for a half-width — or a value past `i32::MAX` aborts). Applies to BOTH the direct and
+    /// `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under
+    /// the same aim tolerance a hand-seated one does.
+    hit_radius: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -460,6 +472,17 @@ fn parse_weapon_range(value: &str) -> i32 {
     i32::try_from(reach).expect("--weapon-range exceeds the i32 range")
 }
 
+/// Parse a `--hit-radius` value to the non-negative beam half-width [`Rules::hit_radius`] carries, the same
+/// u32-then-i32 fence as [`parse_weapon_range`]: the sim resolves a hit only within this lateral tolerance of
+/// the beam (and treats it as the pawn-body half-width a projectile must reach), so a negative half-width is
+/// meaningless (it lands no hit) and a value past `i32::MAX` would wrap it, so both abort before any spawn.
+fn parse_hit_radius(value: &str) -> i32 {
+    let radius: u32 = value
+        .parse()
+        .expect("--hit-radius is a non-negative integer (beam half-width)");
+    i32::try_from(radius).expect("--hit-radius exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -528,6 +551,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-range weapon reaches
     // nothing (lands no ranged hit at any distance), NOT the pre-flag harness.
     let mut weapon_range: i32 = Rules::default().weapon_range;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 hit_radius is a
+    // needle-thin beam that lands only on a dead-centre target, NOT the pre-flag harness.
+    let mut hit_radius: i32 = Rules::default().hit_radius;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -647,6 +673,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--weapon-range" => {
                 weapon_range = parse_weapon_range(&it.next().expect("--weapon-range needs a value"))
             }
+            "--hit-radius" => {
+                hit_radius = parse_hit_radius(&it.next().expect("--hit-radius needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -683,6 +712,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         max_speed,
         perception_range,
         weapon_range,
+        hit_radius,
     }
 }
 
@@ -1446,6 +1476,7 @@ fn rules_from(args: &Args) -> Rules {
         max_speed: args.max_speed,
         perception_range: args.perception_range,
         weapon_range: args.weapon_range,
+        hit_radius: args.hit_radius,
         ..Rules::default()
     }
 }
@@ -2219,6 +2250,7 @@ mod tests {
             max_speed: Rules::default().max_speed,
             perception_range: Rules::default().perception_range,
             weapon_range: Rules::default().weapon_range,
+            hit_radius: Rules::default().hit_radius,
         }
     }
 
@@ -2300,6 +2332,7 @@ mod tests {
             max_speed: Rules::default().max_speed,
             perception_range: Rules::default().perception_range,
             weapon_range: Rules::default().weapon_range,
+            hit_radius: Rules::default().hit_radius,
         }
     }
 
