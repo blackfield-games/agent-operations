@@ -480,6 +480,7 @@ def run_local_match(
     wall_slide: bool = False,
     fall_damage_threshold: int = 0,
     knockback_horizontal: int = 0,
+    dash_cooldown: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -640,7 +641,18 @@ def run_local_match(
     rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
     byte-identical argv. Because it needs no gravity the shove is observable as soon as a hit lands, but
     the default free-for-all roster + seed may not produce a clean displacement, so the pin is argv
-    reachability; a behavioral pos-shove replay is a coupled follow-up."""
+    reachability; a behavioral pos-shove replay is a coupled follow-up.
+
+    Pass `dash_cooldown` (a `u16` tick cadence, `0`..=`65535`) to turn on the `ability`-button dash: a
+    grounded ability press with a move direction bursts the pawn the fixed core `DASH_DISTANCE` along
+    `move_dir`, then this many ticks must elapse before the next dash, so `0` (the default) disables the
+    dash entirely (an ability press is inert). Forwarded as `--dash-cooldown <ticks>` (value-flag, like
+    `gravity`) on BOTH paths via `MatchParams.rules`, only when nonzero. A negative or `> 65535` value
+    raises before any spawn (core takes it as a `u16`, so an out-of-range forward would wrap into a
+    cadence the caller never asked for — and `65536 -> 0` reads as "dash off", doubly wrong — rejected
+    loudly, mirroring the harness's `u16` parse). Default `0` adds no token — byte-identical argv. The
+    burst DISTANCE is a fixed core constant, not a knob; this cadence is the only dash tuning the digest
+    binds, so the pin is argv reachability — a behavioral dash replay is a coupled follow-up."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -691,6 +703,11 @@ def run_local_match(
         raise ValueError(
             f"knockback_horizontal is a planar shove in 0..=2**31-1 (0 = off); got {knockback_horizontal}"
         )
+    if not 0 <= dash_cooldown <= 65535:
+        # Core takes dash_cooldown as a u16, so a negative is meaningless and a value past 65535 would
+        # wrap into a cadence the caller never asked for (e.g. 65536 -> 0, which ALSO reads as "dash off",
+        # so the wrap is doubly wrong) — reject both loudly here, mirroring the harness's u16 parse.
+        raise ValueError(f"dash_cooldown is a tick cadence in 0..=65535 (0 = off); got {dash_cooldown}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -747,6 +764,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag shove on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (no shove) adds no token — byte-identical argv.
         argv += ["--knockback-horizontal", str(knockback_horizontal)]
+    if dash_cooldown:
+        # Same shape as --gravity: a value-flag cadence on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (dash off) adds no token — byte-identical argv.
+        argv += ["--dash-cooldown", str(dash_cooldown)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
