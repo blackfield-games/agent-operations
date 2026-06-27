@@ -484,6 +484,7 @@ def run_local_match(
     pawn_radius: int = 0,
     pawn_height: int = 0,
     max_shield: int = 0,
+    start_health: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -689,7 +690,17 @@ def run_local_match(
     "shield off", doubly wrong — rejected loudly, mirroring the harness's `u16` parse). Default `0` adds
     no token — byte-identical argv. The effect needs a Shield pickup to collect: the default arenas spawn
     none, so pass an `arena` with shield pickups for it to matter — the pin here is argv reachability, a
-    behavioral shield replay is a coupled follow-up."""
+    behavioral shield replay is a coupled follow-up.
+
+    Pass `start_health` (a `u16` HP pool, `0`..=`65535`) to set the health every pawn spawns with and
+    reloads/heals cap toward — lower HP is a faster time-to-kill. UNLIKE the feature-toggle knobs above,
+    this is a base-balance value with a NON-ZERO core default, so it uses a `None` sentinel: omit it (the
+    default `None`) to add no token and let the harness apply its own default — byte-identical argv. A
+    value (even one equal to the core default) forwards `--start-health <hp>` (value-flag) on BOTH paths
+    via `MatchParams.rules`. The sentinel avoids hardcoding the Rust default in Python (the harness owns
+    it). A non-None negative or `> 65535` value raises before any spawn (core takes it as a `u16`, so an
+    out-of-range forward would wrap into a pool the caller never asked for — e.g. `65536 -> 0`, an
+    already-downed spawn — rejected loudly, mirroring the harness's `u16` parse)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -760,6 +771,11 @@ def run_local_match(
         # into a cap the caller never asked for (e.g. 65536 -> 0, which ALSO reads as "shield off", so the
         # wrap is doubly wrong) — reject both loudly here, mirroring the harness's u16 parse.
         raise ValueError(f"max_shield is a shield-pool cap in 0..=65535 (0 = off); got {max_shield}")
+    if start_health is not None and not 0 <= start_health <= 65535:
+        # Core takes start_health as a u16. None means "let the harness apply its default" (no token); a
+        # given value must be in range, else an out-of-range forward would wrap into a pool the caller
+        # never asked for (65536 -> 0, an already-downed spawn) — reject loudly, mirroring the harness u16.
+        raise ValueError(f"start_health is an HP pool in 0..=65535 (None = harness default); got {start_health}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -832,6 +848,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag cap on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (shield off) adds no token — byte-identical argv.
         argv += ["--max-shield", str(max_shield)]
+    if start_health is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--start-health", str(start_health)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
