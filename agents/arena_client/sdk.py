@@ -490,6 +490,7 @@ def run_local_match(
     mag_size: int | None = None,
     max_speed: int | None = None,
     perception_range: int | None = None,
+    weapon_range: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -766,7 +767,21 @@ def run_local_match(
     distance — not the default sightline, so an explicit `0` must forward, never be swallowed. The range is
     `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None negative (meaningless for a radius) or
     `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_perception_range`
-    fence."""
+    fence.
+
+    Pass `weapon_range` (a non-negative `i32` beam reach, `0`..=`2**31-1`) to set how far a beam-hitscan shot
+    reaches, in position units — the sim resolves a hitscan hit only within this reach and expires a traveling
+    projectile once it has flown past it, so a shorter range is closer-quarters engagements. The
+    engagement-distance companion to `perception_range` (`perception_range` sets how far a seat SEES,
+    `weapon_range` how far it can HIT). Like `perception_range` it is a non-negative `i32` base-balance value
+    with a NON-ZERO core default (`30 * POSITION_SCALE`, 30 m), so it uses a `None` sentinel: omit it (the
+    default `None`) to add no token and let the harness apply its own default — byte-identical argv. A value
+    (even one equal to the core default, AND an explicit `0`) forwards `--weapon-range <units>` (value-flag)
+    on BOTH paths via `MatchParams.rules`. The `0` case is degenerate: a `0`-range weapon reaches nothing — it
+    lands no ranged hit at any distance and expires every projectile at the muzzle — not the default reach, so
+    an explicit `0` must forward, never be swallowed. The range is `0`..=`2**31-1` (the `i32` shape, NOT
+    `u16`): a non-None negative (meaningless for a reach) or `> 2**31-1` value raises before any spawn,
+    mirroring the harness's `u32`-then-`i32` `parse_weapon_range` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -871,6 +886,14 @@ def run_local_match(
         raise ValueError(
             f"perception_range is a sightline radius in 0..=2**31-1 (None = harness default); got {perception_range}"
         )
+    if weapon_range is not None and not 0 <= weapon_range <= 2**31 - 1:
+        # Core takes weapon_range as a non-negative i32. None means "let the harness apply its default" (no
+        # token); a given value must be in range, else a negative (meaningless for a reach — and core squares
+        # it, so a negative would reach as far as its magnitude) or a value past i32::MAX (which wraps
+        # negative) would forward a footgun — reject loudly, mirroring the harness u32-then-i32 fence.
+        raise ValueError(
+            f"weapon_range is a beam reach in 0..=2**31-1 (None = harness default); got {weapon_range}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -967,6 +990,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--perception-range", str(perception_range)]
+    if weapon_range is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--weapon-range", str(weapon_range)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
