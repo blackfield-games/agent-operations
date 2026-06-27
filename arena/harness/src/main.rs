@@ -4333,6 +4333,92 @@ mod tests {
     }
 
     #[test]
+    fn melee_damage_parses_as_a_u16_value_flag() {
+        // The value-flag twin of the threading tests: --melee-damage pulls exactly one token and parses it as
+        // the u16 per-swing damage, consuming no following flag. A --melee-damage 70 right before --seats 3 must
+        // parse BOTH.
+        let parsed =
+            parse_args_from(["--melee-damage", "70", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.melee_damage, 70, "--melee-damage 70 parses the per-swing damage");
+        assert_eq!(parsed.seats, 3, "--melee-damage consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --melee-damage is NOT 0 — it is the
+        // Rules default (a 0-damage swing never harms, a harmless melee pawn, not the pre-flag behaviour).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.melee_damage,
+            Rules::default().melee_damage,
+            "no --melee-damage defaults to the Rules default damage, NOT 0"
+        );
+
+        // FM1 (explicit 0 forwards): an explicitly requested 0 is the harmless-swing degenerate — it must forward
+        // verbatim, NOT be coerced back to the default. Only an ABSENT flag is the default.
+        let zero =
+            parse_args_from(["--melee-damage", "0", "--seats", "2"].into_iter().map(String::from));
+        assert_eq!(zero.melee_damage, 0, "an explicit --melee-damage 0 forwards (a harmless swing)");
+    }
+
+    #[test]
+    #[should_panic(expected = "u16")]
+    fn melee_damage_rejects_a_negative() {
+        // FM2 (type bound): melee_damage is a u16; a negative is meaningless for a damage amount and must abort
+        // at the CLI ('-' is not a u16 digit), NOT silently coerce. A value past u16::MAX aborts the same way.
+        parse_args_from(["--melee-damage", "-5"].into_iter().map(String::from));
+    }
+
+    #[test]
+    fn direct_match_threads_melee_damage_into_rules() {
+        // FM1 (default drift): no --melee-damage is the Rules DEFAULT damage — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). This is the base-balance distinction from the feature-toggle
+        // knobs (which default 0/off); pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().melee_damage,
+            Rules::default().melee_damage,
+            "no --melee-damage is the Rules default damage (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { melee_damage: 70, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .melee_damage,
+            70,
+            "--melee-damage 70 threads the damage into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_melee_damage_into_a_matchmade_match() {
+        // FM3 (path skew): --melee-damage must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same damage a
+        // hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { melee_damage: 70, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().melee_damage,
+            70,
+            "the matchmaker forms under --melee-damage 70 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default damage — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().melee_damage,
+            Rules::default().melee_damage,
+            "no --melee-damage: the matchmaker forms the Rules default damage"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
