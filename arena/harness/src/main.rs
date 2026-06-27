@@ -264,6 +264,16 @@ struct Args {
     /// fire cadence a hand-seated one does. The per-shot `damage` (how hard each of those shots lands) is a
     /// separate knob.
     fire_cooldown: u16,
+    /// Magazine capacity (`Rules::mag_size`): the ammo a pawn spawns with, reloads to, and refills toward at
+    /// an ammo pickup — and, since ranged fire gates on `ammo > 0`, the number of shots it can land before a
+    /// reload. Set by `--mag-size`; UNLIKE the feature-toggle knobs above (which default `0` = off) this is a
+    /// base-balance value, so its default is `Rules::default().mag_size` (30) — an absent flag is
+    /// byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT capacity, NOT at `0` (a
+    /// `0`-mag pawn spawns empty and can never fire a ranged shot — it only melees). A `u16` (the parse is the
+    /// fence: a negative or `> 65535` aborts). Applies to BOTH the direct and `--mode` paths through
+    /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same magazine a
+    /// hand-seated one does. Smaller magazine ⇒ more frequent reloads (more ticks spent unable to fire).
+    mag_size: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -438,6 +448,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-cooldown pawn fires
     // every tick (the degenerate unbounded-spawn case), NOT the pre-flag harness.
     let mut fire_cooldown: u16 = Rules::default().fire_cooldown;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-mag pawn spawns empty
+    // and can never fire a ranged shot, NOT the pre-flag harness.
+    let mut mag_size: u16 = Rules::default().mag_size;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -540,6 +553,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("fire-cooldown is a u16 (ticks)")
             }
+            "--mag-size" => {
+                mag_size = it
+                    .next()
+                    .expect("--mag-size needs a value")
+                    .parse()
+                    .expect("mag-size is a u16 (ammo)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -572,6 +592,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         start_health,
         damage,
         fire_cooldown,
+        mag_size,
     }
 }
 
@@ -1331,6 +1352,7 @@ fn rules_from(args: &Args) -> Rules {
         start_health: args.start_health,
         damage: args.damage,
         fire_cooldown: args.fire_cooldown,
+        mag_size: args.mag_size,
         ..Rules::default()
     }
 }
