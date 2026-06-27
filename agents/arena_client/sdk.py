@@ -483,6 +483,7 @@ def run_local_match(
     dash_cooldown: int = 0,
     pawn_radius: int = 0,
     pawn_height: int = 0,
+    max_shield: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -677,7 +678,18 @@ def run_local_match(
     silently planar — and an overflow wraps, both rejected loudly, mirroring the harness's
     `u32`-then-`i32` parse). Default `0` adds no token — byte-identical argv. Only meaningful with
     `pawn_radius > 0` (no occupancy otherwise) AND `gravity > 0` (the sole source of any non-zero `z`),
-    so the pin is argv reachability — a behavioral vault replay is a coupled follow-up."""
+    so the pin is argv reachability — a behavioral vault replay is a coupled follow-up.
+
+    Pass `max_shield` (a `u16` shield-pool cap, `0`..=`65535`) to turn on shield: a pawn starts at `0`
+    shield and earns it (capped here) by collecting a Shield pickup, and incoming damage drains shield
+    before health, so `0` (the default) disables shield entirely (a Shield pickup is inert). Forwarded as
+    `--max-shield <cap>` (value-flag, like `gravity`) on BOTH paths via `MatchParams.rules`, only when
+    nonzero. A negative or `> 65535` value raises before any spawn (core takes it as a `u16`, so an
+    out-of-range forward would wrap into a cap the caller never asked for — and `65536 -> 0` reads as
+    "shield off", doubly wrong — rejected loudly, mirroring the harness's `u16` parse). Default `0` adds
+    no token — byte-identical argv. The effect needs a Shield pickup to collect: the default arenas spawn
+    none, so pass an `arena` with shield pickups for it to matter — the pin here is argv reachability, a
+    behavioral shield replay is a coupled follow-up."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -743,6 +755,11 @@ def run_local_match(
         # value past i32::MAX wraps the band negative (also off) — reject both loudly here, mirroring the
         # harness's u32-then-i32 parse_pawn_height fence.
         raise ValueError(f"pawn_height is an occupancy band in 0..=2**31-1 (0 = planar); got {pawn_height}")
+    if not 0 <= max_shield <= 65535:
+        # Core takes max_shield as a u16, so a negative is meaningless and a value past 65535 would wrap
+        # into a cap the caller never asked for (e.g. 65536 -> 0, which ALSO reads as "shield off", so the
+        # wrap is doubly wrong) — reject both loudly here, mirroring the harness's u16 parse.
+        raise ValueError(f"max_shield is a shield-pool cap in 0..=65535 (0 = off); got {max_shield}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -811,6 +828,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag band on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (planar occupancy) adds no token — byte-identical argv.
         argv += ["--pawn-height", str(pawn_height)]
+    if max_shield:
+        # Same shape as --gravity: a value-flag cap on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (shield off) adds no token — byte-identical argv.
+        argv += ["--max-shield", str(max_shield)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
