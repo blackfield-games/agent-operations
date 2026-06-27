@@ -4098,6 +4098,106 @@ mod tests {
     }
 
     #[test]
+    fn parse_hit_radius_maps_a_non_negative_radius() {
+        assert_eq!(parse_hit_radius("0"), 0);
+        assert_eq!(parse_hit_radius("3000"), 3000);
+        assert_eq!(
+            parse_hit_radius(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid beam half-width"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_hit_radius_rejects_a_negative() {
+        // A beam half-width is non-negative; a negative is meaningless (it would land no hit). Reject it
+        // loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_hit_radius("-3000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_hit_radius_rejects_an_overflow() {
+        // A half-width past i32::MAX must abort, NOT wrap into a negative (which would then miss every shot).
+        // 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_hit_radius("3000000000");
+    }
+
+    #[test]
+    fn hit_radius_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --hit-radius pulls exactly one token (through
+        // parse_hit_radius) and consumes no following flag. A --hit-radius 3000 right before --seats 3
+        // must parse BOTH.
+        let parsed =
+            parse_args_from(["--hit-radius", "3000", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.hit_radius, 3000, "--hit-radius 3000 parses the half-width");
+        assert_eq!(parsed.seats, 3, "--hit-radius consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --hit-radius is NOT 0 — it is
+        // the Rules default (a 0 radius is a needle-thin beam landing only on a dead-centre target, not the
+        // pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.hit_radius,
+            Rules::default().hit_radius,
+            "no --hit-radius defaults to the Rules default radius, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_hit_radius_into_rules() {
+        // FM1 (default drift): no --hit-radius is the Rules DEFAULT radius — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). This is the base-balance distinction from the
+        // feature-toggle knobs (which default 0/off); pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().hit_radius,
+            Rules::default().hit_radius,
+            "no --hit-radius is the Rules default radius (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { hit_radius: 3000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .hit_radius,
+            3000,
+            "--hit-radius 3000 threads the half-width into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_hit_radius_into_a_matchmade_match() {
+        // FM3 (path skew): --hit-radius must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same
+        // half-width a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { hit_radius: 3000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().hit_radius,
+            3000,
+            "the matchmaker forms under --hit-radius 3000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default radius — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().hit_radius,
+            Rules::default().hit_radius,
+            "no --hit-radius: the matchmaker forms the Rules default radius"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
