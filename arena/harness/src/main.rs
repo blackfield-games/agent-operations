@@ -200,6 +200,17 @@ struct Args {
     /// cadence a hand-seated one does. The burst DISTANCE is a fixed core constant, not a flag — this
     /// cadence is the only dash tuning the digest binds.
     dash_cooldown: u16,
+    /// Pawn-vs-pawn occupancy radius (`Rules::pawn_radius`): the body disc every OTHER alive pawn
+    /// presents in the slide path. `0` (the default) DISABLES occupancy — pawns are not obstacles to one
+    /// another and a move may end on another pawn's cell, byte-identical to the pre-flag harness (and the
+    /// replay digest). A positive `i32` set by `--pawn-radius` turns it on: a step whose swept path would
+    /// bring the mover's centre WITHIN this distance of another alive pawn is refused (the mover holds at
+    /// the step origin), gating the walk, the dash burst, AND a `knockback_horizontal` shove alike. A
+    /// negative is rejected at parse — core gates occupancy on `pawn_radius > 0`, so a negative is INERT
+    /// (a silent no-collision footgun) and `> i32::MAX` would wrap. Applies to BOTH the direct and
+    /// `--mode` paths through [`rules_from`] via [`MatchParams::rules`]. The z-companion `pawn_height`
+    /// (the vertical band that lets a jump vault a body) is a separate knob.
+    pawn_radius: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -296,6 +307,17 @@ fn parse_knockback_horizontal(value: &str) -> i32 {
     i32::try_from(shove).expect("--knockback-horizontal exceeds the i32 range")
 }
 
+/// Parse a `--pawn-radius` value to the non-negative occupancy radius [`Rules::pawn_radius`] carries,
+/// the same u32-then-i32 fence as [`parse_gravity`]: core gates occupancy on `pawn_radius > 0`, so a
+/// negative is INERT (silently no pawn-vs-pawn collision — the operator dialed a body and got a ghost)
+/// and a value past `i32::MAX` would wrap the radius, so both abort before any spawn.
+fn parse_pawn_radius(value: &str) -> i32 {
+    let radius: u32 = value
+        .parse()
+        .expect("--pawn-radius is a non-negative integer (occupancy radius)");
+    i32::try_from(radius).expect("--pawn-radius exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -340,6 +362,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut fall_damage_threshold: i32 = 0;
     let mut knockback_horizontal: i32 = 0;
     let mut dash_cooldown: u16 = 0;
+    let mut pawn_radius: i32 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -408,6 +431,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("dash-cooldown is a u16 (ticks)")
             }
+            "--pawn-radius" => {
+                pawn_radius = parse_pawn_radius(&it.next().expect("--pawn-radius needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -434,6 +460,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         fall_damage_threshold,
         knockback_horizontal,
         dash_cooldown,
+        pawn_radius,
     }
 }
 
@@ -1187,6 +1214,7 @@ fn rules_from(args: &Args) -> Rules {
         fall_damage_threshold: args.fall_damage_threshold,
         knockback_horizontal: args.knockback_horizontal,
         dash_cooldown: args.dash_cooldown,
+        pawn_radius: args.pawn_radius,
         ..Rules::default()
     }
 }
@@ -1950,6 +1978,7 @@ mod tests {
             fall_damage_threshold: 0,
             knockback_horizontal: 0,
             dash_cooldown: 0,
+            pawn_radius: 0,
         }
     }
 
@@ -2021,6 +2050,7 @@ mod tests {
             fall_damage_threshold: 0,
             knockback_horizontal: 0,
             dash_cooldown: 0,
+            pawn_radius: 0,
         }
     }
 
