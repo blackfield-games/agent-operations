@@ -2218,6 +2218,7 @@ mod tests {
             mag_size: Rules::default().mag_size,
             max_speed: Rules::default().max_speed,
             perception_range: Rules::default().perception_range,
+            weapon_range: Rules::default().weapon_range,
         }
     }
 
@@ -2298,6 +2299,7 @@ mod tests {
             mag_size: Rules::default().mag_size,
             max_speed: Rules::default().max_speed,
             perception_range: Rules::default().perception_range,
+            weapon_range: Rules::default().weapon_range,
         }
     }
 
@@ -3960,6 +3962,105 @@ mod tests {
             off.rules().perception_range,
             Rules::default().perception_range,
             "no --perception-range: the matchmaker forms the Rules default radius"
+        );
+    }
+
+    #[test]
+    fn parse_weapon_range_maps_a_non_negative_reach() {
+        assert_eq!(parse_weapon_range("0"), 0);
+        assert_eq!(parse_weapon_range("15000"), 15000);
+        assert_eq!(
+            parse_weapon_range(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid weapon reach"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_weapon_range_rejects_a_negative() {
+        // A weapon reach is non-negative; a negative is meaningless (it would land no hit). Reject it loudly
+        // at the CLI; the u32 parse fails the leading '-'.
+        parse_weapon_range("-15000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_weapon_range_rejects_an_overflow() {
+        // A reach past i32::MAX must abort, NOT wrap into a negative (which would then disarm every ranged
+        // shot). 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_weapon_range("3000000000");
+    }
+
+    #[test]
+    fn weapon_range_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --weapon-range pulls exactly one token (through
+        // parse_weapon_range) and consumes no following flag. A --weapon-range 15000 right before --seats 3
+        // must parse BOTH.
+        let parsed =
+            parse_args_from(["--weapon-range", "15000", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.weapon_range, 15000, "--weapon-range 15000 parses the reach");
+        assert_eq!(parsed.seats, 3, "--weapon-range consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --weapon-range is NOT 0 — it is
+        // the Rules default (a 0-range weapon reaches nothing, not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.weapon_range,
+            Rules::default().weapon_range,
+            "no --weapon-range defaults to the Rules default reach, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_weapon_range_into_rules() {
+        // FM1 (default drift): no --weapon-range is the Rules DEFAULT reach — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). This is the base-balance distinction from the
+        // feature-toggle knobs (which default 0/off); pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().weapon_range,
+            Rules::default().weapon_range,
+            "no --weapon-range is the Rules default reach (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { weapon_range: 15000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .weapon_range,
+            15000,
+            "--weapon-range 15000 threads the reach into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_weapon_range_into_a_matchmade_match() {
+        // FM3 (path skew): --weapon-range must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same reach
+        // a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { weapon_range: 15000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().weapon_range,
+            15000,
+            "the matchmaker forms under --weapon-range 15000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default reach — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().weapon_range,
+            Rules::default().weapon_range,
+            "no --weapon-range: the matchmaker forms the Rules default reach"
         );
     }
 
