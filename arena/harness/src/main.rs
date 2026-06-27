@@ -2860,6 +2860,83 @@ mod tests {
     }
 
     #[test]
+    fn dash_cooldown_parses_as_a_u16_value_flag() {
+        // The value-flag twin of the threading tests: --dash-cooldown pulls exactly one token and
+        // parses it as the u16 cadence, consuming no following flag. A --dash-cooldown 20 right before
+        // --seats 3 must parse BOTH (20 ticks, seats 3); absent, it defaults 0 (dash off).
+        let parsed =
+            parse_args_from(["--dash-cooldown", "20", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.dash_cooldown, 20, "--dash-cooldown 20 parses the cadence");
+        assert_eq!(parsed.seats, 3, "--dash-cooldown consumed exactly one token, so --seats 3 parsed");
+
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(none.dash_cooldown, 0, "no --dash-cooldown defaults 0 (dash disabled)");
+    }
+
+    #[test]
+    #[should_panic(expected = "u16")]
+    fn dash_cooldown_rejects_an_overflow() {
+        // FM2 (type bound): dash_cooldown is a u16; a value past u16::MAX must abort at the CLI, NOT
+        // wrap into a small cadence (65536 would wrap to 0 — a zero-cooldown dash-every-tick the
+        // operator did not ask for, and 0 ALSO reads as "dash off", so the wrap is doubly wrong). The
+        // u16 parse catches it; a negative aborts the same way ('-' is not a u16 digit).
+        parse_args_from(["--dash-cooldown", "65536"].into_iter().map(String::from));
+    }
+
+    #[test]
+    fn direct_match_threads_dash_cooldown_into_rules() {
+        // FM1 (default drift): no --dash-cooldown is 0 — the ability press is inert, byte-identical to
+        // the pre-flag harness (and its replay digest). The dash BEHAVIOR (an ability press bursts the
+        // pawn DASH_DISTANCE, then the cadence gates the next) is arena-core's own test; here we pin
+        // the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().dash_cooldown,
+            0,
+            "no --dash-cooldown is 0 (dash off, byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { dash_cooldown: 20, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .dash_cooldown,
+            20,
+            "--dash-cooldown 20 threads the cadence into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_dash_cooldown_into_a_matchmade_match() {
+        // FM3 (path skew): --dash-cooldown must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same
+        // cadence a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { dash_cooldown: 20, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().dash_cooldown,
+            20,
+            "the matchmaker forms under --dash-cooldown 20 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms dash_cooldown 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().dash_cooldown,
+            0,
+            "no --dash-cooldown: the matchmaker forms a disabled dash"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
