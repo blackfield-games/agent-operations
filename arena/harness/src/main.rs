@@ -2153,6 +2153,7 @@ mod tests {
             damage: Rules::default().damage,
             fire_cooldown: Rules::default().fire_cooldown,
             mag_size: Rules::default().mag_size,
+            max_speed: Rules::default().max_speed,
         }
     }
 
@@ -2231,6 +2232,7 @@ mod tests {
             damage: Rules::default().damage,
             fire_cooldown: Rules::default().fire_cooldown,
             mag_size: Rules::default().mag_size,
+            max_speed: Rules::default().max_speed,
         }
     }
 
@@ -3695,6 +3697,105 @@ mod tests {
             off.rules().mag_size,
             Rules::default().mag_size,
             "no --mag-size: the matchmaker forms the Rules default magazine"
+        );
+    }
+
+    #[test]
+    fn parse_max_speed_maps_a_non_negative_magnitude() {
+        assert_eq!(parse_max_speed("0"), 0);
+        assert_eq!(parse_max_speed("400"), 400);
+        assert_eq!(
+            parse_max_speed(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid walk magnitude"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_max_speed_rejects_a_negative() {
+        // Core slides a full-intent walk by max_speed position units; it has no meaning for a negative
+        // (it never walks a pawn backward by the cap), so a forwarded negative is a footgun. Reject it
+        // loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_max_speed("-400");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_max_speed_rejects_an_overflow() {
+        // A magnitude past i32::MAX must abort, NOT wrap into a negative (which core has no movement
+        // meaning for). 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_max_speed("3000000000");
+    }
+
+    #[test]
+    fn max_speed_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --max-speed pulls exactly one token (through
+        // parse_max_speed) and consumes no following flag. A --max-speed 400 right before --seats 3
+        // must parse BOTH.
+        let parsed = parse_args_from(["--max-speed", "400", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.max_speed, 400, "--max-speed 400 parses the walk magnitude");
+        assert_eq!(parsed.seats, 3, "--max-speed consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --max-speed is NOT 0 — it is
+        // the Rules default (a 0-speed pawn is frozen in place, not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.max_speed,
+            Rules::default().max_speed,
+            "no --max-speed defaults to the Rules default pace, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_max_speed_into_rules() {
+        // FM1 (default drift): no --max-speed is the Rules DEFAULT pace — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). This is the base-balance distinction from the
+        // feature-toggle knobs (which default 0/off); pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().max_speed,
+            Rules::default().max_speed,
+            "no --max-speed is the Rules default pace (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { max_speed: 400, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .max_speed,
+            400,
+            "--max-speed 400 threads the walk magnitude into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_max_speed_into_a_matchmade_match() {
+        // FM3 (path skew): --max-speed must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same
+        // pace a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { max_speed: 400, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().max_speed,
+            400,
+            "the matchmaker forms under --max-speed 400 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default pace — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().max_speed,
+            Rules::default().max_speed,
+            "no --max-speed: the matchmaker forms the Rules default pace"
         );
     }
 
