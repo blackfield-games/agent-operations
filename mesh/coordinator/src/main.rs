@@ -7995,7 +7995,10 @@ mod tests {
     /// regardless) would drop this responsive earner and red the test.
     #[tokio::test]
     async fn ws_established_idle_deadline_resets_on_inbound_frame() {
-        let idle = Duration::from_millis(200);
+        // 1s, not 200ms: the quarter-bound keepalive must keep enough slack that a test-runtime
+        // stall under `cargo test` parallelism can't deliver a frame past the reap bound and
+        // false-fail a session that is responsive by construction (the load flake this hit at 200ms).
+        let idle = Duration::from_millis(1000);
         let state = test_state_empty_idle(idle).await;
         let addr = serve_ephemeral(state.clone()).await;
         let (ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -8034,7 +8037,10 @@ mod tests {
     /// the surviving submit proves the in-flight job was never reaped.
     #[tokio::test]
     async fn ws_idle_does_not_reap_an_in_flight_heartbeating_job() {
-        let idle = Duration::from_millis(200);
+        // 1s for scheduler slack under parallel-test load (see
+        // ws_established_idle_deadline_resets_on_inbound_frame): a 200ms bound false-reaps a
+        // heartbeating session whose quarter-bound keepalive is merely scheduled late.
+        let idle = Duration::from_millis(1000);
         let state = AppState::with_store(
             Store::open_in_memory().unwrap(),
             StoreConfig { session_idle_timeout: idle, ..test_config() },
