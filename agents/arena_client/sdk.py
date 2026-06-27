@@ -479,6 +479,7 @@ def run_local_match(
     knockback_velocity: int = 0,
     wall_slide: bool = False,
     fall_damage_threshold: int = 0,
+    knockback_horizontal: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -626,7 +627,20 @@ def run_local_match(
     both rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
     byte-identical argv. It is fully inert while `fall_damage == 0` (it gates a magnitude that is off);
     on the default flat field it is observable at the argv layer alone (a behavioral soft-landing-spared
-    replay needs a coupled `gravity` + `fall_damage` + threshold, a follow-up)."""
+    replay needs a coupled `gravity` + `fall_damage` + threshold, a follow-up).
+
+    Pass `knockback_horizontal` (a non-negative `i32` planar shove, `0`..=`2**31-1`) to displace a hit
+    survivor away from the shooter: a landed damaging hit shoves the target this many position units along
+    the shooter→target octant (through the same `slide()` a walk uses, so it stops at a wall), so `0` (the
+    default) imparts no shove. The horizontal sibling of `knockback_velocity` — but UNLIKE the vertical
+    impulse it needs NO gravity (core gates the shove on `> 0` alone, so it is meaningful in a 2D match).
+    Forwarded as `--knockback-horizontal <n>` (value-flag, like `gravity`) on BOTH paths via
+    `MatchParams.rules`, only when nonzero. A negative or `> i32::MAX` value raises before any spawn (a
+    negative is inert in core's `> 0` gate — a silent no-shove footgun — and an overflow wraps, both
+    rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
+    byte-identical argv. Because it needs no gravity the shove is observable as soon as a hit lands, but
+    the default free-for-all roster + seed may not produce a clean displacement, so the pin is argv
+    reachability; a behavioral pos-shove replay is a coupled follow-up."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -669,6 +683,13 @@ def run_local_match(
         # footgun); reject both loudly here, mirroring the harness's u32-then-i32 parse_fall_damage_threshold.
         raise ValueError(
             f"fall_damage_threshold is an impact-speed gate in 0..=2**31-1 (0 = gate open); got {fall_damage_threshold}"
+        )
+    if not 0 <= knockback_horizontal <= 2**31 - 1:
+        # Core gates the planar shove on knockback_horizontal > 0, so a negative is INERT (silently no
+        # shove — the operator dialed a pull and got nothing) and a value past i32::MAX wraps; reject
+        # both loudly here, mirroring the harness's u32-then-i32 parse_knockback_horizontal fence.
+        raise ValueError(
+            f"knockback_horizontal is a planar shove in 0..=2**31-1 (0 = off); got {knockback_horizontal}"
         )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
@@ -722,6 +743,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag gate on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (gate open) adds no token — byte-identical argv.
         argv += ["--fall-damage-threshold", str(fall_damage_threshold)]
+    if knockback_horizontal:
+        # Same shape as --gravity: a value-flag shove on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (no shove) adds no token — byte-identical argv.
+        argv += ["--knockback-horizontal", str(knockback_horizontal)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
