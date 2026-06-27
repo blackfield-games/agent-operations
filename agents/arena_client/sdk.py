@@ -488,6 +488,7 @@ def run_local_match(
     damage: int | None = None,
     fire_cooldown: int | None = None,
     mag_size: int | None = None,
+    max_speed: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -738,7 +739,20 @@ def run_local_match(
     degenerate: a `0`-capacity magazine spawns a pawn with `0` ammo and every reload refills to `0`, so it can
     NEVER fire a ranged shot — so an explicit `0` must forward, never be swallowed. A non-None negative or
     `> 65535` value raises before any spawn (core takes it as a `u16`, so an out-of-range forward would wrap
-    into a capacity the caller never asked for — rejected loudly, mirroring the harness's `u16` parse)."""
+    into a capacity the caller never asked for — rejected loudly, mirroring the harness's `u16` parse).
+
+    Pass `max_speed` (a non-negative `i32` per-tick pace, `0`..=`2**31-1`) to set the max planar displacement
+    a pawn slides per tick at full move intent, in position units — higher is a faster movement pace. Like
+    `mag_size` it is a base-balance value with a NON-ZERO core default (`200` — 0.2 m/tick, ~6 m/s at 30 Hz),
+    so it uses a `None` sentinel: omit it (the default `None`) to add no token and let the harness apply its
+    own default — byte-identical argv. A value (even one equal to the core default, AND an explicit `0`)
+    forwards `--max-speed <units>` (value-flag) on BOTH paths via `MatchParams.rules`. The `0` case is
+    degenerate: a `0`-speed pawn is FROZEN in place (unable to walk, dodge, or chase), not the default pace —
+    so an explicit `0` must forward, never be swallowed. UNLIKE the `u16` knobs above
+    (`damage`/`fire_cooldown`/`mag_size`, `0`..=`65535`) this is a non-negative `i32`, so the range is
+    `0`..=`2**31-1`: a non-None negative (no movement meaning — core never walks a pawn backward by the cap)
+    or `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_max_speed`
+    fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -829,6 +843,12 @@ def run_local_match(
         # value must be in range, else an out-of-range forward would wrap into a capacity the caller never
         # asked for (65536 -> 0, an unfireable magazine) — reject loudly, mirroring the harness u16.
         raise ValueError(f"mag_size is a round count in 0..=65535 (None = harness default); got {mag_size}")
+    if max_speed is not None and not 0 <= max_speed <= 2**31 - 1:
+        # Core takes max_speed as a non-negative i32. None means "let the harness apply its default" (no
+        # token); a given value must be in range, else a negative (no movement meaning — core never walks a
+        # pawn backward by the cap) or a value past i32::MAX (which wraps negative) would forward a footgun —
+        # reject loudly, mirroring the harness's u32-then-i32 parse_max_speed fence.
+        raise ValueError(f"max_speed is a per-tick pace in 0..=2**31-1 (None = harness default); got {max_speed}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -917,6 +937,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--mag-size", str(mag_size)]
+    if max_speed is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--max-speed", str(max_speed)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
