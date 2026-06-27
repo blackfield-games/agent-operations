@@ -489,6 +489,7 @@ def run_local_match(
     fire_cooldown: int | None = None,
     mag_size: int | None = None,
     max_speed: int | None = None,
+    perception_range: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -752,6 +753,19 @@ def run_local_match(
     (`damage`/`fire_cooldown`/`mag_size`, `0`..=`65535`) this is a non-negative `i32`, so the range is
     `0`..=`2**31-1`: a non-None negative (no movement meaning — core never walks a pawn backward by the cap)
     or `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_max_speed`
+    fence.
+
+    Pass `perception_range` (a non-negative `i32` sightline radius, `0`..=`2**31-1`) to set how far a seat
+    perceives another entity, in position units — an entity is observed only if it lies within this radius of
+    the eye (then further gated by the forward FOV cone), so a shorter range is less battlefield awareness.
+    Like `max_speed` it is a non-negative `i32` base-balance value with a NON-ZERO core default
+    (`40 * POSITION_SCALE`, 40 m), so it uses a `None` sentinel: omit it (the default `None`) to add no token
+    and let the harness apply its own default — byte-identical argv. A value (even one equal to the core
+    default, AND an explicit `0`) forwards `--perception-range <units>` (value-flag) on BOTH paths via
+    `MatchParams.rules`. The `0` case is degenerate: a `0`-range seat is BLIND — it perceives no entity at any
+    distance — not the default sightline, so an explicit `0` must forward, never be swallowed. The range is
+    `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None negative (meaningless for a radius) or
+    `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_perception_range`
     fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
@@ -849,6 +863,14 @@ def run_local_match(
         # pawn backward by the cap) or a value past i32::MAX (which wraps negative) would forward a footgun —
         # reject loudly, mirroring the harness's u32-then-i32 parse_max_speed fence.
         raise ValueError(f"max_speed is a per-tick pace in 0..=2**31-1 (None = harness default); got {max_speed}")
+    if perception_range is not None and not 0 <= perception_range <= 2**31 - 1:
+        # Core takes perception_range as a non-negative i32. None means "let the harness apply its default"
+        # (no token); a given value must be in range, else a negative (meaningless for a radius — perceives
+        # nothing) or a value past i32::MAX (which wraps negative) would forward a footgun — reject loudly,
+        # mirroring the harness's u32-then-i32 parse_perception_range fence.
+        raise ValueError(
+            f"perception_range is a sightline radius in 0..=2**31-1 (None = harness default); got {perception_range}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -941,6 +963,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--max-speed", str(max_speed)]
+    if perception_range is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--perception-range", str(perception_range)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
