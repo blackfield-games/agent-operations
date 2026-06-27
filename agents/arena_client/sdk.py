@@ -477,6 +477,7 @@ def run_local_match(
     vertical_hit_tolerance: int = 0,
     fall_damage: int = 0,
     knockback_velocity: int = 0,
+    wall_slide: bool = False,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -604,7 +605,15 @@ def run_local_match(
     rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
     byte-identical argv. Like `fall_damage` it is a `gravity` companion: the impulse is suppressed
     while `gravity == 0`, so on the default flat field it is observable at the argv layer alone (a
-    behavioral knockback replay is a coupled follow-up)."""
+    behavioral knockback replay is a coupled follow-up).
+
+    Set `wall_slide=True` to slide a grazing move along a blocker instead of dead-stopping
+    (`Rules.wall_slide`): a diagonal step whose full path a blocker refuses retries each axis and keeps
+    the component that clears, so the pawn slides along the surface. Like `friendly_fire` this is a BARE
+    presence flag (`--wall-slide`, no value) carried through BOTH paths via `MatchParams.rules`. Default
+    `False` adds no token — byte-identical argv. The effect needs a blocker to graze: the default empty
+    arena has none, so pass an `arena` with cover (e.g. `"reference"`) for `wall_slide` to diverge
+    movement — its reachability is the contract here, a behavioral slide replay is a coupled follow-up."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -684,6 +693,11 @@ def run_local_match(
         # Same shape as --gravity: a value-flag impulse on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (no impulse) adds no token — byte-identical argv.
         argv += ["--knockback-velocity", str(knockback_velocity)]
+    if wall_slide:
+        # A BARE presence flag (no value, like --friendly-fire): slide a grazing move along a blocker
+        # on both paths (the matchmaker carries it via MatchParams.rules). Default False adds no token —
+        # byte-identical argv. No preflight: a bool cannot be out of range.
+        argv += ["--wall-slide"]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
