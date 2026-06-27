@@ -482,6 +482,7 @@ def run_local_match(
     knockback_horizontal: int = 0,
     dash_cooldown: int = 0,
     pawn_radius: int = 0,
+    pawn_height: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -665,7 +666,18 @@ def run_local_match(
     rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
     byte-identical argv. The z-companion `pawn_height` (the vertical band a jump vaults a body over) is a
     separate knob; the pin here is argv reachability — a behavioral occupancy replay is a coupled
-    follow-up."""
+    follow-up.
+
+    Pass `pawn_height` (a non-negative `i32` body band, `0`..=`2**31-1`) to z-couple `pawn_radius`: with
+    it set, another pawn's body blocks a step only when their XY discs overlap AND their feet are within
+    `pawn_height` (each pawn a cylinder of this height), so a pawn that jumps higher than the band vaults
+    the body. `0` (the default) keeps occupancy PLANAR (elevation ignored). Forwarded as `--pawn-height
+    <n>` (value-flag, like `gravity`) on BOTH paths via `MatchParams.rules`, only when nonzero. A
+    negative or `> i32::MAX` value raises before any spawn (a negative is inert in core's `> 0` gate —
+    silently planar — and an overflow wraps, both rejected loudly, mirroring the harness's
+    `u32`-then-`i32` parse). Default `0` adds no token — byte-identical argv. Only meaningful with
+    `pawn_radius > 0` (no occupancy otherwise) AND `gravity > 0` (the sole source of any non-zero `z`),
+    so the pin is argv reachability — a behavioral vault replay is a coupled follow-up."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -726,6 +738,11 @@ def run_local_match(
         # collision — the operator dialed a body and got a ghost) and a value past i32::MAX wraps; reject
         # both loudly here, mirroring the harness's u32-then-i32 parse_pawn_radius fence.
         raise ValueError(f"pawn_radius is an occupancy radius in 0..=2**31-1 (0 = off); got {pawn_radius}")
+    if not 0 <= pawn_height <= 2**31 - 1:
+        # Core gates the z-band on pawn_height > 0, so a negative reads as off (planar occupancy) and a
+        # value past i32::MAX wraps the band negative (also off) — reject both loudly here, mirroring the
+        # harness's u32-then-i32 parse_pawn_height fence.
+        raise ValueError(f"pawn_height is an occupancy band in 0..=2**31-1 (0 = planar); got {pawn_height}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -790,6 +807,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag radius on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (occupancy off) adds no token — byte-identical argv.
         argv += ["--pawn-radius", str(pawn_radius)]
+    if pawn_height:
+        # Same shape as --gravity: a value-flag band on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (planar occupancy) adds no token — byte-identical argv.
+        argv += ["--pawn-height", str(pawn_height)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
