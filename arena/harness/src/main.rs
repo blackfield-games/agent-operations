@@ -150,6 +150,15 @@ struct Args {
     /// [`MatchParams::rules`]. The companion `fall_damage_threshold` (the speed gate) is a
     /// separate knob.
     fall_damage: u16,
+    /// Upward `z` impulse (`Rules::knockback_velocity`) a landed damaging hit imparts to the
+    /// SURVIVING target — the variable-fall-height source. `0` (the default) imparts no impulse,
+    /// byte-identical to the pre-flag harness (and the replay digest). A non-negative `i32` set by
+    /// `--knockback-velocity` — a negative is rejected at parse (it would launch the target DOWNWARD
+    /// into the floor, an inert footgun). Like `gravity` it bites only with `gravity > 0` (the sole
+    /// source of any non-zero `z`); with gravity off the impulse is suppressed. Applies to BOTH the
+    /// direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`]. The companion
+    /// `knockback_horizontal` (the planar shove, no gravity needed) is a separate knob.
+    knockback_velocity: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -213,6 +222,17 @@ fn parse_vertical_hit_tolerance(value: &str) -> i32 {
     i32::try_from(band).expect("--vertical-hit-tolerance exceeds the i32 range")
 }
 
+/// Parse a `--knockback-velocity` value to the non-negative upward `z` impulse [`Rules::knockback_velocity`]
+/// carries, the same u32-then-i32 fence as [`parse_gravity`]: a negative would launch the hit target
+/// DOWNWARD into the floor and a value past `i32::MAX` would wrap the impulse, so both abort before
+/// any spawn.
+fn parse_knockback_velocity(value: &str) -> i32 {
+    let impulse: u32 = value
+        .parse()
+        .expect("--knockback-velocity is a non-negative integer (upward impulse)");
+    i32::try_from(impulse).expect("--knockback-velocity exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -252,6 +272,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut weapon_mode = WeaponMode::Hitscan;
     let mut vertical_hit_tolerance: i32 = 0;
     let mut fall_damage: u16 = 0;
+    let mut knockback_velocity: i32 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -299,6 +320,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("fall-damage is a u16 (hp)")
             }
+            "--knockback-velocity" => {
+                knockback_velocity =
+                    parse_knockback_velocity(&it.next().expect("--knockback-velocity needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -320,6 +345,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         weapon_mode,
         vertical_hit_tolerance,
         fall_damage,
+        knockback_velocity,
     }
 }
 
@@ -1068,6 +1094,7 @@ fn rules_from(args: &Args) -> Rules {
         weapon_mode: args.weapon_mode,
         vertical_hit_tolerance: args.vertical_hit_tolerance,
         fall_damage: args.fall_damage,
+        knockback_velocity: args.knockback_velocity,
         ..Rules::default()
     }
 }
@@ -1826,6 +1853,7 @@ mod tests {
             weapon_mode: WeaponMode::Hitscan,
             vertical_hit_tolerance: 0,
             fall_damage: 0,
+            knockback_velocity: 0,
         }
     }
 
@@ -1892,6 +1920,7 @@ mod tests {
             weapon_mode: WeaponMode::Hitscan,
             vertical_hit_tolerance: 0,
             fall_damage: 0,
+            knockback_velocity: 0,
         }
     }
 
