@@ -233,6 +233,15 @@ struct Args {
     /// configured — but `max_shield` is a real `Rules` determinant folded into the digest, so the pin is
     /// reachability.
     max_shield: u16,
+    /// Starting (and max) health (`Rules::start_health`): the HP every pawn spawns with and reloads/heals
+    /// cap toward. Set by `--start-health`; UNLIKE the feature-toggle knobs above (which default `0` =
+    /// off) this is a base-balance value, so its default is `Rules::default().start_health` (100) — an
+    /// absent flag is byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT
+    /// health, NOT at `0` (a `0`-health pawn spawns already-downed). A `u16` (the parse is the fence:
+    /// a negative or `> 65535` aborts). Applies to BOTH the direct and `--mode` paths through
+    /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same health
+    /// pool a hand-seated one does. Lower health ⇒ a faster time-to-kill (fewer shots down a pawn).
+    start_health: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -398,6 +407,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut pawn_radius: i32 = 0;
     let mut pawn_height: i32 = 0;
     let mut max_shield: u16 = 0;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 here would spawn
+    // every pawn already-downed, NOT reproduce the pre-flag harness.
+    let mut start_health: u16 = Rules::default().start_health;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -479,6 +491,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("max-shield is a u16 (shield cap)")
             }
+            "--start-health" => {
+                start_health = it
+                    .next()
+                    .expect("--start-health needs a value")
+                    .parse()
+                    .expect("start-health is a u16 (hp)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -508,6 +527,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         pawn_radius,
         pawn_height,
         max_shield,
+        start_health,
     }
 }
 
@@ -1264,6 +1284,7 @@ fn rules_from(args: &Args) -> Rules {
         pawn_radius: args.pawn_radius,
         pawn_height: args.pawn_height,
         max_shield: args.max_shield,
+        start_health: args.start_health,
         ..Rules::default()
     }
 }
@@ -2030,6 +2051,7 @@ mod tests {
             pawn_radius: 0,
             pawn_height: 0,
             max_shield: 0,
+            start_health: Rules::default().start_health,
         }
     }
 
@@ -2104,6 +2126,7 @@ mod tests {
             pawn_radius: 0,
             pawn_height: 0,
             max_shield: 0,
+            start_health: Rules::default().start_health,
         }
     }
 
