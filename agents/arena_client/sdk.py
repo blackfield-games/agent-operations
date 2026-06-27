@@ -475,6 +475,7 @@ def run_local_match(
     gravity: int = 0,
     weapon_mode: str = "hitscan",
     vertical_hit_tolerance: int = 0,
+    fall_damage: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -580,7 +581,18 @@ def run_local_match(
     silent footgun — so they are rejected loudly, mirroring the harness fence). Default `0` adds no
     token — byte-identical argv. It is the combat companion to `gravity`: tolerance only changes a hit
     once `gravity > 0` has moved pawns in `z`, so on the default flat field it is observable at the
-    argv layer alone (a gravity+tolerance replay divergence is a coupled follow-up)."""
+    argv layer alone (a gravity+tolerance replay divergence is a coupled follow-up).
+
+    Pass `fall_damage` (a `u16` HP magnitude, `0`..=`65535`) to punish a hard landing: a falling pawn
+    whose downward impact speed exceeds the core `fall_damage_threshold` takes this much damage on
+    landing, so `0` (the default) keeps every landing safe. Forwarded as `--fall-damage <hp>`
+    (value-flag, like `gravity`) on BOTH paths via `MatchParams.rules`, only when nonzero. A negative
+    or `> 65535` value raises before any spawn (core takes it as a `u16`, so an out-of-range forward
+    would wrap into a magnitude the caller never asked for — rejected loudly, mirroring the harness's
+    `u16` parse). Default `0` adds no token — byte-identical argv. Like `vertical_hit_tolerance` it is
+    a `gravity` companion: damage only fires once `gravity > 0` drops pawns and a landing clears the
+    threshold, so on the default flat field it is observable at the argv layer alone (a behavioral
+    landing-damage replay is a coupled follow-up)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -605,6 +617,11 @@ def run_local_match(
         raise ValueError(
             f"vertical_hit_tolerance is an elevation band in 0..=2**31-1 (0 = off); got {vertical_hit_tolerance}"
         )
+    if not 0 <= fall_damage <= 65535:
+        # Core takes fall_damage as a u16, so a negative is meaningless and a value past 65535 would
+        # wrap into a magnitude the caller never asked for (e.g. 65536 -> 0, every landing safe) —
+        # reject both loudly here, mirroring the harness's u16 --fall-damage parse.
+        raise ValueError(f"fall_damage is a landing magnitude in 0..=65535 (0 = safe); got {fall_damage}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -640,6 +657,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag band on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (combat planar) adds no token — byte-identical argv.
         argv += ["--vertical-hit-tolerance", str(vertical_hit_tolerance)]
+    if fall_damage:
+        # Same shape as --gravity: a value-flag magnitude on both paths (the matchmaker carries it
+        # via MatchParams.rules). Default 0 (safe landings) adds no token — byte-identical argv.
+        argv += ["--fall-damage", str(fall_damage)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
