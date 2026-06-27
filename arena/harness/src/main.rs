@@ -170,6 +170,16 @@ struct Args {
     /// empty default arena has none to graze, so the rule is dark until a `--map` with cover is
     /// configured — but `wall_slide` is a real `Rules` determinant folded into the digest.
     wall_slide: bool,
+    /// Impact-speed gate (`Rules::fall_damage_threshold`) a landing must EXCEED to take `fall_damage`:
+    /// a landing wounds only when its downward impact speed `> fall_damage_threshold`, so this is the
+    /// speed companion to the `fall_damage` magnitude — it decides WHICH landings are "hard". `0` (the
+    /// default) gates nothing — every landing with any downward impact takes the full `fall_damage`,
+    /// byte-identical to the pre-flag harness (and the replay digest); it is fully inert while
+    /// `fall_damage == 0`. A non-negative `i32` set by `--fall-damage-threshold` — a negative is
+    /// rejected at parse (core compares `impact > threshold`, so a negative would make EVERY landing
+    /// wound, the inverse of raising the bar). Applies to BOTH the direct and `--mode` paths through
+    /// [`rules_from`] via [`MatchParams::rules`].
+    fall_damage_threshold: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -244,6 +254,17 @@ fn parse_knockback_velocity(value: &str) -> i32 {
     i32::try_from(impulse).expect("--knockback-velocity exceeds the i32 range")
 }
 
+/// Parse a `--fall-damage-threshold` value to the non-negative impact-speed gate
+/// [`Rules::fall_damage_threshold`] carries, the same u32-then-i32 fence as [`parse_gravity`]: core
+/// compares `impact > threshold`, so a negative threshold would make EVERY landing wound (the inverse
+/// of raising the bar) and a value past `i32::MAX` would wrap the gate — both abort before any spawn.
+fn parse_fall_damage_threshold(value: &str) -> i32 {
+    let gate: u32 = value
+        .parse()
+        .expect("--fall-damage-threshold is a non-negative integer (impact-speed gate)");
+    i32::try_from(gate).expect("--fall-damage-threshold exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -285,6 +306,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut fall_damage: u16 = 0;
     let mut knockback_velocity: i32 = 0;
     let mut wall_slide = false;
+    let mut fall_damage_threshold: i32 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -337,6 +359,11 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     parse_knockback_velocity(&it.next().expect("--knockback-velocity needs a value"))
             }
             "--wall-slide" => wall_slide = true,
+            "--fall-damage-threshold" => {
+                fall_damage_threshold = parse_fall_damage_threshold(
+                    &it.next().expect("--fall-damage-threshold needs a value"),
+                )
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -360,6 +387,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         fall_damage,
         knockback_velocity,
         wall_slide,
+        fall_damage_threshold,
     }
 }
 
@@ -1110,6 +1138,7 @@ fn rules_from(args: &Args) -> Rules {
         fall_damage: args.fall_damage,
         knockback_velocity: args.knockback_velocity,
         wall_slide: args.wall_slide,
+        fall_damage_threshold: args.fall_damage_threshold,
         ..Rules::default()
     }
 }
@@ -1870,6 +1899,7 @@ mod tests {
             fall_damage: 0,
             knockback_velocity: 0,
             wall_slide: false,
+            fall_damage_threshold: 0,
         }
     }
 
@@ -1938,6 +1968,7 @@ mod tests {
             fall_damage: 0,
             knockback_velocity: 0,
             wall_slide: false,
+            fall_damage_threshold: 0,
         }
     }
 
