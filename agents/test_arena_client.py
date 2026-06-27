@@ -2315,6 +2315,61 @@ def test_run_local_match_rejects_an_out_of_range_pawn_height():
             run_local_match("/no/such/harness", [0, 1], policies, pawn_height=bad)
 
 
+def test_run_local_match_forwards_max_shield_and_omits_it_at_the_default(monkeypatch):
+    # max_shield>0 forwards --max-shield <cap> as one value token, mode-independently (before the mode
+    # block, like --gravity); the default 0 (shield off) adds no flag — byte-identical argv. Captured
+    # without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--max-shield" not in captured["argv"], "the default 0 adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, max_shield=50)
+    argv = captured["argv"]
+    assert argv[argv.index("--max-shield") + 1] == "50"
+
+    # Explicit 0 is the default — it must NOT forward (byte-identical argv to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, max_shield=0)
+    assert "--max-shield" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, max_shield=50)
+    argv = captured["argv"]
+    assert argv[argv.index("--max-shield") + 1] == "50"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_max_shield():
+    # max_shield is a u16 in core (0..=65535); a negative or an overflow forwarded blindly would wrap
+    # into a cap the caller never asked for (65536 -> 0, which ALSO reads as "shield off") and abort the
+    # harness, so it raises before any spawn, mirroring the harness's u16 --max-shield parse. A bogus
+    # harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -50, 65536, 2**20):
+        with pytest.raises(ValueError, match="max_shield"):
+            run_local_match("/no/such/harness", [0, 1], policies, max_shield=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
