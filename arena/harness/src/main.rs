@@ -2553,6 +2553,68 @@ mod tests {
     }
 
     #[test]
+    fn direct_match_threads_wall_slide_into_rules() {
+        // FM1 (default drift): no --wall-slide leaves wall_slide false — a grazing move dead-stops at
+        // its origin, byte-identical to the pre-flag harness (and its replay digest). The slide-along
+        // BEHAVIOR (a blocked diagonal projects onto the surface and slides) is arena-core's own test;
+        // here we pin the wiring via the rules() accessor.
+        assert!(
+            !build_direct_match(&direct_args(2, "", 0), 2).rules().wall_slide,
+            "no --wall-slide stops a grazing move (byte-identical to the pre-flag harness)"
+        );
+        assert!(
+            build_direct_match(&Args { wall_slide: true, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .wall_slide,
+            "--wall-slide threads slide-along-a-blocker into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_wall_slide_into_a_matchmade_match() {
+        // FM3 (path skew): --wall-slide must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under it —
+        // proven by forming a 2-seat Human match and reading rules() back (the same accessor the
+        // direct twin uses, so matchmade and hand-seated agree on the movement rule).
+        let mm = build_matchmaker(&Args { wall_slide: true, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert!(
+            formed.rules().wall_slide,
+            "the matchmaker forms under --wall-slide (matchmade == hand-seated)"
+        );
+
+        // No flag still dead-stops a grazing move — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert!(!off.rules().wall_slide, "no --wall-slide: the matchmaker stops a grazing move");
+    }
+
+    #[test]
+    fn wall_slide_flag_consumes_no_following_token() {
+        // FM2 (flag-with-value confusion): --wall-slide is a PRESENCE flag — it flips the bool WITHOUT
+        // swallowing the next token. If the arm wrongly called it.next(), it would eat the following
+        // --seats and that token's "3" would abort as an unknown argument. Pin that a --wall-slide
+        // IMMEDIATELY before --seats 3 parses BOTH: the flag on, seats == 3.
+        let parsed = parse_args_from(["--wall-slide", "--seats", "3"].into_iter().map(String::from));
+        assert!(parsed.wall_slide, "--wall-slide flips the flag");
+        assert_eq!(parsed.seats, 3, "--wall-slide consumed no token, so --seats 3 still parsed");
+
+        // Absent, the parse loop defaults it off (the parse-level twin of the threading FM1).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert!(!none.wall_slide, "no --wall-slide defaults off");
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
