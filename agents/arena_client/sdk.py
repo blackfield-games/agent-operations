@@ -485,6 +485,7 @@ def run_local_match(
     pawn_height: int = 0,
     max_shield: int = 0,
     start_health: int | None = None,
+    damage: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -700,7 +701,18 @@ def run_local_match(
     via `MatchParams.rules`. The sentinel avoids hardcoding the Rust default in Python (the harness owns
     it). A non-None negative or `> 65535` value raises before any spawn (core takes it as a `u16`, so an
     out-of-range forward would wrap into a pool the caller never asked for — e.g. `65536 -> 0`, an
-    already-downed spawn — rejected loudly, mirroring the harness's `u16` parse)."""
+    already-downed spawn — rejected loudly, mirroring the harness's `u16` parse).
+
+    Pass `damage` (a `u16` per-shot HP, `0`..=`65535`) to set the health one landed shot subtracts — lower
+    damage is a slower time-to-kill (more shots to down a pawn). The companion to `start_health` (the two
+    set a match's time-to-kill: this the HP a shot lands, that the HP pool it lands into). Like
+    `start_health` it is a base-balance value with a NON-ZERO core default, so it uses a `None` sentinel:
+    omit it (the default `None`) to add no token and let the harness apply its own default — byte-identical
+    argv. A value (even one equal to the core default, AND an explicit `0`) forwards `--damage <hp>`
+    (value-flag) on BOTH paths via `MatchParams.rules`. A non-None negative or `> 65535` value raises before
+    any spawn (core takes it as a `u16`, so an out-of-range forward would wrap into a per-shot HP the caller
+    never asked for — e.g. `65536 -> 0`, a shot that can never down a pawn — rejected loudly, mirroring the
+    harness's `u16` parse)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -776,6 +788,11 @@ def run_local_match(
         # given value must be in range, else an out-of-range forward would wrap into a pool the caller
         # never asked for (65536 -> 0, an already-downed spawn) — reject loudly, mirroring the harness u16.
         raise ValueError(f"start_health is an HP pool in 0..=65535 (None = harness default); got {start_health}")
+    if damage is not None and not 0 <= damage <= 65535:
+        # Core takes damage as a u16. None means "let the harness apply its default" (no token); a given
+        # value must be in range, else an out-of-range forward would wrap into a per-shot HP the caller never
+        # asked for (65536 -> 0, a shot that can never down a pawn) — reject loudly, mirroring the harness u16.
+        raise ValueError(f"damage is per-shot HP in 0..=65535 (None = harness default); got {damage}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -852,6 +869,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--start-health", str(start_health)]
+    if damage is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--damage", str(damage)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
