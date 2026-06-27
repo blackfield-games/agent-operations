@@ -190,6 +190,16 @@ struct Args {
     /// is rejected at parse (core's `> 0` gate makes it inert, a silent footgun). Applies to BOTH the
     /// direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`].
     knockback_horizontal: i32,
+    /// Dash rate-gate + on/off switch (`Rules::dash_cooldown`): the ticks that must elapse between
+    /// `ability`-button dashes. `0` (the default) DISABLES the dash entirely — an ability press is
+    /// inert, byte-identical to the pre-flag harness (and the replay digest). A positive `u16` set by
+    /// `--dash-cooldown` turns it on: a grounded ability press with a move direction bursts the pawn the
+    /// fixed `DASH_DISTANCE` along `move_dir` (bounds- and blocker-clamped like a step), then this many
+    /// ticks must pass before the next dash. Applies to BOTH the direct and `--mode` paths through
+    /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same dash
+    /// cadence a hand-seated one does. The burst DISTANCE is a fixed core constant, not a flag — this
+    /// cadence is the only dash tuning the digest binds.
+    dash_cooldown: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -329,6 +339,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut wall_slide = false;
     let mut fall_damage_threshold: i32 = 0;
     let mut knockback_horizontal: i32 = 0;
+    let mut dash_cooldown: u16 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -390,6 +401,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                 knockback_horizontal =
                     parse_knockback_horizontal(&it.next().expect("--knockback-horizontal needs a value"))
             }
+            "--dash-cooldown" => {
+                dash_cooldown = it
+                    .next()
+                    .expect("--dash-cooldown needs a value")
+                    .parse()
+                    .expect("dash-cooldown is a u16 (ticks)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -415,6 +433,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         wall_slide,
         fall_damage_threshold,
         knockback_horizontal,
+        dash_cooldown,
     }
 }
 
@@ -1167,6 +1186,7 @@ fn rules_from(args: &Args) -> Rules {
         wall_slide: args.wall_slide,
         fall_damage_threshold: args.fall_damage_threshold,
         knockback_horizontal: args.knockback_horizontal,
+        dash_cooldown: args.dash_cooldown,
         ..Rules::default()
     }
 }
@@ -1929,6 +1949,7 @@ mod tests {
             wall_slide: false,
             fall_damage_threshold: 0,
             knockback_horizontal: 0,
+            dash_cooldown: 0,
         }
     }
 
@@ -1999,6 +2020,7 @@ mod tests {
             wall_slide: false,
             fall_damage_threshold: 0,
             knockback_horizontal: 0,
+            dash_cooldown: 0,
         }
     }
 
