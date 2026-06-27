@@ -2043,6 +2043,63 @@ def test_run_local_match_rejects_an_out_of_range_fall_damage_threshold():
             run_local_match("/no/such/harness", [0, 1], policies, fall_damage_threshold=bad)
 
 
+def test_run_local_match_forwards_knockback_horizontal_and_omits_it_at_the_default(monkeypatch):
+    # knockback_horizontal>0 forwards --knockback-horizontal <n> as one value token, mode-independently
+    # (before the mode block, like --gravity); the default 0 (no shove) adds no flag — byte-identical
+    # argv. Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--knockback-horizontal" not in captured["argv"], "the default 0 adds no flag"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, knockback_horizontal=200)
+    argv = captured["argv"]
+    assert argv[argv.index("--knockback-horizontal") + 1] == "200"
+
+    # Explicit 0 is the default — it must NOT forward (byte-identical argv to omitting it).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, knockback_horizontal=0)
+    assert "--knockback-horizontal" not in captured["argv"]
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match(
+            "h", [0, 1], policies, mode="agent", signing_keys=keys, knockback_horizontal=200
+        )
+    argv = captured["argv"]
+    assert argv[argv.index("--knockback-horizontal") + 1] == "200"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_knockback_horizontal():
+    # knockback_horizontal is a non-negative i32 (0..=2**31-1); a negative is inert in core's `> 0` gate
+    # (silently no shove) and an overflow wraps, so it raises before any spawn, mirroring the harness's
+    # u32-then-i32 parse_knockback_horizontal fence rather than forwarding a value the harness aborts on.
+    # A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -200, 2**31, 2**40):
+        with pytest.raises(ValueError, match="knockback_horizontal"):
+            run_local_match("/no/such/harness", [0, 1], policies, knockback_horizontal=bad)
+
+
 def test_run_local_match_forwards_wall_slide_as_one_bare_flag_and_omits_it_by_default(monkeypatch):
     # wall_slide=True forwards EXACTLY one BARE --wall-slide token (no value, like --friendly-fire),
     # before the mode block so both paths get it; the default False adds no flag — byte-identical argv.
