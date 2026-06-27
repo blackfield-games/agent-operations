@@ -274,6 +274,17 @@ struct Args {
     /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same magazine a
     /// hand-seated one does. Smaller magazine ⇒ more frequent reloads (more ticks spent unable to fire).
     mag_size: u16,
+    /// Max planar displacement per tick at full move intent, in position units (`Rules::max_speed`): the
+    /// distance the sim's per-tick walk slides a pawn at full intent (`magnitude == max_speed`), so a higher
+    /// value is a faster movement pace. Set by `--max-speed`; UNLIKE the feature-toggle knobs above (which
+    /// default `0` = off) this is a base-balance value, so its default is `Rules::default().max_speed` (200 —
+    /// 0.2 m/tick, ~6 m/s at 30 Hz) — an absent flag is byte-identical to the pre-flag harness (and the replay
+    /// digest) at the DEFAULT pace, NOT at `0` (a `0`-speed pawn is frozen in place, unable to walk, dodge, or
+    /// chase). A non-negative `i32` (the u32-then-`i32` fence in [`parse_max_speed`]: a negative — which core
+    /// has no movement meaning for — or a value past `i32::MAX` aborts). Applies to BOTH the direct and
+    /// `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms
+    /// under the same movement pace a hand-seated one does.
+    max_speed: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -392,6 +403,17 @@ fn parse_pawn_height(value: &str) -> i32 {
     i32::try_from(height).expect("--pawn-height exceeds the i32 range")
 }
 
+/// Parse a `--max-speed` value to the non-negative per-tick walk magnitude [`Rules::max_speed`] carries,
+/// the same u32-then-i32 fence as [`parse_gravity`]: core slides a full-intent walk by `max_speed` position
+/// units, so a negative has no movement meaning (core never walks a pawn backward by the cap) and a value
+/// past `i32::MAX` would wrap the displacement, so both abort before any spawn.
+fn parse_max_speed(value: &str) -> i32 {
+    let magnitude: u32 = value
+        .parse()
+        .expect("--max-speed is a non-negative integer (per-tick walk magnitude)");
+    i32::try_from(magnitude).expect("--max-speed exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -451,6 +473,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-mag pawn spawns empty
     // and can never fire a ranged shot, NOT the pre-flag harness.
     let mut mag_size: u16 = Rules::default().mag_size;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-speed pawn is frozen
+    // in place (unable to walk, dodge, or chase), NOT the pre-flag harness.
+    let mut max_speed: i32 = Rules::default().max_speed;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -560,6 +585,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("mag-size is a u16 (ammo)")
             }
+            "--max-speed" => {
+                max_speed = parse_max_speed(&it.next().expect("--max-speed needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -593,6 +621,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         damage,
         fire_cooldown,
         mag_size,
+        max_speed,
     }
 }
 
@@ -1353,6 +1382,7 @@ fn rules_from(args: &Args) -> Rules {
         damage: args.damage,
         fire_cooldown: args.fire_cooldown,
         mag_size: args.mag_size,
+        max_speed: args.max_speed,
         ..Rules::default()
     }
 }
