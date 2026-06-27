@@ -2350,6 +2350,82 @@ mod tests {
     }
 
     #[test]
+    fn direct_match_threads_fall_damage_into_rules() {
+        // FM1 (default drift): no --fall-damage is 0 — every landing safe, byte-identical to the
+        // pre-flag harness (and its replay digest). The hard-landing DAMAGE behavior is arena-core's
+        // own test; here we pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().fall_damage,
+            0,
+            "no --fall-damage is 0 (every landing safe, byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { fall_damage: 25, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .fall_damage,
+            25,
+            "--fall-damage 25 threads the magnitude into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_fall_damage_into_a_matchmade_match() {
+        // FM3 (path skew): --fall-damage must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the
+        // same magnitude a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { fall_damage: 25, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().fall_damage,
+            25,
+            "the matchmaker forms under --fall-damage 25 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms fall_damage 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().fall_damage,
+            0,
+            "no --fall-damage: the matchmaker forms every landing safe"
+        );
+    }
+
+    #[test]
+    fn fall_damage_parses_as_a_u16_value_flag() {
+        // The value-flag twin of the threading tests: --fall-damage pulls exactly one token and
+        // parses it as the u16 magnitude, consuming no following flag. A --fall-damage 25 right
+        // before --seats 3 must parse BOTH (25 hp, seats 3); absent, it defaults 0.
+        let parsed =
+            parse_args_from(["--fall-damage", "25", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.fall_damage, 25, "--fall-damage 25 parses the magnitude");
+        assert_eq!(parsed.seats, 3, "--fall-damage consumed exactly one token, so --seats 3 parsed");
+
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(none.fall_damage, 0, "no --fall-damage defaults 0 (every landing safe)");
+    }
+
+    #[test]
+    #[should_panic(expected = "u16")]
+    fn fall_damage_rejects_an_overflow() {
+        // FM2 (type bound): fall_damage is a u16; a value past u16::MAX must abort at the CLI, NOT
+        // wrap into a small magnitude (65536 would wrap to 0 — silently safe landings the operator
+        // did not ask for). The u16 parse catches it; a negative aborts the same way ('-' is not a
+        // u16 digit).
+        parse_args_from(["--fall-damage", "65536"].into_iter().map(String::from));
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
