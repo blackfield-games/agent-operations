@@ -341,6 +341,18 @@ struct Args {
     /// and bounds the value), applied to BOTH the direct and `--mode` paths through [`rules_from`] via
     /// [`MatchParams::rules`], so a matchmade/ranked match swings for the same damage a hand-seated one does.
     melee_damage: u16,
+    /// Reach of a [`WeaponMode::Melee`] swing, in position units (`Rules::melee_range`): a cleave strikes EVERY
+    /// enemy whose centre is within this distance (`range2 = (melee_range as i128).pow(2)`) AND inside the frontal
+    /// arc, so a longer reach cleaves further and a shorter one demands closer contact (only read in
+    /// [`WeaponMode::Melee`]). Set by `--melee-range`; UNLIKE the feature-toggle knobs (which default `0` = off)
+    /// this is a base-balance value, so its default is `Rules::default().melee_range` (`default_melee_range()` =
+    /// 2·`POSITION_SCALE`, a 2 m reach) — an absent flag is byte-identical to the pre-flag harness (and the replay
+    /// digest) at the DEFAULT reach, NOT at `0` (a `0` reach cleaves only an enemy exactly on the shooter, a
+    /// harmless melee pawn). A non-negative `i32` (the u32-then-`i32` fence in [`parse_melee_range`]: a negative —
+    /// meaningless for a reach — or a value past `i32::MAX` aborts), applied to BOTH the direct and `--mode` paths
+    /// through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match cleaves to the same reach a
+    /// hand-seated one does.
+    melee_range: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -503,6 +515,17 @@ fn parse_hit_radius(value: &str) -> i32 {
     i32::try_from(radius).expect("--hit-radius exceeds the i32 range")
 }
 
+/// Parse a `--melee-range` value to the non-negative cleave reach [`Rules::melee_range`] carries, the same
+/// u32-then-i32 fence as [`parse_weapon_range`]: a swing strikes only enemies `within` this reach (and inside
+/// the frontal arc), so a negative reach is meaningless (it would cleave nothing) and a value past `i32::MAX`
+/// would wrap the reach, so both abort before any spawn.
+fn parse_melee_range(value: &str) -> i32 {
+    let reach: u32 = value
+        .parse()
+        .expect("--melee-range is a non-negative integer (cleave reach)");
+    i32::try_from(reach).expect("--melee-range exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -580,6 +603,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 melee_damage swing
     // never harms (a harmless melee pawn), NOT the pre-flag harness.
     let mut melee_damage: u16 = Rules::default().melee_damage;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 melee_range cleaves
+    // only an enemy exactly on the shooter (a harmless melee pawn), NOT the pre-flag harness.
+    let mut melee_range: i32 = Rules::default().melee_range;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -716,6 +742,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("melee-damage is a u16 (damage per swing)")
             }
+            "--melee-range" => {
+                melee_range = parse_melee_range(&it.next().expect("--melee-range needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -755,6 +784,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         hit_radius,
         melee_cooldown,
         melee_damage,
+        melee_range,
     }
 }
 
@@ -1521,6 +1551,7 @@ fn rules_from(args: &Args) -> Rules {
         hit_radius: args.hit_radius,
         melee_cooldown: args.melee_cooldown,
         melee_damage: args.melee_damage,
+        melee_range: args.melee_range,
         ..Rules::default()
     }
 }
@@ -2297,6 +2328,7 @@ mod tests {
             hit_radius: Rules::default().hit_radius,
             melee_cooldown: Rules::default().melee_cooldown,
             melee_damage: Rules::default().melee_damage,
+            melee_range: Rules::default().melee_range,
         }
     }
 
@@ -2381,6 +2413,7 @@ mod tests {
             hit_radius: Rules::default().hit_radius,
             melee_cooldown: Rules::default().melee_cooldown,
             melee_damage: Rules::default().melee_damage,
+            melee_range: Rules::default().melee_range,
         }
     }
 
