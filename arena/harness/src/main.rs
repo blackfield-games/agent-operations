@@ -211,6 +211,18 @@ struct Args {
     /// `--mode` paths through [`rules_from`] via [`MatchParams::rules`]. The z-companion `pawn_height`
     /// (the vertical band that lets a jump vault a body) is a separate knob.
     pawn_radius: i32,
+    /// Pawn occupancy body HEIGHT (`Rules::pawn_height`): the vertical band that z-couples
+    /// `--pawn-radius`. `0` (the default) keeps occupancy PLANAR — a pawn's elevation is ignored, a pawn
+    /// mid-jump still occupies its ground column, byte-identical to the pre-flag harness (and the replay
+    /// digest). A positive `i32` set by `--pawn-height` couples `z`: another pawn's body blocks a step
+    /// only when their XY discs overlap AND their feet are within `pawn_height` (each pawn a cylinder of
+    /// this height), so a pawn that jumps higher than the band vaults the body instead of freezing. A
+    /// negative is rejected at parse — core gates the band on `pawn_height > 0`, so a negative is INERT
+    /// and `> i32::MAX` would wrap. Applies to BOTH the direct and `--mode` paths through [`rules_from`]
+    /// via [`MatchParams::rules`]. Only meaningful with `--pawn-radius > 0` (no occupancy at all
+    /// otherwise) AND `--gravity > 0` (the sole source of any non-zero `z`); with either off the band
+    /// never changes an outcome — its reachability is the contract here.
+    pawn_height: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -318,6 +330,17 @@ fn parse_pawn_radius(value: &str) -> i32 {
     i32::try_from(radius).expect("--pawn-radius exceeds the i32 range")
 }
 
+/// Parse a `--pawn-height` value to the non-negative occupancy band [`Rules::pawn_height`] carries,
+/// the same u32-then-i32 fence as [`parse_gravity`]: core gates the z-band on `pawn_height > 0`, so a
+/// negative is INERT (silently planar occupancy) and a value past `i32::MAX` would wrap the band, so
+/// both abort before any spawn.
+fn parse_pawn_height(value: &str) -> i32 {
+    let height: u32 = value
+        .parse()
+        .expect("--pawn-height is a non-negative integer (occupancy band)");
+    i32::try_from(height).expect("--pawn-height exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -363,6 +386,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut knockback_horizontal: i32 = 0;
     let mut dash_cooldown: u16 = 0;
     let mut pawn_radius: i32 = 0;
+    let mut pawn_height: i32 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -434,6 +458,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--pawn-radius" => {
                 pawn_radius = parse_pawn_radius(&it.next().expect("--pawn-radius needs a value"))
             }
+            "--pawn-height" => {
+                pawn_height = parse_pawn_height(&it.next().expect("--pawn-height needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -461,6 +488,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         knockback_horizontal,
         dash_cooldown,
         pawn_radius,
+        pawn_height,
     }
 }
 
@@ -1215,6 +1243,7 @@ fn rules_from(args: &Args) -> Rules {
         knockback_horizontal: args.knockback_horizontal,
         dash_cooldown: args.dash_cooldown,
         pawn_radius: args.pawn_radius,
+        pawn_height: args.pawn_height,
         ..Rules::default()
     }
 }
@@ -1979,6 +2008,7 @@ mod tests {
             knockback_horizontal: 0,
             dash_cooldown: 0,
             pawn_radius: 0,
+            pawn_height: 0,
         }
     }
 
@@ -2051,6 +2081,7 @@ mod tests {
             knockback_horizontal: 0,
             dash_cooldown: 0,
             pawn_radius: 0,
+            pawn_height: 0,
         }
     }
 
