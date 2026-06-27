@@ -2307,6 +2307,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_pawn_height_maps_a_non_negative_band() {
+        assert_eq!(parse_pawn_height("0"), 0);
+        assert_eq!(parse_pawn_height("1800"), 1800);
+        assert_eq!(
+            parse_pawn_height(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid band"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_pawn_height_rejects_a_negative() {
+        // Core gates the z-band on `pawn_height > 0`, so a negative is INERT (silently planar occupancy).
+        // Reject it loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_pawn_height("-1800");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_pawn_height_rejects_an_overflow() {
+        // A band past i32::MAX must abort, NOT wrap into a negative (which core would then read as
+        // planar). 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_pawn_height("3000000000");
+    }
+
+    #[test]
     fn parse_weapon_mode_maps_each_name() {
         assert_eq!(parse_weapon_mode("hitscan"), WeaponMode::Hitscan);
         assert_eq!(parse_weapon_mode("projectile"), WeaponMode::Projectile);
@@ -3074,6 +3101,58 @@ mod tests {
             off.rules().pawn_radius,
             0,
             "no --pawn-radius: the matchmaker forms disabled occupancy"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_pawn_height_into_rules() {
+        // FM1 (default drift): no --pawn-height is 0 — occupancy is planar (z ignored), byte-identical to
+        // the pre-flag harness (and its replay digest). The vault BEHAVIOR (a high-enough jump clears a
+        // body band) is arena-core's own test; here we pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().pawn_height,
+            0,
+            "no --pawn-height is 0 (planar occupancy, byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { pawn_height: 1800, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .pawn_height,
+            1800,
+            "--pawn-height 1800 threads the occupancy band into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_pawn_height_into_a_matchmade_match() {
+        // FM3 (path skew): --pawn-height must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same
+        // occupancy band a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { pawn_height: 1800, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().pawn_height,
+            1800,
+            "the matchmaker forms under --pawn-height 1800 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms pawn_height 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().pawn_height,
+            0,
+            "no --pawn-height: the matchmaker forms planar occupancy"
         );
     }
 
