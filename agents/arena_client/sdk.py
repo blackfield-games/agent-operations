@@ -478,6 +478,7 @@ def run_local_match(
     fall_damage: int = 0,
     knockback_velocity: int = 0,
     wall_slide: bool = False,
+    fall_damage_threshold: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -613,7 +614,19 @@ def run_local_match(
     presence flag (`--wall-slide`, no value) carried through BOTH paths via `MatchParams.rules`. Default
     `False` adds no token — byte-identical argv. The effect needs a blocker to graze: the default empty
     arena has none, so pass an `arena` with cover (e.g. `"reference"`) for `wall_slide` to diverge
-    movement — its reachability is the contract here, a behavioral slide replay is a coupled follow-up."""
+    movement — its reachability is the contract here, a behavioral slide replay is a coupled follow-up.
+
+    Pass `fall_damage_threshold` (a non-negative `i32` impact-speed gate, `0`..=`2**31-1`) to raise the
+    bar a landing must clear to take `fall_damage`: core wounds a landing only when its downward impact
+    speed EXCEEDS this gate, so `0` (the default) gates nothing — every impact>0 landing takes the full
+    `fall_damage`. The impact-speed companion to the `fall_damage` magnitude. Forwarded as
+    `--fall-damage-threshold <n>` (value-flag, like `gravity`) on BOTH paths via `MatchParams.rules`,
+    only when nonzero. A negative or `> i32::MAX` value raises before any spawn (a negative makes core's
+    `impact > threshold` true for EVERY landing — the inverse of raising the bar — and an overflow wraps,
+    both rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
+    byte-identical argv. It is fully inert while `fall_damage == 0` (it gates a magnitude that is off);
+    on the default flat field it is observable at the argv layer alone (a behavioral soft-landing-spared
+    replay needs a coupled `gravity` + `fall_damage` + threshold, a follow-up)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -649,6 +662,13 @@ def run_local_match(
         # reject both loudly here, mirroring the harness's u32-then-i32 parse_knockback_velocity fence.
         raise ValueError(
             f"knockback_velocity is an upward impulse in 0..=2**31-1 (0 = off); got {knockback_velocity}"
+        )
+    if not 0 <= fall_damage_threshold <= 2**31 - 1:
+        # Core compares `impact > threshold`, so a negative gate makes EVERY landing (impact > 0) wound
+        # — the inverse of raising the bar — and a value past i32::MAX wraps the gate negative (same
+        # footgun); reject both loudly here, mirroring the harness's u32-then-i32 parse_fall_damage_threshold.
+        raise ValueError(
+            f"fall_damage_threshold is an impact-speed gate in 0..=2**31-1 (0 = gate open); got {fall_damage_threshold}"
         )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
@@ -698,6 +718,10 @@ def run_local_match(
         # on both paths (the matchmaker carries it via MatchParams.rules). Default False adds no token —
         # byte-identical argv. No preflight: a bool cannot be out of range.
         argv += ["--wall-slide"]
+    if fall_damage_threshold:
+        # Same shape as --gravity: a value-flag gate on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (gate open) adds no token — byte-identical argv.
+        argv += ["--fall-damage-threshold", str(fall_damage_threshold)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
