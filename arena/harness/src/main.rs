@@ -2110,6 +2110,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_fall_damage_threshold_maps_a_non_negative_gate() {
+        assert_eq!(parse_fall_damage_threshold("0"), 0);
+        assert_eq!(parse_fall_damage_threshold("3000"), 3000);
+        assert_eq!(
+            parse_fall_damage_threshold(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid gate"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_fall_damage_threshold_rejects_a_negative() {
+        // Core compares `impact > threshold`, so a negative gate would make EVERY landing (impact > 0)
+        // wound — the inverse of raising the bar. Reject it loudly at the CLI; the u32 parse fails the
+        // leading '-'.
+        parse_fall_damage_threshold("-3000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_fall_damage_threshold_rejects_an_overflow() {
+        // A gate past i32::MAX must abort, NOT wrap into a negative (which would then wound every
+        // landing). 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_fall_damage_threshold("3000000000");
+    }
+
+    #[test]
     fn parse_weapon_mode_maps_each_name() {
         assert_eq!(parse_weapon_mode("hitscan"), WeaponMode::Hitscan);
         assert_eq!(parse_weapon_mode("projectile"), WeaponMode::Projectile);
@@ -2580,6 +2608,59 @@ mod tests {
             off.rules().knockback_velocity,
             0,
             "no --knockback-velocity: the matchmaker forms no impulse"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_fall_damage_threshold_into_rules() {
+        // FM1 (default drift): no --fall-damage-threshold is 0 — the gate is wide open (every impact>0
+        // landing takes the full fall_damage once that is on), byte-identical to the pre-flag harness
+        // (and its replay digest). The soft-landing-spared BEHAVIOR is arena-core's own test; here we
+        // pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().fall_damage_threshold,
+            0,
+            "no --fall-damage-threshold is 0 (gate wide open, byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { fall_damage_threshold: 3000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .fall_damage_threshold,
+            3000,
+            "--fall-damage-threshold 3000 threads the gate into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_fall_damage_threshold_into_a_matchmade_match() {
+        // FM3 (path skew): --fall-damage-threshold must reach the --mode path too, not just the direct
+        // one. build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the
+        // same gate a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { fall_damage_threshold: 3000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().fall_damage_threshold,
+            3000,
+            "the matchmaker forms under --fall-damage-threshold 3000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms fall_damage_threshold 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().fall_damage_threshold,
+            0,
+            "no --fall-damage-threshold: the matchmaker forms the gate wide open"
         );
     }
 
