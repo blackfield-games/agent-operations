@@ -481,6 +481,7 @@ def run_local_match(
     fall_damage_threshold: int = 0,
     knockback_horizontal: int = 0,
     dash_cooldown: int = 0,
+    pawn_radius: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -652,7 +653,19 @@ def run_local_match(
     cadence the caller never asked for — and `65536 -> 0` reads as "dash off", doubly wrong — rejected
     loudly, mirroring the harness's `u16` parse). Default `0` adds no token — byte-identical argv. The
     burst DISTANCE is a fixed core constant, not a knob; this cadence is the only dash tuning the digest
-    binds, so the pin is argv reachability — a behavioral dash replay is a coupled follow-up."""
+    binds, so the pin is argv reachability — a behavioral dash replay is a coupled follow-up.
+
+    Pass `pawn_radius` (a non-negative `i32` occupancy radius, `0`..=`2**31-1`) to make pawns physical
+    obstacles to one another: a step whose swept path would bring the mover's centre within this distance
+    of another alive pawn is refused (the mover holds at the step origin), gating the walk, the dash
+    burst, AND a `knockback_horizontal` shove alike, so `0` (the default) disables occupancy (pawns may
+    overlap). Forwarded as `--pawn-radius <n>` (value-flag, like `gravity`) on BOTH paths via
+    `MatchParams.rules`, only when nonzero. A negative or `> i32::MAX` value raises before any spawn (a
+    negative is inert in core's `> 0` gate — a silent no-collision footgun — and an overflow wraps, both
+    rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
+    byte-identical argv. The z-companion `pawn_height` (the vertical band a jump vaults a body over) is a
+    separate knob; the pin here is argv reachability — a behavioral occupancy replay is a coupled
+    follow-up."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -708,6 +721,11 @@ def run_local_match(
         # wrap into a cadence the caller never asked for (e.g. 65536 -> 0, which ALSO reads as "dash off",
         # so the wrap is doubly wrong) — reject both loudly here, mirroring the harness's u16 parse.
         raise ValueError(f"dash_cooldown is a tick cadence in 0..=65535 (0 = off); got {dash_cooldown}")
+    if not 0 <= pawn_radius <= 2**31 - 1:
+        # Core gates pawn-vs-pawn occupancy on pawn_radius > 0, so a negative is INERT (silently no
+        # collision — the operator dialed a body and got a ghost) and a value past i32::MAX wraps; reject
+        # both loudly here, mirroring the harness's u32-then-i32 parse_pawn_radius fence.
+        raise ValueError(f"pawn_radius is an occupancy radius in 0..=2**31-1 (0 = off); got {pawn_radius}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -768,6 +786,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag cadence on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (dash off) adds no token — byte-identical argv.
         argv += ["--dash-cooldown", str(dash_cooldown)]
+    if pawn_radius:
+        # Same shape as --gravity: a value-flag radius on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (occupancy off) adds no token — byte-identical argv.
+        argv += ["--pawn-radius", str(pawn_radius)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
