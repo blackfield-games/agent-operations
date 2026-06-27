@@ -2168,6 +2168,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_knockback_horizontal_maps_a_non_negative_shove() {
+        assert_eq!(parse_knockback_horizontal("0"), 0);
+        assert_eq!(parse_knockback_horizontal("200"), 200);
+        assert_eq!(
+            parse_knockback_horizontal(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid shove"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_knockback_horizontal_rejects_a_negative() {
+        // Core gates the shove on `> 0`, so a negative is INERT (silently no shove — the operator
+        // dialed a pull and got nothing). Reject it loudly at the CLI; the u32 parse fails the
+        // leading '-'.
+        parse_knockback_horizontal("-200");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_knockback_horizontal_rejects_an_overflow() {
+        // A shove past i32::MAX must abort, NOT wrap into a negative (which core would then read as
+        // off). 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_knockback_horizontal("3000000000");
+    }
+
+    #[test]
     fn parse_weapon_mode_maps_each_name() {
         assert_eq!(parse_weapon_mode("hitscan"), WeaponMode::Hitscan);
         assert_eq!(parse_weapon_mode("projectile"), WeaponMode::Projectile);
@@ -2691,6 +2719,59 @@ mod tests {
             off.rules().fall_damage_threshold,
             0,
             "no --fall-damage-threshold: the matchmaker forms the gate wide open"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_knockback_horizontal_into_rules() {
+        // FM1 (default drift): no --knockback-horizontal is 0 — a hit imparts no planar shove (the
+        // target's pos is unchanged), byte-identical to the pre-flag harness (and its replay digest).
+        // The shove BEHAVIOR (a hit displaces the survivor along the bearing through slide()) is
+        // arena-core's own test; here we pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().knockback_horizontal,
+            0,
+            "no --knockback-horizontal is 0 (no shove, byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { knockback_horizontal: 200, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .knockback_horizontal,
+            200,
+            "--knockback-horizontal 200 threads the shove into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_knockback_horizontal_into_a_matchmade_match() {
+        // FM3 (path skew): --knockback-horizontal must reach the --mode path too, not just the direct
+        // one. build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the
+        // same shove a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { knockback_horizontal: 200, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().knockback_horizontal,
+            200,
+            "the matchmaker forms under --knockback-horizontal 200 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms knockback_horizontal 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().knockback_horizontal,
+            0,
+            "no --knockback-horizontal: the matchmaker forms no shove"
         );
     }
 
