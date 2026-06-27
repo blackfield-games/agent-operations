@@ -252,6 +252,18 @@ struct Args {
     /// damage a hand-seated one does. Lower damage ⇒ a slower time-to-kill (more shots to down a pawn). The
     /// HP-pool companion `start_health` (how many such shots a pawn survives) is a separate knob.
     damage: u16,
+    /// Ticks a pawn must wait between ranged shots (`Rules::fire_cooldown`): the rate-of-fire gate the sim
+    /// reloads after every beam/projectile (`pawn.cooldown = fire_cooldown`), so a higher value is a slower
+    /// cadence (fewer shots/sec). Set by `--fire-cooldown`; UNLIKE the feature-toggle knobs above (which
+    /// default `0` = off) this is a base-balance value, so its default is `Rules::default().fire_cooldown`
+    /// (6 — five shots/sec at 30 Hz) — an absent flag is byte-identical to the pre-flag harness (and the
+    /// replay digest) at the DEFAULT cadence, NOT at `0` (a `0`-cooldown pawn can fire EVERY tick, the
+    /// degenerate unbounded-projectile-spawn case core's per-tick-work note warns against). A `u16` (the
+    /// parse is the fence: a negative or `> 65535` aborts). Applies to BOTH the direct and `--mode` paths
+    /// through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same
+    /// fire cadence a hand-seated one does. The per-shot `damage` (how hard each of those shots lands) is a
+    /// separate knob.
+    fire_cooldown: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -423,6 +435,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-damage shot could
     // never down a pawn, NOT reproduce the pre-flag harness.
     let mut damage: u16 = Rules::default().damage;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-cooldown pawn fires
+    // every tick (the degenerate unbounded-spawn case), NOT the pre-flag harness.
+    let mut fire_cooldown: u16 = Rules::default().fire_cooldown;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -518,6 +533,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("damage is a u16 (hp)")
             }
+            "--fire-cooldown" => {
+                fire_cooldown = it
+                    .next()
+                    .expect("--fire-cooldown needs a value")
+                    .parse()
+                    .expect("fire-cooldown is a u16 (ticks)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -549,6 +571,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         max_shield,
         start_health,
         damage,
+        fire_cooldown,
     }
 }
 
@@ -1307,6 +1330,7 @@ fn rules_from(args: &Args) -> Rules {
         max_shield: args.max_shield,
         start_health: args.start_health,
         damage: args.damage,
+        fire_cooldown: args.fire_cooldown,
         ..Rules::default()
     }
 }
@@ -2075,6 +2099,7 @@ mod tests {
             max_shield: 0,
             start_health: Rules::default().start_health,
             damage: Rules::default().damage,
+            fire_cooldown: Rules::default().fire_cooldown,
         }
     }
 
@@ -2151,6 +2176,7 @@ mod tests {
             max_shield: 0,
             start_health: Rules::default().start_health,
             damage: Rules::default().damage,
+            fire_cooldown: Rules::default().fire_cooldown,
         }
     }
 
