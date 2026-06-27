@@ -285,6 +285,18 @@ struct Args {
     /// `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms
     /// under the same movement pace a hand-seated one does.
     max_speed: i32,
+    /// How far a seat perceives another entity, in position units (`Rules::perception_range`): an entity is
+    /// observed only if it lies within this radius of the eye (the sim gates perception on `within(eye,
+    /// target, perception_range)`), so a shorter range is less battlefield awareness. Set by
+    /// `--perception-range`; UNLIKE the feature-toggle knobs above (which default `0` = off) this is a
+    /// base-balance value, so its default is `Rules::default().perception_range` (40·`POSITION_SCALE`, 40 m)
+    /// — an absent flag is byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT
+    /// range, NOT at `0` (a `0`-range seat is BLIND, perceiving no entity at any distance). A non-negative
+    /// `i32` (the u32-then-`i32` fence in [`parse_perception_range`]: a negative — meaningless for a radius —
+    /// or a value past `i32::MAX` aborts). Applies to BOTH the direct and `--mode` paths through
+    /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same perception
+    /// radius a hand-seated one does.
+    perception_range: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -414,6 +426,17 @@ fn parse_max_speed(value: &str) -> i32 {
     i32::try_from(magnitude).expect("--max-speed exceeds the i32 range")
 }
 
+/// Parse a `--perception-range` value to the non-negative perception radius [`Rules::perception_range`]
+/// carries, the same u32-then-i32 fence as [`parse_gravity`]: an entity is observed only if it lies
+/// `within` this radius of the eye, so a negative radius is meaningless (it would perceive nothing) and a
+/// value past `i32::MAX` would wrap the radius, so both abort before any spawn.
+fn parse_perception_range(value: &str) -> i32 {
+    let radius: u32 = value
+        .parse()
+        .expect("--perception-range is a non-negative integer (perception radius)");
+    i32::try_from(radius).expect("--perception-range exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -476,6 +499,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-speed pawn is frozen
     // in place (unable to walk, dodge, or chase), NOT the pre-flag harness.
     let mut max_speed: i32 = Rules::default().max_speed;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-range seat is BLIND
+    // (perceives no entity at any distance), NOT the pre-flag harness.
+    let mut perception_range: i32 = Rules::default().perception_range;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -588,6 +614,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--max-speed" => {
                 max_speed = parse_max_speed(&it.next().expect("--max-speed needs a value"))
             }
+            "--perception-range" => {
+                perception_range =
+                    parse_perception_range(&it.next().expect("--perception-range needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -622,6 +652,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         fire_cooldown,
         mag_size,
         max_speed,
+        perception_range,
     }
 }
 
@@ -1383,6 +1414,7 @@ fn rules_from(args: &Args) -> Rules {
         fire_cooldown: args.fire_cooldown,
         mag_size: args.mag_size,
         max_speed: args.max_speed,
+        perception_range: args.perception_range,
         ..Rules::default()
     }
 }
