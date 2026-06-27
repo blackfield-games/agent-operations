@@ -223,6 +223,16 @@ struct Args {
     /// otherwise) AND `--gravity > 0` (the sole source of any non-zero `z`); with either off the band
     /// never changes an outcome — its reachability is the contract here.
     pawn_height: i32,
+    /// Shield pool cap (`Rules::max_shield`): the ceiling on a pawn's damage-absorbing shield, which
+    /// drains before health. `0` (the default) DISABLES shield — no pawn can hold any and a
+    /// `PickupKind::Shield` is inert, byte-identical to the pre-flag harness (and the replay digest). A
+    /// positive `u16` set by `--max-shield` turns shield pickups on: a pawn starts at `0` shield and
+    /// earns it (capped here) by collecting a Shield pickup. Applies to BOTH the direct and `--mode`
+    /// paths through [`rules_from`] via [`MatchParams::rules`]. The effect needs a Shield pickup to
+    /// collect — the default arenas spawn none, so the cap is dark until a `--map` with shield pickups is
+    /// configured — but `max_shield` is a real `Rules` determinant folded into the digest, so the pin is
+    /// reachability.
+    max_shield: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -387,6 +397,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut dash_cooldown: u16 = 0;
     let mut pawn_radius: i32 = 0;
     let mut pawn_height: i32 = 0;
+    let mut max_shield: u16 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -461,6 +472,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--pawn-height" => {
                 pawn_height = parse_pawn_height(&it.next().expect("--pawn-height needs a value"))
             }
+            "--max-shield" => {
+                max_shield = it
+                    .next()
+                    .expect("--max-shield needs a value")
+                    .parse()
+                    .expect("max-shield is a u16 (shield cap)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -489,6 +507,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         dash_cooldown,
         pawn_radius,
         pawn_height,
+        max_shield,
     }
 }
 
@@ -1244,6 +1263,7 @@ fn rules_from(args: &Args) -> Rules {
         dash_cooldown: args.dash_cooldown,
         pawn_radius: args.pawn_radius,
         pawn_height: args.pawn_height,
+        max_shield: args.max_shield,
         ..Rules::default()
     }
 }
@@ -2009,6 +2029,7 @@ mod tests {
             dash_cooldown: 0,
             pawn_radius: 0,
             pawn_height: 0,
+            max_shield: 0,
         }
     }
 
@@ -2082,6 +2103,7 @@ mod tests {
             dash_cooldown: 0,
             pawn_radius: 0,
             pawn_height: 0,
+            max_shield: 0,
         }
     }
 
