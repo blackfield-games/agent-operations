@@ -297,6 +297,18 @@ struct Args {
     /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match forms under the same perception
     /// radius a hand-seated one does.
     perception_range: i32,
+    /// How far a beam-hitscan shot reaches, in position units (`Rules::weapon_range`): the sim resolves a
+    /// hitscan hit only within this reach (`range2 = (weapon_range as i128).pow(2)`) and expires a traveling
+    /// projectile once it has flown past it, so a shorter range is closer-quarters engagements. Set by
+    /// `--weapon-range`; UNLIKE the feature-toggle knobs above (which default `0` = off) this is a
+    /// base-balance value, so its default is `Rules::default().weapon_range` (30·`POSITION_SCALE`, 30 m) — an
+    /// absent flag is byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT reach, NOT
+    /// at `0` (a `0`-range weapon reaches nothing, landing no ranged hit at any distance). A non-negative
+    /// `i32` (the u32-then-`i32` fence in [`parse_weapon_range`]: a negative — meaningless for a reach — or a
+    /// value past `i32::MAX` aborts). Applies to BOTH the direct and `--mode` paths through [`rules_from`] via
+    /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same weapon reach a hand-seated one
+    /// does.
+    weapon_range: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -437,6 +449,17 @@ fn parse_perception_range(value: &str) -> i32 {
     i32::try_from(radius).expect("--perception-range exceeds the i32 range")
 }
 
+/// Parse a `--weapon-range` value to the non-negative beam reach [`Rules::weapon_range`] carries, the same
+/// u32-then-i32 fence as [`parse_gravity`]: a hitscan shot resolves a hit only `within` this reach and a
+/// traveling projectile expires past it, so a negative reach is meaningless (it would land no hit) and a
+/// value past `i32::MAX` would wrap the reach, so both abort before any spawn.
+fn parse_weapon_range(value: &str) -> i32 {
+    let reach: u32 = value
+        .parse()
+        .expect("--weapon-range is a non-negative integer (beam reach)");
+    i32::try_from(reach).expect("--weapon-range exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -502,6 +525,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-range seat is BLIND
     // (perceives no entity at any distance), NOT the pre-flag harness.
     let mut perception_range: i32 = Rules::default().perception_range;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0-range weapon reaches
+    // nothing (lands no ranged hit at any distance), NOT the pre-flag harness.
+    let mut weapon_range: i32 = Rules::default().weapon_range;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -618,6 +644,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                 perception_range =
                     parse_perception_range(&it.next().expect("--perception-range needs a value"))
             }
+            "--weapon-range" => {
+                weapon_range = parse_weapon_range(&it.next().expect("--weapon-range needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -653,6 +682,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         mag_size,
         max_speed,
         perception_range,
+        weapon_range,
     }
 }
 
@@ -1415,6 +1445,7 @@ fn rules_from(args: &Args) -> Rules {
         mag_size: args.mag_size,
         max_speed: args.max_speed,
         perception_range: args.perception_range,
+        weapon_range: args.weapon_range,
         ..Rules::default()
     }
 }
