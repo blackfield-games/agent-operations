@@ -2034,6 +2034,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_knockback_velocity_maps_a_non_negative_impulse() {
+        assert_eq!(parse_knockback_velocity("0"), 0);
+        assert_eq!(parse_knockback_velocity("800"), 800);
+        assert_eq!(
+            parse_knockback_velocity(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid impulse"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_knockback_velocity_rejects_a_negative() {
+        // A negative impulse would launch the hit target DOWNWARD into the floor, so a forwarded
+        // negative would silently invert the pop-up — reject it loudly at the CLI. The u32 parse
+        // fails the leading '-'.
+        parse_knockback_velocity("-800");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_knockback_velocity_rejects_an_overflow() {
+        // An impulse past i32::MAX must abort, NOT wrap into a negative (which would then launch the
+        // target downward). 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_knockback_velocity("3000000000");
+    }
+
+    #[test]
     fn parse_weapon_mode_maps_each_name() {
         assert_eq!(parse_weapon_mode("hitscan"), WeaponMode::Hitscan);
         assert_eq!(parse_weapon_mode("projectile"), WeaponMode::Projectile);
@@ -2452,6 +2480,59 @@ mod tests {
         // did not ask for). The u16 parse catches it; a negative aborts the same way ('-' is not a
         // u16 digit).
         parse_args_from(["--fall-damage", "65536"].into_iter().map(String::from));
+    }
+
+    #[test]
+    fn direct_match_threads_knockback_velocity_into_rules() {
+        // FM1 (default drift): no --knockback-velocity is 0 — a hit imparts no vertical impulse,
+        // byte-identical to the pre-flag harness (and its replay digest). The pop-up BEHAVIOR (a hit
+        // launches the survivor upward, arcing back under gravity) is arena-core's own test; here we
+        // pin the wiring via the rules() accessor.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().knockback_velocity,
+            0,
+            "no --knockback-velocity is 0 (no impulse, byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { knockback_velocity: 800, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .knockback_velocity,
+            800,
+            "--knockback-velocity 800 threads the impulse into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_knockback_velocity_into_a_matchmade_match() {
+        // FM3 (path skew): --knockback-velocity must reach the --mode path too, not just the direct
+        // one. build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the
+        // same impulse a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { knockback_velocity: 800, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().knockback_velocity,
+            800,
+            "the matchmaker forms under --knockback-velocity 800 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms knockback_velocity 0 — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().knockback_velocity,
+            0,
+            "no --knockback-velocity: the matchmaker forms no impulse"
+        );
     }
 
     #[test]
