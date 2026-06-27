@@ -141,6 +141,15 @@ struct Args {
     /// `z`, this decides whether that `z` gap matters to a shot). Applies to BOTH the direct and
     /// `--mode` paths through [`rules_from`] via [`MatchParams::rules`].
     vertical_hit_tolerance: i32,
+    /// Hard-landing damage magnitude (`Rules::fall_damage`): the HP a landing deals once a
+    /// falling pawn's downward impact speed exceeds `fall_damage_threshold`. `0` (the default)
+    /// keeps every landing safe — no landing damages — byte-identical to the pre-flag harness
+    /// (and the replay digest). A `u16` set by `--fall-damage`; it bites only once `gravity > 0`
+    /// actually drops pawns AND a landing clears the threshold, so on a 2D field it is inert.
+    /// Applies to BOTH the direct and `--mode` paths through [`rules_from`] via
+    /// [`MatchParams::rules`]. The companion `fall_damage_threshold` (the speed gate) is a
+    /// separate knob.
+    fall_damage: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -242,6 +251,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut gravity: i32 = 0;
     let mut weapon_mode = WeaponMode::Hitscan;
     let mut vertical_hit_tolerance: i32 = 0;
+    let mut fall_damage: u16 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -282,6 +292,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     &it.next().expect("--vertical-hit-tolerance needs a value"),
                 )
             }
+            "--fall-damage" => {
+                fall_damage = it
+                    .next()
+                    .expect("--fall-damage needs a value")
+                    .parse()
+                    .expect("fall-damage is a u16 (hp)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -302,6 +319,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         gravity,
         weapon_mode,
         vertical_hit_tolerance,
+        fall_damage,
     }
 }
 
@@ -1049,6 +1067,7 @@ fn rules_from(args: &Args) -> Rules {
         gravity: args.gravity,
         weapon_mode: args.weapon_mode,
         vertical_hit_tolerance: args.vertical_hit_tolerance,
+        fall_damage: args.fall_damage,
         ..Rules::default()
     }
 }
@@ -1806,6 +1825,7 @@ mod tests {
             gravity: 0,
             weapon_mode: WeaponMode::Hitscan,
             vertical_hit_tolerance: 0,
+            fall_damage: 0,
         }
     }
 
@@ -1871,6 +1891,7 @@ mod tests {
             gravity: 0,
             weapon_mode: WeaponMode::Hitscan,
             vertical_hit_tolerance: 0,
+            fall_damage: 0,
         }
     }
 
