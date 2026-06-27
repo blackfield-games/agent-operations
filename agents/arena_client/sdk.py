@@ -476,6 +476,7 @@ def run_local_match(
     weapon_mode: str = "hitscan",
     vertical_hit_tolerance: int = 0,
     fall_damage: int = 0,
+    knockback_velocity: int = 0,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -592,7 +593,18 @@ def run_local_match(
     `u16` parse). Default `0` adds no token — byte-identical argv. Like `vertical_hit_tolerance` it is
     a `gravity` companion: damage only fires once `gravity > 0` drops pawns and a landing clears the
     threshold, so on the default flat field it is observable at the argv layer alone (a behavioral
-    landing-damage replay is a coupled follow-up)."""
+    landing-damage replay is a coupled follow-up).
+
+    Pass `knockback_velocity` (a non-negative `i32` upward impulse, `0`..=`2**31-1`) to pop a hit
+    survivor upward: a landed damaging hit adds this much `z` velocity to the target, which then arcs
+    back under gravity (the variable-fall-height source), so `0` (the default) imparts no impulse.
+    Forwarded as `--knockback-velocity <n>` (value-flag, like `gravity`) on BOTH paths via
+    `MatchParams.rules`, only when nonzero. A negative or `> i32::MAX` value raises before any spawn
+    (a negative would launch the target DOWNWARD into the floor, an overflow would wrap — both
+    rejected loudly, mirroring the harness's `u32`-then-`i32` parse). Default `0` adds no token —
+    byte-identical argv. Like `fall_damage` it is a `gravity` companion: the impulse is suppressed
+    while `gravity == 0`, so on the default flat field it is observable at the argv layer alone (a
+    behavioral knockback replay is a coupled follow-up)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -622,6 +634,13 @@ def run_local_match(
         # wrap into a magnitude the caller never asked for (e.g. 65536 -> 0, every landing safe) —
         # reject both loudly here, mirroring the harness's u16 --fall-damage parse.
         raise ValueError(f"fall_damage is a landing magnitude in 0..=65535 (0 = safe); got {fall_damage}")
+    if not 0 <= knockback_velocity <= 2**31 - 1:
+        # Core adds knockback_velocity as an upward z impulse, so a negative would launch the hit
+        # target DOWNWARD into the floor and a value past i32::MAX would wrap the impulse (also off) —
+        # reject both loudly here, mirroring the harness's u32-then-i32 parse_knockback_velocity fence.
+        raise ValueError(
+            f"knockback_velocity is an upward impulse in 0..=2**31-1 (0 = off); got {knockback_velocity}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -661,6 +680,10 @@ def run_local_match(
         # Same shape as --gravity: a value-flag magnitude on both paths (the matchmaker carries it
         # via MatchParams.rules). Default 0 (safe landings) adds no token — byte-identical argv.
         argv += ["--fall-damage", str(fall_damage)]
+    if knockback_velocity:
+        # Same shape as --gravity: a value-flag impulse on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (no impulse) adds no token — byte-identical argv.
+        argv += ["--knockback-velocity", str(knockback_velocity)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
