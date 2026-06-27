@@ -2370,6 +2370,64 @@ def test_run_local_match_rejects_an_out_of_range_max_shield():
             run_local_match("/no/such/harness", [0, 1], policies, max_shield=bad)
 
 
+def test_run_local_match_forwards_start_health_and_omits_it_when_none(monkeypatch):
+    # start_health is a base-balance knob with a non-zero core default, so it uses a None sentinel: the
+    # default None adds no token (the harness applies its own default — byte-identical argv); a value
+    # forwards --start-health <hp> as one value token, mode-independently (before the mode block).
+    # Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--start-health" not in captured["argv"], "the default None adds no flag (harness default)"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, start_health=50)
+    argv = captured["argv"]
+    assert argv[argv.index("--start-health") + 1] == "50"
+
+    # An explicit 0 is NOT the sentinel — it must forward (a 0-HP/already-downed match the caller asked
+    # for), UNLIKE the feature-toggle knobs where 0 is the omit-default. This is the None-vs-0 distinction.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, start_health=0)
+    argv = captured["argv"]
+    assert argv[argv.index("--start-health") + 1] == "0"
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, start_health=50)
+    argv = captured["argv"]
+    assert argv[argv.index("--start-health") + 1] == "50"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_start_health():
+    # start_health is a u16 in core (0..=65535); a non-None negative or overflow forwarded blindly would
+    # wrap into a pool the caller never asked for (65536 -> 0, an already-downed spawn) and abort the
+    # harness, so it raises before any spawn, mirroring the harness's u16 --start-health parse. None is
+    # exempt (the sentinel). A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -50, 65536, 2**20):
+        with pytest.raises(ValueError, match="start_health"):
+            run_local_match("/no/such/harness", [0, 1], policies, start_health=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
