@@ -487,6 +487,7 @@ def run_local_match(
     start_health: int | None = None,
     damage: int | None = None,
     fire_cooldown: int | None = None,
+    mag_size: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -725,7 +726,19 @@ def run_local_match(
     fire EVERY tick (the unbounded-projectile-spawn degenerate, backstopped only by the core's live-projectile
     cap), not the default cadence — so an explicit `0` must forward, never be swallowed. A non-None negative
     or `> 65535` value raises before any spawn (core takes it as a `u16`, so an out-of-range forward would
-    wrap into a cadence the caller never asked for — rejected loudly, mirroring the harness's `u16` parse)."""
+    wrap into a cadence the caller never asked for — rejected loudly, mirroring the harness's `u16` parse).
+
+    Pass `mag_size` (a `u16` round count, `0`..=`65535`) to set the rounds a full magazine holds before a
+    reload is forced — smaller is more reload pressure (a pawn empties and must reload sooner), the ammo
+    sibling of `fire_cooldown` (that the ticks between shots, this the rounds per magazine — together the
+    sustained-fire envelope). Like `fire_cooldown` it is a base-balance value with a NON-ZERO core default
+    (`30`), so it uses a `None` sentinel: omit it (the default `None`) to add no token and let the harness
+    apply its own default — byte-identical argv. A value (even one equal to the core default, AND an explicit
+    `0`) forwards `--mag-size <rounds>` (value-flag) on BOTH paths via `MatchParams.rules`. The `0` case is
+    degenerate: a `0`-capacity magazine spawns a pawn with `0` ammo and every reload refills to `0`, so it can
+    NEVER fire a ranged shot — so an explicit `0` must forward, never be swallowed. A non-None negative or
+    `> 65535` value raises before any spawn (core takes it as a `u16`, so an out-of-range forward would wrap
+    into a capacity the caller never asked for — rejected loudly, mirroring the harness's `u16` parse)."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -811,6 +824,11 @@ def run_local_match(
         # given value must be in range, else an out-of-range forward would wrap into a cadence the caller
         # never asked for (65536 -> 0, a fire-every-tick pawn) — reject loudly, mirroring the harness u16.
         raise ValueError(f"fire_cooldown is a tick count in 0..=65535 (None = harness default); got {fire_cooldown}")
+    if mag_size is not None and not 0 <= mag_size <= 65535:
+        # Core takes mag_size as a u16. None means "let the harness apply its default" (no token); a given
+        # value must be in range, else an out-of-range forward would wrap into a capacity the caller never
+        # asked for (65536 -> 0, an unfireable magazine) — reject loudly, mirroring the harness u16.
+        raise ValueError(f"mag_size is a round count in 0..=65535 (None = harness default); got {mag_size}")
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -895,6 +913,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--fire-cooldown", str(fire_cooldown)]
+    if mag_size is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--mag-size", str(mag_size)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
