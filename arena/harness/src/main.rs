@@ -159,6 +159,17 @@ struct Args {
     /// direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`]. The companion
     /// `knockback_horizontal` (the planar shove, no gravity needed) is a separate knob.
     knockback_velocity: i32,
+    /// Slide a grazing move along a blocker instead of dead-stopping (`Rules::wall_slide`): when set,
+    /// a diagonal step whose full path is refused by a blocker retries each axis independently and
+    /// keeps the component that clears, so the pawn slides along the surface. A presence flag
+    /// (`--wall-slide`, no value, like `--friendly-fire`); the default `false` stops the move at its
+    /// origin, byte-identical to the pre-flag harness (and the replay digest). Applies to BOTH the
+    /// direct and `--mode` paths through [`rules_from`]: the matchmaker carries it on
+    /// [`MatchParams::rules`], so a matchmade/ranked match forms under the same movement rule a
+    /// hand-seated one does. The effect surfaces only when a move actually grazes a blocker — the
+    /// empty default arena has none to graze, so the rule is dark until a `--map` with cover is
+    /// configured — but `wall_slide` is a real `Rules` determinant folded into the digest.
+    wall_slide: bool,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -273,6 +284,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut vertical_hit_tolerance: i32 = 0;
     let mut fall_damage: u16 = 0;
     let mut knockback_velocity: i32 = 0;
+    let mut wall_slide = false;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -324,6 +336,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                 knockback_velocity =
                     parse_knockback_velocity(&it.next().expect("--knockback-velocity needs a value"))
             }
+            "--wall-slide" => wall_slide = true,
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -346,6 +359,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         vertical_hit_tolerance,
         fall_damage,
         knockback_velocity,
+        wall_slide,
     }
 }
 
@@ -1095,6 +1109,7 @@ fn rules_from(args: &Args) -> Rules {
         vertical_hit_tolerance: args.vertical_hit_tolerance,
         fall_damage: args.fall_damage,
         knockback_velocity: args.knockback_velocity,
+        wall_slide: args.wall_slide,
         ..Rules::default()
     }
 }
@@ -1854,6 +1869,7 @@ mod tests {
             vertical_hit_tolerance: 0,
             fall_damage: 0,
             knockback_velocity: 0,
+            wall_slide: false,
         }
     }
 
@@ -1921,6 +1937,7 @@ mod tests {
             vertical_hit_tolerance: 0,
             fall_damage: 0,
             knockback_velocity: 0,
+            wall_slide: false,
         }
     }
 
