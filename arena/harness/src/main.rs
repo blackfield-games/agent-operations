@@ -180,6 +180,16 @@ struct Args {
     /// wound, the inverse of raising the bar). Applies to BOTH the direct and `--mode` paths through
     /// [`rules_from`] via [`MatchParams::rules`].
     fall_damage_threshold: i32,
+    /// Planar knockback shove (`Rules::knockback_horizontal`): the position units a landed damaging hit
+    /// displaces the SURVIVING target along the shooter→target octant, through the same `slide()` a walk
+    /// uses (so the shove stops AT a wall and never tunnels or leaves the arena). The horizontal sibling
+    /// of `knockback_velocity` — but UNLIKE the vertical impulse it needs NO gravity: a planar shove is
+    /// meaningful in a 2D match (core gates it on `knockback_horizontal > 0` alone). `0` (the default)
+    /// imparts no shove — the target's position is unchanged on a hit, byte-identical to the pre-flag
+    /// harness (and the replay digest). A non-negative `i32` set by `--knockback-horizontal` — a negative
+    /// is rejected at parse (core's `> 0` gate makes it inert, a silent footgun). Applies to BOTH the
+    /// direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`].
+    knockback_horizontal: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -265,6 +275,17 @@ fn parse_fall_damage_threshold(value: &str) -> i32 {
     i32::try_from(gate).expect("--fall-damage-threshold exceeds the i32 range")
 }
 
+/// Parse a `--knockback-horizontal` value to the non-negative planar shove [`Rules::knockback_horizontal`]
+/// carries, the same u32-then-i32 fence as [`parse_gravity`]: core gates the shove on `knockback_horizontal
+/// > 0`, so a negative is INERT (silently no shove — the operator dialed a pull and got nothing) and a value
+/// past `i32::MAX` would wrap the displacement, so both abort before any spawn.
+fn parse_knockback_horizontal(value: &str) -> i32 {
+    let shove: u32 = value
+        .parse()
+        .expect("--knockback-horizontal is a non-negative integer (planar shove)");
+    i32::try_from(shove).expect("--knockback-horizontal exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -307,6 +328,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut knockback_velocity: i32 = 0;
     let mut wall_slide = false;
     let mut fall_damage_threshold: i32 = 0;
+    let mut knockback_horizontal: i32 = 0;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -364,6 +386,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     &it.next().expect("--fall-damage-threshold needs a value"),
                 )
             }
+            "--knockback-horizontal" => {
+                knockback_horizontal =
+                    parse_knockback_horizontal(&it.next().expect("--knockback-horizontal needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -388,6 +414,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         knockback_velocity,
         wall_slide,
         fall_damage_threshold,
+        knockback_horizontal,
     }
 }
 
@@ -1139,6 +1166,7 @@ fn rules_from(args: &Args) -> Rules {
         knockback_velocity: args.knockback_velocity,
         wall_slide: args.wall_slide,
         fall_damage_threshold: args.fall_damage_threshold,
+        knockback_horizontal: args.knockback_horizontal,
         ..Rules::default()
     }
 }
@@ -1900,6 +1928,7 @@ mod tests {
             knockback_velocity: 0,
             wall_slide: false,
             fall_damage_threshold: 0,
+            knockback_horizontal: 0,
         }
     }
 
@@ -1969,6 +1998,7 @@ mod tests {
             knockback_velocity: 0,
             wall_slide: false,
             fall_damage_threshold: 0,
+            knockback_horizontal: 0,
         }
     }
 
