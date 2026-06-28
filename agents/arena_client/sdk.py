@@ -491,6 +491,7 @@ def run_local_match(
     max_speed: int | None = None,
     perception_range: int | None = None,
     weapon_range: int | None = None,
+    hit_radius: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -781,7 +782,22 @@ def run_local_match(
     lands no ranged hit at any distance and expires every projectile at the muzzle — not the default reach, so
     an explicit `0` must forward, never be swallowed. The range is `0`..=`2**31-1` (the `i32` shape, NOT
     `u16`): a non-None negative (meaningless for a reach) or `> 2**31-1` value raises before any spawn,
-    mirroring the harness's `u32`-then-`i32` `parse_weapon_range` fence."""
+    mirroring the harness's `u32`-then-`i32` `parse_weapon_range` fence.
+
+    Pass `hit_radius` (a non-negative `i32` lateral hit tolerance, `0`..=`2**31-1`) to set the beam half-width,
+    in position units — the sim counts a hitscan hit only when the squared perpendicular distance from the
+    shot axis is `<= hit_radius**2`, so a wider radius forgives more aim error and a narrower one demands a more
+    dead-centre target (in `weapon_mode="projectile"` it doubles as the pawn-body half-width a projectile's swept
+    path must reach). The accuracy lever, orthogonal to `weapon_range` (that sets how FAR a shot reaches, this how
+    WIDE its tolerance). Like `weapon_range` it is a non-negative `i32` base-balance value with a NON-ZERO core
+    default (`1500`, 1.5 m), so it uses a `None` sentinel: omit it (the default `None`) to add no token and let the
+    harness apply its own default — byte-identical argv. A value (even one equal to the core default, AND an
+    explicit `0`) forwards `--hit-radius <units>` (value-flag) on BOTH paths via `MatchParams.rules`. The `0` case
+    is degenerate: a `0`-radius beam is pin-precise — only a perfectly on-axis shot connects (squared perpendicular
+    distance `<= 0`) — not the default tolerance, so an explicit `0` must forward, never be swallowed. The range is
+    `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None negative (a squared perpendicular distance is never
+    `< 0`, so a negative is meaningless) or `> 2**31-1` value raises before any spawn, mirroring the harness's
+    `u32`-then-`i32` `parse_hit_radius` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -894,6 +910,14 @@ def run_local_match(
         raise ValueError(
             f"weapon_range is a beam reach in 0..=2**31-1 (None = harness default); got {weapon_range}"
         )
+    if hit_radius is not None and not 0 <= hit_radius <= 2**31 - 1:
+        # Core takes hit_radius as a non-negative i32. None means "let the harness apply its default" (no token);
+        # a given value must be in range, else a negative (a squared perpendicular distance is never < 0, so a
+        # negative tolerance is meaningless) or a value past i32::MAX (which wraps negative) would forward a
+        # footgun — reject loudly, mirroring the harness's u32-then-i32 parse_hit_radius fence.
+        raise ValueError(
+            f"hit_radius is a lateral tolerance in 0..=2**31-1 (None = harness default); got {hit_radius}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -994,6 +1018,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--weapon-range", str(weapon_range)]
+    if hit_radius is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--hit-radius", str(hit_radius)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
