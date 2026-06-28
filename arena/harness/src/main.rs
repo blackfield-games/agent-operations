@@ -4831,6 +4831,104 @@ mod tests {
     }
 
     #[test]
+    fn parse_pickup_radius_maps_a_non_negative_radius() {
+        assert_eq!(parse_pickup_radius("0"), 0);
+        assert_eq!(parse_pickup_radius("4000"), 4000);
+        assert_eq!(
+            parse_pickup_radius(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid collection radius"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_pickup_radius_rejects_a_negative() {
+        // A collection radius is non-negative; a negative is meaningless (a squared distance is never < 0).
+        // Reject it loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_pickup_radius("-4000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_pickup_radius_rejects_an_overflow() {
+        // A radius past i32::MAX must abort, NOT wrap into a negative. 3_000_000_000 fits a u32 but not an i32,
+        // so i32::try_from catches it.
+        parse_pickup_radius("3000000000");
+    }
+
+    #[test]
+    fn pickup_radius_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --pickup-radius pulls exactly one token (through
+        // parse_pickup_radius) and consumes no following flag. A --pickup-radius 4000 right before --seats 3
+        // must parse BOTH.
+        let parsed =
+            parse_args_from(["--pickup-radius", "4000", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.pickup_radius, 4000, "--pickup-radius 4000 parses the radius");
+        assert_eq!(parsed.seats, 3, "--pickup-radius consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --pickup-radius is NOT 0 — it is the
+        // Rules default (a 0 radius is collectible only by a pawn exactly on the pickup, not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.pickup_radius,
+            Rules::default().pickup_radius,
+            "no --pickup-radius defaults to the Rules default radius, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_pickup_radius_into_rules() {
+        // FM1 (default drift): no --pickup-radius is the Rules DEFAULT radius — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). Pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().pickup_radius,
+            Rules::default().pickup_radius,
+            "no --pickup-radius is the Rules default radius (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { pickup_radius: 4000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .pickup_radius,
+            4000,
+            "--pickup-radius 4000 threads the radius into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_pickup_radius_into_a_matchmade_match() {
+        // FM3 (path skew): --pickup-radius must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same radius a
+        // hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { pickup_radius: 4000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().pickup_radius,
+            4000,
+            "the matchmaker forms under --pickup-radius 4000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default radius — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().pickup_radius,
+            Rules::default().pickup_radius,
+            "no --pickup-radius: the matchmaker forms the Rules default radius"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
