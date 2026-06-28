@@ -4588,6 +4588,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_projectile_speed_maps_a_non_negative_speed() {
+        assert_eq!(parse_projectile_speed("0"), 0);
+        assert_eq!(parse_projectile_speed("8000"), 8000);
+        assert_eq!(
+            parse_projectile_speed(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid travel speed"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_projectile_speed_rejects_a_negative() {
+        // A travel speed is non-negative; a negative is meaningless (core flies a projectile forward along the
+        // octant, never backward). Reject it loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_projectile_speed("-8000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_projectile_speed_rejects_an_overflow() {
+        // A speed past i32::MAX must abort, NOT wrap into a negative (which would then fly nothing).
+        // 3_000_000_000 fits a u32 but not an i32, so i32::try_from catches it.
+        parse_projectile_speed("3000000000");
+    }
+
+    #[test]
+    fn projectile_speed_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --projectile-speed pulls exactly one token (through
+        // parse_projectile_speed) and consumes no following flag. A --projectile-speed 8000 right before
+        // --seats 3 must parse BOTH.
+        let parsed = parse_args_from(
+            ["--projectile-speed", "8000", "--seats", "3"].into_iter().map(String::from),
+        );
+        assert_eq!(parsed.projectile_speed, 8000, "--projectile-speed 8000 parses the speed");
+        assert_eq!(
+            parsed.seats, 3,
+            "--projectile-speed consumed exactly one token, so --seats 3 parsed"
+        );
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --projectile-speed is NOT 0 — it is
+        // the Rules default (a 0-speed shot never leaves the muzzle and is force-expired landing no hit, not the
+        // pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.projectile_speed,
+            Rules::default().projectile_speed,
+            "no --projectile-speed defaults to the Rules default speed, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_projectile_speed_into_rules() {
+        // FM1 (default drift): no --projectile-speed is the Rules DEFAULT speed — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). This is the base-balance distinction from the feature-toggle
+        // knobs (which default 0/off); pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().projectile_speed,
+            Rules::default().projectile_speed,
+            "no --projectile-speed is the Rules default speed (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { projectile_speed: 8000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .projectile_speed,
+            8000,
+            "--projectile-speed 8000 threads the speed into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_projectile_speed_into_a_matchmade_match() {
+        // FM3 (path skew): --projectile-speed must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same speed a
+        // hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { projectile_speed: 8000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().projectile_speed,
+            8000,
+            "the matchmaker forms under --projectile-speed 8000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default speed — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().projectile_speed,
+            Rules::default().projectile_speed,
+            "no --projectile-speed: the matchmaker forms the Rules default speed"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
