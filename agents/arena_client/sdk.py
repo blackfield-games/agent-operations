@@ -495,6 +495,7 @@ def run_local_match(
     melee_cooldown: int | None = None,
     melee_damage: int | None = None,
     melee_range: int | None = None,
+    projectile_speed: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -841,7 +842,23 @@ def run_local_match(
     must forward, never be swallowed. The range is `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None
     negative (core squares the reach, so a negative would cleave as far as its magnitude — a misleading sign) or
     `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_melee_range`
-    fence."""
+    fence.
+
+    Pass `projectile_speed` (a non-negative `i32` per-tick travel speed, `0`..=`2**31-1`) to set how fast a
+    `weapon_mode="projectile"` shot flies, in position units per tick — a fired projectile spawns and travels this
+    far each tick along the firing octant, hitting only when its swept path crosses a body, so a faster shot
+    closes the gap to a strafing target sooner and a slower one is easier to dodge (read only in
+    `weapon_mode="projectile"`, where core snaps it to the octant and clamps it to a per-tick bound at spawn, but
+    still bound into the `Rules` replay digest). The travel-speed lever for the projectile weapon mode. Like
+    `melee_range` it is a non-negative `i32` base-balance value with a NON-ZERO core default (`2 * POSITION_SCALE`,
+    2 m/tick), so it uses a `None` sentinel: omit it (the default `None`) to add no token and let the harness apply
+    its own default — byte-identical argv. A value (even one equal to the core default, AND an explicit `0`)
+    forwards `--projectile-speed <units>` (value-flag) on BOTH paths via `MatchParams.rules`. The `0` case is
+    degenerate: a `0`-speed shot never leaves the muzzle and is force-expired by core's termination backstop
+    landing no hit — not the default speed, so an explicit `0` must forward, never be swallowed. The range is
+    `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None negative (core flies a projectile FORWARD along the
+    octant, never backward) or `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32`
+    `parse_projectile_speed` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -984,6 +1001,14 @@ def run_local_match(
         raise ValueError(
             f"melee_range is a cleave reach in 0..=2**31-1 (None = harness default); got {melee_range}"
         )
+    if projectile_speed is not None and not 0 <= projectile_speed <= 2**31 - 1:
+        # Core takes projectile_speed as a non-negative i32. None means "let the harness apply its default" (no
+        # token); a given value must be in range, else a negative (core flies a projectile forward along the
+        # octant, never backward) or a value past i32::MAX (which wraps negative) would forward a footgun — reject
+        # loudly, mirroring the harness's u32-then-i32 parse_projectile_speed fence.
+        raise ValueError(
+            f"projectile_speed is a per-tick travel speed in 0..=2**31-1 (None = harness default); got {projectile_speed}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1100,6 +1125,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--melee-range", str(melee_range)]
+    if projectile_speed is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--projectile-speed", str(projectile_speed)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
