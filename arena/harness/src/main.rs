@@ -4716,6 +4716,89 @@ mod tests {
     }
 
     #[test]
+    fn action_deadline_micros_parses_as_a_u32_value_flag() {
+        // The value-flag twin of the threading tests: --action-deadline-micros pulls exactly one token (a plain
+        // u32 .parse()) and consumes no following flag. A --action-deadline-micros 100000 right before --seats 3
+        // must parse BOTH.
+        let parsed = parse_args_from(
+            ["--action-deadline-micros", "100000", "--seats", "3"].into_iter().map(String::from),
+        );
+        assert_eq!(parsed.action_deadline_micros, 100000, "--action-deadline-micros 100000 parses the budget");
+        assert_eq!(parsed.seats, 3, "--action-deadline-micros consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --action-deadline-micros is NOT 0 —
+        // it is the Rules default (a 0 budget gives a seat no time to act, not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.action_deadline_micros,
+            Rules::default().action_deadline_micros,
+            "no --action-deadline-micros defaults to the Rules default budget, NOT 0"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "u32")]
+    fn action_deadline_micros_rejects_a_negative() {
+        // A microsecond budget is non-negative; the plain u32 parse fails the leading '-' (and bounds the value
+        // at u32::MAX, so an overflow aborts on the same parse). Reject it loudly at the CLI.
+        parse_args_from(["--action-deadline-micros", "-100000"].into_iter().map(String::from));
+    }
+
+    #[test]
+    fn direct_match_threads_action_deadline_micros_into_rules() {
+        // FM1 (default drift): no --action-deadline-micros is the Rules DEFAULT budget — NOT 0 — byte-identical
+        // to the pre-flag harness (and its replay digest). Pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().action_deadline_micros,
+            Rules::default().action_deadline_micros,
+            "no --action-deadline-micros is the Rules default budget (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(
+                &Args { action_deadline_micros: 100000, ..direct_args(2, "reference", 0) },
+                2
+            )
+            .rules()
+            .action_deadline_micros,
+            100000,
+            "--action-deadline-micros 100000 threads the budget into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_action_deadline_micros_into_a_matchmade_match() {
+        // FM3 (path skew): --action-deadline-micros must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same budget a
+        // hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { action_deadline_micros: 100000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().action_deadline_micros,
+            100000,
+            "the matchmaker forms under --action-deadline-micros 100000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default budget — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().action_deadline_micros,
+            Rules::default().action_deadline_micros,
+            "no --action-deadline-micros: the matchmaker forms the Rules default budget"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
