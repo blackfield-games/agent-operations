@@ -492,6 +492,7 @@ def run_local_match(
     perception_range: int | None = None,
     weapon_range: int | None = None,
     hit_radius: int | None = None,
+    melee_cooldown: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -797,7 +798,20 @@ def run_local_match(
     distance `<= 0`) — not the default tolerance, so an explicit `0` must forward, never be swallowed. The range is
     `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None negative (a squared perpendicular distance is never
     `< 0`, so a negative is meaningless) or `> 2**31-1` value raises before any spawn, mirroring the harness's
-    `u32`-then-`i32` `parse_hit_radius` fence."""
+    `u32`-then-`i32` `parse_hit_radius` fence.
+
+    Pass `melee_cooldown` (a `u16` tick count, `0`..=`65535`) to set the ticks BETWEEN melee swings — the swing
+    cadence in `weapon_mode="melee"` (a pawn may swing only when its melee cooldown is `0`, so a lower value is a
+    faster cleave). The melee twin of the ranged `fire_cooldown`, read only in `weapon_mode="melee"` (a hitscan or
+    projectile match ignores it at runtime) but still bound into the `Rules` replay digest. Like `damage` it is a
+    base-balance value with a NON-ZERO core default (`15` ticks), so it uses a `None` sentinel: omit it (the
+    default `None`) to add no token and let the harness apply its own default — byte-identical argv. A value (even
+    one equal to the core default, AND an explicit `0`) forwards `--melee-cooldown <ticks>` (value-flag) on BOTH
+    paths via `MatchParams.rules`. The `0` case is the sharp degenerate: melee is gated only on `melee_cooldown`
+    (it needs no ammo), so a `0` cooldown swings on EVERY tick — a continuous cleave that downs every enemy in arc
+    the instant they enter it — not the default cadence, so an explicit `0` must forward, never be swallowed. The
+    range is `0`..=`65535` (the `u16` shape, NOT the `i32` `0`..=`2**31-1` of the radius/reach twins): a non-None
+    negative or `> 65535` value raises before any spawn, mirroring the harness's `u16` `parse()` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -918,6 +932,13 @@ def run_local_match(
         raise ValueError(
             f"hit_radius is a lateral tolerance in 0..=2**31-1 (None = harness default); got {hit_radius}"
         )
+    if melee_cooldown is not None and not 0 <= melee_cooldown <= 65535:
+        # Core takes melee_cooldown as a u16. None means "let the harness apply its default" (no token); a given
+        # value must be in range, else an out-of-range forward would wrap into a cadence the caller never asked
+        # for (65536 -> 0, a swing-every-tick continuous cleave) — reject loudly, mirroring the harness u16.
+        raise ValueError(
+            f"melee_cooldown is a tick count in 0..=65535 (None = harness default); got {melee_cooldown}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1022,6 +1043,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--hit-radius", str(hit_radius)]
+    if melee_cooldown is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--melee-cooldown", str(melee_cooldown)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
