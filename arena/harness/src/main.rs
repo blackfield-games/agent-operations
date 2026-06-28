@@ -388,6 +388,18 @@ struct Args {
     /// past `i32::MAX` aborts), applied to BOTH the direct and `--mode` paths through [`rules_from`] via
     /// [`MatchParams::rules`], so a matchmade/ranked match collects at the same radius a hand-seated one does.
     pickup_radius: i32,
+    /// Ticks a collected pickup stays dormant before it respawns at its spawn point (`Rules::pickup_respawn_cooldown`):
+    /// a deterministic per-tick countdown (no wall-clock) the sim arms when a pawn collects a pickup, so a longer
+    /// cooldown keeps a contested heal/ammo spot empty longer (a real tempo decision) and a shorter one refreshes it
+    /// sooner (a pickup-free match never consults it). Set by `--pickup-respawn-cooldown`; UNLIKE the feature-toggle
+    /// knobs (which default `0` = off) this is a base-balance value, so its default is
+    /// `Rules::default().pickup_respawn_cooldown` (`default_pickup_respawn_cooldown()` = 300 ticks, ~10 s at 30 Hz) —
+    /// an absent flag is byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT cooldown, NOT
+    /// at `0` (a `0` cooldown respawns the pickup the tick after collection, so it is effectively always present — a
+    /// real config an explicit `0` must forward). A `u16` (the plain `.parse()` rejects a negative and bounds the
+    /// value), applied to BOTH the direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a
+    /// matchmade/ranked match respawns pickups on the same cooldown a hand-seated one does.
+    pickup_respawn_cooldown: u16,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -672,6 +684,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 pickup_radius is
     // collectible only by a pawn exactly on the pickup, NOT the pre-flag harness.
     let mut pickup_radius: i32 = Rules::default().pickup_radius;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 pickup_respawn_cooldown
+    // respawns the pickup the tick after collection (effectively always present), NOT the pre-flag harness.
+    let mut pickup_respawn_cooldown: u16 = Rules::default().pickup_respawn_cooldown;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -825,6 +840,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--pickup-radius" => {
                 pickup_radius = parse_pickup_radius(&it.next().expect("--pickup-radius needs a value"))
             }
+            "--pickup-respawn-cooldown" => {
+                pickup_respawn_cooldown = it
+                    .next()
+                    .expect("--pickup-respawn-cooldown needs a value")
+                    .parse()
+                    .expect("pickup-respawn-cooldown is a u16 (ticks)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -868,6 +890,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         projectile_speed,
         action_deadline_micros,
         pickup_radius,
+        pickup_respawn_cooldown,
     }
 }
 
@@ -1638,6 +1661,7 @@ fn rules_from(args: &Args) -> Rules {
         projectile_speed: args.projectile_speed,
         action_deadline_micros: args.action_deadline_micros,
         pickup_radius: args.pickup_radius,
+        pickup_respawn_cooldown: args.pickup_respawn_cooldown,
         ..Rules::default()
     }
 }
@@ -2418,6 +2442,7 @@ mod tests {
             projectile_speed: Rules::default().projectile_speed,
             action_deadline_micros: Rules::default().action_deadline_micros,
             pickup_radius: Rules::default().pickup_radius,
+            pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
         }
     }
 
@@ -2506,6 +2531,7 @@ mod tests {
             projectile_speed: Rules::default().projectile_speed,
             action_deadline_micros: Rules::default().action_deadline_micros,
             pickup_radius: Rules::default().pickup_radius,
+            pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
         }
     }
 
