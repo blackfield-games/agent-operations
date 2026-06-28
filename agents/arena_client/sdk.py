@@ -494,6 +494,7 @@ def run_local_match(
     hit_radius: int | None = None,
     melee_cooldown: int | None = None,
     melee_damage: int | None = None,
+    melee_range: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -825,7 +826,22 @@ def run_local_match(
     The `0` case is degenerate: a `0`-damage swing harms nobody — a harmless melee pawn, every swing whiffs even on
     a perfect arc hit — not the default damage, so an explicit `0` must forward, never be swallowed. The range is
     `0`..=`65535` (the `u16` shape, NOT the `i32` of the radius/reach twins): a non-None negative or `> 65535`
-    value raises before any spawn, mirroring the harness's `u16` `parse()` fence."""
+    value raises before any spawn, mirroring the harness's `u16` `parse()` fence.
+
+    Pass `melee_range` (a non-negative `i32` cleave reach, `0`..=`2**31-1`) to set how far a `weapon_mode="melee"`
+    swing reaches, in position units — the sim cleaves EVERY enemy whose centre is within this distance (squared:
+    `(melee_range)**2`) AND inside the frontal arc, so a longer reach cleaves from farther and a shorter one
+    demands closing the distance (read only in `weapon_mode="melee"` but still bound into the `Rules` replay
+    digest). The melee twin of the ranged `weapon_range`. Like `hit_radius` it is a non-negative `i32` base-balance
+    value with a NON-ZERO core default (`2 * POSITION_SCALE`, 2 m), so it uses a `None` sentinel: omit it (the
+    default `None`) to add no token and let the harness apply its own default — byte-identical argv. A value (even
+    one equal to the core default, AND an explicit `0`) forwards `--melee-range <units>` (value-flag) on BOTH paths
+    via `MatchParams.rules`. The `0` case is degenerate: a `0`-reach swing cleaves nothing — its squared reach is
+    `0`, so no enemy centre is ever within it (a harmless melee pawn) — not the default reach, so an explicit `0`
+    must forward, never be swallowed. The range is `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None
+    negative (core squares the reach, so a negative would cleave as far as its magnitude — a misleading sign) or
+    `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_melee_range`
+    fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -960,6 +976,14 @@ def run_local_match(
         raise ValueError(
             f"melee_damage is per-swing HP in 0..=65535 (None = harness default); got {melee_damage}"
         )
+    if melee_range is not None and not 0 <= melee_range <= 2**31 - 1:
+        # Core takes melee_range as a non-negative i32. None means "let the harness apply its default" (no token);
+        # a given value must be in range, else a negative (core squares the reach, so a negative would cleave as
+        # far as its magnitude) or a value past i32::MAX (which wraps negative) would forward a footgun — reject
+        # loudly, mirroring the harness's u32-then-i32 parse_melee_range fence.
+        raise ValueError(
+            f"melee_range is a cleave reach in 0..=2**31-1 (None = harness default); got {melee_range}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1072,6 +1096,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--melee-damage", str(melee_damage)]
+    if melee_range is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--melee-range", str(melee_range)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
