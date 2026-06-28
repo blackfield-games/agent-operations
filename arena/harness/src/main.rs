@@ -367,6 +367,16 @@ struct Args {
     /// through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match flies shots at the same
     /// speed a hand-seated one does.
     projectile_speed: i32,
+    /// Per-action wall-clock deadline in microseconds (`Rules::action_deadline_micros`): the time budget a seat
+    /// has to return its action each tick, enforced by the transport's bounded-latency invariant — a tighter
+    /// budget stresses an agent's compute, a looser one forgives a slow policy. Set by `--action-deadline-micros`;
+    /// UNLIKE the feature-toggle knobs (which default `0` = off) this is a base-balance value, so its default is
+    /// `Rules::default().action_deadline_micros` (`50_000`, 50 ms) — an absent flag is byte-identical to the
+    /// pre-flag harness (and the replay digest) at the DEFAULT budget, NOT at `0` (a `0` budget gives a seat no
+    /// time to act). A `u32` (the plain `.parse()` rejects a negative and bounds the value at `u32::MAX`), applied
+    /// to BOTH the direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a
+    /// matchmade/ranked match enforces the same deadline a hand-seated one does.
+    action_deadline_micros: u32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -634,6 +644,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 projectile_speed shot
     // never leaves the muzzle and is force-expired landing no hit, NOT the pre-flag harness.
     let mut projectile_speed: i32 = Rules::default().projectile_speed;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 action_deadline_micros
+    // gives a seat no time to act, NOT the pre-flag harness.
+    let mut action_deadline_micros: u32 = Rules::default().action_deadline_micros;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -777,6 +790,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                 projectile_speed =
                     parse_projectile_speed(&it.next().expect("--projectile-speed needs a value"))
             }
+            "--action-deadline-micros" => {
+                action_deadline_micros = it
+                    .next()
+                    .expect("--action-deadline-micros needs a value")
+                    .parse()
+                    .expect("action-deadline-micros is a u32 (microseconds)")
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -818,6 +838,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         melee_damage,
         melee_range,
         projectile_speed,
+        action_deadline_micros,
     }
 }
 
@@ -1586,6 +1607,7 @@ fn rules_from(args: &Args) -> Rules {
         melee_damage: args.melee_damage,
         melee_range: args.melee_range,
         projectile_speed: args.projectile_speed,
+        action_deadline_micros: args.action_deadline_micros,
         ..Rules::default()
     }
 }
@@ -2364,6 +2386,7 @@ mod tests {
             melee_damage: Rules::default().melee_damage,
             melee_range: Rules::default().melee_range,
             projectile_speed: Rules::default().projectile_speed,
+            action_deadline_micros: Rules::default().action_deadline_micros,
         }
     }
 
@@ -2450,6 +2473,7 @@ mod tests {
             melee_damage: Rules::default().melee_damage,
             melee_range: Rules::default().melee_range,
             projectile_speed: Rules::default().projectile_speed,
+            action_deadline_micros: Rules::default().action_deadline_micros,
         }
     }
 
