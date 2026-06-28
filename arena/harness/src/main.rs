@@ -353,6 +353,20 @@ struct Args {
     /// through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match cleaves to the same reach a
     /// hand-seated one does.
     melee_range: i32,
+    /// Travel speed of a [`WeaponMode::Projectile`] shot, in position units per tick (`Rules::projectile_speed`):
+    /// a fired projectile spawns and flies this far each tick along the firing octant, hitting only when its
+    /// swept path crosses a body, so a faster shot closes the gap to a strafing target sooner and a slower one
+    /// is easier to dodge over its flight (only read in [`WeaponMode::Projectile`]; core snaps it to the octant
+    /// and clamps it to a per-tick bound at spawn). Set by `--projectile-speed`; UNLIKE the feature-toggle knobs
+    /// (which default `0` = off) this is a base-balance value, so its default is `Rules::default().projectile_speed`
+    /// (`default_projectile_speed()` = 2·`POSITION_SCALE`, 2 m/tick) — an absent flag is byte-identical to the
+    /// pre-flag harness (and the replay digest) at the DEFAULT speed, NOT at `0` (a `0`-speed shot never leaves the
+    /// muzzle and is force-expired by the termination backstop, landing no hit). A non-negative `i32` (the
+    /// u32-then-`i32` fence in [`parse_projectile_speed`]: a negative — a projectile flies forward along the
+    /// octant, never backward — or a value past `i32::MAX` aborts), applied to BOTH the direct and `--mode` paths
+    /// through [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match flies shots at the same
+    /// speed a hand-seated one does.
+    projectile_speed: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -526,6 +540,17 @@ fn parse_melee_range(value: &str) -> i32 {
     i32::try_from(reach).expect("--melee-range exceeds the i32 range")
 }
 
+/// Parse a `--projectile-speed` value to the non-negative travel speed [`Rules::projectile_speed`] carries, the
+/// same u32-then-i32 fence as [`parse_melee_range`]: a projectile flies forward along the firing octant at this
+/// per-tick speed, so a negative is meaningless (core never flies a shot backward) and a value past `i32::MAX`
+/// would wrap the speed, so both abort before any spawn.
+fn parse_projectile_speed(value: &str) -> i32 {
+    let speed: u32 = value
+        .parse()
+        .expect("--projectile-speed is a non-negative integer (per-tick travel speed)");
+    i32::try_from(speed).expect("--projectile-speed exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -606,6 +631,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 melee_range cleaves
     // only an enemy exactly on the shooter (a harmless melee pawn), NOT the pre-flag harness.
     let mut melee_range: i32 = Rules::default().melee_range;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 projectile_speed shot
+    // never leaves the muzzle and is force-expired landing no hit, NOT the pre-flag harness.
+    let mut projectile_speed: i32 = Rules::default().projectile_speed;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -745,6 +773,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--melee-range" => {
                 melee_range = parse_melee_range(&it.next().expect("--melee-range needs a value"))
             }
+            "--projectile-speed" => {
+                projectile_speed =
+                    parse_projectile_speed(&it.next().expect("--projectile-speed needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -785,6 +817,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         melee_cooldown,
         melee_damage,
         melee_range,
+        projectile_speed,
     }
 }
 
@@ -1552,6 +1585,7 @@ fn rules_from(args: &Args) -> Rules {
         melee_cooldown: args.melee_cooldown,
         melee_damage: args.melee_damage,
         melee_range: args.melee_range,
+        projectile_speed: args.projectile_speed,
         ..Rules::default()
     }
 }
@@ -2329,6 +2363,7 @@ mod tests {
             melee_cooldown: Rules::default().melee_cooldown,
             melee_damage: Rules::default().melee_damage,
             melee_range: Rules::default().melee_range,
+            projectile_speed: Rules::default().projectile_speed,
         }
     }
 
@@ -2414,6 +2449,7 @@ mod tests {
             melee_cooldown: Rules::default().melee_cooldown,
             melee_damage: Rules::default().melee_damage,
             melee_range: Rules::default().melee_range,
+            projectile_speed: Rules::default().projectile_speed,
         }
     }
 
