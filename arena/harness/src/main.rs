@@ -377,6 +377,17 @@ struct Args {
     /// to BOTH the direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a
     /// matchmade/ranked match enforces the same deadline a hand-seated one does.
     action_deadline_micros: u32,
+    /// Heal/ammo collection radius in position units (`Rules::pickup_radius`): a pawn collects a pickup only when
+    /// its centre is within this distance of the pickup, so a wider radius makes a pickup easier to grab and a
+    /// tighter one demands closer contact. Set by `--pickup-radius`; UNLIKE the feature-toggle knobs (which
+    /// default `0` = off) this is a base-balance value, so its default is `Rules::default().pickup_radius`
+    /// (`default_pickup_radius()` = `POSITION_SCALE`, a 1 m contact disc) — an absent flag is byte-identical to
+    /// the pre-flag harness (and the replay digest) at the DEFAULT radius, NOT at `0` (a `0` radius is collectible
+    /// only by a pawn exactly on the pickup). A non-negative `i32` (the u32-then-`i32` fence in
+    /// [`parse_pickup_radius`]: a negative — a squared distance is never `< 0`, so it is meaningless — or a value
+    /// past `i32::MAX` aborts), applied to BOTH the direct and `--mode` paths through [`rules_from`] via
+    /// [`MatchParams::rules`], so a matchmade/ranked match collects at the same radius a hand-seated one does.
+    pickup_radius: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -561,6 +572,17 @@ fn parse_projectile_speed(value: &str) -> i32 {
     i32::try_from(speed).expect("--projectile-speed exceeds the i32 range")
 }
 
+/// Parse a `--pickup-radius` value to the non-negative collection radius [`Rules::pickup_radius`] carries, the
+/// same u32-then-i32 fence as [`parse_hit_radius`]: a pawn collects a pickup only `within` this radius, so a
+/// negative is meaningless (a squared distance is never `< 0`) and a value past `i32::MAX` would wrap the radius,
+/// so both abort before any spawn.
+fn parse_pickup_radius(value: &str) -> i32 {
+    let radius: u32 = value
+        .parse()
+        .expect("--pickup-radius is a non-negative integer (collection radius)");
+    i32::try_from(radius).expect("--pickup-radius exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -647,6 +669,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 action_deadline_micros
     // gives a seat no time to act, NOT the pre-flag harness.
     let mut action_deadline_micros: u32 = Rules::default().action_deadline_micros;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 pickup_radius is
+    // collectible only by a pawn exactly on the pickup, NOT the pre-flag harness.
+    let mut pickup_radius: i32 = Rules::default().pickup_radius;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -797,6 +822,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("action-deadline-micros is a u32 (microseconds)")
             }
+            "--pickup-radius" => {
+                pickup_radius = parse_pickup_radius(&it.next().expect("--pickup-radius needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -839,6 +867,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         melee_range,
         projectile_speed,
         action_deadline_micros,
+        pickup_radius,
     }
 }
 
@@ -1608,6 +1637,7 @@ fn rules_from(args: &Args) -> Rules {
         melee_range: args.melee_range,
         projectile_speed: args.projectile_speed,
         action_deadline_micros: args.action_deadline_micros,
+        pickup_radius: args.pickup_radius,
         ..Rules::default()
     }
 }
@@ -2387,6 +2417,7 @@ mod tests {
             melee_range: Rules::default().melee_range,
             projectile_speed: Rules::default().projectile_speed,
             action_deadline_micros: Rules::default().action_deadline_micros,
+            pickup_radius: Rules::default().pickup_radius,
         }
     }
 
@@ -2474,6 +2505,7 @@ mod tests {
             melee_range: Rules::default().melee_range,
             projectile_speed: Rules::default().projectile_speed,
             action_deadline_micros: Rules::default().action_deadline_micros,
+            pickup_radius: Rules::default().pickup_radius,
         }
     }
 
