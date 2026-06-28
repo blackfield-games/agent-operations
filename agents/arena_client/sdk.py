@@ -493,6 +493,7 @@ def run_local_match(
     weapon_range: int | None = None,
     hit_radius: int | None = None,
     melee_cooldown: int | None = None,
+    melee_damage: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -811,7 +812,20 @@ def run_local_match(
     (it needs no ammo), so a `0` cooldown swings on EVERY tick — a continuous cleave that downs every enemy in arc
     the instant they enter it — not the default cadence, so an explicit `0` must forward, never be swallowed. The
     range is `0`..=`65535` (the `u16` shape, NOT the `i32` `0`..=`2**31-1` of the radius/reach twins): a non-None
-    negative or `> 65535` value raises before any spawn, mirroring the harness's `u16` `parse()` fence."""
+    negative or `> 65535` value raises before any spawn, mirroring the harness's `u16` `parse()` fence.
+
+    Pass `melee_damage` (a `u16` per-swing HP, `0`..=`65535`) to set the health one `weapon_mode="melee"` swing
+    subtracts from each enemy it cleaves (clamped to the target's health, so a huge value one-shots and cannot
+    overkill into a wrap) — lower damage is more swings to down a pawn. The melee twin of the ranged `damage`,
+    read only in `weapon_mode="melee"` (a hitscan or projectile match ignores it at runtime) but still bound into
+    the `Rules` replay digest. Like `melee_cooldown` it is a `u16` base-balance value with a NON-ZERO core default
+    (`50`, two swings to down a full pawn), so it uses a `None` sentinel: omit it (the default `None`) to add no
+    token and let the harness apply its own default — byte-identical argv. A value (even one equal to the core
+    default, AND an explicit `0`) forwards `--melee-damage <hp>` (value-flag) on BOTH paths via `MatchParams.rules`.
+    The `0` case is degenerate: a `0`-damage swing harms nobody — a harmless melee pawn, every swing whiffs even on
+    a perfect arc hit — not the default damage, so an explicit `0` must forward, never be swallowed. The range is
+    `0`..=`65535` (the `u16` shape, NOT the `i32` of the radius/reach twins): a non-None negative or `> 65535`
+    value raises before any spawn, mirroring the harness's `u16` `parse()` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -939,6 +953,13 @@ def run_local_match(
         raise ValueError(
             f"melee_cooldown is a tick count in 0..=65535 (None = harness default); got {melee_cooldown}"
         )
+    if melee_damage is not None and not 0 <= melee_damage <= 65535:
+        # Core takes melee_damage as a u16. None means "let the harness apply its default" (no token); a given
+        # value must be in range, else an out-of-range forward would wrap into a per-swing HP the caller never
+        # asked for (65536 -> 0, a harmless swing) — reject loudly, mirroring the harness u16.
+        raise ValueError(
+            f"melee_damage is per-swing HP in 0..=65535 (None = harness default); got {melee_damage}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1047,6 +1068,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--melee-cooldown", str(melee_cooldown)]
+    if melee_damage is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--melee-damage", str(melee_damage)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
