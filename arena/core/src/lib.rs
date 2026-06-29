@@ -1480,6 +1480,10 @@ impl Match {
                 team: me.team,
                 position: me.pos,
                 z: me.z,
+                // The seat's own per-tick vertical velocity, read straight off the pawn —
+                // the vertical twin of `velocity`, so the owner can predict its jump apex
+                // and landing tick. `0` on the ground and when gravity is off.
+                z_vel: me.z_vel,
                 facing: me.facing,
                 velocity: me.vel,
                 health: me.health,
