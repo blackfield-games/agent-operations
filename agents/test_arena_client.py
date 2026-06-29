@@ -216,6 +216,29 @@ def test_self_state_carries_dash_cooldown_but_visible_entity_does_not():
         })
 
 
+def test_self_state_carries_score_but_visible_entity_does_not():
+    # Own cumulative match score (damage dealt). UNLIKE cooldown/shield it is not secret
+    # — the same i32 is public on the broadcast scoreboard — but it stays own-state only:
+    # SelfState REQUIRES it (the Rust wire always carries it, so a drift fails loud
+    # instead of silently defaulting), and VisibleEntity must REJECT it (extra=forbid
+    # mirrors the Rust wire-pin exclusion), so an enemy's exact score (who is ahead) is
+    # never on the per-seat perception slice.
+    own = {
+        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+        "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
+        "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 42, "alive": True,
+    }
+    assert proto.SelfState.model_validate(own).score == 42
+    with pytest.raises(pydantic.ValidationError):
+        proto.SelfState.model_validate({k: v for k, v in own.items() if k != "score"})
+    with pytest.raises(pydantic.ValidationError):
+        proto.VisibleEntity.model_validate({
+            "entity_id": 1, "kind": "player", "team": 2,
+            "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+            "in_line_of_sight": True, "score": 42,
+        })
+
+
 def test_unknown_field_is_rejected():
     # extra=forbid: a field the Python type does not know is a decode error, not a
     # silent drop — the same wire-shape discipline the Rust crate enforces.
