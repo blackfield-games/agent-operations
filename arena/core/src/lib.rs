@@ -3653,6 +3653,46 @@ pub struct PickupCase {
     pub active_timeline: Vec<bool>,
 }
 
+/// A pinned vertical-jump-arc case (domain v18): a single pawn (seat 0) under a given
+/// [`Rules::gravity`] takes a jump-pressed `step` from `(start_z, start_z_vel)`, then rides
+/// the arc to its landing, recording the full per-tick `(z, z_vel)` `trajectory` (the launch
+/// tick through the landing tick inclusive). Pins the semi-implicit Euler a twin must
+/// reproduce: a GROUNDED jump press (`z == 0 && z_vel == 0`) sets `z_vel` to the fixed
+/// [`JUMP_VELOCITY`], then each tick integrates `z += z_vel` BEFORE `z_vel -= gravity` — so
+/// `z` reaches [`JUMP_VELOCITY`] on the launch tick and the apex falls a tick later than an
+/// explicit-Euler (decrement-first) twin's, and the descent snaps to `z == 0` with `z_vel`
+/// cleared on the determined `landing_tick`. Gated on `gravity > 0`: with gravity off (the
+/// default) the press is inert, the trajectory stays flat at `0`, and the match is
+/// byte-identical to a 2D one (`landing_tick` is `None`, `apex_z` is `0`). A jump pressed
+/// mid-air (`start_z > 0`) does NOT re-launch — only a grounded pawn jumps — so a held-jump
+/// air case rides the EXISTING arc unchanged. A twin that uses a different launch impulse,
+/// integrates in the wrong order (off-by-one at apex/landing), allows an air-jump, or
+/// mishandles the `z == 0` snap fails the matching case. Distinct from the `fall_damage` /
+/// `knockback` / `z_occupancy` categories, which USE `z` yet pin landing-damage / impulse /
+/// occupancy, never the rising arc itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JumpCase {
+    pub label: String,
+    pub gravity: i32,
+    /// Seat 0's starting elevation: `0` for a grounded launch, `> 0` for the air-jump case
+    /// (placed mid-arc so a press must NOT re-launch it).
+    pub start_z: i32,
+    /// Seat 0's starting vertical velocity — `0` grounded, the live arc rate for the air-jump.
+    pub start_z_vel: i32,
+    /// Whether the jump button is held on EVERY recorded tick (`true`) or pressed only on the
+    /// opening tick (`false`). The held cases pin that a jump never double-jumps mid-air.
+    pub hold_jump: bool,
+    /// The pawn's `(z, z_vel)` after each `step`, from the opening (launch) tick through the
+    /// landing tick inclusive — the full arc a twin replays. Pinning the whole trajectory (not
+    /// just the apex) fixes the integration ORDER bit-for-bit.
+    pub trajectory: Vec<(i32, i32)>,
+    /// The peak `z` over the arc (the apex); `0` for a gravity-off / inert case.
+    pub apex_z: i32,
+    /// The `trajectory` index at which the pawn returns to `z == 0` (the landing tick), or
+    /// `None` when it never leaves the ground (gravity off).
+    pub landing_tick: Option<u16>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -4009,6 +4049,12 @@ pub struct ParityVectors {
     /// [`Rules::pickup_radius`] gate, and the [`Rules::pickup_respawn_cooldown`] dormancy —
     /// distinct from the match-level `pickup_collected` digest case (layout-binds-the-hash).
     pub pickups: Vec<PickupCase>,
+    /// vertical-jump-arc cases (domain v18): a grounded jump press launches `z_vel` to the
+    /// fixed [`JUMP_VELOCITY`] and semi-implicit Euler integrates the arc (`z += z_vel` before
+    /// `z_vel -= gravity`) to a determined apex and a clean `z == 0` landing — gated on
+    /// `gravity > 0` (off ⇒ inert, 2D-identical) and refusing an air-jump. Pins the rising arc
+    /// itself, which `fall_damage` / `knockback` / `z_occupancy` use yet never pin.
+    pub jumps: Vec<JumpCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4075,9 +4121,18 @@ pub struct ParityVectors {
 /// exactly the cooldown later). The pickup layout was already folded into
 /// `canonical_encoding`, so this is pure coverage (no committed match hash moves) — the
 /// match-level `pickup_collected` case pins only that the layout binds the digest, never
-/// the effect/cap/radius/respawn that a twin must reproduce.
+/// the effect/cap/radius/respawn that a twin must reproduce;
+/// bumped to v18 for the VERTICAL JUMP ARC — a new `jumps` category pins the gravity-gated
+/// arc itself: a grounded jump press sets `z_vel` to the fixed [`JUMP_VELOCITY`] and
+/// semi-implicit Euler (`z += z_vel` BEFORE `z_vel -= gravity`) integrates `z` to a determined
+/// apex and a clean `z == 0` landing, gated on `gravity > 0` (off ⇒ inert and 2D-identical)
+/// and refusing an air-jump (only a grounded pawn launches). `gravity` was already folded into
+/// `canonical_encoding`, so this is pure coverage (no committed match hash moves) — the
+/// `fall_damage`, `knockback`, and `z_occupancy` categories USE `z` yet pin landing-damage,
+/// the launch impulse, and occupancy, never the per-tick rising trajectory a twin must
+/// reproduce (a wrong launch impulse or explicit-Euler order diverges silently until now).
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v17";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v18";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4481,6 +4536,50 @@ fn pickup_case(
         collected,
         active_timeline,
     }
+}
+
+/// Build a vertical-jump-arc case: place seat 0 at the origin with elevation
+/// `(start_z, start_z_vel)`, set [`Rules::gravity`], and step a jump-pressed `Match` — holding
+/// the jump every tick when `hold_jump`, else pressing it only on the opening tick — recording
+/// the pawn's `(z, z_vel)` after each step until it lands (returns to `z == 0` having left the
+/// ground) or `max_ticks` elapse. The intent sets the `jump` button directly (not
+/// [`parity_intent`], which presses `fire`). The trajectory is read off the real sim integrator
+/// (`Match::step`), never a hand-computed arc, so the golden cannot drift from the reference
+/// physics (or bake in the wrong Euler order).
+fn jump_case(label: &str, gravity: i32, start_z: i32, start_z_vel: i32, hold_jump: bool, max_ticks: u16) -> JumpCase {
+    let rules = Rules { gravity, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].z = start_z;
+    m.pawns[0].z_vel = start_z_vel;
+    // Seat 1 idles far away on a distinct team so the match stays Live across the arc and only
+    // seat 0's vertical trajectory is recorded.
+    m.pawns[1].pos = Vec2 { x: 30_000, y: 0 };
+    let press = ActionIntent {
+        move_dir: Vec2::ZERO,
+        aim: EAST,
+        buttons: arena_proto::ActionButtons { fire: false, jump: true, ability: false, reload: false },
+    };
+    let idle = parity_intent(Vec2::ZERO, EAST, false);
+    let mut trajectory = Vec::new();
+    let mut airborne_seen = false;
+    let mut landing_tick = None;
+    for t in 0..max_ticks {
+        let press_now = hold_jump || t == 0;
+        let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+        intents.insert(0, if press_now { press } else { idle });
+        m.step(&intents);
+        trajectory.push((m.pawns[0].z, m.pawns[0].z_vel));
+        if m.pawns[0].z > 0 {
+            airborne_seen = true;
+        } else if airborne_seen {
+            landing_tick = Some(t);
+            break;
+        }
+    }
+    let apex_z = trajectory.iter().map(|&(z, _)| z).max().unwrap_or(0);
+    JumpCase { label: label.to_string(), gravity, start_z, start_z_vel, hold_jump, trajectory, apex_z, landing_tick }
 }
 
 /// Build a pawn-occupancy case: place the mover (seat 0) at `start` and an obstacle
@@ -5257,6 +5356,25 @@ pub fn parity_vectors() -> ParityVectors {
                 // Respawn: collect on tick 1, then (pawn off the pad) dormant through the 3-tick
                 // cooldown and collectable again -- stepped cooldown+1 ticks to observe reactivation.
                 pickup_case("collected_pickup_respawns_after_cooldown", PickupKind::Health, origin, origin, 40, 50, base, 4),
+            ]
+        },
+        jumps: {
+            // gravity 480 divides 2400 (= 2·JUMP_VELOCITY) but NOT 1200, so the descent crosses
+            // the ground EXACTLY on a tick (nz == 0, no overshoot-snap like the g=500 unit test)
+            // with a single unambiguous apex — the cleanest divisor for pinning the Euler order.
+            let g = 480;
+            vec![
+                // Full grounded arc (pressed once, then ridden with no input): z launches to
+                // JUMP_VELOCITY, z_vel decrements by exactly g each tick, the pawn peaks at 2160
+                // and lands back at z==0 on the 6th tick (index 5).
+                jump_case("grounded_arc_launches_decelerates_peaks_lands", g, 0, 0, false, 12),
+                // Gravity off (the default): a HELD jump is inert — z and z_vel stay 0 and the
+                // match is byte-identical to a 2D one, so the arc is rule-driven, not setup-driven.
+                jump_case("gravity_off_jump_is_inert", 0, 0, 0, true, 4),
+                // Air-jump: a pawn already mid-arc holding jump every tick does NOT re-launch —
+                // only a grounded pawn jumps. Started at the post-launch state
+                // (JUMP_VELOCITY, JUMP_VELOCITY - g), so its trajectory is the grounded arc's tail.
+                jump_case("air_jump_does_not_relaunch", g, JUMP_VELOCITY, JUMP_VELOCITY - g, true, 12),
             ]
         },
         matches: vec![

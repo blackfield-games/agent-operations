@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v17",
+  "domain": "blackfield/arena/parity-vectors/v18",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2173,6 +2173,101 @@
         false,
         true
       ]
+    }
+  ],
+  "jumps": [
+    {
+      "label": "grounded_arc_launches_decelerates_peaks_lands",
+      "gravity": 480,
+      "start_z": 0,
+      "start_z_vel": 0,
+      "hold_jump": false,
+      "trajectory": [
+        [
+          1200,
+          720
+        ],
+        [
+          1920,
+          240
+        ],
+        [
+          2160,
+          -240
+        ],
+        [
+          1920,
+          -720
+        ],
+        [
+          1200,
+          -1200
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "apex_z": 2160,
+      "landing_tick": 5
+    },
+    {
+      "label": "gravity_off_jump_is_inert",
+      "gravity": 0,
+      "start_z": 0,
+      "start_z_vel": 0,
+      "hold_jump": true,
+      "trajectory": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "apex_z": 0,
+      "landing_tick": null
+    },
+    {
+      "label": "air_jump_does_not_relaunch",
+      "gravity": 480,
+      "start_z": 1200,
+      "start_z_vel": 720,
+      "hold_jump": true,
+      "trajectory": [
+        [
+          1920,
+          240
+        ],
+        [
+          2160,
+          -240
+        ],
+        [
+          1920,
+          -720
+        ],
+        [
+          1200,
+          -1200
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "apex_z": 2160,
+      "landing_tick": 4
     }
   ],
   "matches": [
