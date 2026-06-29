@@ -498,6 +498,7 @@ def run_local_match(
     projectile_speed: int | None = None,
     action_deadline_micros: int | None = None,
     pickup_radius: int | None = None,
+    pickup_respawn_cooldown: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -883,7 +884,20 @@ def run_local_match(
     a pawn exactly on the pickup (effectively uncollectable) — not the default reach, so an explicit `0` must forward,
     never be swallowed. The range is `0`..=`2**31-1` (the `i32` shape like `melee_range`, NOT `u16`): a non-None negative
     (core compares a squared distance, never `< 0`) or `> 2**31-1` value raises before any spawn, mirroring the
-    harness's `u32`-then-`i32` `parse_pickup_radius` fence."""
+    harness's `u32`-then-`i32` `parse_pickup_radius` fence.
+
+    Pass `pickup_respawn_cooldown` (a tick count, `0`..=`65535`) to set how long a collected pickup stays dormant
+    before it respawns at its spawn point — a deterministic per-tick countdown (no wall-clock) the sim arms when a
+    pawn collects a pickup, so a longer cooldown keeps a contested heal/ammo spot empty longer and a shorter one
+    refreshes it sooner (a pickup-free match never consults it). Like the other base-balance knobs it has a NON-ZERO
+    core default (`300` ticks, ~10 s at 30 Hz), so it uses a `None` sentinel: omit it (the default `None`) to add no
+    token and let the harness apply its own default — byte-identical argv. A value (even one equal to the core default,
+    AND an explicit `0`) forwards `--pickup-respawn-cooldown <ticks>` (value-flag) on BOTH paths via
+    `MatchParams.rules`. The `0` case is degenerate: a `0` cooldown respawns a collected pickup the very next tick
+    (effectively always present) — not the default dormancy, so an explicit `0` must forward, never be swallowed. The
+    range is `0`..=`65535` (the `u16` shape like `melee_cooldown`/`melee_damage`, NOT the `i32` reach knobs or the
+    `u32` deadline): a non-None negative or `> 65535` value raises before any spawn, mirroring the harness's `u16`
+    parse."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -1050,6 +1064,13 @@ def run_local_match(
         raise ValueError(
             f"pickup_radius is a collection reach in 0..=2**31-1 (None = harness default); got {pickup_radius}"
         )
+    if pickup_respawn_cooldown is not None and not 0 <= pickup_respawn_cooldown <= 65535:
+        # Core takes pickup_respawn_cooldown as a u16. None means "let the harness apply its default" (no token); a
+        # given value must be in range, else an out-of-range forward would wrap into a dormancy the caller never
+        # asked for (65536 -> 0, an always-present pickup) — reject loudly, mirroring the harness u16.
+        raise ValueError(
+            f"pickup_respawn_cooldown is a tick count in 0..=65535 (None = harness default); got {pickup_respawn_cooldown}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1179,6 +1200,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--pickup-radius", str(pickup_radius)]
+    if pickup_respawn_cooldown is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--pickup-respawn-cooldown", str(pickup_respawn_cooldown)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
