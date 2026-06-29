@@ -496,6 +496,7 @@ def run_local_match(
     melee_damage: int | None = None,
     melee_range: int | None = None,
     projectile_speed: int | None = None,
+    action_deadline_micros: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -858,7 +859,19 @@ def run_local_match(
     landing no hit — not the default speed, so an explicit `0` must forward, never be swallowed. The range is
     `0`..=`2**31-1` (the `i32` shape, NOT `u16`): a non-None negative (core flies a projectile FORWARD along the
     octant, never backward) or `> 2**31-1` value raises before any spawn, mirroring the harness's `u32`-then-`i32`
-    `parse_projectile_speed` fence."""
+    `parse_projectile_speed` fence.
+
+    Pass `action_deadline_micros` (a per-action wall-clock budget in microseconds, `0`..=`2**32-1`) to set how long
+    a seat has to answer an observation before the match-runner forfeits that tick on its behalf — the timing knob
+    the transport enforces, not a combat balance value (a tighter budget pressures a slow agent; a slow seat that
+    misses it skips its action that tick). Like `projectile_speed` it is a base-balance value with a NON-ZERO core
+    default (`50_000`, 50 ms), so it uses a `None` sentinel: omit it (the default `None`) to add no token and let the
+    harness apply its own default — byte-identical argv. A value (even one equal to the core default, AND an explicit
+    `0`) forwards `--action-deadline-micros <micros>` (value-flag) on BOTH paths via `MatchParams.rules`. The `0` case
+    is degenerate: a `0`-microsecond budget forfeits every seat's tick the instant it is offered (no seat can ever
+    act) — not the default budget, so an explicit `0` must forward, never be swallowed. The range is `0`..=`2**32-1`
+    (the `u32` shape, wider than the `i32` knobs and with no negative): a non-None negative or `> 2**32-1` value raises
+    before any spawn, mirroring the harness's `u32` parse."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -1009,6 +1022,14 @@ def run_local_match(
         raise ValueError(
             f"projectile_speed is a per-tick travel speed in 0..=2**31-1 (None = harness default); got {projectile_speed}"
         )
+    if action_deadline_micros is not None and not 0 <= action_deadline_micros <= 2**32 - 1:
+        # Core takes action_deadline_micros as a u32 (wider than the i32 knobs, no negative). None means "let the
+        # harness apply its own default" (no token); a given value must be in range, else a negative or a value past
+        # u32::MAX (which wraps) would forward a footgun the harness aborts on — reject loudly, mirroring the
+        # harness's u32 parse.
+        raise ValueError(
+            f"action_deadline_micros is a per-action microsecond budget in 0..=2**32-1 (None = harness default); got {action_deadline_micros}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1129,6 +1150,11 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--projectile-speed", str(projectile_speed)]
+    if action_deadline_micros is not None:
+        # Per-action deadline value-flag on both paths (the matchmaker carries it via MatchParams.rules), forwarded
+        # before the mode block so it reaches the direct and --mode paths alike. None (omitted) adds no token so the
+        # harness applies its own default — byte-identical argv.
+        argv += ["--action-deadline-micros", str(action_deadline_micros)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
