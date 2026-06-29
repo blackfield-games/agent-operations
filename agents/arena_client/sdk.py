@@ -500,6 +500,7 @@ def run_local_match(
     pickup_radius: int | None = None,
     pickup_respawn_cooldown: int | None = None,
     spawn_jitter: int | None = None,
+    spawn_radius: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -911,7 +912,20 @@ def run_local_match(
     no per-seed perturbation — not the default scatter, so an explicit `0` must forward, never be swallowed. The range
     is `0`..=`2**31-1` (the `i32` shape like `pickup_radius`, NOT `u16`): a non-None negative (core would invert the
     `[-jitter, +jitter]` draw span, and independently rejects `spawn_jitter < 0` as an invalid `Rules`) or `> 2**31-1`
-    value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_spawn_jitter` fence."""
+    value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_spawn_jitter` fence.
+
+    Pass `spawn_radius` (the spawn-line half-width in position units, `0`..=`2**31-1`) to set how far apart the seats
+    open: the sim spreads the seats evenly across `[-spawn_radius, +spawn_radius]` on the X axis at match start, then
+    `spawn_jitter` perturbs each, so a wider radius opens the seats farther apart and a `0` radius stacks every seat
+    on the X origin (only the jitter then separates them). Like the other base-balance knobs it has a NON-ZERO core
+    default (`20000`, a 20 m half-width), so it uses a `None` sentinel: omit it (the default `None`) to add no token
+    and let the harness apply its own default — byte-identical argv. A value (even one equal to the core default, AND
+    an explicit `0`) forwards `--spawn-radius <units>` (value-flag) on BOTH paths via `MatchParams.rules`. The `0`
+    case is degenerate: a `0` radius stacks every seat on the X origin — not the default spread, so an explicit `0`
+    must forward, never be swallowed. The range is `0`..=`2**31-1` (the `i32` shape like `spawn_jitter`, NOT `u16`): a
+    non-None negative (core would invert the `[-radius, +radius]` spread span, and independently rejects
+    `spawn_radius < 0` as an invalid `Rules`) or `> 2**31-1` value raises before any spawn, mirroring the harness's
+    `u32`-then-`i32` `parse_spawn_radius` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -1093,6 +1107,14 @@ def run_local_match(
         raise ValueError(
             f"spawn_jitter is a per-axis opening jitter in 0..=2**31-1 (None = harness default); got {spawn_jitter}"
         )
+    if spawn_radius is not None and not 0 <= spawn_radius <= 2**31 - 1:
+        # Core takes spawn_radius as a non-negative i32. None means "let the harness apply its default" (no token);
+        # a given value must be in range, else a negative (core would invert the [-radius, +radius] spread span, and
+        # rejects spawn_radius < 0 as an invalid Rules) or a value past i32::MAX (which wraps negative) would forward
+        # a footgun — reject loudly, mirroring the harness's u32-then-i32 parse_spawn_radius fence.
+        raise ValueError(
+            f"spawn_radius is a spawn-line half-width in 0..=2**31-1 (None = harness default); got {spawn_radius}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1230,6 +1252,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--spawn-jitter", str(spawn_jitter)]
+    if spawn_radius is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--spawn-radius", str(spawn_radius)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
