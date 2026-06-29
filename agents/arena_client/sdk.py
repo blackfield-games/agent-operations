@@ -497,6 +497,7 @@ def run_local_match(
     melee_range: int | None = None,
     projectile_speed: int | None = None,
     action_deadline_micros: int | None = None,
+    pickup_radius: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -871,7 +872,18 @@ def run_local_match(
     is degenerate: a `0`-microsecond budget forfeits every seat's tick the instant it is offered (no seat can ever
     act) — not the default budget, so an explicit `0` must forward, never be swallowed. The range is `0`..=`2**32-1`
     (the `u32` shape, wider than the `i32` knobs and with no negative): a non-None negative or `> 2**32-1` value raises
-    before any spawn, mirroring the harness's `u32` parse."""
+    before any spawn, mirroring the harness's `u32` parse.
+
+    Pass `pickup_radius` (a collection reach in core distance units, `0`..=`2**31-1`) to set how close a pawn's centre
+    must get to a world pickup to collect it — a wider radius grabs from farther, a tighter one demands closer contact.
+    Like the other base-balance knobs it has a NON-ZERO core default (`1000`, a 1 m contact disc), so it uses a `None`
+    sentinel: omit it (the default `None`) to add no token and let the harness apply its own default — byte-identical
+    argv. A value (even one equal to the core default, AND an explicit `0`) forwards `--pickup-radius <units>`
+    (value-flag) on BOTH paths via `MatchParams.rules`. The `0` case is degenerate: a `0` radius is collectible only by
+    a pawn exactly on the pickup (effectively uncollectable) — not the default reach, so an explicit `0` must forward,
+    never be swallowed. The range is `0`..=`2**31-1` (the `i32` shape like `melee_range`, NOT `u16`): a non-None negative
+    (core compares a squared distance, never `< 0`) or `> 2**31-1` value raises before any spawn, mirroring the
+    harness's `u32`-then-`i32` `parse_pickup_radius` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -1030,6 +1042,14 @@ def run_local_match(
         raise ValueError(
             f"action_deadline_micros is a per-action microsecond budget in 0..=2**32-1 (None = harness default); got {action_deadline_micros}"
         )
+    if pickup_radius is not None and not 0 <= pickup_radius <= 2**31 - 1:
+        # Core takes pickup_radius as a non-negative i32. None means "let the harness apply its default" (no token);
+        # a given value must be in range, else a negative (core compares a squared distance, never < 0) or a value
+        # past i32::MAX (which wraps negative) would forward a footgun — reject loudly, mirroring the harness's
+        # u32-then-i32 parse_pickup_radius fence.
+        raise ValueError(
+            f"pickup_radius is a collection reach in 0..=2**31-1 (None = harness default); got {pickup_radius}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1155,6 +1175,10 @@ def run_local_match(
         # before the mode block so it reaches the direct and --mode paths alike. None (omitted) adds no token so the
         # harness applies its own default — byte-identical argv.
         argv += ["--action-deadline-micros", str(action_deadline_micros)]
+    if pickup_radius is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--pickup-radius", str(pickup_radius)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
