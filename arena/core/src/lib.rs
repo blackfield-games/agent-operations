@@ -5569,6 +5569,33 @@ mod tests {
     }
 
     #[test]
+    fn observe_exposes_own_credited_score_matching_the_broadcast() {
+        // The seat reads its OWN match score off its observation the way it reads its
+        // cooldown: `0` at spawn, then the exact credited total the broadcast scoreboard
+        // shows for it at the same tick. Score is own-state only — it lives on SelfState,
+        // never on a VisibleEntity (the type carries no score field), so an enemy's
+        // standing stays off the per-seat perception slice.
+        let mut m = close_match(7);
+        assert_eq!(m.observe(0).own.score, 0, "no damage dealt at spawn");
+        assert_eq!(m.observe(1).own.score, 0, "no damage dealt at spawn");
+
+        // Seat 0 fires on seat 1 until it lands its first credited hit; its OWN score
+        // must then equal this pawn's broadcast scoreboard entry at that same tick —
+        // both read the one pawn field, never recomputed, so they can never disagree.
+        let aim = m.observe(0).own.facing;
+        while m.phase() == MatchPhase::Live && m.observe(0).own.score == 0 {
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, aim, true))]);
+        }
+        let own0 = m.observe(0).own.score;
+        assert!(own0 > 0, "seat 0's credited damage surfaces on its own observation");
+        let s0 = m.broadcast().entities.into_iter().find(|e| e.entity_id == 0).unwrap();
+        assert_eq!(own0, s0.score, "own score equals the broadcast scoreboard at the same tick");
+        // Score is offense-credited: seat 1 has dealt no damage, so it still reads 0
+        // even after taking the hit (it is not symmetric with damage TAKEN).
+        assert_eq!(m.observe(1).own.score, 0, "taking damage does not raise the victim's score");
+    }
+
+    #[test]
     fn spawns_are_seed_deterministic_and_mirrored() {
         let a = new_match(7);
         let b = new_match(7);
