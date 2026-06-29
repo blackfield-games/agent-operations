@@ -3693,6 +3693,40 @@ pub struct JumpCase {
     pub landing_tick: Option<u16>,
 }
 
+/// A pinned shield-absorption case (domain v19): a single target (seat 1) holding
+/// `shield_before` / `health_before` takes ONE point-blank `weapon_mode` hit of `raw`
+/// damage through the REAL combat path, and the shield-first sink
+/// ([`Match::apply_hp_damage`], the one core every weapon mode funnels through) splits it:
+/// `absorbed = min(raw, shield_before)` drains the SHIELD first, the overflow
+/// `to_health = min(raw - absorbed, health_before)` spills to HEALTH, and the
+/// score-credited `effective = absorbed + to_health` is CLAMPED to the pools actually
+/// present — never `raw` when the hit overcommits past `shield + health`. A twin that
+/// drained health before shield, double-counted the absorbed portion, or returned the raw
+/// instead of the clamped effective diverges. With `shield_before == 0` (and `max_shield`
+/// off, the default) the sink is exactly `raw.min(health)` removed from health — a
+/// shieldless hit is byte-identical to the pre-shield per-site clamp. Hitscan, melee, and
+/// projectile share this ONE sink, so the same `(raw, shield, health)` produces the same
+/// split in every mode (the `shared_sink_*` trio pins it). Distinct from the `knockback`
+/// category, which pins the post-hit impulse the weapon wrapper ([`Match::damage_pawn`])
+/// adds ON TOP of this core, never the absorb/overflow split itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShieldAbsorbCase {
+    pub label: String,
+    pub weapon_mode: WeaponMode,
+    /// The weapon's raw damage before absorption (`Rules::damage` for hitscan/projectile,
+    /// `Rules::melee_damage` for melee — set equal here so the mode never changes the raw).
+    pub raw: u16,
+    pub shield_before: u16,
+    pub health_before: u16,
+    pub shield_after: u16,
+    pub health_after: u16,
+    /// The effective damage the sink dealt: `absorbed + to_health`, clamped to the pools
+    /// present (`shield_before + health_before`), NOT necessarily `raw`.
+    pub effective: u16,
+    /// Whether the target survived (`health_after > 0`).
+    pub alive: bool,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -4055,6 +4089,13 @@ pub struct ParityVectors {
     /// `gravity > 0` (off ⇒ inert, 2D-identical) and refusing an air-jump. Pins the rising arc
     /// itself, which `fall_damage` / `knockback` / `z_occupancy` use yet never pin.
     pub jumps: Vec<JumpCase>,
+    /// shield-absorption cases (domain v19): one point-blank weapon hit splits via the
+    /// shield-first sink ([`Match::apply_hp_damage`]) — `absorbed = min(raw, shield)` drains
+    /// the shield, the overflow spills to health, and the effective is clamped to the pools
+    /// present. Pins the absorb/overflow split a twin must reproduce — shared across all three
+    /// weapon modes, byte-identical to the per-site clamp when shieldless — which the
+    /// `knockback` category (post-hit impulse) never pins.
+    pub shield_absorption: Vec<ShieldAbsorbCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4130,9 +4171,18 @@ pub struct ParityVectors {
 /// `canonical_encoding`, so this is pure coverage (no committed match hash moves) — the
 /// `fall_damage`, `knockback`, and `z_occupancy` categories USE `z` yet pin landing-damage,
 /// the launch impulse, and occupancy, never the per-tick rising trajectory a twin must
-/// reproduce (a wrong launch impulse or explicit-Euler order diverges silently until now).
+/// reproduce (a wrong launch impulse or explicit-Euler order diverges silently until now);
+/// bumped to v19 for SHIELD ABSORPTION — a new `shield_absorption` category pins the
+/// shield-first damage sink ([`Match::apply_hp_damage`]): one weapon hit drains
+/// `absorbed = min(raw, shield)` from the shield FIRST, spills the overflow
+/// `min(raw - absorbed, health)` to health, and credits the effective `absorbed + to_health`
+/// CLAMPED to the pools present (never `raw` when the hit overcommits). `max_shield` was
+/// already folded into `canonical_encoding`, so this is pure coverage (no committed match
+/// hash moves) — the `knockback` category pins the post-hit impulse the weapon wrapper adds
+/// ON TOP of this sink, never the absorb/overflow split, which all three weapon modes share
+/// and which a twin draining health-first or returning the raw would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v18";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v19";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4823,6 +4873,53 @@ fn knockback_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocit
     }
 }
 
+/// Build a shield-absorption case: grant the target (seat 1) `shield_before` / `health_before`,
+/// fire ONE point-blank `mode` hit of `raw` damage through the REAL combat path, and record
+/// how the shield-first sink split it. `Rules::damage` AND `Rules::melee_damage` are both set
+/// to `raw` so every mode deals the identical raw (the shared sink is the discriminator, not a
+/// per-mode damage stat); `max_shield` is set to `shield_before` so the granted shield is a
+/// legitimate full pool (and stays 0 — the default shieldless config — for the no-shield case).
+/// Knockback/gravity stay off, so the hit exercises the pure absorb/overflow split with no
+/// impulse. Same point-blank geometry as `knockback_case` (target due east at 1500), so the
+/// shot lands in every mode; `effective` is read back from the pool deltas (`absorbed +
+/// to_health`), the score-credited value the sink returns.
+fn shield_absorb_case(label: &str, mode: WeaponMode, raw: u16, shield_before: u16, health_before: u16) -> ShieldAbsorbCase {
+    let rules = Rules { weapon_mode: mode, damage: raw, melee_damage: raw, max_shield: shield_before, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+    m.pawns[1].shield = shield_before;
+    m.pawns[1].health = health_before;
+    match mode {
+        WeaponMode::Hitscan => m.resolve_fire(0),
+        WeaponMode::Melee => m.resolve_melee(0),
+        WeaponMode::Projectile => {
+            m.spawn_projectile(0);
+            let mut age = 0u16;
+            while !m.projectiles.is_empty() && age < MAX_PROJECTILE_LIFETIME {
+                m.advance_projectiles();
+                age += 1;
+            }
+        }
+    }
+    let shield_after = m.pawns[1].shield;
+    let health_after = m.pawns[1].health;
+    let effective = (shield_before - shield_after) + (health_before - health_after);
+    ShieldAbsorbCase {
+        label: label.to_string(),
+        weapon_mode: mode,
+        raw,
+        shield_before,
+        health_before,
+        shield_after,
+        health_after,
+        effective,
+        alive: m.pawns[1].alive,
+    }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -5377,6 +5474,27 @@ pub fn parity_vectors() -> ParityVectors {
                 jump_case("air_jump_does_not_relaunch", g, JUMP_VELOCITY, JUMP_VELOCITY - g, true, 12),
             ]
         },
+        shield_absorption: vec![
+            // Full absorb: a 100-shield pawn eats a 40 hit entirely — shield 100->60, health
+            // untouched at 100, effective 40 (all absorbed).
+            shield_absorb_case("full_absorb_no_health_loss", WeaponMode::Hitscan, 40, 100, 100),
+            // Partial absorb: a 30-shield pawn takes a 50 hit — shield drains to 0, the 20
+            // overflow spills to health (100->80), effective 50 (the whole raw landed).
+            shield_absorb_case("partial_absorb_overflow_to_health", WeaponMode::Hitscan, 50, 30, 100),
+            // Shared sink: the SAME (raw 35, shield 20, health 100) hit through each of the three
+            // weapon modes — all funnel through apply_hp_damage, so all three split identically
+            // (shield 20->0, health 100->85, effective 35). The mode must not change the split.
+            shield_absorb_case("shared_sink_hitscan", WeaponMode::Hitscan, 35, 20, 100),
+            shield_absorb_case("shared_sink_melee", WeaponMode::Melee, 35, 20, 100),
+            shield_absorb_case("shared_sink_projectile", WeaponMode::Projectile, 35, 20, 100),
+            // No shield (max_shield 0, the default): the sink is exactly raw.min(health) removed
+            // from health (100->60), byte-identical to the pre-shield per-site clamp.
+            shield_absorb_case("no_shield_byte_identity", WeaponMode::Hitscan, 40, 0, 100),
+            // Lethal overflow: a 100 hit on a 10-shield / 30-health pawn drains the shield, spills
+            // min(90,30)=30 to health (->0, downed), and the effective is CLAMPED to the 40 pools
+            // present, NOT the raw 100 — a twin returning the raw over-credits the kill.
+            shield_absorb_case("lethal_overflow_clamps_effective", WeaponMode::Hitscan, 100, 10, 30),
+        ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

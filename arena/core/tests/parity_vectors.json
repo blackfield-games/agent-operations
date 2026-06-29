@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v18",
+  "domain": "blackfield/arena/parity-vectors/v19",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2268,6 +2268,85 @@
       ],
       "apex_z": 2160,
       "landing_tick": 4
+    }
+  ],
+  "shield_absorption": [
+    {
+      "label": "full_absorb_no_health_loss",
+      "weapon_mode": "hitscan",
+      "raw": 40,
+      "shield_before": 100,
+      "health_before": 100,
+      "shield_after": 60,
+      "health_after": 100,
+      "effective": 40,
+      "alive": true
+    },
+    {
+      "label": "partial_absorb_overflow_to_health",
+      "weapon_mode": "hitscan",
+      "raw": 50,
+      "shield_before": 30,
+      "health_before": 100,
+      "shield_after": 0,
+      "health_after": 80,
+      "effective": 50,
+      "alive": true
+    },
+    {
+      "label": "shared_sink_hitscan",
+      "weapon_mode": "hitscan",
+      "raw": 35,
+      "shield_before": 20,
+      "health_before": 100,
+      "shield_after": 0,
+      "health_after": 85,
+      "effective": 35,
+      "alive": true
+    },
+    {
+      "label": "shared_sink_melee",
+      "weapon_mode": "melee",
+      "raw": 35,
+      "shield_before": 20,
+      "health_before": 100,
+      "shield_after": 0,
+      "health_after": 85,
+      "effective": 35,
+      "alive": true
+    },
+    {
+      "label": "shared_sink_projectile",
+      "weapon_mode": "projectile",
+      "raw": 35,
+      "shield_before": 20,
+      "health_before": 100,
+      "shield_after": 0,
+      "health_after": 85,
+      "effective": 35,
+      "alive": true
+    },
+    {
+      "label": "no_shield_byte_identity",
+      "weapon_mode": "hitscan",
+      "raw": 40,
+      "shield_before": 0,
+      "health_before": 100,
+      "shield_after": 0,
+      "health_after": 60,
+      "effective": 40,
+      "alive": true
+    },
+    {
+      "label": "lethal_overflow_clamps_effective",
+      "weapon_mode": "hitscan",
+      "raw": 100,
+      "shield_before": 10,
+      "health_before": 30,
+      "shield_after": 0,
+      "health_after": 0,
+      "effective": 40,
+      "alive": false
     }
   ],
   "matches": [
