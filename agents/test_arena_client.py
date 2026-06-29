@@ -3204,6 +3204,72 @@ def test_run_local_match_rejects_an_out_of_range_pickup_radius():
             run_local_match("/no/such/harness", [0, 1], policies, pickup_radius=bad)
 
 
+def test_run_local_match_forwards_pickup_respawn_cooldown_and_omits_it_when_none(monkeypatch):
+    # pickup_respawn_cooldown is a base-balance knob with a non-zero core default (300 ticks), so it uses a None
+    # sentinel: the default None adds no token (the harness applies its own default — byte-identical argv); a value
+    # forwards --pickup-respawn-cooldown <ticks> as one value token, mode-independently (before the mode block).
+    # Captured without a harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--pickup-respawn-cooldown" not in captured["argv"], "the default None adds no flag (harness default)"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, pickup_respawn_cooldown=450)
+    argv = captured["argv"]
+    assert argv[argv.index("--pickup-respawn-cooldown") + 1] == "450"
+
+    # An explicit 0 is NOT the sentinel — it must forward (an always-present pickup that respawns the tick after
+    # collection, the caller asked for), UNLIKE the feature-toggle knobs where 0 is the omit-default. None-vs-0.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, pickup_respawn_cooldown=0)
+    argv = captured["argv"]
+    assert argv[argv.index("--pickup-respawn-cooldown") + 1] == "0"
+
+    # The u16 ceiling (65535) forwards — pins the INCLUSIVE upper bound (a `< 65535` off-by-one would wrongly reject
+    # it), the largest dormancy core accepts before the u16 wraps.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, pickup_respawn_cooldown=65535)
+    argv = captured["argv"]
+    assert argv[argv.index("--pickup-respawn-cooldown") + 1] == "65535"
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, pickup_respawn_cooldown=450)
+    argv = captured["argv"]
+    assert argv[argv.index("--pickup-respawn-cooldown") + 1] == "450"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_pickup_respawn_cooldown():
+    # pickup_respawn_cooldown is a u16 in core (0..=65535), NOT an i32/u32 — a non-None negative or a value past
+    # 65535 (which would wrap into a dormancy the caller never asked for) forwarded blindly would abort the harness,
+    # so it raises before any spawn, mirroring the harness's u16 parse() fence. None is exempt (the sentinel).
+    # 65536 IS rejected here (the discriminating boundary the wider i32/u32 twins forward). A bogus harness path
+    # proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -450, 65536, 2**20):
+        with pytest.raises(ValueError, match="pickup_respawn_cooldown"):
+            run_local_match("/no/such/harness", [0, 1], policies, pickup_respawn_cooldown=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
