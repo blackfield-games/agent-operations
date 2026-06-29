@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v16",
+  "domain": "blackfield/arena/parity-vectors/v17",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2014,6 +2014,165 @@
       },
       "dash_cooldown_after": 10,
       "dashed": true
+    }
+  ],
+  "pickups": [
+    {
+      "label": "heal_below_cap_clamps_to_max_health",
+      "kind": "health",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 40,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 80,
+      "after": 100,
+      "cap": 100,
+      "collected": true,
+      "active_timeline": [
+        false
+      ]
+    },
+    {
+      "label": "heal_at_cap_no_overheal",
+      "kind": "health",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 40,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 100,
+      "after": 100,
+      "cap": 100,
+      "collected": true,
+      "active_timeline": [
+        false
+      ]
+    },
+    {
+      "label": "ammo_refills_and_clamps_to_mag_size",
+      "kind": "ammo",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 10,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 25,
+      "after": 30,
+      "cap": 30,
+      "collected": true,
+      "active_timeline": [
+        false
+      ]
+    },
+    {
+      "label": "shield_clamps_to_max_shield",
+      "kind": "shield",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 70,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 0,
+      "after": 50,
+      "cap": 50,
+      "collected": true,
+      "active_timeline": [
+        false
+      ]
+    },
+    {
+      "label": "just_inside_radius_collects",
+      "kind": "health",
+      "start": {
+        "x": 1000,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 15,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 80,
+      "after": 95,
+      "cap": 100,
+      "collected": true,
+      "active_timeline": [
+        false
+      ]
+    },
+    {
+      "label": "just_outside_radius_no_collect",
+      "kind": "health",
+      "start": {
+        "x": 1001,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 15,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 80,
+      "after": 80,
+      "cap": 100,
+      "collected": false,
+      "active_timeline": [
+        true
+      ]
+    },
+    {
+      "label": "collected_pickup_respawns_after_cooldown",
+      "kind": "health",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 40,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 50,
+      "after": 90,
+      "cap": 100,
+      "collected": true,
+      "active_timeline": [
+        false,
+        false,
+        false,
+        true
+      ]
     }
   ],
   "matches": [

@@ -3615,6 +3615,44 @@ pub struct DashCase {
     pub dashed: bool,
 }
 
+/// A pinned pickup-behavior case (domain v17): seat 0 stands at `start` near a single
+/// configured pickup at `pickup_pos` and the match steps, applying the per-kind collection
+/// effect — a [`PickupKind::Health`] heals capped at the pawn's `max_health`, an
+/// [`PickupKind::Ammo`] refills capped at [`Rules::mag_size`], a [`PickupKind::Shield`]
+/// grants shield capped at [`Rules::max_shield`] — when the pawn centre is within
+/// [`Rules::pickup_radius`], after which the pickup goes dormant for
+/// [`Rules::pickup_respawn_cooldown`] ticks then reactivates. This pins the EFFECT, the
+/// CAP, the radius GATE, and the respawn timing — none of which the match-level
+/// `pickup_collected` digest case (which only binds the layout into the hash) exercises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickupCase {
+    pub label: String,
+    pub kind: PickupKind,
+    /// Seat 0's position while the pickup is processed.
+    pub start: Vec2,
+    pub pickup_pos: Vec2,
+    /// The configured effect magnitude, clamped to the kind's ceiling at collection.
+    pub amount: u16,
+    pub radius: i32,
+    pub respawn_cooldown: u16,
+    /// The kind-relevant stat (health / ammo / shield) BEFORE the collecting step.
+    pub before: u16,
+    /// ...and AFTER it: the clamped effect, never past `cap`.
+    pub after: u16,
+    /// The ceiling the effect clamps to for this kind — `max_health` / `mag_size` /
+    /// `max_shield`. A correct effect is `min(before + amount, cap)`.
+    pub cap: u16,
+    /// `true` when seat 0 collected the pickup this step (it went dormant). A pawn just
+    /// outside the radius collects nothing and this is `false`.
+    pub collected: bool,
+    /// The pickup's `active` flag after each recorded step from the collecting tick onward:
+    /// one entry for the single-step effect/radius cases (`[false]` collected→dormant, or
+    /// `[true]` uncollected→still active); the full dormant→reactivate window for the
+    /// respawn case (`[false.., true]`, stepped `respawn_cooldown + 1` ticks with the pawn
+    /// moved off the pad so the reactivation is not instantly re-collected).
+    pub active_timeline: Vec<bool>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -3966,6 +4004,11 @@ pub struct ParityVectors {
     /// after the walk, through the same `slide()` (clamped, no tunnel), consuming the
     /// cooldown on trigger — pinning the burst distance, the cooldown gate, and the cover.
     pub dashes: Vec<DashCase>,
+    /// pickup-behavior cases (domain v17): the per-kind collection effect (heal to
+    /// `max_health`, ammo to `mag_size`, shield to `max_shield`), the inclusive
+    /// [`Rules::pickup_radius`] gate, and the [`Rules::pickup_respawn_cooldown`] dormancy —
+    /// distinct from the match-level `pickup_collected` digest case (layout-binds-the-hash).
+    pub pickups: Vec<PickupCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4023,9 +4066,18 @@ pub struct ParityVectors {
 /// wall — never tunnels), then consumes the cooldown ON TRIGGER. `dash_cooldown` was
 /// already folded into `canonical_encoding`, so this is pure coverage (no committed match
 /// hash moves) — the `moves`/`wall_slides` cases never press the ability, so the burst
-/// distance, the cooldown gate, and the no-tunnel were unpinned until now.
+/// distance, the cooldown gate, and the no-tunnel were unpinned until now;
+/// bumped to v17 for PICKUP BEHAVIOR — a new `pickups` category pins the per-kind
+/// collection EFFECT (a Health pickup heals capped at `max_health`, an Ammo refills capped
+/// at [`Rules::mag_size`], a Shield grants capped at [`Rules::max_shield`]), the inclusive
+/// [`Rules::pickup_radius`] gate (a pawn at the radius collects, one a unit past does not),
+/// and the [`Rules::pickup_respawn_cooldown`] dormancy (a collected pickup reactivates
+/// exactly the cooldown later). The pickup layout was already folded into
+/// `canonical_encoding`, so this is pure coverage (no committed match hash moves) — the
+/// match-level `pickup_collected` case pins only that the layout binds the digest, never
+/// the effect/cap/radius/respawn that a twin must reproduce.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v16";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v17";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4356,6 +4408,78 @@ fn dash_case(
         end,
         dash_cooldown_after,
         dashed,
+    }
+}
+
+/// Build a pickup-behavior case: seat 0 starts at `start` near a single configured pickup
+/// at `pickup_pos` with its kind-relevant stat pre-set to `before`, and the match steps
+/// `ticks` times. The first step is the collection tick (recording the stat after and
+/// whether the pickup went dormant); when `ticks > 1` (the respawn case) the pawn is then
+/// moved off the pad and the remaining ticks record the pickup's `active` flag across the
+/// dormancy window, so the reactivation is observed rather than instantly re-collected. The
+/// effect is read off the real sim (`process_pickups` via `step`), never hand-computed.
+#[allow(clippy::too_many_arguments)]
+fn pickup_case(
+    label: &str,
+    kind: PickupKind,
+    start: Vec2,
+    pickup_pos: Vec2,
+    amount: u16,
+    before: u16,
+    rules: Rules,
+    ticks: u16,
+) -> PickupCase {
+    let bounds = Vec2 { x: 50_000, y: 50_000 };
+    let config = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds, seats: 2 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let spawn = PickupSpawn { kind, position: pickup_pos, amount };
+    let mut m = Match::new_with_pickups(parity_match_id(), config, rules, roster, Vec::new(), vec![spawn], 1);
+    m.pawns[0].pos = start;
+    match kind {
+        PickupKind::Health => m.pawns[0].health = before,
+        PickupKind::Ammo => m.pawns[0].ammo = before,
+        PickupKind::Shield => m.pawns[0].shield = before,
+    }
+    // Seat 1 idles at the far corner so the match stays Live and only seat 0 can collect.
+    m.pawns[1].pos = Vec2 { x: bounds.x, y: bounds.y };
+    let cap = match kind {
+        PickupKind::Health => m.pawns[0].max_health,
+        PickupKind::Ammo => m.rules.mag_size,
+        PickupKind::Shield => m.rules.max_shield,
+    };
+    let stat = |m: &Match| match kind {
+        PickupKind::Health => m.pawns[0].health,
+        PickupKind::Ammo => m.pawns[0].ammo,
+        PickupKind::Shield => m.pawns[0].shield,
+    };
+    let radius = m.rules.pickup_radius;
+    let respawn_cooldown = m.rules.pickup_respawn_cooldown;
+    let intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    m.step(&intents);
+    let after = stat(&m);
+    let collected = !m.pickups[0].active;
+    let mut active_timeline = vec![m.pickups[0].active];
+    if ticks > 1 {
+        // Off the pad so a reactivated pickup is not instantly re-collected the same tick.
+        m.pawns[0].pos = Vec2 { x: bounds.x, y: 0 };
+        for _ in 1..ticks {
+            m.step(&intents);
+            active_timeline.push(m.pickups[0].active);
+        }
+    }
+    PickupCase {
+        label: label.to_string(),
+        kind,
+        start,
+        pickup_pos,
+        amount,
+        radius,
+        respawn_cooldown,
+        before,
+        after,
+        cap,
+        collected,
+        active_timeline,
     }
 }
 
@@ -5109,6 +5233,30 @@ pub fn parity_vectors() -> ParityVectors {
                 // FIRES (arming the cooldown to 10) yet slide() refuses the burst, so the pawn holds
                 // at x=200 -- consume-on-trigger AND no tunnel through the wall.
                 dash_case("dash_into_wall_holds_no_tunnel", Vec2::ZERO, east, 200, bounds, vec![burst_wall], 10, 0),
+            ]
+        },
+        pickups: {
+            // A tight 1000-unit collection radius and a 3-tick respawn. start_health 100 is the
+            // heal cap, mag_size 30 the ammo cap; shield needs a non-zero max_shield to grant any.
+            let base = Rules { spawn_jitter: 0, pickup_radius: 1000, pickup_respawn_cooldown: 3, ..Default::default() };
+            let shield_rules = Rules { max_shield: 50, ..base };
+            let origin = Vec2::ZERO;
+            vec![
+                // Heal: a wounded pawn (80/100) takes amount 40 -> clamped to max_health (100), not 120.
+                pickup_case("heal_below_cap_clamps_to_max_health", PickupKind::Health, origin, origin, 40, 80, base, 1),
+                // Heal at full health: the pickup is still consumed but grants nothing (no overheal).
+                pickup_case("heal_at_cap_no_overheal", PickupKind::Health, origin, origin, 40, 100, base, 1),
+                // Ammo: a partial magazine (25/30) takes amount 10 -> clamped to mag_size (30), not 35.
+                pickup_case("ammo_refills_and_clamps_to_mag_size", PickupKind::Ammo, origin, origin, 10, 25, base, 1),
+                // Shield: from 0, amount 70 grants shield clamped to max_shield (50), not 70.
+                pickup_case("shield_clamps_to_max_shield", PickupKind::Shield, origin, origin, 70, 0, shield_rules, 1),
+                // Radius gate (inclusive): a pawn at EXACTLY pickup_radius collects (d^2 == r^2).
+                pickup_case("just_inside_radius_collects", PickupKind::Health, Vec2 { x: 1_000, y: 0 }, origin, 15, 80, base, 1),
+                // ...one unit past does not (d^2 > r^2) -- same kind/amount/before, only +1 on x.
+                pickup_case("just_outside_radius_no_collect", PickupKind::Health, Vec2 { x: 1_001, y: 0 }, origin, 15, 80, base, 1),
+                // Respawn: collect on tick 1, then (pawn off the pad) dormant through the 3-tick
+                // cooldown and collectable again -- stepped cooldown+1 ticks to observe reactivation.
+                pickup_case("collected_pickup_respawns_after_cooldown", PickupKind::Health, origin, origin, 40, 50, base, 4),
             ]
         },
         matches: vec![
