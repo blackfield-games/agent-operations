@@ -1498,6 +1498,10 @@ impl Match {
                 // it carries the identical pending-decrement adjustment — the agent's
                 // dash-ready predicate is the clean `dash_cooldown == 0`.
                 dash_cooldown: me.dash_cooldown.saturating_sub(1),
+                // The seat's own credited score, read straight off the pawn (the same
+                // field the broadcast and SeatOutcome read), never recomputed: `0` at
+                // spawn, equal to this pawn's BroadcastEntity score at the same tick.
+                score: me.score,
                 alive: me.alive,
             },
             visible,
