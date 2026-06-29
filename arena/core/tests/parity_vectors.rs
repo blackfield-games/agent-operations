@@ -601,6 +601,33 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // predicate reads both seats' z, not just the mover's.
     assert!(swap_block.mover_z == 0 && swap_block.obstacle_z > 0, "the block-swap elevates the obstacle, not the mover");
     assert!(swap_clear.mover_z == 0 && swap_clear.obstacle_z > 0, "the clear-swap elevates the obstacle, not the mover");
+
+    // Wall-slide (v15): the flag flips a refused diagonal from a dead-stop to a slide along
+    // the unblocked axis; an inside corner holds even on; and when BOTH axis retries are
+    // clear the fixed X-before-Y order decides. A twin that dead-stops under the flag,
+    // slides the wrong axis, lets a corner through, or resolves Y-first fails one of these.
+    let ws = |label: &str| v.wall_slides.iter().find(|c| c.label == label).unwrap();
+    let off = ws("diagonal_into_wall_dead_stops");
+    let on = ws("diagonal_into_wall_slides_along_y");
+    // The load-bearing pair: same start, intent, AND wall — only wall_slide differs, so the
+    // flag alone flips the outcome (off holds at the origin, on slides north along the wall).
+    assert_eq!((off.start, off.move_dir), (on.start, on.move_dir), "the off/on pair shares start + intent");
+    assert_eq!(off.blockers, on.blockers, "the off/on pair shares the wall geometry — only wall_slide differs");
+    assert!(!off.wall_slide && off.blocked && off.end == off.start, "flag off: a diagonal into the wall dead-stops");
+    assert!(on.wall_slide && !on.blocked && on.end != on.start, "flag on: the refused diagonal slides instead of holding");
+    assert!(on.end.x == off.start.x && on.end.y != off.start.y, "the slide runs along Y — the wall refused the X component");
+    // An inside corner (both axis retries refused) holds even with the flag on — the slide
+    // is not an unconditional "move somewhere".
+    let corner = ws("inside_corner_still_holds");
+    assert!(corner.wall_slide && corner.blocked && corner.end == corner.start, "an inside corner holds even with wall_slide on");
+    // X-before-Y: a nub squarely on the diagonal refuses the full step while neither axis-
+    // aligned path touches it, so the resolution ORDER alone picks the outcome — X, not Y.
+    let xfirst = ws("both_retries_clear_x_first");
+    assert!(xfirst.wall_slide && !xfirst.blocked, "the X-first case slides");
+    assert!(
+        xfirst.end.x != xfirst.start.x && xfirst.end.y == xfirst.start.y,
+        "both retries clear -> X-first wins (slides on X, not Y)"
+    );
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
