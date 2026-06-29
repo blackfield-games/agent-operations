@@ -331,6 +331,15 @@ def _intent_attributions(
     non-empty roster (an empty roster means npc legitimately fell back to its default, so
     the gate stays silent), preserving the FM1/FM2/FM3 contract above.
 
+    A SECOND must_not consumer follows the factions branch: ``intent:must_not`` can bar an
+    npc archetype outright (the frontier forbids ``civilians``), which npc HONORS by
+    excluding it from the pick — so a layer that still spawns one is rejected, named npc,
+    keyed off ``intent:must_not``. The barred set is recomputed with npc's OWN
+    ``_forbidden_archetypes`` (the ``MUST_NOT_ARCHETYPE`` bridge) so the gate tracks npc in
+    lock-step, and it is NOT redundant with the factions membership check: a roster that
+    wrongly includes ``civilian`` passes membership but is caught here, and an empty roster
+    (factions silent) still bars a tampered civilian pick.
+
     The lighting loop closes the fourth and last intent (``intent:beats``): lighting turns
     the director's free-form mood line into atmospheric fog and, for every beat it MODELS,
     emits a ``def Volume "Atmosphere"`` whose ``drivenBy`` lists those recognized tokens.
@@ -424,6 +433,30 @@ def _intent_attributions(
                     f"intent:factions unmet: npc spawned archetype "
                     f"{match.group(1)!r} not in the faction roster "
                     f"{sorted(set(roster))}; re-run npc",
+                ))
+
+    # The must_not->npc loop: intent:must_not can bar an npc archetype outright (the frontier
+    # forbids "civilians"). npc HONORS it by excluding the barred archetype from its pick, so a
+    # layer that STILL spawns one is a tampered/desynced npc layer — reject it, naming npc,
+    # keyed off intent:must_not. `forbidden` is recomputed with npc's OWN _forbidden_archetypes
+    # (the MUST_NOT_ARCHETYPE bridge) so the gate tracks npc's vocabulary in lock-step — it can
+    # never demand a ban npc no longer applies, nor miss a newly-barred archetype. This is
+    # NOT redundant with the factions branch above: a roster that wrongly INCLUDES civilian
+    # passes membership yet must be rejected here, and an empty roster (the factions branch
+    # stays silent) still bars a tampered civilian pick. Fires ONLY for a present archetype in
+    # the forbidden set; no barred token, a non-forbidden archetype, or a missing npc layer
+    # yields no pair (deferring to the well-formedness / missing-layer gates), holding the same
+    # FM1/FM2/FM3 contract.
+    forbidden = npc._forbidden_archetypes(_director_intent(layers, layers_root, "must_not"))
+    if forbidden:
+        npc_text = _layer_text(layers, "npc", layers_root)
+        if npc_text is not None:
+            match = re.search(r'archetype\s*=\s*"([^"]+)"', npc_text)
+            if match and match.group(1) in forbidden:
+                out.append((
+                    "npc",
+                    f"intent:must_not unmet: npc spawned forbidden archetype "
+                    f"{match.group(1)!r} (intent:must_not forbids {sorted(forbidden)}); re-run npc",
                 ))
 
     # The lighting loop closes the FOURTH and last intent (intent:beats): lighting turns the
