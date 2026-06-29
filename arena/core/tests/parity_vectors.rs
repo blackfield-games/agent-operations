@@ -9,7 +9,7 @@
 
 use arena_core::{
     expected_score_bp, parity_vectors, rating_delta, AimMode, MatchOutcome, ParityVectors,
-    PerceptionVerdict, WeaponMode, RATING_DIFF_CAP, RATING_SCALE,
+    PerceptionVerdict, WeaponMode, DASH_DISTANCE, RATING_DIFF_CAP, RATING_SCALE,
 };
 use arena_proto::Vec2;
 
@@ -628,6 +628,46 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         xfirst.end.x != xfirst.start.x && xfirst.end.y == xfirst.start.y,
         "both retries clear -> X-first wins (slides on X, not Y)"
     );
+
+    // Dash (v16): a ready ability press bursts the pawn an extra DASH_DISTANCE along move_dir
+    // AFTER the walk and arms the cooldown; the SAME press on cooldown is a plain walk (no
+    // burst); a zero-direction press does nothing and keeps the dash ready; and a dash into a
+    // wall fires (arming the cooldown) yet holds at the post-walk position — the burst routes
+    // through slide(), so it cannot tunnel. A twin that dashes the wrong distance, ignores the
+    // cooldown gate, bursts a directionless press, or tunnels the burst fails one of these.
+    let ds = |label: &str| v.dashes.iter().find(|c| c.label == label).unwrap();
+    let ready = ds("ready_dash_bursts_walk_plus_distance");
+    let oncd = ds("dash_on_cooldown_is_a_plain_walk");
+    // The load-bearing pair: same start, intent, AND (empty) blockers — only the pawn's own
+    // cooldown differs (ready 0 vs mid-cooldown), so the cooldown gate alone decides burst-vs-walk.
+    assert_eq!((ready.start, ready.move_dir), (oncd.start, oncd.move_dir), "the ready/on-cooldown pair shares start + intent");
+    assert_eq!(ready.blockers, oncd.blockers, "the ready/on-cooldown pair shares the geometry — only the cooldown differs");
+    // Ready: the burst travels exactly the walk (max_speed) PLUS DASH_DISTANCE and fires, arming
+    // the cooldown up from ready 0. A plain walk would move only max_speed — the burst is unmistakable.
+    assert!(ready.dashed, "a ready ability press dashes");
+    assert_eq!(ready.end.x, ready.start.x + ready.max_speed + DASH_DISTANCE, "the ready dash bursts walk + DASH_DISTANCE along move_dir");
+    assert_eq!(ready.end.y, ready.start.y, "a due-east dash moves only x");
+    assert!(ready.dash_cooldown_after > ready.dash_cooldown_before, "the fired dash armed its cooldown (up from ready 0)");
+    // On cooldown: only the walk applies (no burst), and the cooldown is NOT re-armed — it just
+    // ticked down by one. A twin that always bursts, or that re-arms a refused dash, fails here.
+    assert!(!oncd.dashed, "a dash on cooldown does not fire");
+    assert_eq!(oncd.end.x, oncd.start.x + oncd.max_speed, "the on-cooldown press is a plain walk — no burst");
+    assert!(oncd.end.x != ready.end.x, "the cooldown gate alone separates the burst from the walk");
+    assert_eq!(oncd.dash_cooldown_after, oncd.dash_cooldown_before - 1, "a cooldown-refused dash only ticks the clock down, never re-arms it");
+    // Zero direction: a press with no direction is a no-op that does NOT spend the cooldown — the
+    // pawn holds and the dash stays ready (after == before).
+    let zero = ds("zero_direction_press_does_nothing");
+    assert!(!zero.dashed && zero.end == zero.start, "a zero-direction press dashes nothing and moves nothing");
+    assert_eq!(zero.dash_cooldown_after, zero.dash_cooldown_before, "a directionless press leaves the cooldown unspent (still ready)");
+    // No tunnel: a wall across the burst path refuses it, so the dash FIRES (arming the cooldown
+    // exactly like the clean ready dash — consume-on-trigger) yet the pawn holds at its post-walk
+    // position, short of the wall — it does NOT punch through to the ready burst endpoint.
+    let wall = ds("dash_into_wall_holds_no_tunnel");
+    assert!(wall.dashed, "the dash into a wall still fires (consume-on-trigger)");
+    assert_eq!(wall.dash_cooldown_after, ready.dash_cooldown_after, "a wall-refused dash arms the cooldown exactly like a clean fire");
+    assert_eq!(wall.end.x, wall.start.x + wall.max_speed, "the burst is refused — only the walk applied, the pawn holds short of the wall");
+    assert!(wall.end.x != ready.end.x, "the wall-refused dash did NOT tunnel to the ready burst endpoint");
+    assert!(!wall.blockers.is_empty(), "the no-tunnel case carries its wall");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
