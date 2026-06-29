@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v19",
+  "domain": "blackfield/arena/parity-vectors/v20",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2347,6 +2347,165 @@
       "health_after": 0,
       "effective": 40,
       "alive": false
+    }
+  ],
+  "fire_cycle": [
+    {
+      "label": "held_fire_one_shot_per_cooldown_window",
+      "weapon_mode": "hitscan",
+      "fire_cooldown": 3,
+      "mag_size": 6,
+      "reload_tick": null,
+      "timeline": [
+        [
+          true,
+          5,
+          3
+        ],
+        [
+          false,
+          5,
+          2
+        ],
+        [
+          false,
+          5,
+          1
+        ],
+        [
+          true,
+          4,
+          3
+        ],
+        [
+          false,
+          4,
+          2
+        ],
+        [
+          false,
+          4,
+          1
+        ],
+        [
+          true,
+          3,
+          3
+        ],
+        [
+          false,
+          3,
+          2
+        ],
+        [
+          false,
+          3,
+          1
+        ],
+        [
+          true,
+          2,
+          3
+        ]
+      ]
+    },
+    {
+      "label": "mag_dry_then_empty_fire_refused",
+      "weapon_mode": "hitscan",
+      "fire_cooldown": 2,
+      "mag_size": 2,
+      "reload_tick": null,
+      "timeline": [
+        [
+          true,
+          1,
+          2
+        ],
+        [
+          false,
+          1,
+          1
+        ],
+        [
+          true,
+          0,
+          2
+        ],
+        [
+          false,
+          0,
+          1
+        ],
+        [
+          false,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "label": "reload_refills_to_mag_size_then_fires",
+      "weapon_mode": "hitscan",
+      "fire_cooldown": 2,
+      "mag_size": 2,
+      "reload_tick": 5,
+      "timeline": [
+        [
+          true,
+          1,
+          2
+        ],
+        [
+          false,
+          1,
+          1
+        ],
+        [
+          true,
+          0,
+          2
+        ],
+        [
+          false,
+          0,
+          1
+        ],
+        [
+          false,
+          0,
+          0
+        ],
+        [
+          false,
+          2,
+          2
+        ],
+        [
+          false,
+          2,
+          1
+        ],
+        [
+          true,
+          1,
+          2
+        ],
+        [
+          false,
+          1,
+          1
+        ]
+      ]
     }
   ],
   "matches": [

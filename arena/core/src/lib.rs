@@ -3727,6 +3727,43 @@ pub struct ShieldAbsorbCase {
     pub alive: bool,
 }
 
+/// A pinned fire-rate-cycle case (domain v20): seat 0 HOLDS the fire button across a
+/// window of ticks under a configured ([`Rules::fire_cooldown`], [`Rules::mag_size`]),
+/// pressing RELOAD instead on `reload_tick` if set, against a tanky point-blank dummy
+/// (seat 1) that survives the whole window — and the per-tick `(fired, ammo, cooldown)`
+/// is recorded after each [`Match::step`]. This pins the cadence a twin must reproduce:
+/// a fire with `cooldown == 0` and `ammo > 0` discharges (decrementing `ammo` by one and
+/// setting `cooldown` to `fire_cooldown`), the tick-start saturating countdown re-opens
+/// the gate exactly `fire_cooldown` ticks later so held fire lands ONE shot per
+/// `fire_cooldown`-tick window, a fire at `ammo == 0` is REFUSED (no shot, no
+/// negative ammo, the cooldown left untouched), and a reload sets `ammo` back to
+/// `mag_size` and `cooldown` to `fire_cooldown` (so the next shot waits out the
+/// cooldown). A twin that cools down a tick early (fires too fast), decrements ammo
+/// without discharging, fires on an empty mag, or refills past `mag_size` diverges on at
+/// least one tick. `fired` is read off the point-blank target taking damage — a shot
+/// DISCHARGED ⇔ it connected at point blank — so the timeline cross-checks the ammo drain
+/// against an ACTUAL hit, not a bare counter. Distinct from the `pickups` category, whose
+/// Ammo pickup refills a magazine but pins neither the cooldown gate nor the per-shot
+/// drain, and from the match-level `matches`, which fire full games but never pin the
+/// cycle itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FireCycleCase {
+    pub label: String,
+    /// The weapon mode under test — `Hitscan` for the whole category, so the shot lands
+    /// the same tick it discharges (`fired` reads off the instant hit).
+    pub weapon_mode: WeaponMode,
+    pub fire_cooldown: u16,
+    pub mag_size: u16,
+    /// The tick index a reload is pressed instead of fire, or `None` when fire is held on
+    /// every recorded tick.
+    pub reload_tick: Option<u16>,
+    /// `(fired, ammo, cooldown)` after each `step`, from tick `0` through the last —
+    /// `fired` is whether seat 0's shot connected this tick (the point-blank target's
+    /// health dropped). Pinning the whole timeline (not a single shot) fixes the gate
+    /// tick-for-tick, so an off-by-one twin records a different fired-cadence.
+    pub timeline: Vec<(bool, u16, u16)>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -4096,6 +4133,13 @@ pub struct ParityVectors {
     /// weapon modes, byte-identical to the per-site clamp when shieldless — which the
     /// `knockback` category (post-hit impulse) never pins.
     pub shield_absorption: Vec<ShieldAbsorbCase>,
+    /// fire-rate-cycle cases (domain v20): seat 0 holds the fire button under a configured
+    /// ([`Rules::fire_cooldown`], [`Rules::mag_size`]) and the per-tick `(fired, ammo,
+    /// cooldown)` is recorded — pinning that a held fire lands ONE shot per
+    /// `fire_cooldown`-tick window draining ammo by one per shot, an empty-mag fire is
+    /// refused, and a reload refills to exactly `mag_size` while arming the cooldown. Pins the
+    /// cadence the `pickups` Ammo refill and the full `matches` exercise but never fix.
+    pub fire_cycle: Vec<FireCycleCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4180,9 +4224,19 @@ pub struct ParityVectors {
 /// already folded into `canonical_encoding`, so this is pure coverage (no committed match
 /// hash moves) — the `knockback` category pins the post-hit impulse the weapon wrapper adds
 /// ON TOP of this sink, never the absorb/overflow split, which all three weapon modes share
-/// and which a twin draining health-first or returning the raw would get wrong.
+/// and which a twin draining health-first or returning the raw would get wrong;
+/// bumped to v20 for the FIRE-RATE CYCLE — a new `fire_cycle` category pins the cadence held
+/// fire produces: a fire with `cooldown == 0` and `ammo > 0` discharges (ammo `-= 1`, cooldown
+/// `= fire_cooldown`), the tick-start saturating countdown re-opens the gate exactly
+/// `fire_cooldown` ticks later so held fire lands ONE shot per `fire_cooldown`-tick window,
+/// a fire at `ammo == 0` is REFUSED (no shot, no negative ammo), and a reload sets `ammo` to
+/// `mag_size` and `cooldown` to `fire_cooldown`. `fire_cooldown` and `mag_size` were already
+/// folded into `canonical_encoding`, so this is pure coverage (no committed match hash moves) —
+/// the `pickups` Ammo refill caps a magazine but pins neither the cooldown gate nor the per-shot
+/// drain, and the full `matches` fire whole games yet never fix the cycle a twin that cools down
+/// a tick early, fires on empty, or refills past `mag_size` would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v19";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v20";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4920,6 +4974,44 @@ fn shield_absorb_case(label: &str, mode: WeaponMode, raw: u16, shield_before: u1
     }
 }
 
+/// Build a fire-rate-cycle case: seat 0 holds fire (or reloads on `reload_tick`) for
+/// `ticks` ticks under (`fire_cooldown`, `mag_size`) against a point-blank dummy that
+/// survives the window, recording `(fired, ammo, cooldown)` after each step. `fired` is
+/// read off the target taking damage — a point-blank Hitscan shot connects the same tick
+/// it discharges — so the timeline cross-checks the ammo drain against an actual hit.
+fn fire_cycle_case(label: &str, mode: WeaponMode, fire_cooldown: u16, mag_size: u16, reload_tick: Option<u16>, ticks: u16) -> FireCycleCase {
+    let rules = Rules { weapon_mode: mode, fire_cooldown, mag_size, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    // Seat 1 idles point-blank on the enemy team with a huge health pool, so every shot
+    // connects yet it never downs — the match stays Live and only the cadence is recorded.
+    m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+    m.pawns[1].health = 50_000;
+    let fire = ActionIntent {
+        move_dir: Vec2::ZERO,
+        aim: EAST,
+        buttons: arena_proto::ActionButtons { fire: true, jump: false, ability: false, reload: false },
+    };
+    let reload = ActionIntent {
+        move_dir: Vec2::ZERO,
+        aim: EAST,
+        buttons: arena_proto::ActionButtons { fire: false, jump: false, ability: false, reload: true },
+    };
+    let mut timeline = Vec::new();
+    for t in 0..ticks {
+        let hp_before = m.pawns[1].health;
+        let press = if reload_tick == Some(t) { reload } else { fire };
+        let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+        intents.insert(0, press);
+        m.step(&intents);
+        let fired = m.pawns[1].health < hp_before;
+        timeline.push((fired, m.pawns[0].ammo, m.pawns[0].cooldown));
+    }
+    FireCycleCase { label: label.to_string(), weapon_mode: mode, fire_cooldown, mag_size, reload_tick, timeline }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -5494,6 +5586,21 @@ pub fn parity_vectors() -> ParityVectors {
             // min(90,30)=30 to health (->0, downed), and the effective is CLAMPED to the 40 pools
             // present, NOT the raw 100 — a twin returning the raw over-credits the kill.
             shield_absorb_case("lethal_overflow_clamps_effective", WeaponMode::Hitscan, 100, 10, 30),
+        ],
+        fire_cycle: vec![
+            // Held fire, fire_cooldown 3 / mag 6 across 10 ticks: a shot lands on ticks 0, 3, 6, 9
+            // (one per fire_cooldown = 3-tick window), ammo drains 6->5->4->3->2 (one per shot,
+            // held between), and the cooldown reloads to 3 on each shot then counts 3,2,1 down to
+            // the next eligible tick — the off-by-one a too-fast twin trips on.
+            fire_cycle_case("held_fire_one_shot_per_cooldown_window", WeaponMode::Hitscan, 3, 6, None, 10),
+            // Fire the 2-round mag dry then keep holding: shots at ticks 0 and 2 empty it, after
+            // which every held fire is REFUSED — fired stays false, ammo sticks at 0 (never
+            // negative), and the refused empty press leaves the cooldown at 0.
+            fire_cycle_case("mag_dry_then_empty_fire_refused", WeaponMode::Hitscan, 2, 2, None, 7),
+            // Empty the mag (ticks 0, 2), refuse the empty fire at 4, then RELOAD at tick 5: ammo
+            // refills to exactly mag_size (2) and the cooldown arms to fire_cooldown (2), so the
+            // tick-6 fire is still cooling and the first post-reload shot lands at tick 7.
+            fire_cycle_case("reload_refills_to_mag_size_then_fires", WeaponMode::Hitscan, 2, 2, Some(5), 9),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
