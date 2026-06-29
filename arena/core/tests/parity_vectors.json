@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v14",
+  "domain": "blackfield/arena/parity-vectors/v15",
   "protocol_version": 1,
   "spawns": [
     {
@@ -1748,6 +1748,159 @@
       "pawn_height": 1000,
       "end": {
         "x": 4000,
+        "y": 0
+      },
+      "blocked": false
+    }
+  ],
+  "wall_slides": [
+    {
+      "label": "diagonal_into_wall_dead_stops",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 600,
+        "y": 800
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 100,
+            "y": -5000
+          },
+          "max": {
+            "x": 300,
+            "y": 5000
+          },
+          "height": 0
+        }
+      ],
+      "wall_slide": false,
+      "end": {
+        "x": 0,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "diagonal_into_wall_slides_along_y",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 600,
+        "y": 800
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 100,
+            "y": -5000
+          },
+          "max": {
+            "x": 300,
+            "y": 5000
+          },
+          "height": 0
+        }
+      ],
+      "wall_slide": true,
+      "end": {
+        "x": 0,
+        "y": 160
+      },
+      "blocked": false
+    },
+    {
+      "label": "inside_corner_still_holds",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 600,
+        "y": 800
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 100,
+            "y": -5000
+          },
+          "max": {
+            "x": 300,
+            "y": 5000
+          },
+          "height": 0
+        },
+        {
+          "min": {
+            "x": -5000,
+            "y": 100
+          },
+          "max": {
+            "x": 5000,
+            "y": 300
+          },
+          "height": 0
+        }
+      ],
+      "wall_slide": true,
+      "end": {
+        "x": 0,
+        "y": 0
+      },
+      "blocked": true
+    },
+    {
+      "label": "both_retries_clear_x_first",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 600,
+        "y": 800
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 50,
+            "y": 70
+          },
+          "max": {
+            "x": 70,
+            "y": 90
+          },
+          "height": 0
+        }
+      ],
+      "wall_slide": true,
+      "end": {
+        "x": 120,
         "y": 0
       },
       "blocked": false

@@ -3552,6 +3552,35 @@ pub struct MoveCase {
     pub blocked: bool,
 }
 
+/// A pinned wall-slide case (domain v15): a single mover (seat 0) takes one `step`
+/// with `move_dir` against `blockers` while [`Rules::wall_slide`] is `wall_slide`, and
+/// the resulting position is recorded. The companion of [`MoveCase`] for the `slide`
+/// retry the `moves` cases never exercise — they all run the flag OFF (its default), so
+/// a refused diagonal there always dead-stops. With `wall_slide` ON a genuinely diagonal
+/// step whose full swept path is refused retries the axis-separated components — X-only
+/// first, then Y-only — so the pawn slides along the unblocked axis, while an inside
+/// corner (both axes refused) still holds. This category pins the ON behavior and,
+/// crucially, the fixed X-before-Y resolution ORDER: a twin that dead-stops under the
+/// flag, slides on the wrong axis, or resolves Y-first fails the matching case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WallSlideCase {
+    pub label: String,
+    pub start: Vec2,
+    /// The move intent (`MOVE_INTENT_SCALE` units, server-clamped to `max_speed`).
+    pub move_dir: Vec2,
+    pub max_speed: i32,
+    pub bounds: Vec2,
+    pub blockers: Vec<Blocker>,
+    /// Whether [`Rules::wall_slide`] is on for this case — the sole determinant that
+    /// flips a refused diagonal from a dead-stop to a slide along the unblocked axis.
+    pub wall_slide: bool,
+    /// Seat 0's position after exactly one `step` with this intent.
+    pub end: Vec2,
+    /// `true` when the step produced no displacement — here a wall refusal: a dead-stop
+    /// with the flag off, or an inside-corner hold (both axis retries refused) with it on.
+    pub blocked: bool,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -3893,6 +3922,11 @@ pub struct ParityVectors {
     /// (`|dz| <= pawn_height`), so a pawn that jumped high enough vaults the body — the
     /// z-coupling sibling of the planar `pawn_collisions` category.
     pub z_occupancy: Vec<ZOccupancyCase>,
+    /// wall-slide cases (domain v15): with [`Rules::wall_slide`] on, a refused diagonal
+    /// step retries the axis-separated components (X-only first, then Y-only) so the pawn
+    /// slides along the unblocked axis instead of dead-stopping — the movement sibling of
+    /// the flag-off `moves` cover cases, pinning the ON behavior and the X-before-Y order.
+    pub wall_slides: Vec<WallSlideCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3936,9 +3970,15 @@ pub struct ParityVectors {
 /// `z_occupancy` category pins the rule that, under a positive height, a pawn-body refusal
 /// also requires the mover's and obstacle's feet within the band (`|dz| <= pawn_height`),
 /// so a pawn that jumped high enough vaults the body instead of freezing — the occupancy
-/// twin of v4's `vertical_hit_tolerance` (hits) and v5's `Blocker.height` (walls).
+/// twin of v4's `vertical_hit_tolerance` (hits) and v5's `Blocker.height` (walls);
+/// bumped to v15 for WALL-SLIDE — a new `wall_slides` category pins the
+/// [`Rules::wall_slide`] retry that, when a diagonal step is refused, slides the pawn
+/// along the unblocked axis (X-only first, then Y-only) instead of dead-stopping. The
+/// flag was already folded into `canonical_encoding`, so this is a pure coverage
+/// addition (no committed match hash moves) — the `moves` cases all run it OFF, so the ON
+/// behavior and the X-before-Y order were unpinned until now.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v14";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v15";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4185,6 +4225,38 @@ fn move_case(
     m.step(&intents);
     let end = m.pawns[0].pos;
     MoveCase { label: label.to_string(), start, move_dir, max_speed, bounds, blockers, end, blocked: end == start }
+}
+
+/// Build a wall-slide case: place seat 0 at `start` in a 2-seat (stays-Live) match with
+/// [`Rules::wall_slide`] set to `wall_slide`, `step` once with the move intent against
+/// `blockers`, and record where the mover ends. The companion of [`move_case`] for the
+/// `slide` retry the `moves` cases never exercise (they all run the flag off): with it on
+/// a refused diagonal slides along the unblocked axis, so this is where the ON behavior
+/// and the X-before-Y order are captured for the twin. `blocked == (end == start)`, so a
+/// dead-stop (flag off) and an inside-corner hold (flag on, both axes refused) both read
+/// blocked while a genuine slide does not.
+#[allow(clippy::too_many_arguments)]
+fn wall_slide_case(
+    label: &str,
+    start: Vec2,
+    move_dir: Vec2,
+    max_speed: i32,
+    bounds: Vec2,
+    blockers: Vec<Blocker>,
+    wall_slide: bool,
+) -> WallSlideCase {
+    let rules = Rules { max_speed, wall_slide, spawn_jitter: 0, ..Default::default() };
+    let config = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds, seats: 2 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), config, rules, roster, blockers.clone(), 1);
+    m.pawns[0].pos = start;
+    // Seat 1 idles at the far corner so the match stays Live and seat 0 alone moves.
+    m.pawns[1].pos = Vec2 { x: bounds.x, y: bounds.y };
+    let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    intents.insert(0, parity_intent(move_dir, EAST, false));
+    m.step(&intents);
+    let end = m.pawns[0].pos;
+    WallSlideCase { label: label.to_string(), start, move_dir, max_speed, bounds, blockers, wall_slide, end, blocked: end == start }
 }
 
 /// Build a pawn-occupancy case: place the mover (seat 0) at `start` and an obstacle
@@ -4886,6 +4958,31 @@ pub fn parity_vectors() -> ParityVectors {
                 z_occupancy_case("swap_obstacle_high_blocks", start, east, 1_000, obstacle, R, 0, 500, H),
                 // Symmetry: swapping which pawn is elevated preserves the CLEAR (|dz| 5000).
                 z_occupancy_case("swap_obstacle_high_clears", start, east, 1_000, obstacle, R, 0, 5_000, H),
+            ]
+        },
+        wall_slides: {
+            // A NE diagonal intent (mag 1000) at max_speed 200 -> dx=120, dy=160. A tall
+            // vertical wall east of the origin refuses the eastward component but never the
+            // pure-north one, so on the flag the pawn slides straight north.
+            let ne = Vec2 { x: 600, y: 800 };
+            let bounds = Vec2 { x: 50_000, y: 50_000 };
+            let east_wall = Blocker { min: Vec2 { x: 100, y: -5_000 }, max: Vec2 { x: 300, y: 5_000 }, height: 0 };
+            let north_wall = Blocker { min: Vec2 { x: -5_000, y: 100 }, max: Vec2 { x: 5_000, y: 300 }, height: 0 };
+            // A small nub straddling the (0,0)->(120,160) diagonal midpoint (60,80) but clear
+            // of both the y=0 (X-only) and x=0 (Y-only) paths: it refuses the full step while
+            // both axis retries are clear, so the X-before-Y order alone picks the outcome.
+            let nub = Blocker { min: Vec2 { x: 50, y: 70 }, max: Vec2 { x: 70, y: 90 }, height: 0 };
+            vec![
+                // Flag OFF: the diagonal into the wall dead-stops at the origin (historical rule).
+                wall_slide_case("diagonal_into_wall_dead_stops", Vec2::ZERO, ne, 200, bounds, vec![east_wall], false),
+                // Flag ON, SAME geometry: the eastward component is refused, the northward one
+                // is clear, so the pawn slides straight north (x stays 0, short of the wall).
+                wall_slide_case("diagonal_into_wall_slides_along_y", Vec2::ZERO, ne, 200, bounds, vec![east_wall], true),
+                // Flag ON, inside corner (walls east AND north): both axis retries refused, so
+                // the pawn holds even on — the slide is not an unconditional "move somewhere".
+                wall_slide_case("inside_corner_still_holds", Vec2::ZERO, ne, 200, bounds, vec![east_wall, north_wall], true),
+                // Flag ON, both retries clear: the fixed X-first convention slides on X, not Y.
+                wall_slide_case("both_retries_clear_x_first", Vec2::ZERO, ne, 200, bounds, vec![nub], true),
             ]
         },
         matches: vec![
