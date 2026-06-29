@@ -499,6 +499,7 @@ def run_local_match(
     action_deadline_micros: int | None = None,
     pickup_radius: int | None = None,
     pickup_respawn_cooldown: int | None = None,
+    spawn_jitter: int | None = None,
     timeout: float = 30.0,
 ) -> dict[int, MatchResult]:
     """Run one match against the harnessed reference core: connect an ArenaClient
@@ -897,7 +898,20 @@ def run_local_match(
     (effectively always present) — not the default dormancy, so an explicit `0` must forward, never be swallowed. The
     range is `0`..=`65535` (the `u16` shape like `melee_cooldown`/`melee_damage`, NOT the `i32` reach knobs or the
     `u32` deadline): a non-None negative or `> 65535` value raises before any spawn, mirroring the harness's `u16`
-    parse."""
+    parse.
+
+    Pass `spawn_jitter` (a per-axis jitter in position units, `0`..=`2**31-1`) to set how far the PRNG perturbs each
+    seat's opening position: when the sim seats pawns around the opening line it draws a per-axis offset in
+    `[-spawn_jitter, +spawn_jitter]`, so a wider jitter scatters the opening more (the seed perturbs it) and a `0`
+    jitter is a fully deterministic opening (every seed seats pawns at the exact same spots). Like the other
+    base-balance knobs it has a NON-ZERO core default (`2000`, a 2 m per-axis jitter), so it uses a `None` sentinel:
+    omit it (the default `None`) to add no token and let the harness apply its own default — byte-identical argv. A
+    value (even one equal to the core default, AND an explicit `0`) forwards `--spawn-jitter <units>` (value-flag) on
+    BOTH paths via `MatchParams.rules`. The `0` case is degenerate: a `0` jitter is a fully deterministic opening with
+    no per-seed perturbation — not the default scatter, so an explicit `0` must forward, never be swallowed. The range
+    is `0`..=`2**31-1` (the `i32` shape like `pickup_radius`, NOT `u16`): a non-None negative (core would invert the
+    `[-jitter, +jitter]` draw span, and independently rejects `spawn_jitter < 0` as an invalid `Rules`) or `> 2**31-1`
+    value raises before any spawn, mirroring the harness's `u32`-then-`i32` `parse_spawn_jitter` fence."""
     ids = agent_ids or {s: f"agent-{s}" for s in seats}
     keys = signing_keys or {}
     humans = human_seats or []
@@ -1071,6 +1085,14 @@ def run_local_match(
         raise ValueError(
             f"pickup_respawn_cooldown is a tick count in 0..=65535 (None = harness default); got {pickup_respawn_cooldown}"
         )
+    if spawn_jitter is not None and not 0 <= spawn_jitter <= 2**31 - 1:
+        # Core takes spawn_jitter as a non-negative i32. None means "let the harness apply its default" (no token);
+        # a given value must be in range, else a negative (core would invert the [-jitter, +jitter] draw span, and
+        # rejects spawn_jitter < 0 as an invalid Rules) or a value past i32::MAX (which wraps negative) would forward
+        # a footgun — reject loudly, mirroring the harness's u32-then-i32 parse_spawn_jitter fence.
+        raise ValueError(
+            f"spawn_jitter is a per-axis opening jitter in 0..=2**31-1 (None = harness default); got {spawn_jitter}"
+        )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
@@ -1204,6 +1226,10 @@ def run_local_match(
         # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
         # (omitted) adds no token so the harness applies its own default — byte-identical argv.
         argv += ["--pickup-respawn-cooldown", str(pickup_respawn_cooldown)]
+    if spawn_jitter is not None:
+        # Base-balance value-flag on both paths (the matchmaker carries it via MatchParams.rules). None
+        # (omitted) adds no token so the harness applies its own default — byte-identical argv.
+        argv += ["--spawn-jitter", str(spawn_jitter)]
     if mode is not None:
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
