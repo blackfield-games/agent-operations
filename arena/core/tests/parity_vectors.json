@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v15",
+  "domain": "blackfield/arena/parity-vectors/v16",
   "protocol_version": 1,
   "spawns": [
     {
@@ -1904,6 +1904,116 @@
         "y": 0
       },
       "blocked": false
+    }
+  ],
+  "dashes": [
+    {
+      "label": "ready_dash_bursts_walk_plus_distance",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [],
+      "dash_cooldown_before": 0,
+      "end": {
+        "x": 3200,
+        "y": 0
+      },
+      "dash_cooldown_after": 10,
+      "dashed": true
+    },
+    {
+      "label": "dash_on_cooldown_is_a_plain_walk",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [],
+      "dash_cooldown_before": 5,
+      "end": {
+        "x": 200,
+        "y": 0
+      },
+      "dash_cooldown_after": 4,
+      "dashed": false
+    },
+    {
+      "label": "zero_direction_press_does_nothing",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 0,
+        "y": 0
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [],
+      "dash_cooldown_before": 0,
+      "end": {
+        "x": 0,
+        "y": 0
+      },
+      "dash_cooldown_after": 0,
+      "dashed": false
+    },
+    {
+      "label": "dash_into_wall_holds_no_tunnel",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "max_speed": 200,
+      "bounds": {
+        "x": 50000,
+        "y": 50000
+      },
+      "blockers": [
+        {
+          "min": {
+            "x": 1000,
+            "y": -2000
+          },
+          "max": {
+            "x": 1200,
+            "y": 2000
+          },
+          "height": 0
+        }
+      ],
+      "dash_cooldown_before": 0,
+      "end": {
+        "x": 200,
+        "y": 0
+      },
+      "dash_cooldown_after": 10,
+      "dashed": true
     }
   ],
   "matches": [

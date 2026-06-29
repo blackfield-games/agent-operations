@@ -3581,6 +3581,40 @@ pub struct WallSlideCase {
     pub blocked: bool,
 }
 
+/// A pinned dash case (domain v16): seat 0 takes one ability-pressed `step` with
+/// `move_dir`, and its resulting position and dash cooldown are recorded. A dash is an
+/// extra [`DASH_DISTANCE`] burst along `move_dir` AFTER the normal walk, gated on
+/// [`Rules::dash_cooldown`] being set, the pawn's own cooldown ready, AND a non-zero
+/// direction — then it consumes the cooldown ON TRIGGER (a wall refusing the burst is
+/// not a free retry). Both the walk and the burst route through `Match::slide`, so the
+/// dash can no more tunnel a wall or leave the arena than a walk can. This category pins
+/// the burst DISTANCE, the cooldown GATE, and that the burst respects cover — none of
+/// which the `moves`/`wall_slides` cases (which never press the ability) exercise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DashCase {
+    pub label: String,
+    pub start: Vec2,
+    /// The move intent (`MOVE_INTENT_SCALE` units): the walk clamps it to `max_speed`,
+    /// the dash bursts the fixed [`DASH_DISTANCE`] along the SAME direction.
+    pub move_dir: Vec2,
+    pub max_speed: i32,
+    pub bounds: Vec2,
+    pub blockers: Vec<Blocker>,
+    /// Seat 0's own dash cooldown BEFORE the tick: `0` is ready, positive is mid-cooldown.
+    /// The step ticks it down once, then the dash is refused unless it has reached `0`.
+    pub dash_cooldown_before: u16,
+    /// Seat 0's position after exactly one ability-pressed `step` (walk, then any burst).
+    pub end: Vec2,
+    /// Seat 0's dash cooldown AFTER the step: armed to [`Rules::dash_cooldown`] when the
+    /// dash fired (even if a wall then refused the burst — consume-on-trigger), otherwise
+    /// just the pre-tick value decremented once (a cooldown-refused dash never re-arms).
+    pub dash_cooldown_after: u16,
+    /// `true` when the dash FIRED this tick (it armed the cooldown), distinct from whether
+    /// the burst displaced the pawn: a dash into a wall fires yet holds at the post-walk
+    /// position. A disabled / on-cooldown / zero-direction press is `false`.
+    pub dashed: bool,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -3927,6 +3961,11 @@ pub struct ParityVectors {
     /// slides along the unblocked axis instead of dead-stopping — the movement sibling of
     /// the flag-off `moves` cover cases, pinning the ON behavior and the X-before-Y order.
     pub wall_slides: Vec<WallSlideCase>,
+    /// dash cases (domain v16): an ability press with a ready [`Rules::dash_cooldown`] and
+    /// a non-zero direction bursts the pawn an extra [`DASH_DISTANCE`] along `move_dir`
+    /// after the walk, through the same `slide()` (clamped, no tunnel), consuming the
+    /// cooldown on trigger — pinning the burst distance, the cooldown gate, and the cover.
+    pub dashes: Vec<DashCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -3976,9 +4015,17 @@ pub struct ParityVectors {
 /// along the unblocked axis (X-only first, then Y-only) instead of dead-stopping. The
 /// flag was already folded into `canonical_encoding`, so this is a pure coverage
 /// addition (no committed match hash moves) — the `moves` cases all run it OFF, so the ON
-/// behavior and the X-before-Y order were unpinned until now.
+/// behavior and the X-before-Y order were unpinned until now;
+/// bumped to v16 for the DASH BURST — a new `dashes` category pins the
+/// [`Rules::dash_cooldown`]-gated ability burst: an ability press with a ready cooldown
+/// and a non-zero direction bursts the pawn an extra [`DASH_DISTANCE`] along `move_dir`
+/// AFTER the walk, routed through the same `slide()` (clamped to bounds, refused by a
+/// wall — never tunnels), then consumes the cooldown ON TRIGGER. `dash_cooldown` was
+/// already folded into `canonical_encoding`, so this is pure coverage (no committed match
+/// hash moves) — the `moves`/`wall_slides` cases never press the ability, so the burst
+/// distance, the cooldown gate, and the no-tunnel were unpinned until now.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v15";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v16";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -4257,6 +4304,59 @@ fn wall_slide_case(
     m.step(&intents);
     let end = m.pawns[0].pos;
     WallSlideCase { label: label.to_string(), start, move_dir, max_speed, bounds, blockers, wall_slide, end, blocked: end == start }
+}
+
+/// Build a dash case: seat 0 starts at `start` with `cooldown_before` already on its dash
+/// clock, the rules enable the dash at `rules_cooldown`, and it takes one ability-pressed
+/// `step` with `move_dir` — recording the resulting position and dash cooldown. The intent
+/// sets the `ability` button directly (not [`parity_intent`], which presses `fire`). The
+/// burst runs the same sim `slide()`, never a hand-computed endpoint, so the golden cannot
+/// drift from the real dash arc (or bake in a tunnel).
+#[allow(clippy::too_many_arguments)]
+fn dash_case(
+    label: &str,
+    start: Vec2,
+    move_dir: Vec2,
+    max_speed: i32,
+    bounds: Vec2,
+    blockers: Vec<Blocker>,
+    rules_cooldown: u16,
+    cooldown_before: u16,
+) -> DashCase {
+    let rules = Rules { max_speed, dash_cooldown: rules_cooldown, spawn_jitter: 0, ..Default::default() };
+    let config = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds, seats: 2 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), config, rules, roster, blockers.clone(), 1);
+    m.pawns[0].pos = start;
+    m.pawns[0].dash_cooldown = cooldown_before;
+    // Seat 1 idles at the far corner so the match stays Live and seat 0 alone moves.
+    m.pawns[1].pos = Vec2 { x: bounds.x, y: bounds.y };
+    let press = ActionIntent {
+        move_dir,
+        aim: EAST,
+        buttons: arena_proto::ActionButtons { fire: false, jump: false, ability: true, reload: false },
+    };
+    let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    intents.insert(0, press);
+    m.step(&intents);
+    let end = m.pawns[0].pos;
+    let dash_cooldown_after = m.pawns[0].dash_cooldown;
+    // The dash fired iff it armed the cooldown to the rule value — the only writer of that
+    // value (the tick-down otherwise only decrements), so `after == rule` is sim-truth that
+    // the burst triggered, even when a wall then refused the displacement.
+    let dashed = rules_cooldown > 0 && dash_cooldown_after == rules_cooldown;
+    DashCase {
+        label: label.to_string(),
+        start,
+        move_dir,
+        max_speed,
+        bounds,
+        blockers,
+        dash_cooldown_before: cooldown_before,
+        end,
+        dash_cooldown_after,
+        dashed,
+    }
 }
 
 /// Build a pawn-occupancy case: place the mover (seat 0) at `start` and an obstacle
@@ -4983,6 +5083,32 @@ pub fn parity_vectors() -> ParityVectors {
                 wall_slide_case("inside_corner_still_holds", Vec2::ZERO, ne, 200, bounds, vec![east_wall, north_wall], true),
                 // Flag ON, both retries clear: the fixed X-first convention slides on X, not Y.
                 wall_slide_case("both_retries_clear_x_first", Vec2::ZERO, ne, 200, bounds, vec![nub], true),
+            ]
+        },
+        dashes: {
+            // An east intent (mag 1000) at max_speed 200 -> walk +200; the dash bursts the
+            // fixed DASH_DISTANCE (3000) along the same bearing, so a ready dash travels
+            // +3200 to x=3200 while a plain walk travels only +200 -- the burst is unmistakable.
+            let east = Vec2 { x: MOVE_INTENT_SCALE, y: 0 };
+            let bounds = Vec2 { x: 50_000, y: 50_000 };
+            // A wall east of the post-walk position (x=200) but inside the burst's reach
+            // (x<3200): the walk clears it, the dash burst crosses it and is refused, so the
+            // pawn holds at its post-walk position rather than tunnelling to x=3200.
+            let burst_wall = Blocker { min: Vec2 { x: 1_000, y: -2_000 }, max: Vec2 { x: 1_200, y: 2_000 }, height: 0 };
+            vec![
+                // Ready (cooldown 0): walk +200 then burst +3000 -> x=3200, and the dash arms
+                // the cooldown to the rule value (10).
+                dash_case("ready_dash_bursts_walk_plus_distance", Vec2::ZERO, east, 200, bounds, Vec::new(), 10, 0),
+                // SAME geometry, but mid-cooldown (before 5 -> ticks to 4): the dash is refused
+                // and ONLY the +200 walk applies -- no burst, the cooldown is not re-armed.
+                dash_case("dash_on_cooldown_is_a_plain_walk", Vec2::ZERO, east, 200, bounds, Vec::new(), 10, 5),
+                // Zero direction: the ability press is a no-op (no direction to dash) -- the pawn
+                // holds AND the cooldown stays ready (unspent), so a later directionful press dashes.
+                dash_case("zero_direction_press_does_nothing", Vec2::ZERO, Vec2::ZERO, 200, bounds, Vec::new(), 10, 0),
+                // Ready, but a wall sits across the burst path: the walk clears to x=200, the dash
+                // FIRES (arming the cooldown to 10) yet slide() refuses the burst, so the pawn holds
+                // at x=200 -- consume-on-trigger AND no tunnel through the wall.
+                dash_case("dash_into_wall_holds_no_tunnel", Vec2::ZERO, east, 200, bounds, vec![burst_wall], 10, 0),
             ]
         },
         matches: vec![
