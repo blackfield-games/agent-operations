@@ -1336,6 +1336,98 @@ async def test_run_npc_intent_gate_does_not_special_case_the_fallback_archetype(
     assert verdict.accepted, verdict.issues
 
 
+# ---- npc must_not loop: a barred archetype (civilians) must never reach the layer ----
+#
+# The director DECLARES intent:must_not and npc HONORS it by excluding the barred archetype
+# from its pick; these pin that the validator VERIFIES it — rejecting an npc layer that still
+# spawns a forbidden archetype (routed to npc), catching the cases the factions membership
+# check structurally can't (a roster that NAMES civilian, an empty roster), and staying
+# silent when the token is absent, the archetype is allowed, or the layer is missing.
+
+
+async def test_run_rejects_a_forbidden_civilian_npc_archetype_and_routes_to_npc(tmp_path):
+    # FM2 (false accept): the director forbids civilians via intent:must_not but npc's layer
+    # spawns one — a tampered/desynced pick. The gate must catch it, name npc, and key the
+    # message off intent:must_not (never a pipeline-earlier specialist) so route-back targets
+    # npc. The token is "civilians" alone so only the npc branch fires (dense_vegetation would
+    # also trip biome's cap check and muddy the routing — biome is pipeline-earlier).
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="civilians"),
+        "npc": _npc_body("civilian"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:must_not" in i and "civilian" in i for i in verdict.issues)
+    assert "npc" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "npc"
+    assert _route_back_target(verdict) == "npc"
+
+
+async def test_run_rejects_a_civilian_even_when_the_roster_names_it(tmp_path):
+    # Non-redundancy with the factions branch (case B): a desynced roster that WRONGLY rosters
+    # civilian makes the membership check pass, yet the must_not branch must still reject — the
+    # ban outranks roster membership.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(factions="civilian,raider", must_not="civilians"),
+        "npc": _npc_body("civilian"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:must_not" in i and "civilian" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "npc"
+
+
+async def test_run_rejects_a_civilian_under_an_empty_roster(tmp_path):
+    # Non-redundancy with the factions branch (case C): with no intent:factions the membership
+    # check is silent, but a must_not that forbids civilians must still bar a tampered civilian
+    # layer — the ban does not need a roster to bite.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="civilians"),
+        "npc": _npc_body("civilian"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:must_not" in i and "civilian" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "npc"
+
+
+async def test_run_must_not_npc_gate_accepts_a_non_forbidden_archetype(tmp_path):
+    # FM1 (no false reject): the director forbids civilians but npc spawns an ALLOWED archetype
+    # — the gate must stay silent. The ban bars only the named archetype, nothing else.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(factions="raider,sentinel", must_not="civilians"),
+        "npc": _npc_body("raider"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_must_not_npc_gate_silent_without_the_civilians_token(tmp_path):
+    # FM4 (token scope): a must_not that does NOT name civilians imposes no npc ban, so even an
+    # npc layer spawning a civilian validates against the must_not branch. Only the civilians
+    # token bars the civilian archetype (that other tokens map to no archetype is pinned in
+    # test_npc's _forbidden_archetypes unit test); interior_volumes alone keeps biome silent too.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="interior_volumes"),
+        "npc": _npc_body("civilian"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_must_not_npc_gate_degrades_on_a_missing_npc_layer(tmp_path):
+    # FM3 (missing-layer degrade): the director forbids civilians but npc's FILE is gone. The
+    # must_not branch must skip the unreadable layer (never crash the final gate); the
+    # missing-layer gate rejects and routes back to npc.
+    bodies = {"director": _director_body(must_not="civilians")}
+    verdict = await validator.run(
+        _brief(), _set_with_missing(tmp_path, bodies, missing="npc"), layers_root=tmp_path
+    )
+    assert not verdict.accepted
+    assert "npc" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "npc"
+
+
 # ---- lighting loop: the Atmosphere must be driven by the director's recognized beats ----
 #
 # The director DECLARES intent:beats (a free-form mood line) and lighting HONORS it by
