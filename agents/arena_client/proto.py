@@ -146,6 +146,10 @@ class SelfState(_Wire):
     # move_dir). Same start-of-tick adjustment as cooldown, so the dash-ready
     # predicate is simply `dash_cooldown == 0`. Own state only — never on VisibleEntity.
     dash_cooldown: U16
+    # The seat's own cumulative match score (damage dealt) — the same i32 the broadcast
+    # scoreboard carries for this pawn. Own state only: never on VisibleEntity, since an
+    # enemy's exact score is a tactical read the per-seat perception slice excludes.
+    score: I32
     alive: bool
 
 

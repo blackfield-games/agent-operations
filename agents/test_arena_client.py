@@ -156,7 +156,7 @@ def test_self_state_carries_cooldown_but_visible_entity_does_not():
     own = {
         "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
         "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
-        "ammo": 30, "cooldown": 3, "dash_cooldown": 0, "alive": True,
+        "ammo": 30, "cooldown": 3, "dash_cooldown": 0, "score": 0, "alive": True,
     }
     assert proto.SelfState.model_validate(own).cooldown == 3
     with pytest.raises(pydantic.ValidationError):
@@ -181,7 +181,7 @@ def test_self_state_carries_shield_but_visible_entity_does_not():
     own = {
         "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
         "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 40,
-        "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": True,
+        "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True,
     }
     assert proto.SelfState.model_validate(own).shield == 40
     with pytest.raises(pydantic.ValidationError):
@@ -203,7 +203,7 @@ def test_self_state_carries_dash_cooldown_but_visible_entity_does_not():
     own = {
         "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
         "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
-        "ammo": 30, "cooldown": 0, "dash_cooldown": 7, "alive": True,
+        "ammo": 30, "cooldown": 0, "dash_cooldown": 7, "score": 0, "alive": True,
     }
     assert proto.SelfState.model_validate(own).dash_cooldown == 7
     with pytest.raises(pydantic.ValidationError):
@@ -240,7 +240,7 @@ def test_out_of_domain_fields_are_rejected():
     with pytest.raises(pydantic.ValidationError):
         proto.SelfState.model_validate({  # seat is u8
             "seat": -1, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
-            "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": True,
+            "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True,
         })
     with pytest.raises(pydantic.ValidationError):
         proto.Welcome.model_validate(  # match_id must be a UUID
@@ -450,7 +450,7 @@ def _observe_frame(tick: int = 0, seat: int = 0, alive: bool = True, deadline: i
         "type": "observe", "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH,
         "seat": seat, "tick": tick, "phase": "live", "deadline_micros": deadline,
         "own": {"seat": seat, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
-                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": alive},
+                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": alive},
         "visible": [],
     }
 
@@ -671,7 +671,7 @@ def test_static_geometry_never_rides_the_parity_bounded_observation():
             "phase": "live", "deadline_micros": 50_000,
             "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
                     "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
-                    "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": True},
+                    "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True},
             "visible": [], "blockers": [],
         })
 
@@ -735,7 +735,7 @@ def test_static_pickup_layout_never_rides_the_parity_bounded_observation():
             "phase": "live", "deadline_micros": 50_000,
             "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
                     "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
-                    "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "alive": True},
+                    "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True},
             "visible": [], "pickup_points": [],
         })
 
@@ -874,7 +874,7 @@ def _make_obs(x, y, ammo=30, alive=True, team=0, facing=0, visible=()):
         "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 0,
         "phase": "live", "deadline_micros": 50_000,
         "own": {"seat": 0, "team": team, "position": {"x": x, "y": y}, "z": 0, "facing": facing,
-                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": ammo, "cooldown": 0, "dash_cooldown": 0, "alive": alive},
+                "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": ammo, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": alive},
         "visible": [_entry(v) for v in visible],
     })
 
