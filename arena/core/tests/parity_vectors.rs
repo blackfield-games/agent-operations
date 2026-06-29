@@ -860,6 +860,88 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(!lethal.alive && lethal.health_after == 0, "the lethal overflow downs the pawn");
     assert_eq!(lethal.effective, lethal.shield_before + lethal.health_before, "the effective is clamped to the pools present");
     assert!(lethal.effective < lethal.raw, "the effective is strictly less than the overcommitted raw");
+
+    // Fire-rate cycle (v20): holding fire discharges exactly one shot per fire_cooldown-tick
+    // window — the fire sets cooldown to fire_cooldown and the tick-start saturating countdown
+    // re-opens the gate only fire_cooldown ticks later — draining ammo by one per shot; a fire at
+    // ammo==0 is REFUSED (no shot, no negative ammo, the cooldown left untouched); and a reload
+    // refills ammo to EXACTLY mag_size while arming the cooldown to fire_cooldown (so it cannot
+    // fire on the reload tick or the next). A twin that cools down a tick early (fires too fast),
+    // decrements ammo without discharging, fires on empty, or refills past mag_size diverges.
+    let fc = |label: &str| v.fire_cycle.iter().find(|c| c.label == label).unwrap();
+    // THE discriminator: every case replays the reference fire-cycle state machine INDEPENDENTLY
+    // of the sim — cooldown counts down at tick start (saturating at 0), a press at cooldown 0 with
+    // ammo>0 discharges (ammo -= 1, cooldown = fire_cooldown), an empty/cooling press is inert, and
+    // a reload sets ammo = mag_size + cooldown = fire_cooldown — so a wrong-cadence twin diverges.
+    for c in &v.fire_cycle {
+        let (mut ammo, mut cooldown) = (c.mag_size, 0u16);
+        let expected: Vec<(bool, u16, u16)> = (0..c.timeline.len() as u16)
+            .map(|t| {
+                cooldown = cooldown.saturating_sub(1);
+                let fired = if c.reload_tick == Some(t) {
+                    ammo = c.mag_size;
+                    cooldown = c.fire_cooldown;
+                    false
+                } else if cooldown == 0 && ammo > 0 {
+                    ammo -= 1;
+                    cooldown = c.fire_cooldown;
+                    true
+                } else {
+                    false
+                };
+                (fired, ammo, cooldown)
+            })
+            .collect();
+        assert_eq!(c.timeline, expected, "{}: the recorded cadence must match the reference fire-cycle recomputation", c.label);
+        // Cross-checks the recompute can't fake: ammo never exceeds mag_size, and only a discharge
+        // or a reload moves it — a non-firing, non-reloading tick leaves the magazine untouched.
+        for (i, &(fired, a, _)) in c.timeline.iter().enumerate() {
+            assert!(a <= c.mag_size, "{}: ammo never exceeds mag_size (no overfill)", c.label);
+            if !fired && c.reload_tick != Some(i as u16) {
+                let prev = if i == 0 { c.mag_size } else { c.timeline[i - 1].1 };
+                assert_eq!(a, prev, "{}: a tick that neither fired nor reloaded leaves ammo unchanged", c.label);
+            }
+        }
+    }
+
+    // Held fire (fire_cooldown 3, mag 6): exactly one shot per fire_cooldown=3-tick window — a twin
+    // firing a tick early (period 2: ticks 0,2,4,6,8) or late (period 4: 0,4,8) records different
+    // fire ticks. The fire ticks are evenly spaced by fire_cooldown.
+    let held = fc("held_fire_one_shot_per_cooldown_window");
+    assert_eq!((held.fire_cooldown, held.mag_size), (3, 6));
+    let held_fires: Vec<usize> = held.timeline.iter().enumerate().filter(|(_, &(f, ..))| f).map(|(i, _)| i).collect();
+    assert_eq!(held_fires, vec![0, 3, 6, 9], "one shot per fire_cooldown-tick window — not a tick early or late");
+    for w in held_fires.windows(2) {
+        assert_eq!(w[1] - w[0], usize::from(held.fire_cooldown), "consecutive shots are spaced exactly fire_cooldown ticks apart");
+    }
+    // Each firing tick decrements ammo by exactly one; between shots the magazine holds.
+    for &i in &held_fires {
+        let prev = if i == 0 { held.mag_size } else { held.timeline[i - 1].1 };
+        assert_eq!(held.timeline[i].1, prev - 1, "a fired tick decrements ammo by exactly one");
+    }
+    assert_eq!(held.timeline.iter().map(|&(_, a, _)| a).collect::<Vec<_>>(), vec![5, 5, 5, 4, 4, 4, 3, 3, 3, 2], "ammo drops once per shot and holds between");
+    // The cooldown re-arms to fire_cooldown on each shot and ticks strictly down to the open gate.
+    assert_eq!(held.timeline.iter().map(|&(_, _, c)| c).collect::<Vec<_>>(), vec![3, 2, 1, 3, 2, 1, 3, 2, 1, 3], "the cooldown re-arms to fire_cooldown on each shot and counts down between");
+
+    // Mag dry then empty-fire refused (fire_cooldown 2, mag 2): the 2-round mag fires twice then
+    // every held fire is inert — no shot, ammo pinned at 0 (never negative), the cooldown idle.
+    let dry = fc("mag_dry_then_empty_fire_refused");
+    let dry_fires: Vec<usize> = dry.timeline.iter().enumerate().filter(|(_, &(f, ..))| f).map(|(i, _)| i).collect();
+    assert_eq!(dry_fires, vec![0, 2], "the 2-round mag fires exactly twice then runs dry");
+    for &(fired, ammo, _) in &dry.timeline[3..] {
+        assert!(!fired && ammo == 0, "a fire on an empty mag is refused — no shot, and ammo never underflows past 0");
+    }
+    assert_eq!(*dry.timeline.last().unwrap(), (false, 0, 0), "a refused empty fire never re-arms the cooldown");
+
+    // Reload refills to mag_size then fires (fire_cooldown 2, mag 2, reload at tick 5): the empty
+    // mag (refused at 4) is refilled to EXACTLY mag_size, the reload arms the cooldown so the next
+    // tick is still cooling, and the first post-reload shot lands once the cooldown clears.
+    let reload = fc("reload_refills_to_mag_size_then_fires");
+    assert_eq!(reload.reload_tick, Some(5));
+    assert_eq!(reload.timeline[4], (false, 0, 0), "the pre-reload tick is an empty-mag refusal");
+    assert_eq!(reload.timeline[5], (false, reload.mag_size, reload.fire_cooldown), "the reload refills to EXACTLY mag_size and arms the cooldown — no shot on the reload tick");
+    assert!(!reload.timeline[6].0, "the tick after a reload is still cooling down — no fire yet");
+    assert_eq!(reload.timeline[7], (true, reload.mag_size - 1, reload.fire_cooldown), "the first post-reload shot lands once the cooldown clears, draining the refilled mag");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
