@@ -242,6 +242,16 @@ pub struct SelfState {
     /// 0`). Own state only — never on [`VisibleEntity`]/[`BroadcastEntity`], since an
     /// enemy's dash readiness is the same tactical x-ray as its ammo or fire timing.
     pub dash_cooldown: u16,
+    /// This pawn's own cumulative match score — the identical credited total the
+    /// broadcast scoreboard carries for it ([`BroadcastEntity`]'s `score`, cumulative
+    /// damage dealt). `0` at spawn, monotonic non-negative as the seat lands hits.
+    /// Surfaced here so a controller can read its OWN standing the way a human reads the
+    /// HUD. Unlike `ammo`/`cooldown`/`shield` it is NOT secret — the same value is public
+    /// on the broadcast — but it stays own-state-only on a parity-bounded [`Observation`]:
+    /// it is never added to a [`VisibleEntity`], since an enemy's exact score (who is
+    /// ahead, who has landed hits) is a tactical read the per-seat perception slice
+    /// deliberately excludes.
+    pub score: i32,
     pub alive: bool,
 }
 
@@ -662,6 +672,7 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
             ammo: 30,
             cooldown: 5,
             dash_cooldown: 3,
+            score: 12,
             alive: true,
         },
         visible: vec![VisibleEntity {
@@ -1656,12 +1667,13 @@ mod tests {
             ammo: 30,
             cooldown: 5,
             dash_cooldown: 3,
+            score: 7,
             alive: true,
         };
         let json = serde_json::to_value(s).unwrap();
         assert_eq!(
             object_keys(&json),
-            ["alive", "ammo", "cooldown", "dash_cooldown", "facing", "health", "max_health", "position", "seat", "shield", "team", "velocity", "z"],
+            ["alive", "ammo", "cooldown", "dash_cooldown", "facing", "health", "max_health", "position", "score", "seat", "shield", "team", "velocity", "z"],
             "SelfState gained or lost a field — the observable self-surface is a security contract"
         );
         for forbidden in ["enemies", "visible", "all_pawns", "rng_state", "world", "world_state"] {
@@ -1706,7 +1718,7 @@ mod tests {
                 "position": { "x": 0, "y": 0 }, "z": 0,
                 "facing": 16384,
                 "velocity": { "x": 0, "y": 0 },
-                "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 5, "dash_cooldown": 0, "alive": true
+                "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 5, "dash_cooldown": 0, "score": 9, "alive": true
             },
             "visible": [{
                 "entity_id": 7, "kind": "player", "team": 2,
@@ -2269,6 +2281,7 @@ mod tests {
                 ammo: 30,
                 cooldown: 5,
                 dash_cooldown: 0,
+                score: 9,
                 alive: true,
             },
             visible: vec![VisibleEntity {
