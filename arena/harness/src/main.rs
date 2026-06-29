@@ -400,6 +400,18 @@ struct Args {
     /// value), applied to BOTH the direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a
     /// matchmade/ranked match respawns pickups on the same cooldown a hand-seated one does.
     pickup_respawn_cooldown: u16,
+    /// Per-axis spawn jitter in position units (`Rules::spawn_jitter`): when the sim seats pawns around the opening
+    /// ring it perturbs each seat by a PRNG draw in `[-spawn_jitter, +spawn_jitter]` per axis, so the seed scatters
+    /// the opening (a wider jitter scatters it more) and a `0` jitter is a fully deterministic opening. Set by
+    /// `--spawn-jitter`; UNLIKE the feature-toggle knobs (which default `0` = off) this is a base-balance value, so
+    /// its default is `Rules::default().spawn_jitter` (`2 * POSITION_SCALE`, a 2 m per-axis jitter) — an absent flag
+    /// is byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT jitter, NOT at `0` (a `0`
+    /// jitter is a deterministic opening with no per-seed perturbation — a real config an explicit `0` must forward).
+    /// A non-negative `i32` (the u32-then-`i32` fence in [`parse_spawn_jitter`]: a negative — which would invert the
+    /// jitter span — or a value past `i32::MAX` aborts), applied to BOTH the direct and `--mode` paths through
+    /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match scatters its opening the same way a
+    /// hand-seated one does.
+    spawn_jitter: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -595,6 +607,17 @@ fn parse_pickup_radius(value: &str) -> i32 {
     i32::try_from(radius).expect("--pickup-radius exceeds the i32 range")
 }
 
+/// Parse a `--spawn-jitter` value to the non-negative per-axis jitter [`Rules::spawn_jitter`] carries, the same
+/// u32-then-i32 fence as [`parse_pickup_radius`]: the PRNG perturbs each seat's opening position by a draw in
+/// `[-spawn_jitter, +spawn_jitter]` per axis, so a negative is meaningless (it would invert the jitter span) and
+/// a value past `i32::MAX` would wrap the span, so both abort before any spawn.
+fn parse_spawn_jitter(value: &str) -> i32 {
+    let jitter: u32 = value
+        .parse()
+        .expect("--spawn-jitter is a non-negative integer (per-axis spawn jitter)");
+    i32::try_from(jitter).expect("--spawn-jitter exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -687,6 +710,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 pickup_respawn_cooldown
     // respawns the pickup the tick after collection (effectively always present), NOT the pre-flag harness.
     let mut pickup_respawn_cooldown: u16 = Rules::default().pickup_respawn_cooldown;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 spawn_jitter is a fully
+    // deterministic opening with no per-seed perturbation, NOT the pre-flag harness.
+    let mut spawn_jitter: i32 = Rules::default().spawn_jitter;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -847,6 +873,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("pickup-respawn-cooldown is a u16 (ticks)")
             }
+            "--spawn-jitter" => {
+                spawn_jitter = parse_spawn_jitter(&it.next().expect("--spawn-jitter needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -891,6 +920,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         action_deadline_micros,
         pickup_radius,
         pickup_respawn_cooldown,
+        spawn_jitter,
     }
 }
 
@@ -1662,6 +1692,7 @@ fn rules_from(args: &Args) -> Rules {
         action_deadline_micros: args.action_deadline_micros,
         pickup_radius: args.pickup_radius,
         pickup_respawn_cooldown: args.pickup_respawn_cooldown,
+        spawn_jitter: args.spawn_jitter,
         ..Rules::default()
     }
 }
@@ -2443,6 +2474,7 @@ mod tests {
             action_deadline_micros: Rules::default().action_deadline_micros,
             pickup_radius: Rules::default().pickup_radius,
             pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
+            spawn_jitter: Rules::default().spawn_jitter,
         }
     }
 
@@ -2532,6 +2564,7 @@ mod tests {
             action_deadline_micros: Rules::default().action_deadline_micros,
             pickup_radius: Rules::default().pickup_radius,
             pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
+            spawn_jitter: Rules::default().spawn_jitter,
         }
     }
 
