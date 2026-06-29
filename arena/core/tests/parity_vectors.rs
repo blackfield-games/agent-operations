@@ -9,7 +9,8 @@
 
 use arena_core::{
     expected_score_bp, parity_vectors, rating_delta, AimMode, MatchOutcome, ParityVectors,
-    PerceptionVerdict, PickupCase, WeaponMode, DASH_DISTANCE, RATING_DIFF_CAP, RATING_SCALE,
+    PerceptionVerdict, PickupCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY, RATING_DIFF_CAP,
+    RATING_SCALE,
 };
 use arena_proto::{PickupKind, Vec2};
 
@@ -742,6 +743,67 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // an uncollected one stays active.
     assert_eq!(heal.active_timeline, vec![false], "a collected single-step pickup is dormant after");
     assert_eq!(outside.active_timeline, vec![true], "an uncollected pickup stays active");
+
+    // Jump arc (v18): a grounded jump press launches z to JUMP_VELOCITY, then semi-implicit Euler
+    // (z += z_vel BEFORE z_vel -= gravity) integrates the arc to a clean z==0 landing; with gravity
+    // off the press is inert; and a jump pressed mid-air never re-launches. A twin that uses the
+    // wrong impulse, integrates in the wrong order (off-by-one apex/landing), allows an air-jump,
+    // or mishandles the z==0 snap fails one of these.
+    let jc = |label: &str| v.jumps.iter().find(|c| c.label == label).unwrap();
+    let arc = jc("grounded_arc_launches_decelerates_peaks_lands");
+    // Launch from rest: the FIRST recorded z is exactly JUMP_VELOCITY — z_vel is set to
+    // JUMP_VELOCITY on the launch tick and `z += z_vel` raises z there before the first decrement.
+    assert_eq!((arc.start_z, arc.start_z_vel), (0, 0), "the arc launches from rest on the ground");
+    assert_eq!(arc.trajectory[0].0, JUMP_VELOCITY, "the launch tick raises z to exactly JUMP_VELOCITY");
+    // Per-tick gravity decrement: z_vel falls by EXACTLY gravity every airborne tick — an
+    // explicit-Euler twin that decrements BEFORE the move would record a different z_vel here.
+    let land = arc.landing_tick.expect("the grounded arc lands") as usize;
+    for k in 1..land {
+        assert_eq!(arc.trajectory[k].1, arc.trajectory[k - 1].1 - arc.gravity, "z_vel falls by exactly gravity each airborne tick");
+    }
+    // Apex: the recorded peak is the maximum z of the trajectory, and the arc rises strictly past
+    // its launch height before the descent (the semi-implicit step keeps adding z_vel post-launch).
+    assert_eq!(arc.apex_z, arc.trajectory.iter().map(|&(z, _)| z).max().unwrap(), "apex_z is the trajectory peak");
+    assert!(arc.apex_z > JUMP_VELOCITY, "the arc rises past the launch height before falling");
+    // Landing: the descent snaps to z==0 with z_vel cleared on the landing tick, and z stays
+    // strictly above the ground until then (no early zero, no negative-z tunnel).
+    assert_eq!(arc.trajectory[land], (0, 0), "the arc lands at z==0 with z_vel cleared");
+    assert!(arc.trajectory[..land].iter().all(|&(z, _)| z > 0), "z stays above ground until the landing tick");
+    // THE discriminator: the whole trajectory replays the reference semi-implicit Euler
+    // bit-for-bit — set z_vel to JUMP_VELOCITY (the grounded launch), then `z += z_vel` BEFORE
+    // `z_vel -= gravity` each tick, snapping to (0,0) when z would cross the ground. Recomputed
+    // here independently of the sim, so a wrong-order or wrong-impulse twin diverges immediately.
+    let mut expected = Vec::new();
+    let (mut z, mut z_vel) = (0i64, JUMP_VELOCITY as i64);
+    loop {
+        let nz = z + z_vel;
+        if nz <= 0 {
+            expected.push((0i32, 0i32));
+            break;
+        }
+        z = nz;
+        z_vel -= arc.gravity as i64;
+        expected.push((z as i32, z_vel as i32));
+    }
+    assert_eq!(arc.trajectory, expected, "the recorded arc matches the semi-implicit Euler recomputation tick-for-tick");
+
+    // Gravity off (the default): a HELD jump never lifts the pawn — z and z_vel stay 0, with no
+    // apex and no landing, byte-identical to a 2D match. The arc is rule-driven, not setup-driven.
+    let inert = jc("gravity_off_jump_is_inert");
+    assert_eq!(inert.gravity, 0, "the inert case runs with gravity off");
+    assert!(inert.hold_jump, "...while the jump is HELD every tick");
+    assert!(inert.trajectory.iter().all(|&p| p == (0, 0)), "with gravity off a held jump leaves z and z_vel at 0");
+    assert_eq!((inert.apex_z, inert.landing_tick), (0, None), "no apex and no landing — the pawn never leaves the ground");
+
+    // Air-jump: a pawn already airborne (start_z > 0) holding jump every tick does NOT re-launch —
+    // only a grounded pawn jumps. Started at the post-launch state (JUMP_VELOCITY, JUMP_VELOCITY -
+    // gravity), so its trajectory is EXACTLY the grounded arc's tail (the continuation with no
+    // effective input). A twin that re-launched would reset z_vel to JUMP_VELOCITY and diverge.
+    let air = jc("air_jump_does_not_relaunch");
+    assert!(air.start_z > 0 && air.hold_jump, "the air-jump pawn starts airborne and holds the jump button");
+    assert_eq!(&air.trajectory[..], &arc.trajectory[1..], "a held jump mid-air rides the existing arc — the grounded arc's tail, no re-launch");
+    assert!(air.trajectory[0].0 < air.start_z + JUMP_VELOCITY, "z was NOT re-boosted by a second launch impulse");
+    assert!(air.trajectory[0].1 < JUMP_VELOCITY, "...and z_vel was not reset to the launch impulse");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
