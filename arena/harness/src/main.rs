@@ -5215,6 +5215,104 @@ mod tests {
     }
 
     #[test]
+    fn parse_spawn_radius_maps_a_non_negative_radius() {
+        assert_eq!(parse_spawn_radius("0"), 0);
+        assert_eq!(parse_spawn_radius("50000"), 50000);
+        assert_eq!(
+            parse_spawn_radius(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid spawn-line half-width"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_spawn_radius_rejects_a_negative() {
+        // A spawn-line half-width is non-negative; a negative would invert the [-radius, +radius] spread span.
+        // Reject it loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_spawn_radius("-50000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_spawn_radius_rejects_an_overflow() {
+        // A half-width past i32::MAX must abort, NOT wrap into a negative. 3_000_000_000 fits a u32 but not an i32,
+        // so i32::try_from catches it.
+        parse_spawn_radius("3000000000");
+    }
+
+    #[test]
+    fn spawn_radius_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --spawn-radius pulls exactly one token (through
+        // parse_spawn_radius) and consumes no following flag. A --spawn-radius 50000 right before --seats 3
+        // must parse BOTH.
+        let parsed =
+            parse_args_from(["--spawn-radius", "50000", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.spawn_radius, 50000, "--spawn-radius 50000 parses the half-width");
+        assert_eq!(parsed.seats, 3, "--spawn-radius consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --spawn-radius is NOT 0 — it is the
+        // Rules default (a 0 radius stacks every seat on the X origin, not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.spawn_radius,
+            Rules::default().spawn_radius,
+            "no --spawn-radius defaults to the Rules default half-width, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_spawn_radius_into_rules() {
+        // FM1 (default drift): no --spawn-radius is the Rules DEFAULT half-width — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). Pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().spawn_radius,
+            Rules::default().spawn_radius,
+            "no --spawn-radius is the Rules default half-width (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { spawn_radius: 50000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .spawn_radius,
+            50000,
+            "--spawn-radius 50000 threads the half-width into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_spawn_radius_into_a_matchmade_match() {
+        // FM3 (path skew): --spawn-radius must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same half-width
+        // a hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { spawn_radius: 50000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().spawn_radius,
+            50000,
+            "the matchmaker forms under --spawn-radius 50000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default half-width — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().spawn_radius,
+            Rules::default().spawn_radius,
+            "no --spawn-radius: the matchmaker forms the Rules default half-width"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
