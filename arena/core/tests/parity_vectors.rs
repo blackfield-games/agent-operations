@@ -931,6 +931,10 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     for &(fired, ammo, _) in &dry.timeline[3..] {
         assert!(!fired && ammo == 0, "a fire on an empty mag is refused — no shot, and ammo never underflows past 0");
     }
+    // The load-bearing empty-mag pin: by tick 4 the cooldown has cleared (gate open) yet the mag is
+    // empty, so the refusal is the ammo==0 gate ALONE — a twin that fires on an empty mag once the
+    // cooldown clears diverges exactly here, where a cooldown-only model would discharge.
+    assert_eq!(dry.timeline[4], (false, 0, 0), "cooldown clear but mag empty: the fire is refused on emptiness alone");
     assert_eq!(*dry.timeline.last().unwrap(), (false, 0, 0), "a refused empty fire never re-arms the cooldown");
 
     // Reload refills to mag_size then fires (fire_cooldown 2, mag 2, reload at tick 5): the empty
