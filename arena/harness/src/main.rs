@@ -412,6 +412,18 @@ struct Args {
     /// [`rules_from`] via [`MatchParams::rules`], so a matchmade/ranked match scatters its opening the same way a
     /// hand-seated one does.
     spawn_jitter: i32,
+    /// Half-width of the opening spawn line in position units (`Rules::spawn_radius`): the sim spreads the seats
+    /// evenly across `[-spawn_radius, +spawn_radius]` on the X axis at match start (then `spawn_jitter` perturbs
+    /// each), so a wider radius opens the seats farther apart and a `0` radius stacks every seat on the X origin
+    /// (only the jitter then separates them). Set by `--spawn-radius`; UNLIKE the feature-toggle knobs (which
+    /// default `0` = off) this is a base-balance value, so its default is `Rules::default().spawn_radius`
+    /// (`20 * POSITION_SCALE`, a 20 m half-width) — an absent flag is byte-identical to the pre-flag harness (and
+    /// the replay digest) at the DEFAULT half-width, NOT at `0` (a `0` radius stacks the seats on the origin — a
+    /// real config an explicit `0` must forward). A non-negative `i32` (the u32-then-`i32` fence in
+    /// [`parse_spawn_radius`]: a negative — which would invert the spread span — or a value past `i32::MAX` aborts),
+    /// applied to BOTH the direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a
+    /// matchmade/ranked match opens its seats the same way a hand-seated one does.
+    spawn_radius: i32,
 }
 
 /// Parse a `--mode` value into a [`MatchMode`]; the harness exposes the three
@@ -618,6 +630,17 @@ fn parse_spawn_jitter(value: &str) -> i32 {
     i32::try_from(jitter).expect("--spawn-jitter exceeds the i32 range")
 }
 
+/// Parse a `--spawn-radius` value to the non-negative half-width [`Rules::spawn_radius`] carries, the same
+/// u32-then-i32 fence as [`parse_spawn_jitter`]: the sim spreads the seats across `[-spawn_radius, +spawn_radius]`
+/// on the X axis at the opening, so a negative is meaningless (it would invert the spread span) and a value past
+/// `i32::MAX` would wrap the half-width, so both abort before any spawn.
+fn parse_spawn_radius(value: &str) -> i32 {
+    let radius: u32 = value
+        .parse()
+        .expect("--spawn-radius is a non-negative integer (spawn-line half-width)");
+    i32::try_from(radius).expect("--spawn-radius exceeds the i32 range")
+}
+
 /// Parse a `--weapon-mode` value to the fire-resolution kind, rejecting an unknown name loudly
 /// (mirroring [`parse_aim_mode`]). `weapon_mode` decides how a fire press resolves — instant
 /// beam hitscan, a traveling projectile, or a melee cleave — so a typo must abort, never
@@ -713,6 +736,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 spawn_jitter is a fully
     // deterministic opening with no per-seed perturbation, NOT the pre-flag harness.
     let mut spawn_jitter: i32 = Rules::default().spawn_jitter;
+    // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 spawn_radius stacks every
+    // seat on the X origin (only spawn_jitter then separates them), NOT the pre-flag harness.
+    let mut spawn_radius: i32 = Rules::default().spawn_radius;
     let mut it = args;
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -876,6 +902,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--spawn-jitter" => {
                 spawn_jitter = parse_spawn_jitter(&it.next().expect("--spawn-jitter needs a value"))
             }
+            "--spawn-radius" => {
+                spawn_radius = parse_spawn_radius(&it.next().expect("--spawn-radius needs a value"))
+            }
             other => panic!("unknown argument: {other}"),
         }
     }
@@ -921,6 +950,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         pickup_radius,
         pickup_respawn_cooldown,
         spawn_jitter,
+        spawn_radius,
     }
 }
 
@@ -1653,12 +1683,11 @@ fn handshake_matchmade(
 /// The combat [`Rules`] both seating paths form under, derived from the harness flags so
 /// a matchmade (`--mode`) match and a hand-seated direct match play under the SAME tuning.
 /// The matchmaker carries it via [`MatchParams::rules`] ([`build_matchmaker`]); the direct
-/// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). The
-/// perception-memory window (`--perception-memory`), the FOV cone (`--fov`), the aim
-/// resolution (`--aim-mode`), allied damage (`--friendly-fire`), gravity (`--gravity`), and
-/// the weapon mode (`--weapon-mode`) are dialable; every other field stays at [`Rules::default`],
-/// and each knob defaults to its `Rules::default` value, so a no-flag run is byte-identical to
-/// the pre-knob harness.
+/// path passes it straight to [`Match::new_with_pickups`] ([`build_direct_match`]). Every
+/// `Rules` determinant is now flag-dialable, and each knob defaults to its [`Rules::default`]
+/// value, so a no-flag run forms a `Rules` byte-identical to [`Rules::default`] (and the
+/// pre-knob harness). The explicit construction — no `..Rules::default()` spread — means a new
+/// `Rules` field added upstream fails this build until it too is threaded through a flag.
 fn rules_from(args: &Args) -> Rules {
     Rules {
         perception_memory_ticks: args.perception_memory,
@@ -1693,7 +1722,7 @@ fn rules_from(args: &Args) -> Rules {
         pickup_radius: args.pickup_radius,
         pickup_respawn_cooldown: args.pickup_respawn_cooldown,
         spawn_jitter: args.spawn_jitter,
-        ..Rules::default()
+        spawn_radius: args.spawn_radius,
     }
 }
 
@@ -2475,6 +2504,7 @@ mod tests {
             pickup_radius: Rules::default().pickup_radius,
             pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
             spawn_jitter: Rules::default().spawn_jitter,
+            spawn_radius: Rules::default().spawn_radius,
         }
     }
 
@@ -2565,6 +2595,7 @@ mod tests {
             pickup_radius: Rules::default().pickup_radius,
             pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
             spawn_jitter: Rules::default().spawn_jitter,
+            spawn_radius: Rules::default().spawn_radius,
         }
     }
 
