@@ -3270,6 +3270,73 @@ def test_run_local_match_rejects_an_out_of_range_pickup_respawn_cooldown():
             run_local_match("/no/such/harness", [0, 1], policies, pickup_respawn_cooldown=bad)
 
 
+def test_run_local_match_forwards_spawn_jitter_and_omits_it_when_none(monkeypatch):
+    # spawn_jitter is a base-balance knob with a non-zero core default (2000), so it uses a None sentinel: the
+    # default None adds no token (the harness applies its own default — byte-identical argv); a value forwards
+    # --spawn-jitter <units> as one value token, mode-independently (before the mode block). Captured without a
+    # harness via the spy gateway.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--spawn-jitter" not in captured["argv"], "the default None adds no flag (harness default)"
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, spawn_jitter=3000)
+    argv = captured["argv"]
+    assert argv[argv.index("--spawn-jitter") + 1] == "3000"
+
+    # An explicit 0 is NOT the sentinel — it must forward (a fully deterministic opening with no per-seed
+    # perturbation, the caller asked for), UNLIKE the feature-toggle knobs where 0 is the omit-default. None-vs-0.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, spawn_jitter=0)
+    argv = captured["argv"]
+    assert argv[argv.index("--spawn-jitter") + 1] == "0"
+
+    # The i32 ceiling (2**31-1) forwards — a value past the u16 twins' 65535 max, proving this knob's range is the
+    # wider i32, not the u16 the cadence/damage knobs use (a discriminating boundary the u16 twins would reject).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, spawn_jitter=2**31 - 1)
+    argv = captured["argv"]
+    assert argv[argv.index("--spawn-jitter") + 1] == str(2**31 - 1)
+
+    # Threads under --mode too (mode-independent forward): the flag and --mode both reach argv.
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, mode="agent", signing_keys=keys, spawn_jitter=3000)
+    argv = captured["argv"]
+    assert argv[argv.index("--spawn-jitter") + 1] == "3000"
+    assert argv[argv.index("--mode") + 1] == "agent"
+
+
+def test_run_local_match_rejects_an_out_of_range_spawn_jitter():
+    # spawn_jitter is a non-negative i32 in core (0..=2**31-1), NOT a u16 — a non-None negative (core would invert
+    # the [-jitter, +jitter] draw span, and rejects spawn_jitter < 0 as an invalid Rules) or a value past i32::MAX
+    # (which wraps negative) forwarded blindly would be a footgun and abort the harness, so it raises before any
+    # spawn, mirroring the harness's u32-then-i32 parse_spawn_jitter fence. None is exempt (the sentinel). 2**31 IS
+    # rejected here (past i32::MAX, unlike the u32 action_deadline_micros). A bogus harness path proves the guard
+    # precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -3000, 2**31, 2**40):
+        with pytest.raises(ValueError, match="spawn_jitter"):
+            run_local_match("/no/such/harness", [0, 1], policies, spawn_jitter=bad)
+
+
 def test_run_local_match_surfaces_a_perception_memory_echo_to_a_policy():
     # The end-to-end payoff: --map reference (a central occluder) + a memory window means a
     # seat that loses sight of its enemy still receives its last-known position as a
