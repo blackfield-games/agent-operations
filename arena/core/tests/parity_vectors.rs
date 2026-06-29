@@ -9,8 +9,8 @@
 
 use arena_core::{
     expected_score_bp, parity_vectors, rating_delta, AimMode, MatchOutcome, ParityVectors,
-    PerceptionVerdict, PickupCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY, RATING_DIFF_CAP,
-    RATING_SCALE,
+    PerceptionVerdict, PickupCase, ShieldAbsorbCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY,
+    RATING_DIFF_CAP, RATING_SCALE,
 };
 use arena_proto::{PickupKind, Vec2};
 
@@ -804,6 +804,62 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(&air.trajectory[..], &arc.trajectory[1..], "a held jump mid-air rides the existing arc — the grounded arc's tail, no re-launch");
     assert!(air.trajectory[0].0 < air.start_z + JUMP_VELOCITY, "z was NOT re-boosted by a second launch impulse");
     assert!(air.trajectory[0].1 < JUMP_VELOCITY, "...and z_vel was not reset to the launch impulse");
+
+    // Shield absorption (v19): one weapon hit splits via the shield-first sink — absorbed =
+    // min(raw, shield) drains the shield FIRST, the overflow (raw - absorbed) spills to health
+    // clamped, and the effective is the pools actually removed (never the raw when the hit
+    // overcommits). The same hit through all three weapon modes splits identically (the shared
+    // sink); a shieldless hit is byte-identical to the per-site clamp. A twin that drains
+    // health-first, double-counts the absorbed portion, allows a per-mode shield rule, or returns
+    // the raw fails one of these.
+    let sc = |label: &str| v.shield_absorption.iter().find(|c| c.label == label).unwrap();
+    // THE discriminator: every case replays the reference shield-first split INDEPENDENTLY of the
+    // sim (absorbed = min(raw, shield); to_health = min(raw - absorbed, health); effective =
+    // absorbed + to_health), so a health-first or raw-returning twin diverges on at least one.
+    for c in &v.shield_absorption {
+        let absorbed = c.raw.min(c.shield_before);
+        let to_health = (c.raw - absorbed).min(c.health_before);
+        assert_eq!(c.shield_after, c.shield_before - absorbed, "{}: shield drains by min(raw, shield) FIRST", c.label);
+        assert_eq!(c.health_after, c.health_before - to_health, "{}: the overflow spills to health, clamped to it", c.label);
+        assert_eq!(c.effective, absorbed + to_health, "{}: effective is absorbed + to_health, clamped to the pools present", c.label);
+        assert_eq!(c.alive, c.health_after > 0, "{}: the target is downed exactly when health hits 0", c.label);
+    }
+    // Full absorb: the shield ate the whole hit — health untouched, shield drained but not depleted,
+    // effective == raw (all of it absorbed).
+    let full = sc("full_absorb_no_health_loss");
+    assert_eq!(full.health_after, full.health_before, "a fully-absorbed hit costs no health");
+    assert!(full.shield_after < full.shield_before && full.shield_after > 0, "the shield drained but was not depleted");
+    assert_eq!(full.effective, full.raw, "all of the raw was absorbed");
+    // Partial absorb: the shield depleted to 0 and the overflow cost health; the whole raw landed.
+    let part = sc("partial_absorb_overflow_to_health");
+    assert_eq!(part.shield_after, 0, "a partial absorb depletes the shield");
+    assert!(part.health_after < part.health_before, "the overflow past the shield costs health");
+    assert_eq!(part.effective, part.raw, "shield + overflow == the whole raw landed");
+    // Shared sink: the SAME (raw, shield, health) through hitscan, melee, and projectile splits
+    // IDENTICALLY — all three funnel through apply_hp_damage, so the weapon mode cannot change the
+    // absorb/overflow. A twin with a per-mode shield rule diverges here.
+    let (hs, ml, pj) = (sc("shared_sink_hitscan"), sc("shared_sink_melee"), sc("shared_sink_projectile"));
+    assert_eq!(
+        (hs.weapon_mode, ml.weapon_mode, pj.weapon_mode),
+        (WeaponMode::Hitscan, WeaponMode::Melee, WeaponMode::Projectile),
+        "the trio covers all three weapon modes",
+    );
+    let split = |c: &ShieldAbsorbCase| (c.raw, c.shield_before, c.health_before, c.shield_after, c.health_after, c.effective);
+    assert_eq!(split(hs), split(ml), "hitscan and melee split the same hit identically — the shared sink");
+    assert_eq!(split(ml), split(pj), "melee and projectile split the same hit identically — the shared sink");
+    // No shield (max_shield 0, the default): exactly raw.min(health) from health, shield untouched
+    // at 0 — byte-identical to the pre-shield per-site clamp.
+    let none = sc("no_shield_byte_identity");
+    assert_eq!((none.shield_before, none.shield_after), (0, 0), "the shieldless case carries no shield");
+    assert_eq!(none.health_after, none.health_before - none.raw.min(none.health_before), "shieldless is raw.min(health) straight from health");
+    assert_eq!(none.effective, none.raw.min(none.health_before), "shieldless effective is raw.min(health)");
+    // Lethal overflow: the hit overcommits past shield + health — the shield drains, the overflow
+    // downs the pawn, and the effective is CLAMPED to the pools present (40), NOT the raw (100). A
+    // twin that credited the raw over-scores the kill.
+    let lethal = sc("lethal_overflow_clamps_effective");
+    assert!(!lethal.alive && lethal.health_after == 0, "the lethal overflow downs the pawn");
+    assert_eq!(lethal.effective, lethal.shield_before + lethal.health_before, "the effective is clamped to the pools present");
+    assert!(lethal.effective < lethal.raw, "the effective is strictly less than the overcommitted raw");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
