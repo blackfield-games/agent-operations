@@ -128,6 +128,10 @@ class SelfState(_Wire):
     team: U16
     position: Vec2
     z: I32
+    # Per-tick vertical velocity — the rate z changes, the vertical twin of velocity:
+    # positive rising, negative falling, 0 at rest / when gravity is off. Own state only,
+    # never on VisibleEntity (an enemy's vertical velocity is the same x-ray as its planar).
+    z_vel: I32
     facing: U16
     velocity: Vec2
     health: U16

@@ -154,7 +154,7 @@ def test_self_state_carries_cooldown_but_visible_entity_does_not():
     # model must accept it — and require it, since the wire always carries it, so a
     # Rust/Python drift fails loud instead of silently defaulting.
     own = {
-        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
         "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
         "ammo": 30, "cooldown": 3, "dash_cooldown": 0, "score": 0, "alive": True,
     }
@@ -179,7 +179,7 @@ def test_self_state_carries_shield_but_visible_entity_does_not():
     # defaulting), and VisibleEntity must REJECT it (extra=forbid mirrors the Rust
     # wire-pin exclusion), so an enemy's remaining mitigation is never an x-ray.
     own = {
-        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
         "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 40,
         "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True,
     }
@@ -201,7 +201,7 @@ def test_self_state_carries_dash_cooldown_but_visible_entity_does_not():
     # (extra=forbid mirrors the Rust wire-pin exclusion), so an enemy's dash
     # readiness is never an x-ray.
     own = {
-        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
         "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
         "ammo": 30, "cooldown": 0, "dash_cooldown": 7, "score": 0, "alive": True,
     }
@@ -224,7 +224,7 @@ def test_self_state_carries_score_but_visible_entity_does_not():
     # mirrors the Rust wire-pin exclusion), so an enemy's exact score (who is ahead) is
     # never on the per-seat perception slice.
     own = {
-        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
         "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
         "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 42, "alive": True,
     }
@@ -262,7 +262,7 @@ def test_out_of_domain_fields_are_rejected():
         })
     with pytest.raises(pydantic.ValidationError):
         proto.SelfState.model_validate({  # seat is u8
-            "seat": -1, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+            "seat": -1, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
             "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True,
         })
     with pytest.raises(pydantic.ValidationError):
@@ -472,7 +472,7 @@ def _observe_frame(tick: int = 0, seat: int = 0, alive: bool = True, deadline: i
     return {
         "type": "observe", "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH,
         "seat": seat, "tick": tick, "phase": "live", "deadline_micros": deadline,
-        "own": {"seat": seat, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+        "own": {"seat": seat, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
                 "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": alive},
         "visible": [],
     }
@@ -692,7 +692,7 @@ def test_static_geometry_never_rides_the_parity_bounded_observation():
         Observation.model_validate({
             "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 1,
             "phase": "live", "deadline_micros": 50_000,
-            "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+            "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
                     "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
                     "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True},
             "visible": [], "blockers": [],
@@ -756,7 +756,7 @@ def test_static_pickup_layout_never_rides_the_parity_bounded_observation():
         Observation.model_validate({
             "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 1,
             "phase": "live", "deadline_micros": 50_000,
-            "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+            "own": {"seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
                     "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
                     "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True},
             "visible": [], "pickup_points": [],
@@ -896,7 +896,7 @@ def _make_obs(x, y, ammo=30, alive=True, team=0, facing=0, visible=()):
     return Observation.model_validate({
         "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH, "seat": 0, "tick": 0,
         "phase": "live", "deadline_micros": 50_000,
-        "own": {"seat": 0, "team": team, "position": {"x": x, "y": y}, "z": 0, "facing": facing,
+        "own": {"seat": 0, "team": team, "position": {"x": x, "y": y}, "z": 0, "z_vel": 0, "facing": facing,
                 "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": ammo, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": alive},
         "visible": [_entry(v) for v in visible],
     })
