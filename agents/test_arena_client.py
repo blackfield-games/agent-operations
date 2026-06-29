@@ -239,6 +239,30 @@ def test_self_state_carries_score_but_visible_entity_does_not():
         })
 
 
+def test_self_state_carries_z_vel_but_visible_entity_does_not():
+    # Own vertical velocity (the rate z changes) — the vertical twin of `velocity`. Own
+    # state only: SelfState REQUIRES it (the Rust wire always carries it, so a drift fails
+    # loud instead of silently defaulting), and VisibleEntity must REJECT it
+    # (extra=forbid), so an enemy's vertical velocity (when it lands, whether it is
+    # committed to a jump) is never on the per-seat perception slice.
+    own = {
+        "seat": 0, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 700, "facing": 0,
+        "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0,
+        "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": True,
+    }
+    assert proto.SelfState.model_validate(own).z_vel == 700
+    # A falling pawn reads negative — the signed i32 is load-bearing (a u16 would misread).
+    assert proto.SelfState.model_validate({**own, "z_vel": -700}).z_vel == -700
+    with pytest.raises(pydantic.ValidationError):
+        proto.SelfState.model_validate({k: v for k, v in own.items() if k != "z_vel"})
+    with pytest.raises(pydantic.ValidationError):
+        proto.VisibleEntity.model_validate({
+            "entity_id": 1, "kind": "player", "team": 2,
+            "position": {"x": 0, "y": 0}, "z": 0, "facing": 0,
+            "in_line_of_sight": True, "z_vel": 700,
+        })
+
+
 def test_unknown_field_is_rejected():
     # extra=forbid: a field the Python type does not know is a decode error, not a
     # silent drop — the same wire-shape discipline the Rust crate enforces.
