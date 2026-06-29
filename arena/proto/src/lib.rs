@@ -214,6 +214,14 @@ pub struct SelfState {
     pub position: Vec2,
     /// Elevation in [`POSITION_SCALE`] units; `0` on a planar arena.
     pub z: i32,
+    /// Per-tick vertical velocity — the rate `z` changes each tick, the vertical twin of
+    /// the planar `velocity`. Positive while rising after a jump, negative while falling,
+    /// `0` at rest and whenever vertical physics is off (`Rules::gravity == 0`). Lets the
+    /// owner predict its own jump apex and landing tick the way a human reads their own
+    /// rise and fall. Own state only — never on [`VisibleEntity`], since an enemy's exact
+    /// vertical velocity (when it will land, whether it is committed to a jump) is the same
+    /// tactical x-ray as its planar `velocity`.
+    pub z_vel: i32,
     pub facing: Bam,
     /// Per-tick planar velocity (see [`VELOCITY_SCALE`]).
     pub velocity: Vec2,
@@ -664,6 +672,7 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
             team: 1,
             position: Vec2::ZERO,
             z: 0,
+            z_vel: 250,
             facing: 0x4000,
             velocity: Vec2::ZERO,
             health: 100,
@@ -1659,6 +1668,7 @@ mod tests {
             team: 1,
             position: Vec2 { x: 0, y: 0 },
             z: 0,
+            z_vel: 250,
             facing: 0x4000,
             velocity: Vec2 { x: 0, y: 0 },
             health: 100,
@@ -1673,7 +1683,7 @@ mod tests {
         let json = serde_json::to_value(s).unwrap();
         assert_eq!(
             object_keys(&json),
-            ["alive", "ammo", "cooldown", "dash_cooldown", "facing", "health", "max_health", "position", "score", "seat", "shield", "team", "velocity", "z"],
+            ["alive", "ammo", "cooldown", "dash_cooldown", "facing", "health", "max_health", "position", "score", "seat", "shield", "team", "velocity", "z", "z_vel"],
             "SelfState gained or lost a field — the observable self-surface is a security contract"
         );
         for forbidden in ["enemies", "visible", "all_pawns", "rng_state", "world", "world_state"] {
@@ -1715,7 +1725,7 @@ mod tests {
             "deadline_micros": 50_000,
             "own": {
                 "seat": 0, "team": 1,
-                "position": { "x": 0, "y": 0 }, "z": 0,
+                "position": { "x": 0, "y": 0 }, "z": 0, "z_vel": 0,
                 "facing": 16384,
                 "velocity": { "x": 0, "y": 0 },
                 "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 5, "dash_cooldown": 0, "score": 9, "alive": true
@@ -2273,6 +2283,7 @@ mod tests {
                 team: 1,
                 position: Vec2::ZERO,
                 z: 0,
+                z_vel: 0,
                 facing: 0x4000,
                 velocity: Vec2::ZERO,
                 health: 100,

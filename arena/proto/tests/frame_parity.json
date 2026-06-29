@@ -100,7 +100,8 @@
             "x": 0,
             "y": 0
           },
-          "z": 0
+          "z": 0,
+          "z_vel": 250
         },
         "phase": "live",
         "protocol_version": 1,
