@@ -179,6 +179,72 @@ def test_empty_roster_falls_back_to_default():
     assert npc._select_archetype(RegionCoord(x=1, y=2).region_id, []) == npc.NPC_ARCHETYPE
 
 
+def test_forbidden_archetypes_bridges_the_plural_must_not_token():
+    # The director's must_not token is the PLURAL "civilians"; the npc archetype the
+    # SINGULAR "civilian" — MUST_NOT_ARCHETYPE maps them so the ban actually bites.
+    assert npc._forbidden_archetypes(["civilians"]) == frozenset({"civilian"})
+    assert "civilian" in npc.CHARACTER_TRIS  # the barred token names a real, budgeted archetype
+
+
+def test_forbidden_archetypes_skips_tokens_it_does_not_own():
+    # must_not also carries other specialists' constraints — dense_vegetation is biome's
+    # cap, interior_volumes names no archetype. npc bans ONLY archetypes it owns, so a
+    # non-archetype must_not never narrows its pick (no false roster shrink).
+    assert npc._forbidden_archetypes(["dense_vegetation", "interior_volumes"]) == frozenset()
+    assert npc._forbidden_archetypes(["dense_vegetation", "civilians"]) == frozenset({"civilian"})
+
+
+def test_select_excludes_a_forbidden_roster_member():
+    # A desynced roster that NAMES a barred archetype: _select_archetype must never return
+    # it, picking only from the allowed remainder across every region.
+    roster = ["civilian", "raider"]
+    forbidden = frozenset({"civilian"})
+    for x in range(-6, 7):
+        rid = RegionCoord(x=x, y=0).region_id
+        assert npc._select_archetype(rid, roster, forbidden) == "raider"
+
+
+def test_select_falls_back_when_every_roster_member_is_forbidden():
+    # Roster collapses to nothing under the ban → the budgeted fallback, never an empty or
+    # barred pick (NPC_ARCHETYPE is "scavenger", itself never forbidden).
+    rid = RegionCoord(x=1, y=2).region_id
+    assert npc._select_archetype(rid, ["civilian"], frozenset({"civilian"})) == npc.NPC_ARCHETYPE
+    assert npc.NPC_ARCHETYPE not in npc._forbidden_archetypes(["civilians"])
+
+
+def test_select_is_byte_identical_when_nothing_is_forbidden():
+    # FM1 (no-op on the normal path): FACTION_ARCHETYPES has no civilian, so a real roster
+    # filters to itself and the pick is unchanged — the forbidden arg cannot perturb the
+    # region hash when it excludes nothing, keeping the emitted layer byte-identical.
+    roster = list(director.FACTION_ARCHETYPES)
+    for x in range(-6, 7):
+        rid = RegionCoord(x=x, y=0).region_id
+        base = npc._select_archetype(rid, roster)
+        assert npc._select_archetype(rid, roster, frozenset()) == base
+        assert npc._select_archetype(rid, roster, frozenset({"civilian"})) == base
+
+
+@pytest.mark.asyncio
+async def test_run_honors_must_not_and_never_fields_a_civilian(tmp_path, monkeypatch):
+    # End-to-end honor leg: a director layer that (wrongly) rosters civilian AND forbids it
+    # via intent:must_not — npc must drop the barred archetype and emit an allowed one, so a
+    # validator route-back converges instead of re-picking the same civilian forever.
+    monkeypatch.chdir(tmp_path)
+    brief = WorldBrief(biome="scorched", region=RegionCoord(x=5, y=9))
+    rel = f"director/{brief.region.region_id}.usda"
+    layer_path = tmp_path / "layers" / rel
+    layer_path.parent.mkdir(parents=True, exist_ok=True)
+    layer_path.write_text(
+        '#usda 1.0\ndef Scope "Director"\n{\n'
+        '    custom string intent:factions = "civilian,raider"\n'
+        '    custom string intent:must_not = "dense_vegetation,interior_volumes,civilians"\n'
+        "}\n"
+    )
+    stub = LayerSpec(specialist="director", region_id=brief.region.region_id, path=rel, summary="rosters civilian")
+    layer = await npc.run(brief, [stub])
+    assert _archetype_from_usd((tmp_path / "layers" / layer.path).read_text()) == "raider"
+
+
 @pytest.mark.asyncio
 async def test_no_director_layer_falls_back_to_default(tmp_path, monkeypatch):
     # prior without a director layer (a pre-director pipeline order, or a failed
