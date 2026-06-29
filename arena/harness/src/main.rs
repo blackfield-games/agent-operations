@@ -5086,6 +5086,104 @@ mod tests {
     }
 
     #[test]
+    fn parse_spawn_jitter_maps_a_non_negative_jitter() {
+        assert_eq!(parse_spawn_jitter("0"), 0);
+        assert_eq!(parse_spawn_jitter("5000"), 5000);
+        assert_eq!(
+            parse_spawn_jitter(&i32::MAX.to_string()),
+            i32::MAX,
+            "the whole non-negative i32 range is a valid per-axis jitter"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-negative")]
+    fn parse_spawn_jitter_rejects_a_negative() {
+        // A spawn jitter is non-negative; a negative would invert the [-jitter, +jitter] draw span (lo > hi).
+        // Reject it loudly at the CLI; the u32 parse fails the leading '-'.
+        parse_spawn_jitter("-5000");
+    }
+
+    #[test]
+    #[should_panic(expected = "i32 range")]
+    fn parse_spawn_jitter_rejects_an_overflow() {
+        // A jitter past i32::MAX must abort, NOT wrap into a negative. 3_000_000_000 fits a u32 but not an i32,
+        // so i32::try_from catches it.
+        parse_spawn_jitter("3000000000");
+    }
+
+    #[test]
+    fn spawn_jitter_parses_as_a_value_flag() {
+        // The value-flag twin of the threading tests: --spawn-jitter pulls exactly one token (through
+        // parse_spawn_jitter) and consumes no following flag. A --spawn-jitter 5000 right before --seats 3
+        // must parse BOTH.
+        let parsed =
+            parse_args_from(["--spawn-jitter", "5000", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.spawn_jitter, 5000, "--spawn-jitter 5000 parses the jitter");
+        assert_eq!(parsed.seats, 3, "--spawn-jitter consumed exactly one token, so --seats 3 parsed");
+
+        // FM1 (non-zero default): UNLIKE the feature-toggle knobs, an absent --spawn-jitter is NOT 0 — it is the
+        // Rules default (a 0 jitter is a fully deterministic opening, not the pre-flag harness).
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(
+            none.spawn_jitter,
+            Rules::default().spawn_jitter,
+            "no --spawn-jitter defaults to the Rules default jitter, NOT 0"
+        );
+    }
+
+    #[test]
+    fn direct_match_threads_spawn_jitter_into_rules() {
+        // FM1 (default drift): no --spawn-jitter is the Rules DEFAULT jitter — NOT 0 — byte-identical to the
+        // pre-flag harness (and its replay digest). Pin the default reproduces, not zeroes.
+        assert_eq!(
+            build_direct_match(&direct_args(2, "", 0), 2).rules().spawn_jitter,
+            Rules::default().spawn_jitter,
+            "no --spawn-jitter is the Rules default jitter (byte-identical to the pre-flag harness)"
+        );
+        assert_eq!(
+            build_direct_match(&Args { spawn_jitter: 5000, ..direct_args(2, "reference", 0) }, 2)
+                .rules()
+                .spawn_jitter,
+            5000,
+            "--spawn-jitter 5000 threads the jitter into Rules (alongside an arena, independently)"
+        );
+    }
+
+    #[test]
+    fn build_matchmaker_threads_spawn_jitter_into_a_matchmade_match() {
+        // FM3 (path skew): --spawn-jitter must reach the --mode path too, not just the direct one.
+        // build_matchmaker carries it via MatchParams.rules, so a MATCHMADE match forms under the same jitter a
+        // hand-seated one does (read back via the same rules() accessor).
+        let mm = build_matchmaker(&Args { spawn_jitter: 5000, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(
+            formed.rules().spawn_jitter,
+            5000,
+            "the matchmaker forms under --spawn-jitter 5000 (matchmade == hand-seated)"
+        );
+
+        // No flag still forms the Rules default jitter — byte-identical to the pre-knob matchmaker.
+        let off = build_matchmaker(&direct_args(2, "", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.rules().spawn_jitter,
+            Rules::default().spawn_jitter,
+            "no --spawn-jitter: the matchmaker forms the Rules default jitter"
+        );
+    }
+
+    #[test]
     fn direct_match_threads_the_weapon_mode_into_rules() {
         // FM1 (default drift): no --weapon-mode is Hitscan — the instant beam, byte-identical to
         // the pre-flag harness (and its replay digest). The fire BEHAVIOR (a projectile flies, a
