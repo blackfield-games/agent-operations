@@ -6939,6 +6939,32 @@ mod tests {
     }
 
     #[test]
+    fn observe_exposes_own_vertical_velocity_matching_the_pawn() {
+        // The seat reads its OWN vertical velocity off its observation — the vertical twin
+        // of `velocity`. `0` at rest on the ground; after a jump it carries the live arc
+        // rate (positive rising, negative falling), equal to the pawn's z_vel at the same
+        // tick (read off the pawn, never recomputed). Own-state only: VisibleEntity has no
+        // z_vel field, so an enemy's vertical velocity is never an x-ray.
+        let mut m = jump_match(500, 1);
+        assert_eq!(m.observe(0).own.z_vel, 0, "at rest on the ground the vertical velocity is 0");
+        assert_eq!(m.observe(0).own.z, 0, "and the pawn is grounded");
+
+        // Jump, then ride the arc: the exposed z_vel equals the pawn's every tick and is
+        // positive while rising.
+        step_with(&mut m, &[(0, jump_press())]);
+        assert!(m.observe(0).own.z_vel > 0, "just after the jump the pawn is rising (z_vel > 0)");
+        assert_eq!(m.observe(0).own.z_vel, m.pawns[0].z_vel, "own z_vel equals the pawn's at the same tick");
+
+        // Ride past the apex: a descending pawn reads NEGATIVE — the signed i32 is load-
+        // bearing (a u16 would misread a fall as a climb).
+        while m.pawns[0].z_vel >= 0 {
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+        }
+        assert!(m.observe(0).own.z_vel < 0, "past the apex the pawn is falling (z_vel < 0)");
+        assert_eq!(m.observe(0).own.z_vel, m.pawns[0].z_vel, "the falling z_vel also matches the pawn");
+    }
+
+    #[test]
     fn gravity_zero_keeps_z_inert_and_the_match_2d() {
         // FM2: gravity 0 (the default) DISABLES vertical physics — a spammed jump never
         // lifts a pawn and the match plays exactly as the pre-jump 2D one. Two default
