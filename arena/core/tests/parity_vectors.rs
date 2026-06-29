@@ -9,9 +9,9 @@
 
 use arena_core::{
     expected_score_bp, parity_vectors, rating_delta, AimMode, MatchOutcome, ParityVectors,
-    PerceptionVerdict, WeaponMode, DASH_DISTANCE, RATING_DIFF_CAP, RATING_SCALE,
+    PerceptionVerdict, PickupCase, WeaponMode, DASH_DISTANCE, RATING_DIFF_CAP, RATING_SCALE,
 };
-use arena_proto::Vec2;
+use arena_proto::{PickupKind, Vec2};
 
 const EAST: u16 = 0;
 const WEST: u16 = 0x8000;
@@ -668,6 +668,80 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(wall.end.x, wall.start.x + wall.max_speed, "the burst is refused — only the walk applied, the pawn holds short of the wall");
     assert!(wall.end.x != ready.end.x, "the wall-refused dash did NOT tunnel to the ready burst endpoint");
     assert!(!wall.blockers.is_empty(), "the no-tunnel case carries its wall");
+
+    // Pickup behavior (v17): each kind applies its CLAMPED effect — Health heals to max_health,
+    // Ammo refills to mag_size, Shield grants to max_shield — when the pawn is within the
+    // inclusive pickup_radius, after which the pickup is dormant for exactly
+    // pickup_respawn_cooldown ticks then reactivates. A twin that overheals/over-shields,
+    // mis-applies a kind, uses the wrong radius edge, or respawns on the wrong tick fails one.
+    let pu = |label: &str| v.pickups.iter().find(|c| c.label == label).unwrap();
+    // Health clamps to max_health: a wounded pawn (below the cap) heals UP TO the cap and no
+    // further — the amount would overshoot, so the cap (not a raw add) is the load-bearing rule.
+    let heal = pu("heal_below_cap_clamps_to_max_health");
+    assert_eq!(heal.kind, PickupKind::Health);
+    assert!(heal.before < heal.cap, "the heal case starts below the cap");
+    assert_eq!(heal.after, heal.cap, "the heal reaches the cap");
+    assert!(heal.before + heal.amount > heal.cap, "the amount would OVERSHOOT the cap");
+    assert!(heal.after < heal.before + heal.amount, "the heal is clamped, not raw-added (no overheal)");
+    assert!(heal.collected, "the heal pickup is collected");
+    // At full health the pickup is still consumed but grants nothing — the no-overheal pin.
+    let full = pu("heal_at_cap_no_overheal");
+    assert_eq!((full.before, full.after), (full.cap, full.cap), "a heal at full health stays at the cap");
+    assert!(full.collected, "the pickup is consumed even with no effect to apply");
+    // Ammo refills toward mag_size and clamps there.
+    let ammo = pu("ammo_refills_and_clamps_to_mag_size");
+    assert_eq!(ammo.kind, PickupKind::Ammo);
+    assert!(ammo.after > ammo.before, "the ammo pickup refilled the magazine");
+    assert_eq!(ammo.after, ammo.cap, "ammo clamps to mag_size");
+    assert!(ammo.before + ammo.amount > ammo.cap, "the refill amount would overshoot the magazine");
+    // Shield grants toward max_shield and clamps there.
+    let shield = pu("shield_clamps_to_max_shield");
+    assert_eq!(shield.kind, PickupKind::Shield);
+    assert_eq!(shield.before, 0, "the shield case starts with no shield");
+    assert_eq!(shield.after, shield.cap, "the shield grant clamps to max_shield");
+    assert!(shield.amount > shield.cap, "the amount would overshoot the shield cap");
+    // Each kind clamps to its OWN distinct ceiling — a twin that uses one cap for all fails here.
+    assert!(
+        heal.cap != ammo.cap && ammo.cap != shield.cap && heal.cap != shield.cap,
+        "the three kinds clamp to distinct caps (max_health / mag_size / max_shield)"
+    );
+    // Radius gate (inclusive boundary): a pawn at EXACTLY pickup_radius collects; one a single
+    // unit past does not. The pair shares kind/amount/before/radius — only the position differs,
+    // and the test's own `within` independently confirms each side of the boundary.
+    let inside = pu("just_inside_radius_collects");
+    let outside = pu("just_outside_radius_no_collect");
+    assert_eq!(
+        (inside.kind, inside.amount, inside.before, inside.radius),
+        (outside.kind, outside.amount, outside.before, outside.radius),
+        "the radius pair shares everything but the position"
+    );
+    assert!(inside.collected && inside.after == inside.before + inside.amount, "just inside the radius the pawn collects and heals the full amount");
+    assert!(!outside.collected && outside.after == outside.before, "just outside the radius nothing is collected");
+    // Independently recompute the squared distance (the `within` helper is shadowed by a local
+    // above): the collector is at-or-inside the radius, the non-collector exactly one unit past.
+    let dist2 = |c: &PickupCase| {
+        let dx = c.start.x as i64 - c.pickup_pos.x as i64;
+        let dy = c.start.y as i64 - c.pickup_pos.y as i64;
+        dx * dx + dy * dy
+    };
+    assert!(dist2(inside) <= (inside.radius as i64).pow(2), "the collecting pawn is within (<=) the radius");
+    assert!(dist2(outside) > (outside.radius as i64).pow(2), "the non-collecting pawn is just past the radius");
+    // Respawn timing: a collected pickup is dormant through the cooldown window then reactivates
+    // exactly pickup_respawn_cooldown ticks after collection (recorded with the pawn off the pad).
+    let respawn = pu("collected_pickup_respawns_after_cooldown");
+    assert!(respawn.collected, "the pickup is collected on the first tick");
+    assert_eq!(
+        respawn.active_timeline.len(),
+        usize::from(respawn.respawn_cooldown) + 1,
+        "the timeline spans the collection tick plus the full cooldown window"
+    );
+    let (window, last) = respawn.active_timeline.split_at(respawn.active_timeline.len() - 1);
+    assert!(window.iter().all(|&a| !a), "the pickup is dormant throughout the cooldown window");
+    assert!(last[0], "it reactivates exactly cooldown ticks after collection");
+    // The single-step cases each carry a one-entry timeline: a collected pickup is dormant after,
+    // an uncollected one stays active.
+    assert_eq!(heal.active_timeline, vec![false], "a collected single-step pickup is dormant after");
+    assert_eq!(outside.active_timeline, vec![true], "an uncollected pickup stays active");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
