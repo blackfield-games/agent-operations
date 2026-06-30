@@ -3865,7 +3865,10 @@ pub struct PerceptionMemoryTick {
 /// `observe` surface (its `in_line_of_sight == false` entry), NOT an internal TTL counter,
 /// so the contract pins observable behavior, not the twin's memory representation. Distinct
 /// from the `perception` category (the live range/cone/LOS verdicts), which never exercises
-/// the decay/refresh a stale echo a twin must reproduce.
+/// the decay/refresh a stale echo a twin must reproduce. The loss CAUSE does not change the
+/// lifetime: a target lost by OCCLUSION (stepped behind a [`Blocker`] while still in range)
+/// freezes and decays on the SAME countdown as one lost by range, so the case records the
+/// world `blockers` — the timeline alone cannot show why an in-range target stopped being seen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerceptionMemoryCase {
     pub label: String,
@@ -4492,6 +4495,9 @@ pub struct ParityVectors {
     /// for exactly the window then dropped, that a re-sighting refreshes the echo and resets
     /// the countdown, and that the default-off window remembers nothing. The `perception`
     /// category pins the live verdicts; this pins the stale-echo decay/refresh it never does.
+    /// v34 adds the OCCLUSION-loss seam: a target lost behind a wall while STILL in range
+    /// (the recorded `blockers`) freezes and decays identically to a range-loss, pinning that
+    /// the loss CAUSE does not change the memory lifetime.
     pub perception_memory: Vec<PerceptionMemoryCase>,
     /// match-outcome cases (domain v23): a constructed end-state run through
     /// [`Match::outcomes`], pinning the per-seat placement ranking — survivors first, then
@@ -4735,7 +4741,18 @@ pub struct ParityVectors {
 /// `final_tick == max_ticks` (the timeout, not a wipe). A twin that ended a tick early/late on the cap, or
 /// scored a timeout as a blanket draw, diverges. The new field is `None` on every hand-set entry and the
 /// case records outcome pools (placement/score), not a new committed digest, so this is pure coverage —
-/// no committed match hash moves. Each is a deliberate convention change every twin must follow.
+/// no committed match hash moves.
+/// Bumped to v34 EXTENDING the `perception_memory` category with the OCCLUSION-loss path: every existing
+/// memory case loses the target by RANGE (walking it to 45 m), so the occlusion-loss branch — a target
+/// stepped behind a [`Blocker`] while STILL inside `perception_range`, lost only because the sightline is
+/// broken — was unpinned. One case steps the target from 5 m (seen) to 15 m behind a wall and records the
+/// SAME live→frozen-echo→decay timeline as the range-loss case: the echo holds the frozen last-seen 5 m
+/// (never the live, in-range 15 m it moved to) and decays at the IDENTICAL tick offset, pinning that the
+/// loss CAUSE does not change the memory lifetime. `PerceptionMemoryCase` gains a `blockers` field (empty
+/// on every range-loss entry, recording the wall here) so a twin can reproduce the broken sightline — the
+/// timeline alone cannot show why an in-range target stopped being perceived. The field defaults empty on
+/// existing entries and the case records the `observe` timeline, not a new committed digest, so this is
+/// pure coverage — no committed match hash moves. Each is a deliberate convention change every twin must follow.
 const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v34";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
@@ -5616,8 +5633,10 @@ fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u
 /// Build a perception-memory case: seat 0 (at the origin, facing EAST, full-circle FOV)
 /// watches seat 1 walk through `target_path` — one position per tick — under
 /// `perception_memory_ticks`, recording seat 0's `observe` view of seat 1 after each step.
-/// Reads the live/echo state off the public `observe` surface only, never the internal
-/// `seat_memory`, so the timeline is exactly what a twin reproduces.
+/// `blockers` places vision cover in the world (empty for a range-loss case; a wall for an
+/// occlusion-loss case where the target is lost behind it while still in range). Reads the
+/// live/echo state off the public `observe` surface only, never the internal `seat_memory`,
+/// so the timeline is exactly what a twin reproduces.
 fn perception_memory_case(label: &str, window: u16, blockers: Vec<Blocker>, target_path: Vec<Vec2>) -> PerceptionMemoryCase {
     let rules = Rules { perception_memory_ticks: window, spawn_jitter: 0, ..Default::default() };
     let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
