@@ -3706,7 +3706,11 @@ pub struct JumpCase {
 /// off, the default) the sink is exactly `raw.min(health)` removed from health — a
 /// shieldless hit is byte-identical to the pre-shield per-site clamp. Hitscan, melee, and
 /// projectile share this ONE sink, so the same `(raw, shield, health)` produces the same
-/// split in every mode (the `shared_sink_*` trio pins it). Distinct from the `knockback`
+/// split in every mode (the `shared_sink_*` trio pins it). The v29 `raw == shield` exact-drain
+/// seam pins the boundary: a hit whose raw EXACTLY equals the shield depletes it to precisely 0
+/// with NO health spill (`to_health = min(raw - absorbed, health) = min(0, health) = 0`), the
+/// point `full_absorb` (raw < shield) and `partial_absorb` (raw > shield) straddle but never land
+/// on — where a `<=` / `<` off-by-one twin diverges. Distinct from the `knockback`
 /// category, which pins the post-hit impulse the weapon wrapper ([`Match::damage_pawn`])
 /// adds ON TOP of this core, never the absorb/overflow split itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
