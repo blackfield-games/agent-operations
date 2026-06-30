@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v34");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v35");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -1283,6 +1283,19 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(credit(h), credit(ml), "hitscan and melee credit the same enemy hit identically — the shared convention");
     assert_eq!(credit(ml), credit(pj), "melee and projectile credit the same enemy hit identically — the shared convention");
     assert_eq!(credit(h), (25, 25, 25, true), "the shared enemy hit credits 25 (the damage dealt) and the target lives");
+    // Shielded enemy (v35): a hit on a SHIELDED target credits the FULL effective — the absorbed
+    // shield PLUS the health spill — not just the health portion. raw 25 > shield 10 > 0, so the hit
+    // drains the shield (10) AND spills to health (15); the credit is 25, and the absorbed 10 is part
+    // of it. Every case above hits a shield-0 target where credit == health removed; a twin that
+    // credited only the spilled 15 (dropping the absorbed shield) diverges here alone.
+    let shld = scr("enemy_shielded_credits_absorbed_plus_spill");
+    let absorbed = shld.raw.min(shld.target_shield);
+    let spill = shld.raw - absorbed; // the target is at full health, so the spill never clamps
+    assert!(absorbed > 0 && spill > 0, "the hit BOTH drained shield AND spilled to health (raw > shield > 0)");
+    assert!(shld.target_alive, "the shielded target survives the hit");
+    assert_eq!(shld.damage, absorbed + spill, "the credit is the FULL effective: absorbed shield + health spill");
+    assert!(shld.damage > spill, "...strictly MORE than the health portion alone — the absorbed shield is credited, not dropped");
+    assert_eq!(shld.score_after - shld.score_before, shld.damage as i32, "...and that full effective is exactly what scores");
 
     // Action clamp (v25): ActionIntent::clamped() is the canonical anti-god-mode move-intent clamp.
     // An in-range request passes through untouched; an overlong one is L2-normalized to a magnitude
