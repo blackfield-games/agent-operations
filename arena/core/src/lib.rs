@@ -3988,6 +3988,70 @@ pub struct ActionIngestCase {
     pub clamped_move_dir: Option<Vec2>,
 }
 
+/// One entity as it appears in a recorded [`Observation`]'s visible set — a faithful mirror of
+/// [`arena_proto::VisibleEntity`], so the recorded entry carries ONLY the perceivable facets
+/// (id/kind/team/position/z/facing/in_line_of_sight). An enemy's private combat state
+/// (health/ammo/cooldown/shield/score/velocity/z_vel) is ABSENT by construction — there is no field
+/// for it — so a recorded enemy entry IS the anti-omniscience bound, not just an assertion about it.
+/// Widening [`arena_proto::VisibleEntity`] would drift this golden and is pinned against by
+/// `arena_proto`'s `visible_entity_exposes_no_hidden_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedEntity {
+    pub entity_id: u32,
+    pub kind: arena_proto::EntityKind,
+    pub team: TeamId,
+    pub position: Vec2,
+    pub z: i32,
+    pub facing: Bam,
+    pub in_line_of_sight: bool,
+}
+
+/// A pinned observation-shape case (domain v27): one [`Match::observe`] call recorded as the SHAPE an
+/// agent acts on — the seat's OWN full state (the one place private HUD state appears, recorded field
+/// for field) plus the per-entity-bounded `visible` set. It pins the two behavioral conventions the
+/// proto wire-shape test (which pins only the STRUCT's field set) cannot:
+/// - the cooldown/dash NEXT-ACTION off-by-one — `cooldown` is the raw pawn cooldown's
+///   `saturating_sub(1)`, so the agent's fire-ready predicate is the clean `cooldown == 0` and a twin
+///   exposing the raw value mis-times every shot (and dash, the identical adjustment);
+/// - the anti-omniscience per-entity bound — a visible enemy carries ONLY position/facing
+///   (+id/kind/team/z/in_line_of_sight), NEVER its health/ammo/cooldown/shield/score/velocity/z_vel.
+///
+/// `raw_cooldown`/`raw_dash_cooldown` record the pre-adjustment pawn values so the off-by-one is a
+/// recorded discriminator (built by a real fire, not a hand-picked pair). Distinct from the
+/// `perception` category, which pins WHICH entities are visible (the id set) but neither the own-state
+/// exposure, the cooldown off-by-one, nor the per-entity field bound a twin reproduces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationCase {
+    pub label: String,
+    pub seat: SeatId,
+    pub team: TeamId,
+    pub position: Vec2,
+    pub z: i32,
+    pub z_vel: i32,
+    pub facing: Bam,
+    pub velocity: Vec2,
+    pub health: u16,
+    pub max_health: u16,
+    pub shield: u16,
+    pub ammo: u16,
+    /// The fire cooldown AS EXPOSED — the next-action value `raw_cooldown.saturating_sub(1)`, so the
+    /// fire-ready predicate is the clean `cooldown == 0`.
+    pub cooldown: u16,
+    /// The dash cooldown AS EXPOSED — `raw_dash_cooldown.saturating_sub(1)`, the identical adjustment.
+    pub dash_cooldown: u16,
+    pub score: i32,
+    pub alive: bool,
+    /// The RAW pawn fire cooldown before observe's next-action adjustment — the off-by-one
+    /// discriminator: the exposed `cooldown` MUST equal `raw_cooldown.saturating_sub(1)`.
+    pub raw_cooldown: u16,
+    /// The RAW pawn dash cooldown before the same adjustment.
+    pub raw_dash_cooldown: u16,
+    /// The per-tick bounded-latency deadline the observation carries ([`Rules::action_deadline_micros`]).
+    pub deadline_micros: u32,
+    /// The seat's perceivable set — each entry the anti-omniscience bound made structural.
+    pub visible: Vec<ObservedEntity>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
