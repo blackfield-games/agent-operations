@@ -1123,6 +1123,49 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(credit(h), credit(ml), "hitscan and melee credit the same enemy hit identically — the shared convention");
     assert_eq!(credit(ml), credit(pj), "melee and projectile credit the same enemy hit identically — the shared convention");
     assert_eq!(credit(h), (25, 25, 25, true), "the shared enemy hit credits 25 (the damage dealt) and the target lives");
+
+    // Action clamp (v25): ActionIntent::clamped() is the canonical anti-god-mode move-intent clamp.
+    // An in-range request passes through untouched; an overlong one is L2-normalized to a magnitude
+    // of at most the cap (direction preserved, never rounding up); the {i32::MIN,i32::MIN} overflow
+    // input is clamped, NOT wrapped through; and aim/buttons pass verbatim. A twin that skips the
+    // clamp, sums the squares in i64, clamps component-wise (an L∞ box), or drops aim/buttons diverges.
+    let clamp = |label: &str| v.action_clamp.iter().find(|c| c.label == label).unwrap();
+    let mag_sq = |p: Vec2| (p.x as i64 * p.x as i64) as u64 + (p.y as i64 * p.y as i64) as u64;
+    // THE invariants, recomputed INDEPENDENT of the recorded clamp: the clamped magnitude never
+    // exceeds the cap; aim+buttons pass through verbatim (the clamp touches only move_dir);
+    // was_clamped holds exactly when the raw request was over the cap; and an in-range request is
+    // returned byte-identical.
+    for c in &v.action_clamp {
+        assert!(mag_sq(c.clamped_move_dir) <= c.cap_mag_sq, "{}: the clamped magnitude never exceeds the cap", c.label);
+        assert_eq!((c.clamped_aim, c.clamped_buttons), (c.aim, c.buttons), "{}: the clamp passes aim and buttons through verbatim", c.label);
+        assert_eq!(c.was_clamped, c.raw_mag_sq > c.cap_mag_sq, "{}: a clamp happens exactly when the raw request is over the cap", c.label);
+        if !c.was_clamped {
+            assert_eq!(c.clamped_move_dir, c.move_dir, "{}: an in-range request is returned untouched", c.label);
+        }
+    }
+    // At the cap exactly (mag² == cap²): the `<=` bound is INCLUSIVE — a max-speed request is honored,
+    // not shrunk. A twin using `<` would clamp this and quietly cap top speed below the real limit.
+    let at_cap = clamp("at_cap_axis_passes_unchanged");
+    assert!(at_cap.raw_mag_sq == at_cap.cap_mag_sq && !at_cap.was_clamped, "a request exactly at the cap is honored, not clamped");
+    // The overlong diagonal L2-normalizes: result mag² ≤ cap² and strictly < the raw, the positive
+    // diagonal preserved (x == y > 0). A component-wise (L∞) clamp would yield (cap, cap) at mag²
+    // twice the cap — ABOVE it — so the ≤-cap invariant above is what rejects a box clamp.
+    let diag = clamp("overlong_diagonal_normalizes_to_cap");
+    assert!(diag.was_clamped && mag_sq(diag.clamped_move_dir) < diag.raw_mag_sq, "the overlong diagonal shrinks below the raw");
+    assert!(diag.clamped_move_dir.x == diag.clamped_move_dir.y && diag.clamped_move_dir.x > 0, "the positive diagonal direction is preserved");
+    // THE attack: {i32::MIN, i32::MIN}. raw_mag_sq is exactly 2⁶³ (`i64::MAX + 1`) — a twin that
+    // sums the squares in i64 wraps it negative, the `mag² <= cap²` test passes, and the god-mode
+    // vector flies through unclamped. The real clamp widens to u64 and normalizes; assert it shrank
+    // to the cap AND kept the third-quadrant (both-negative) direction a wrapping twin can't reproduce.
+    let overflow = clamp("overflow_input_clamps_without_wrapping");
+    assert_eq!(overflow.raw_mag_sq, 1u64 << 63, "the attacker input's squared magnitude is exactly 2^63 — the i64-overflow boundary");
+    assert!(overflow.was_clamped && mag_sq(overflow.clamped_move_dir) <= overflow.cap_mag_sq, "the overflow input is clamped to the cap, not wrapped through at god-mode speed");
+    assert!(overflow.clamped_move_dir.x < 0 && overflow.clamped_move_dir.y < 0, "the negative direction is preserved (not sign-flipped by a wrap)");
+    // Pass-through: an overlong move carrying a live aim + pressed buttons keeps both — the clamp is
+    // move-only. A twin that zeroed the aim or dropped a button on the clamp path diverges here.
+    let keep = clamp("overlong_keeps_aim_and_buttons");
+    assert!(keep.was_clamped && keep.aim != 0 && (keep.buttons.fire || keep.buttons.jump), "the case clamps a move while carrying a live aim + buttons");
+    assert_eq!((keep.clamped_aim, keep.clamped_buttons), (keep.aim, keep.buttons), "the clamp preserves the live aim and buttons");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
