@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v37",
+  "domain": "blackfield/arena/parity-vectors/v38",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3307,6 +3307,19 @@
       "score_before": 0,
       "score_after": 10,
       "damage": 10,
+      "target_alive": true,
+      "target_shield": 20
+    },
+    {
+      "label": "enemy_exact_drain_credits_shield",
+      "weapon_mode": "hitscan",
+      "friendly_fire": false,
+      "raw": 20,
+      "shooter_team": 0,
+      "target_team": 1,
+      "score_before": 0,
+      "score_after": 20,
+      "damage": 20,
       "target_alive": true,
       "target_shield": 20
     }

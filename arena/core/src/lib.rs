@@ -4797,8 +4797,16 @@ pub struct ParityVectors {
 /// health-damage credits `dealt` right on v35 yet credits 0 here. One case hits a shielded enemy with `raw 10 <=
 /// shield 20`: absorbed 10, no spill, the credit is 10 with the target untouched on health. No struct change
 /// (`target_shield` exists from v35) — just the appended case, so this is pure coverage and no committed match
-/// hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v37";
+/// hash moves. Bumped to v38 EXTENDING the `score_credit` category with the EXACT-DRAIN credit seam: v35 pins
+/// `raw > shield` (overflow spills, credit = absorbed + spill) and v37 `raw < shield` (the shield SURVIVES,
+/// credit = absorbed alone), leaving the boundary `raw == shield` unpinned in the CREDIT dimension. There the
+/// shield is drained to EXACTLY 0 (the WHOLE shield consumed, unlike v37) yet ZERO health spills (unlike v35),
+/// and the credit is the whole shield. `shield_absorption`'s v29 case pins this `raw == shield` boundary for
+/// the POOL split but never the credit. One case hits a shielded enemy at `raw 20 == shield 20` (100 hp):
+/// absorbed 20, no spill, the credit is 20 with the target untouched on health. No struct change (`target_shield`
+/// exists from v35) — just the appended case, so this is pure coverage and no committed match hash moves. Each
+/// is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v38";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6816,6 +6824,16 @@ pub fn parity_vectors() -> ParityVectors {
             // only when health drops) credits dealt right on v35 yet credits 0 here — this completes
             // the shielded-credit bracket (partial spill v35, full absorb here).
             score_credit_case("enemy_full_absorb_credits_shield", WeaponMode::Hitscan, 10, false, 1, 100, 20),
+            // Exact-drain seam (v38): a hit whose raw EXACTLY equals the shield (raw 20 == shield 20)
+            // drains the shield to PRECISELY 0 with ZERO health spill, yet still credits the absorbed
+            // shield ALONE — credit 20, the WHOLE shield, the target (100 hp) untouched on health. This
+            // is the boundary BETWEEN the v35 partial spill (raw > shield: credit absorbed + spill) and
+            // the v37 strict full absorb (raw < shield: the shield SURVIVES): here the shield is fully
+            // consumed (shield_after 0, unlike v37) yet nothing reaches health (unlike v35).
+            // shield_absorption's v29 case pins this raw == shield boundary for the POOL split; this
+            // pins it for the CREDIT — a twin that double-credits a shield it breaks exactly, or spills
+            // the breaking hit to health, diverges here alone.
+            score_credit_case("enemy_exact_drain_credits_shield", WeaponMode::Hitscan, 20, false, 1, 100, 20),
         ],
         action_clamp: vec![
             // A sub-cap diagonal (mag² 720_000 < cap² 1_000_000) is in range and passes through
