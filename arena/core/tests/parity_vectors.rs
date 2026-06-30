@@ -1166,6 +1166,50 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let keep = clamp("overlong_keeps_aim_and_buttons");
     assert!(keep.was_clamped && keep.aim != 0 && (keep.buttons.fire || keep.buttons.jump), "the case clamps a move while carrying a live aim + buttons");
     assert_eq!((keep.clamped_aim, keep.clamped_buttons), (keep.aim, keep.buttons), "the clamp preserves the live aim and buttons");
+
+    // Action ingest (v26): Match::ingest is the server-authoritative gate. It accepts iff EVERY gate
+    // passes (right version, live, own match, own seat, current tick, alive); otherwise it rejects
+    // with the FIRST failing check in a fixed order. A twin that accepts when it shouldn't, rejects
+    // when it shouldn't, or reports a check out of order diverges.
+    let ingest = |label: &str| v.action_ingest.iter().find(|c| c.label == label).unwrap();
+    let reason = |label: &str| ingest(label).reject_reason.as_deref();
+    // THE invariant, recomputed INDEPENDENT of the sim: accepted iff every gate condition holds, and
+    // the reject reason is present (and the clamped move absent) exactly when rejected.
+    for c in &v.action_ingest {
+        let all_pass = c.version_ok && c.phase_live && c.claimed_own_match
+            && c.claimed_seat == c.auth_seat && c.claimed_tick == c.current_tick && c.seat_alive;
+        assert_eq!(c.accepted, all_pass, "{}: accepted iff every gate passes", c.label);
+        assert_eq!(c.reject_reason.is_none(), c.accepted, "{}: a reject reason is present iff rejected", c.label);
+        assert_eq!(c.clamped_move_dir.is_some(), c.accepted, "{}: the clamped intent is returned iff accepted", c.label);
+    }
+    // The accept returns the SAME clamp action_clamp pins: an overlong 3-4-5 request → (600, 800),
+    // not the raw — the gate normalizes on the accept path, it never trusts the envelope's magnitude.
+    let accept = ingest("accepted_well_formed");
+    assert_eq!(accept.clamped_move_dir, Some(Vec2 { x: 600, y: 800 }), "the accepted action's overlong move comes back clamped, not raw");
+    // Each reject fires for its OWN violated rule — the six security/structural gates.
+    assert_eq!(reason("rejected_version_drift"), Some("Version"), "a version mismatch is rejected as Version");
+    assert_eq!(reason("rejected_not_live"), Some("NotLive"), "an off-phase action is rejected as NotLive");
+    assert_eq!(reason("rejected_wrong_match"), Some("WrongMatch"), "an action for another match is rejected as WrongMatch");
+    assert_eq!(reason("rejected_wrong_seat"), Some("WrongSeat"), "an action for another seat is rejected as WrongSeat");
+    assert_eq!(reason("rejected_seat_down"), Some("SeatDown"), "a downed seat's action is rejected as SeatDown");
+    // Stale-tick rejects BOTH a future and a past tick — the rule is `claimed != current`, not `<`.
+    let (future, stale) = (ingest("rejected_future_tick"), ingest("rejected_stale_tick"));
+    assert_eq!((reason("rejected_future_tick"), reason("rejected_stale_tick")), (Some("StaleTick"), Some("StaleTick")), "both a future and a past tick are rejected as StaleTick");
+    assert!(future.claimed_tick > future.current_tick && stale.claimed_tick < stale.current_tick, "the two stale cases bracket the current tick from both sides");
+    // The wrong-seat reject shares the accept's geometry — ONLY the claimed seat differs — so it pins
+    // the authenticated-identity gate specifically, not some incidental difference from the accept.
+    let wrong_seat = ingest("rejected_wrong_seat");
+    assert!(
+        wrong_seat.claimed_seat != wrong_seat.auth_seat
+            && (wrong_seat.claimed_tick, wrong_seat.current_tick, wrong_seat.claimed_own_match, wrong_seat.version_ok, wrong_seat.phase_live, wrong_seat.seat_alive)
+                == (accept.claimed_tick, accept.current_tick, accept.claimed_own_match, accept.version_ok, accept.phase_live, accept.seat_alive),
+        "the wrong-seat case differs from the accept ONLY in the claimed seat",
+    );
+    // Precedence: an action violating TWO rules reports the EARLIER check. NotLive (gate 2) precedes
+    // WrongSeat (gate 4); WrongSeat (gate 4) precedes StaleTick (gate 5). A twin that checked seat
+    // before phase, or tick before seat, would report the wrong reason for the same action.
+    assert_eq!(reason("precedence_not_live_precedes_wrong_seat"), Some("NotLive"), "not-live is reported before wrong-seat");
+    assert_eq!(reason("precedence_wrong_seat_precedes_stale_tick"), Some("WrongSeat"), "wrong-seat is reported before stale-tick");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
