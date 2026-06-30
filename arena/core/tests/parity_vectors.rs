@@ -1327,6 +1327,22 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(fa.target_alive, "the target survives untouched on health");
     assert_eq!(fa.damage, fa_absorbed, "the credit is the absorbed shield ALONE — zero health removed");
     assert_eq!(fa.score_after - fa.score_before, fa_absorbed as i32, "...and that absorbed shield is exactly what scores — a twin crediting only health damage would score 0 here");
+    // Exact-drain seam (v38): a hit whose raw EXACTLY equals the shield (raw == target_shield) drains
+    // the shield to PRECISELY 0 with zero health spill, yet credits the WHOLE shield alone. This is the
+    // boundary between v35 (raw > shield, overflow spills) and v37 (raw < shield, shield survives): here
+    // the absorbed equals the ENTIRE shield (fully consumed, unlike v37) yet nothing reaches health
+    // (unlike v35). shield_absorption's v29 case pins this raw == shield boundary for the POOL split;
+    // this pins it for the CREDIT. A twin that double-credits a shield it breaks exactly, or spills the
+    // breaking hit to health, diverges here alone.
+    let ed = scr("enemy_exact_drain_credits_shield");
+    let ed_absorbed = ed.raw.min(ed.target_shield);
+    let ed_spill = ed.raw - ed_absorbed;
+    assert_eq!(ed.raw, ed.target_shield, "the hit raw EXACTLY equals the shield — the exact-drain seam (raw == shield)");
+    assert_eq!(ed_spill, 0, "...no health spills — the shield exactly covers the hit (unlike v35's overflow)");
+    assert_eq!(ed_absorbed, ed.target_shield, "...the absorbed equals the WHOLE shield — drained to exactly 0 (unlike v37, where the shield survives)");
+    assert!(ed.target_alive, "the target survives untouched on health");
+    assert_eq!(ed.damage, ed.target_shield, "the credit is the whole shield and no more — not raw-doubled, not health-spilled");
+    assert_eq!(ed.score_after - ed.score_before, ed.target_shield as i32, "...and exactly that drained shield scores");
 
     // Action clamp (v25): ActionIntent::clamped() is the canonical anti-god-mode move-intent clamp.
     // An in-range request passes through untouched; an overlong one is L2-normalized to a magnitude
