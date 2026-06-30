@@ -4787,9 +4787,15 @@ pub struct ParityVectors {
 /// cross-impl (a twin that credited only the nearest cleaved enemy stayed green). `MeleeCleaveCase` gains a
 /// `shooter_score` field recording the post-swing score; the existing `cleave_strikes_all_in_arc_and_range` case
 /// already cleaves two enemies (50 each) so its score is 100, the single-strike cases 50. The field is pure
-/// coverage (it records the credit pool, not a new committed digest) — no committed match hash moves. Each is a
-/// deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v36";
+/// coverage (it records the credit pool, not a new committed digest) — no committed match hash moves. Bumped to
+/// v37 EXTENDING the `score_credit` category with the FULL-ABSORB shield credit: v35 pinned the shielded credit
+/// only for `raw > shield > 0` (the hit spills to health), so a hit FULLY absorbed by the shield (`raw <= shield`,
+/// zero health spill) crediting the absorbed shield ALONE was unpinned — a twin that gated the credit on
+/// health-damage credits `dealt` right on v35 yet credits 0 here. One case hits a shielded enemy with `raw 10 <=
+/// shield 20`: absorbed 10, no spill, the credit is 10 with the target untouched on health. No struct change
+/// (`target_shield` exists from v35) — just the appended case, so this is pure coverage and no committed match
+/// hash moves. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v37";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6800,6 +6806,13 @@ pub fn parity_vectors() -> ParityVectors {
             // removed; a twin that credited only the spilled 15 (dropping the absorbed 10) diverges
             // here alone.
             score_credit_case("enemy_shielded_credits_absorbed_plus_spill", WeaponMode::Hitscan, 25, false, 1, 100, 10),
+            // Full absorb (v37): a hit FULLY absorbed by the shield (raw 10 <= shield 20) still
+            // credits the absorbed shield ALONE — absorbed 10, NO health spill (to_health 0), so
+            // the credit is 10 with the target untouched on health (100 hp). The v35 case spills to
+            // health (raw 25 > shield 10), so a twin that gated the credit on health-damage (award
+            // only when health drops) credits dealt right on v35 yet credits 0 here — this completes
+            // the shielded-credit bracket (partial spill v35, full absorb here).
+            score_credit_case("enemy_full_absorb_credits_shield", WeaponMode::Hitscan, 10, false, 1, 100, 20),
         ],
         action_clamp: vec![
             // A sub-cap diagonal (mag² 720_000 < cap² 1_000_000) is in range and passes through
