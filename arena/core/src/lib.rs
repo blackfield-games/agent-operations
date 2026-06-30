@@ -4456,6 +4456,13 @@ pub struct ParityVectors {
     pub score_credit: Vec<ScoreCreditCase>,
     pub action_clamp: Vec<ActionClampCase>,
     pub action_ingest: Vec<ActionIngestCase>,
+    /// observation-shape cases (domain v27): one [`Match::observe`] recorded as the SHAPE an agent
+    /// acts on — the seat's OWN full state (the cooldown/dash reported as the next-action
+    /// `saturating_sub(1)`) plus the per-entity-bounded visible set (a perceived enemy carries only
+    /// position/facing, never its private combat state). The `perception` category pins WHICH
+    /// entities are visible; this pins the observation SHAPE — the own exposure, the off-by-one, and
+    /// the anti-omniscience per-entity bound — that the proto wire-shape test pins only structurally.
+    pub observe: Vec<ObservationCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4610,9 +4617,22 @@ pub struct ParityVectors {
 /// is recorded (accept + clamped move, or the reason), no `canonical_encoding` field moved, so this
 /// is pure coverage — the `action_clamp` category pins the accept-path clamp but never the GATE that
 /// a twin accepting an action for another seat, replaying a stale tick, or mis-ordering the checks
-/// would get wrong.
+/// would get wrong;
+/// bumped to v27 for the OBSERVATION SHAPE — a new `observe` category pins [`Match::observe`], the
+/// parity-bounded slice an agent acts on. It records the seat's OWN full state (the one place private
+/// HUD state appears) field for field PLUS the per-entity-bounded visible set, pinning the two
+/// behavioral conventions the proto wire-shape test (which pins only the struct's field set) cannot:
+/// the cooldown/dash NEXT-ACTION off-by-one (the exposed `cooldown` is the raw pawn cooldown's
+/// `saturating_sub(1)`, so the agent's ready predicate is the clean `== 0` and a twin exposing the raw
+/// value mis-times every shot/dash — built here by a GENUINE fire + dash so the decrement is the real
+/// sim path), and the anti-omniscience per-entity bound (a visible enemy carries ONLY
+/// position/facing/z, never its health/ammo/cooldown/shield/score/velocity/z_vel). observe reads off
+/// existing pawn/rules state, no `canonical_encoding` field moved, so this is pure coverage (no
+/// committed match hash moves) — the `perception` category pins WHICH entities are visible (the id
+/// set) but never the own-state exposure, the cooldown off-by-one, nor the per-entity field bound a
+/// twin that exposes the raw cooldown, drops an own field, or leaks an enemy's private state would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v26";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v27";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5611,6 +5631,140 @@ fn action_ingest_case(label: &str, s: IngestScenario) -> ActionIngestCase {
     }
 }
 
+/// An enemy (seat 1) one `observe` case places in seat 0's range + full-circle cone, with
+/// distinctive PRIVATE state observe must never surface for it (a perceived enemy carries only
+/// position/facing/z, never `health`/`ammo`/`z_vel`).
+struct ObserveEnemy {
+    pos: Vec2,
+    facing: Bam,
+    z: i32,
+    z_vel: i32,
+    health: u16,
+    ammo: u16,
+}
+
+/// The scenario one `observe` case sets up before a single [`Match::observe`] recorded for seat 0.
+/// When `fire_first` is false the own pawn fields are written directly, so the case pins observe's
+/// faithful per-field COPY of each one; when true, one real [`Match::step`] arms a GENUINE fire +
+/// dash cooldown (and the own-state overrides are unused), so the recorded `raw_*` vs exposed value
+/// is the true `saturating_sub(1)` and not a hand-picked pair. `enemy` adds a perceivable seat 1.
+struct ObserveScenario {
+    z: i32,
+    z_vel: i32,
+    velocity: Vec2,
+    health: u16,
+    shield: u16,
+    ammo: u16,
+    score: i32,
+    /// Arm the cooldowns via a real fire + dash step instead of writing the own state directly.
+    fire_first: bool,
+    /// [`Rules::dash_cooldown`] for the match — non-zero so a `fire_first` step's dash arms it.
+    dash_cooldown: u16,
+    enemy: Option<ObserveEnemy>,
+}
+
+impl ObserveScenario {
+    /// A grounded observer at natural spawn state (full health, full mag, no shield, no cooldown), no
+    /// enemy — each case overrides only the fields it pins.
+    fn baseline() -> Self {
+        Self {
+            z: 0,
+            z_vel: 0,
+            velocity: Vec2::ZERO,
+            health: 100,
+            shield: 0,
+            ammo: 30,
+            score: 0,
+            fire_first: false,
+            dash_cooldown: 0,
+            enemy: None,
+        }
+    }
+}
+
+/// Build an observation-shape case: place the observer (seat 0) at the origin facing EAST and an
+/// optional enemy (seat 1) in its range + full-circle cone, set up the own state (directly, or by a
+/// genuine fire + dash step when `fire_first`), record the RAW pawn cooldowns, then run the REAL
+/// [`Match::observe`] and record the own full state, deadline, and the per-entity-bounded visible set.
+fn observation_case(label: &str, s: ObserveScenario) -> ObservationCase {
+    let seats = if s.enemy.is_some() { 2 } else { 1 };
+    let rules = Rules { dash_cooldown: s.dash_cooldown, spawn_jitter: 0, ..Default::default() };
+    let mut roster = vec![parity_seat(0, 0)];
+    if s.enemy.is_some() {
+        roster.push(parity_seat(1, 1));
+    }
+    let mut m = Match::new(parity_match_id(), parity_config(seats), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    if let Some(e) = &s.enemy {
+        m.pawns[1].pos = e.pos;
+        m.pawns[1].facing = e.facing;
+        m.pawns[1].z = e.z;
+        m.pawns[1].z_vel = e.z_vel;
+        m.pawns[1].health = e.health;
+        m.pawns[1].ammo = e.ammo;
+    }
+    if s.fire_first {
+        // One genuine step: a real fire arms `cooldown` to fire_cooldown and a real dash arms
+        // `dash_cooldown` to the rule, so observe's saturating_sub(1) is recorded against a true
+        // sim-armed value (the off-by-one a twin reproduces), not a hand-set field.
+        let intent = ActionIntent {
+            move_dir: Vec2 { x: MOVE_INTENT_SCALE, y: 0 },
+            aim: EAST,
+            buttons: ActionButtons { fire: true, jump: false, ability: true, reload: false },
+        };
+        m.step(&BTreeMap::from([(0, intent)]));
+    } else {
+        // Write the own state directly so the case pins observe's faithful per-field copy.
+        m.pawns[0].z = s.z;
+        m.pawns[0].z_vel = s.z_vel;
+        m.pawns[0].vel = s.velocity;
+        m.pawns[0].health = s.health;
+        m.pawns[0].shield = s.shield;
+        m.pawns[0].ammo = s.ammo;
+        m.pawns[0].score = s.score;
+    }
+    let raw_cooldown = m.pawns[0].cooldown;
+    let raw_dash_cooldown = m.pawns[0].dash_cooldown;
+    let obs = m.observe(0);
+    let visible = obs
+        .visible
+        .iter()
+        .map(|e| ObservedEntity {
+            entity_id: e.entity_id,
+            kind: e.kind,
+            team: e.team,
+            position: e.position,
+            z: e.z,
+            facing: e.facing,
+            in_line_of_sight: e.in_line_of_sight,
+        })
+        .collect();
+    let own = obs.own;
+    ObservationCase {
+        label: label.to_string(),
+        seat: own.seat,
+        team: own.team,
+        position: own.position,
+        z: own.z,
+        z_vel: own.z_vel,
+        facing: own.facing,
+        velocity: own.velocity,
+        health: own.health,
+        max_health: own.max_health,
+        shield: own.shield,
+        ammo: own.ammo,
+        cooldown: own.cooldown,
+        dash_cooldown: own.dash_cooldown,
+        score: own.score,
+        alive: own.alive,
+        raw_cooldown,
+        raw_dash_cooldown,
+        deadline_micros: obs.deadline_micros,
+        visible,
+    }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -6338,6 +6492,49 @@ pub fn parity_vectors() -> ParityVectors {
             action_ingest_case("precedence_not_live_precedes_wrong_seat", IngestScenario { live: false, claimed_seat: 1, ..IngestScenario::well_formed() }),
             // Wrong-seat precedes stale-tick: an action for another seat AND a stale tick reads WrongSeat.
             action_ingest_case("precedence_wrong_seat_precedes_stale_tick", IngestScenario { claimed_seat: 1, claimed_tick: 99, ..IngestScenario::well_formed() }),
+        ],
+        observe: vec![
+            // Full own-state exposure: a lone observer's every own scalar written directly to a
+            // distinctive value and surfaced verbatim by observe — the per-field copy a twin
+            // reproduces. No enemy, so `visible` is empty (nothing perceived).
+            observation_case(
+                "own_state_full_exposure",
+                ObserveScenario { z: 500, z_vel: 250, velocity: Vec2 { x: 300, y: -200 }, health: 70, shield: 40, ammo: 20, score: 15, ..ObserveScenario::baseline() },
+            ),
+            // The cooldown/dash NEXT-ACTION off-by-one via a GENUINE fire + dash: one real step arms
+            // `cooldown` to fire_cooldown (6) and `dash_cooldown` to the rule (8); observe exposes them
+            // decremented (5, 7). raw N -> exposed N-1, built by the sim — not a hand-set field — so a
+            // twin exposing the raw value (mis-timing every shot and dash) diverges.
+            observation_case(
+                "cooldown_exposed_as_next_action",
+                ObserveScenario { fire_first: true, dash_cooldown: 8, ..ObserveScenario::baseline() },
+            ),
+            // The anti-omniscience per-entity bound: a visible enemy (seat 1, point-blank, facing back)
+            // carries ONLY position/facing; the OWN state carries the private HUD the enemy entry never
+            // does. The enemy's distinctive private health/ammo are set but observe surfaces neither.
+            observation_case(
+                "visible_enemy_position_only",
+                ObserveScenario {
+                    health: 80,
+                    shield: 25,
+                    ammo: 15,
+                    enemy: Some(ObserveEnemy { pos: Vec2 { x: 2000, y: 0 }, facing: WEST, z: 0, z_vel: 0, health: 33, ammo: 7 }),
+                    ..ObserveScenario::baseline()
+                },
+            ),
+            // Own-vs-visible divergence on z_vel: an airborne observer exposes its OWN live z_vel (its
+            // jump/landing commitment), but a visible airborne enemy carries position + z (perceivable)
+            // yet NO z_vel — the kinematic x-ray the bound excludes. A twin that surfaced the enemy's
+            // z_vel, or dropped the owner's, diverges.
+            observation_case(
+                "observer_midair_exposes_own_z_vel",
+                ObserveScenario {
+                    z: 1200,
+                    z_vel: 1100,
+                    enemy: Some(ObserveEnemy { pos: Vec2 { x: 2000, y: 0 }, facing: WEST, z: 600, z_vel: -800, health: 50, ammo: 12 }),
+                    ..ObserveScenario::baseline()
+                },
+            ),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v26",
+  "domain": "blackfield/arena/parity-vectors/v27",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3208,6 +3208,146 @@
       "accepted": false,
       "reject_reason": "WrongSeat",
       "clamped_move_dir": null
+    }
+  ],
+  "observe": [
+    {
+      "label": "own_state_full_exposure",
+      "seat": 0,
+      "team": 0,
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "z": 500,
+      "z_vel": 250,
+      "facing": 0,
+      "velocity": {
+        "x": 300,
+        "y": -200
+      },
+      "health": 70,
+      "max_health": 100,
+      "shield": 40,
+      "ammo": 20,
+      "cooldown": 0,
+      "dash_cooldown": 0,
+      "score": 15,
+      "alive": true,
+      "raw_cooldown": 0,
+      "raw_dash_cooldown": 0,
+      "deadline_micros": 50000,
+      "visible": []
+    },
+    {
+      "label": "cooldown_exposed_as_next_action",
+      "seat": 0,
+      "team": 0,
+      "position": {
+        "x": 3200,
+        "y": 0
+      },
+      "z": 0,
+      "z_vel": 0,
+      "facing": 0,
+      "velocity": {
+        "x": 3200,
+        "y": 0
+      },
+      "health": 100,
+      "max_health": 100,
+      "shield": 0,
+      "ammo": 29,
+      "cooldown": 5,
+      "dash_cooldown": 7,
+      "score": 0,
+      "alive": true,
+      "raw_cooldown": 6,
+      "raw_dash_cooldown": 8,
+      "deadline_micros": 50000,
+      "visible": []
+    },
+    {
+      "label": "visible_enemy_position_only",
+      "seat": 0,
+      "team": 0,
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "z": 0,
+      "z_vel": 0,
+      "facing": 0,
+      "velocity": {
+        "x": 0,
+        "y": 0
+      },
+      "health": 80,
+      "max_health": 100,
+      "shield": 25,
+      "ammo": 15,
+      "cooldown": 0,
+      "dash_cooldown": 0,
+      "score": 0,
+      "alive": true,
+      "raw_cooldown": 0,
+      "raw_dash_cooldown": 0,
+      "deadline_micros": 50000,
+      "visible": [
+        {
+          "entity_id": 1,
+          "kind": "player",
+          "team": 1,
+          "position": {
+            "x": 2000,
+            "y": 0
+          },
+          "z": 0,
+          "facing": 32768,
+          "in_line_of_sight": true
+        }
+      ]
+    },
+    {
+      "label": "observer_midair_exposes_own_z_vel",
+      "seat": 0,
+      "team": 0,
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "z": 1200,
+      "z_vel": 1100,
+      "facing": 0,
+      "velocity": {
+        "x": 0,
+        "y": 0
+      },
+      "health": 100,
+      "max_health": 100,
+      "shield": 0,
+      "ammo": 30,
+      "cooldown": 0,
+      "dash_cooldown": 0,
+      "score": 0,
+      "alive": true,
+      "raw_cooldown": 0,
+      "raw_dash_cooldown": 0,
+      "deadline_micros": 50000,
+      "visible": [
+        {
+          "entity_id": 1,
+          "kind": "player",
+          "team": 1,
+          "position": {
+            "x": 2000,
+            "y": 0
+          },
+          "z": 600,
+          "facing": 32768,
+          "in_line_of_sight": true
+        }
+      ]
     }
   ],
   "matches": [
