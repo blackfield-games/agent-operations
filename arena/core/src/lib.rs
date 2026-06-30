@@ -3898,7 +3898,12 @@ pub struct SeatPlacement {
 /// that ranks score before survivors, that splits a tie, that ranks teammates as rivals, or
 /// that sums a team's score wrong diverges. This placement is the input the ranked-rating
 /// delta (the `rating_deltas` / `field_deltas` categories) settles from, never pinned in
-/// isolation until now.
+/// isolation until now. The hand-set cases pin the placement of a GIVEN end-state but not WHEN
+/// a match reaches one; the v33 `timeout_at_max_ticks_ranks_survivors` case closes that — it
+/// steps a REAL free-for-all idle to the `max_ticks` cap so both teams survive, recording in
+/// [`timeout`](MatchOutcomeCase::timeout) the `(final_tick, max_ticks)` that proves the end was
+/// the `tick >= max_ticks` branch (a timeout, not a wipe) and that `outcomes()` ranks the
+/// surviving seats by score there too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchOutcomeCase {
     pub label: String,
