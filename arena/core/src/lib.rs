@@ -3966,6 +3966,11 @@ pub struct ScoreCreditCase {
     pub damage: u16,
     /// Whether the target survived the hit (`health > 0`).
     pub target_alive: bool,
+    /// The shield the target carried BEFORE the hit (0 on every unshielded case). A shielded target
+    /// absorbs the hit shield-first, so the credited `damage` is the absorbed shield PLUS the health
+    /// spill — recorded so a twin reproduces the shielded setup and a credit that dropped the
+    /// absorbed portion (scoring only the health removed) is caught.
+    pub target_shield: u16,
 }
 
 /// A pinned action-clamp case (domain v25): one [`ActionIntent::clamped`] call — the canonical
@@ -4753,7 +4758,15 @@ pub struct ParityVectors {
 /// timeline alone cannot show why an in-range target stopped being perceived. The field defaults empty on
 /// existing entries and the case records the `observe` timeline, not a new committed digest, so this is
 /// pure coverage — no committed match hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v34";
+/// Bumped to v35 EXTENDING the `score_credit` category with the SHIELDED-enemy credit: every existing
+/// score_credit case hits a shield-0 target where the credit equals the health removed, so the path where the
+/// credited `dealt` is the absorbed shield PLUS the health spill (`raw > shield > 0`) was unpinned. One case
+/// hits a shielded enemy (raw 25, shield 10, 100 hp) — the hit drains the shield (10) AND spills to health
+/// (15), so the credit is the full effective 25, NOT just the 15 health portion. `ScoreCreditCase` gains a
+/// `target_shield` field (0 on every existing entry) so a twin reproduces the shielded setup; the field defaults
+/// 0 and the case records the credit/effective pools, not a new committed digest, so this is pure coverage — no
+/// committed match hash moves. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v35";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5709,16 +5722,19 @@ fn timeout_outcome_case(label: &str, max_ticks: u64, leader_score: i32) -> Match
 /// geometry (same seats, same point-blank line) so the only thing under test is the credit, not
 /// the hit detection. The friendly/ally pair shares this geometry (`target_team == 0`) and differs
 /// only on the flag: with it on the ally is hit (damage, zero credit), with it off the ally is
-/// never selected (no damage, zero credit).
-fn score_credit_case(label: &str, mode: WeaponMode, raw: u16, friendly_fire: bool, target_team: TeamId, target_health: u16) -> ScoreCreditCase {
+/// never selected (no damage, zero credit). `target_shield` grants the target shield before the
+/// hit (0 on the unshielded cases); a shielded target absorbs shield-first, so the credited
+/// effective is the absorbed shield plus the health spill — mirrors `shield_absorb_case`'s grant.
+fn score_credit_case(label: &str, mode: WeaponMode, raw: u16, friendly_fire: bool, target_team: TeamId, target_health: u16, target_shield: u16) -> ScoreCreditCase {
     let shooter_team: TeamId = 0;
-    let rules = Rules { weapon_mode: mode, damage: raw, melee_damage: raw, friendly_fire, spawn_jitter: 0, ..Default::default() };
+    let rules = Rules { weapon_mode: mode, damage: raw, melee_damage: raw, friendly_fire, max_shield: target_shield, spawn_jitter: 0, ..Default::default() };
     let roster = vec![parity_seat(0, shooter_team), parity_seat(1, target_team)];
     let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
     m.pawns[0].pos = Vec2::ZERO;
     m.pawns[0].facing = EAST;
     m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
     m.pawns[1].health = target_health;
+    m.pawns[1].shield = target_shield;
     let score_before = m.pawns[0].score;
     let (shield_before, health_before) = (m.pawns[1].shield, m.pawns[1].health);
     match mode {
@@ -5747,6 +5763,7 @@ fn score_credit_case(label: &str, mode: WeaponMode, raw: u16, friendly_fire: boo
         // shielded case still has `damage == credit`. Mirrors shield_absorb_case's `effective`.
         damage: (shield_before - m.pawns[1].shield) + (health_before - m.pawns[1].health),
         target_alive: m.pawns[1].alive,
+        target_shield,
     }
 }
 
@@ -6727,22 +6744,29 @@ pub fn parity_vectors() -> ParityVectors {
             // Enemy hit credits the EFFECTIVE damage: a 25 hit on a 100-hp enemy survivor scores
             // +25 (the hp removed), the target lives. Here damage == raw, so it pairs with the
             // overkill case (where damage < raw) to fix that the credit is `dealt`, not `raw`.
-            score_credit_case("enemy_hitscan_credits_effective", WeaponMode::Hitscan, 25, false, 1, 100),
+            score_credit_case("enemy_hitscan_credits_effective", WeaponMode::Hitscan, 25, false, 1, 100, 0),
             // Overkill credits the CLAMPED hp, not the raw: a 100 hit on a 30-hp enemy downs it and
             // scores +30 (the pool actually removed), strictly < the overcommitted raw 100. A twin
             // that credits the raw over-scores the kill.
-            score_credit_case("enemy_lethal_overkill_credits_clamped", WeaponMode::Hitscan, 100, false, 1, 30),
+            score_credit_case("enemy_lethal_overkill_credits_clamped", WeaponMode::Hitscan, 100, false, 1, 30, 0),
             // Friendly hit (same team) under friendly_fire ON deals real damage (25) but credits
             // ZERO — a team hit is never rewarded. Shares the ally case's geometry; only the flag differs.
-            score_credit_case("friendly_hitscan_under_ff_credits_zero", WeaponMode::Hitscan, 25, true, 0, 100),
+            score_credit_case("friendly_hitscan_under_ff_credits_zero", WeaponMode::Hitscan, 25, true, 0, 100, 0),
             // Ally (same team) with friendly_fire OFF is never SELECTED: no damage at all, zero
             // credit. The zero here is no-hit, not a scored-then-zeroed hit (damage == 0 proves it).
-            score_credit_case("ally_hitscan_ff_off_no_damage_no_credit", WeaponMode::Hitscan, 25, false, 0, 100),
+            score_credit_case("ally_hitscan_ff_off_no_damage_no_credit", WeaponMode::Hitscan, 25, false, 0, 100, 0),
             // The SAME enemy hit (raw 25, 100-hp survivor) through melee and projectile credits
             // IDENTICALLY to hitscan — each mode carries its own `if !friendly { score += dealt }`,
             // so the trio pins that resolve_fire / resolve_melee / the projectile sink agree.
-            score_credit_case("enemy_melee_credits_effective", WeaponMode::Melee, 25, false, 1, 100),
-            score_credit_case("enemy_projectile_credits_effective", WeaponMode::Projectile, 25, false, 1, 100),
+            score_credit_case("enemy_melee_credits_effective", WeaponMode::Melee, 25, false, 1, 100, 0),
+            score_credit_case("enemy_projectile_credits_effective", WeaponMode::Projectile, 25, false, 1, 100, 0),
+            // Shielded enemy (v35): a hit on a SHIELDED target credits the FULL effective — the
+            // absorbed shield PLUS the health spill — not just the health portion. raw 25 > shield 10
+            // > 0, so the hit drains the shield (10) AND spills to health (15): dealt 25, the target
+            // (100 hp) survives. Every case above hits a shield-0 target where credit == health
+            // removed; a twin that credited only the spilled 15 (dropping the absorbed 10) diverges
+            // here alone.
+            score_credit_case("enemy_shielded_credits_absorbed_plus_spill", WeaponMode::Hitscan, 25, false, 1, 100, 10),
         ],
         action_clamp: vec![
             // A sub-cap diagonal (mag² 720_000 < cap² 1_000_000) is in range and passes through
