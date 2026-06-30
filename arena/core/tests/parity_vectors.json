@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v21",
+  "domain": "blackfield/arena/parity-vectors/v22",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2601,6 +2601,158 @@
           },
           "struck": false,
           "damage": 0
+        }
+      ]
+    }
+  ],
+  "perception_memory": [
+    {
+      "label": "memory_off_vanishes_at_once",
+      "perception_memory_ticks": 0,
+      "timeline": [
+        {
+          "live_pos": {
+            "x": 5000,
+            "y": 0
+          },
+          "in_sight": true,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        }
+      ]
+    },
+    {
+      "label": "last_known_freezes_then_decays",
+      "perception_memory_ticks": 3,
+      "timeline": [
+        {
+          "live_pos": {
+            "x": 5000,
+            "y": 0
+          },
+          "in_sight": true,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": {
+            "x": 5000,
+            "y": 0
+          }
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": {
+            "x": 5000,
+            "y": 0
+          }
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        }
+      ]
+    },
+    {
+      "label": "resight_refreshes_and_resets",
+      "perception_memory_ticks": 2,
+      "timeline": [
+        {
+          "live_pos": {
+            "x": 5000,
+            "y": 0
+          },
+          "in_sight": true,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": {
+            "x": 5000,
+            "y": 0
+          }
+        },
+        {
+          "live_pos": {
+            "x": 8000,
+            "y": 0
+          },
+          "in_sight": true,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": {
+            "x": 8000,
+            "y": 0
+          }
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
         }
       ]
     }

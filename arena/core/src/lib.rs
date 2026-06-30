@@ -3804,6 +3804,44 @@ pub struct MeleeCleaveCase {
     pub targets: Vec<MeleeTarget>,
 }
 
+/// One tick of seat 0's view of the target (seat 1) in a [`PerceptionMemoryCase`], read
+/// straight off [`Match::observe`] — the only surface a twin reproduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerceptionMemoryTick {
+    /// Where the target ACTUALLY is this tick (it may be out of sight).
+    pub live_pos: Vec2,
+    /// The observer sees the target live this tick (`observe` reports it with
+    /// `in_line_of_sight == true`).
+    pub in_sight: bool,
+    /// The stale last-known echo the observer's `observe` surfaces (a `VisibleEntity` with
+    /// `in_line_of_sight == false`) — `Some(last-seen position)` while the entry is within
+    /// the memory window, `None` when the target is live-visible, decayed, or never seen.
+    pub remembered_pos: Option<Vec2>,
+}
+
+/// A pinned perception-memory case (domain v22): seat 0 watches seat 1 move in and out of
+/// sight under a configured [`Rules::perception_memory_ticks`], and the per-tick view from
+/// [`Match::observe`] is recorded. This pins what a twin must reproduce: while the target
+/// is in sight `observe` reports it live; once lost, `observe` surfaces its LAST PERCEIVED
+/// position (frozen — NOT the live position it moved to while unseen) flagged out of sight,
+/// for exactly `perception_memory_ticks` ticks, then drops it; and a re-sighting REFRESHES
+/// the echo to the new live position and RESETS the countdown. With
+/// `perception_memory_ticks == 0` (the default) nothing is remembered — a lost target
+/// vanishes at once, byte-identical to exclusion-only perception. A twin that leaks the
+/// live position of an occluded entity, counts the decay off by one, never refreshes, or
+/// fails to reset the countdown on re-sight diverges. The echo is read off the public
+/// `observe` surface (its `in_line_of_sight == false` entry), NOT an internal TTL counter,
+/// so the contract pins observable behavior, not the twin's memory representation. Distinct
+/// from the `perception` category (the live range/cone/LOS verdicts), which never exercises
+/// the decay/refresh a stale echo a twin must reproduce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerceptionMemoryCase {
+    pub label: String,
+    pub perception_memory_ticks: u16,
+    /// Seat 0's view of seat 1 after each `step`, one entry per scripted tick.
+    pub timeline: Vec<PerceptionMemoryTick>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -4186,6 +4224,13 @@ pub struct ParityVectors {
     /// set, the arc/range/LOS exclusions, and the point-blank zero-offset edge a nearest-only
     /// `hits` twin would get wrong.
     pub melee_cleave: Vec<MeleeCleaveCase>,
+    /// perception-memory cases (domain v22): seat 0's per-tick [`Match::observe`] view of a
+    /// target moving in and out of sight under [`Rules::perception_memory_ticks`] — pinning
+    /// that a lost target's LAST PERCEIVED position is surfaced (frozen, out-of-sight-flagged)
+    /// for exactly the window then dropped, that a re-sighting refreshes the echo and resets
+    /// the countdown, and that the default-off window remembers nothing. The `perception`
+    /// category pins the live verdicts; this pins the stale-echo decay/refresh it never does.
+    pub perception_memory: Vec<PerceptionMemoryCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4290,9 +4335,19 @@ pub struct ParityVectors {
 /// struck. `melee_range`/`melee_damage` were already folded into `canonical_encoding`, so this is
 /// pure coverage (no committed match hash moves) — the `hits` category pins the nearest-only ranged
 /// beam, never the multi-target arc a twin that cleaves through cover or strikes only one would
-/// get wrong.
+/// get wrong;
+/// bumped to v22 for PERCEPTION MEMORY — a new `perception_memory` category pins the
+/// last-known-position decay/refresh gated by [`Rules::perception_memory_ticks`]: once a seat
+/// loses sight of a target, [`Match::observe`] surfaces its LAST PERCEIVED position (frozen,
+/// flagged out of sight) for exactly the window then drops it, a re-sighting refreshes the echo
+/// to the new live position and resets the countdown, and the default-off window (0) remembers
+/// nothing (byte-identical to exclusion-only perception). `perception_memory_ticks` was already
+/// folded into `canonical_encoding`, so this is pure coverage (no committed match hash moves) —
+/// the `perception` category pins the live range/cone/LOS verdicts, never the stale-echo decay a
+/// twin that leaks an occluded entity's live position, mis-counts the decay, or never refreshes
+/// would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v21";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v22";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5097,6 +5152,31 @@ fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u
     MeleeCleaveCase { label: label.to_string(), facing, melee_range, melee_damage, blockers, targets }
 }
 
+/// Build a perception-memory case: seat 0 (at the origin, facing EAST, full-circle FOV)
+/// watches seat 1 walk through `target_path` — one position per tick — under
+/// `perception_memory_ticks`, recording seat 0's `observe` view of seat 1 after each step.
+/// Reads the live/echo state off the public `observe` surface only, never the internal
+/// `seat_memory`, so the timeline is exactly what a twin reproduces.
+fn perception_memory_case(label: &str, window: u16, target_path: Vec<Vec2>) -> PerceptionMemoryCase {
+    let rules = Rules { perception_memory_ticks: window, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    let timeline = target_path
+        .into_iter()
+        .map(|live_pos| {
+            m.pawns[1].pos = live_pos;
+            m.step(&BTreeMap::new());
+            let ent = m.observe(0).visible.into_iter().find(|e| e.entity_id == 1);
+            let in_sight = matches!(&ent, Some(e) if e.in_line_of_sight);
+            let remembered_pos = ent.filter(|e| !e.in_line_of_sight).map(|e| e.position);
+            PerceptionMemoryTick { live_pos, in_sight, remembered_pos }
+        })
+        .collect();
+    PerceptionMemoryCase { label: label.to_string(), perception_memory_ticks: window, timeline }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -5725,6 +5805,24 @@ pub fn parity_vectors() -> ParityVectors {
                         Vec2 { x: 1500, y: 0 }, // behind the wall -> not struck
                     ],
                 ),
+            ]
+        },
+        perception_memory: {
+            let seen_a = Vec2 { x: 5 * POSITION_SCALE, y: 0 }; // 5 m, inside the 40 m range
+            let seen_b = Vec2 { x: 8 * POSITION_SCALE, y: 0 }; // 8 m, a DIFFERENT in-range sighting
+            let out = Vec2 { x: 45 * POSITION_SCALE, y: 0 }; // 45 m, beyond range -> lost
+            vec![
+                // Off (the default window 0): a target seen then lost is NEVER remembered — no
+                // echo ever surfaces, byte-identical to exclusion-only perception.
+                perception_memory_case("memory_off_vanishes_at_once", 0, vec![seen_a, out, out]),
+                // Freeze + decay (window 3): once lost, observe surfaces the LAST PERCEIVED
+                // position (frozen at seen_a, NOT the live `out` it moved to) for the window, then
+                // drops it — the exact decay tick pinned by when the echo goes None.
+                perception_memory_case("last_known_freezes_then_decays", 3, vec![seen_a, out, out, out, out, out]),
+                // Refresh + reset (window 2): the echo freezes at seen_a, a re-sighting at seen_b
+                // REFRESHES the echo to seen_b AND resets the countdown, then it decays from seen_b —
+                // a second decay restarting from the full window, not a stale first freeze.
+                perception_memory_case("resight_refreshes_and_resets", 2, vec![seen_a, out, seen_b, out, out, out]),
             ]
         },
         matches: vec![
