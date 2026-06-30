@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v25",
+  "domain": "blackfield/arena/parity-vectors/v26",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3063,6 +3063,151 @@
       "raw_mag_sq": 25000000,
       "cap_mag_sq": 1000000,
       "was_clamped": true
+    }
+  ],
+  "action_ingest": [
+    {
+      "label": "accepted_well_formed",
+      "auth_seat": 0,
+      "claimed_seat": 0,
+      "current_tick": 0,
+      "claimed_tick": 0,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": true,
+      "seat_alive": true,
+      "accepted": true,
+      "reject_reason": null,
+      "clamped_move_dir": {
+        "x": 600,
+        "y": 800
+      }
+    },
+    {
+      "label": "rejected_version_drift",
+      "auth_seat": 0,
+      "claimed_seat": 0,
+      "current_tick": 0,
+      "claimed_tick": 0,
+      "claimed_own_match": true,
+      "version_ok": false,
+      "phase_live": true,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "Version",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "rejected_not_live",
+      "auth_seat": 0,
+      "claimed_seat": 0,
+      "current_tick": 0,
+      "claimed_tick": 0,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": false,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "NotLive",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "rejected_wrong_match",
+      "auth_seat": 0,
+      "claimed_seat": 0,
+      "current_tick": 0,
+      "claimed_tick": 0,
+      "claimed_own_match": false,
+      "version_ok": true,
+      "phase_live": true,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "WrongMatch",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "rejected_wrong_seat",
+      "auth_seat": 0,
+      "claimed_seat": 1,
+      "current_tick": 0,
+      "claimed_tick": 0,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": true,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "WrongSeat",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "rejected_future_tick",
+      "auth_seat": 0,
+      "claimed_seat": 0,
+      "current_tick": 0,
+      "claimed_tick": 99,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": true,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "StaleTick",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "rejected_stale_tick",
+      "auth_seat": 0,
+      "claimed_seat": 0,
+      "current_tick": 50,
+      "claimed_tick": 10,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": true,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "StaleTick",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "rejected_seat_down",
+      "auth_seat": 0,
+      "claimed_seat": 0,
+      "current_tick": 0,
+      "claimed_tick": 0,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": true,
+      "seat_alive": false,
+      "accepted": false,
+      "reject_reason": "SeatDown",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "precedence_not_live_precedes_wrong_seat",
+      "auth_seat": 0,
+      "claimed_seat": 1,
+      "current_tick": 0,
+      "claimed_tick": 0,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": false,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "NotLive",
+      "clamped_move_dir": null
+    },
+    {
+      "label": "precedence_wrong_seat_precedes_stale_tick",
+      "auth_seat": 0,
+      "claimed_seat": 1,
+      "current_tick": 0,
+      "claimed_tick": 99,
+      "claimed_own_match": true,
+      "version_ok": true,
+      "phase_live": true,
+      "seat_alive": true,
+      "accepted": false,
+      "reject_reason": "WrongSeat",
+      "clamped_move_dir": null
     }
   ],
   "matches": [

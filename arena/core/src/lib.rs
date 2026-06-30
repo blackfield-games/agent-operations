@@ -4391,6 +4391,7 @@ pub struct ParityVectors {
     /// `shield_absorption` category pins the split that produces `dealt`; this pins the credit on top.
     pub score_credit: Vec<ScoreCreditCase>,
     pub action_clamp: Vec<ActionClampCase>,
+    pub action_ingest: Vec<ActionIngestCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4534,9 +4535,20 @@ pub struct ParityVectors {
 /// The clamp is a pure function recorded as the move-vector pools, no `canonical_encoding` field
 /// moved, so this is pure coverage — the `moves` category drives a whole `step` and pins the
 /// resulting POSITION but only ever from ALREADY-IN-RANGE intents, never the magnitude clamp a twin
-/// that skips it, sums the squares in `i64`, or clamps component-wise would get wrong.
+/// that skips it, sums the squares in `i64`, or clamps component-wise would get wrong;
+/// bumped to v26 for the ACTION GATE — a new `action_ingest` category pins [`Match::ingest`], the
+/// server-authoritative gate every action crosses before it is simulated. It rejects with one of six
+/// [`RejectReason`]s in a FIXED order (version → not-live → wrong-match → wrong-seat → stale-tick →
+/// down-seat) and on accept returns the clamped intent (the same clamp `action_clamp` pins). The
+/// gate is the named arena security boundary — an agent may act only for ITS OWN seat, only for the
+/// CURRENT tick (no stale/future replay), and only while ALIVE on a LIVE match — and an action
+/// violating two rules reports the EARLIER check, the precedence a twin must mirror. The decision
+/// is recorded (accept + clamped move, or the reason), no `canonical_encoding` field moved, so this
+/// is pure coverage — the `action_clamp` category pins the accept-path clamp but never the GATE that
+/// a twin accepting an action for another seat, replaying a stale tick, or mis-ordering the checks
+/// would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v25";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v26";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5458,6 +5470,83 @@ fn action_clamp_case(label: &str, move_dir: Vec2, aim: Bam, buttons: ActionButto
     }
 }
 
+/// The scenario one `action_ingest` case feeds [`Match::ingest`]: a well-formed baseline that each
+/// reject case perturbs in exactly ONE field, so the only difference between accept and a reject is
+/// the rule the reject names (a precedence case perturbs two to pin the check order).
+struct IngestScenario {
+    auth_seat: SeatId,
+    claimed_seat: SeatId,
+    current_tick: u64,
+    claimed_tick: u64,
+    own_match: bool,
+    version_ok: bool,
+    live: bool,
+    seat_alive: bool,
+}
+
+impl IngestScenario {
+    fn well_formed() -> Self {
+        Self { auth_seat: 0, claimed_seat: 0, current_tick: 0, claimed_tick: 0, own_match: true, version_ok: true, live: true, seat_alive: true }
+    }
+}
+
+/// The stable [`RejectReason`] discriminant a twin compares against — the variant name only, since
+/// the `expected`/`got` payloads are scenario-specific and not part of the cross-impl contract.
+fn reject_name(r: &RejectReason) -> String {
+    match r {
+        RejectReason::Version(_) => "Version",
+        RejectReason::NotLive => "NotLive",
+        RejectReason::WrongMatch { .. } => "WrongMatch",
+        RejectReason::WrongSeat { .. } => "WrongSeat",
+        RejectReason::StaleTick { .. } => "StaleTick",
+        RejectReason::SeatDown { .. } => "SeatDown",
+    }
+    .to_string()
+}
+
+/// Build an action-ingest case: set up a Live match at `current_tick`, down the authenticated seat
+/// if the scenario asks, frame an `Action` carrying the claim fields + an overlong 3-4-5 move (so an
+/// ACCEPT records the same clamp `action_clamp` pins), run the REAL [`Match::ingest`], and record the
+/// scenario + the accept/reject decision a twin reproduces.
+fn action_ingest_case(label: &str, s: IngestScenario) -> ActionIngestCase {
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let rules = Rules { spawn_jitter: 0, ..Default::default() };
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.tick = s.current_tick;
+    if !s.live {
+        m.phase = MatchPhase::Ended;
+    }
+    if !s.seat_alive {
+        m.pawns[s.auth_seat as usize].alive = false;
+        m.pawns[s.auth_seat as usize].health = 0;
+    }
+    let action = Action {
+        protocol_version: if s.version_ok { PROTOCOL_VERSION } else { PROTOCOL_VERSION + 1 },
+        match_id: if s.own_match { parity_match_id() } else { Uuid::nil() },
+        seat: s.claimed_seat,
+        tick: s.claimed_tick,
+        intent: parity_intent(Vec2 { x: 3000, y: 4000 }, EAST, false),
+    };
+    let (accepted, reject_reason, clamped_move_dir) = match m.ingest(s.auth_seat, &action) {
+        Ok(intent) => (true, None, Some(intent.move_dir)),
+        Err(reason) => (false, Some(reject_name(&reason)), None),
+    };
+    ActionIngestCase {
+        label: label.to_string(),
+        auth_seat: s.auth_seat,
+        claimed_seat: s.claimed_seat,
+        current_tick: s.current_tick,
+        claimed_tick: s.claimed_tick,
+        claimed_own_match: s.own_match,
+        version_ok: s.version_ok,
+        phase_live: s.live,
+        seat_alive: s.seat_alive,
+        accepted,
+        reject_reason,
+        clamped_move_dir,
+    }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -6161,6 +6250,30 @@ pub fn parity_vectors() -> ParityVectors {
             // The clamp touches ONLY move_dir: an overlong move with a live aim + pressed buttons keeps
             // both verbatim, so a twin that drops aim/buttons while normalizing the move diverges here.
             action_clamp_case("overlong_keeps_aim_and_buttons", Vec2 { x: 5000, y: 0 }, WEST, ActionButtons { fire: true, jump: true, ability: false, reload: false }),
+        ],
+        action_ingest: vec![
+            // The well-formed baseline: own seat, current tick, own match, right version, live, alive.
+            // Accepted — and the overlong 3-4-5 move comes back clamped to (600, 800), the same
+            // anti-god-mode clamp action_clamp pins, proving the gate normalizes on the accept path.
+            action_ingest_case("accepted_well_formed", IngestScenario::well_formed()),
+            // Each reject perturbs the baseline in ONE field, so the only difference from the accept
+            // is the rule it violates — a twin that accepts any of these breaches that invariant.
+            action_ingest_case("rejected_version_drift", IngestScenario { version_ok: false, ..IngestScenario::well_formed() }),
+            action_ingest_case("rejected_not_live", IngestScenario { live: false, ..IngestScenario::well_formed() }),
+            action_ingest_case("rejected_wrong_match", IngestScenario { own_match: false, ..IngestScenario::well_formed() }),
+            // Acting for another seat: the connection is seat 0, the envelope claims seat 1.
+            action_ingest_case("rejected_wrong_seat", IngestScenario { claimed_seat: 1, ..IngestScenario::well_formed() }),
+            // Stale-tick rejects BOTH directions: a future tick (99 vs 0) and a past tick (10 vs 50).
+            action_ingest_case("rejected_future_tick", IngestScenario { claimed_tick: 99, ..IngestScenario::well_formed() }),
+            action_ingest_case("rejected_stale_tick", IngestScenario { current_tick: 50, claimed_tick: 10, ..IngestScenario::well_formed() }),
+            // A corpse cannot act: seat 0 is downed, its own well-formed action is still refused.
+            action_ingest_case("rejected_seat_down", IngestScenario { seat_alive: false, ..IngestScenario::well_formed() }),
+            // Precedence: an action violating TWO rules reports the EARLIER check in ingest's fixed
+            // order (version → not-live → wrong-match → wrong-seat → stale-tick → down-seat). Not-live
+            // precedes wrong-seat, so an off-phase action for another seat reads NotLive, not WrongSeat.
+            action_ingest_case("precedence_not_live_precedes_wrong_seat", IngestScenario { live: false, claimed_seat: 1, ..IngestScenario::well_formed() }),
+            // Wrong-seat precedes stale-tick: an action for another seat AND a stale tick reads WrongSeat.
+            action_ingest_case("precedence_wrong_seat_precedes_stale_tick", IngestScenario { claimed_seat: 1, claimed_tick: 99, ..IngestScenario::well_formed() }),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
