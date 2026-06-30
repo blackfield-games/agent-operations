@@ -946,6 +946,49 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(reload.timeline[5], (false, reload.mag_size, reload.fire_cooldown), "the reload refills to EXACTLY mag_size and arms the cooldown — no shot on the reload tick");
     assert!(!reload.timeline[6].0, "the tick after a reload is still cooling down — no fire yet");
     assert_eq!(reload.timeline[7], (true, reload.mag_size - 1, reload.fire_cooldown), "the first post-reload shot lands once the cooldown clears, draining the refilled mag");
+
+    // Melee cleave (v21): one swing strikes EVERY eligible target (alive enemy within melee_range,
+    // inside the MELEE_ARC_SPREAD frontal arc, with a clear sightline), each for melee_damage — not
+    // just the nearest. A twin that strikes only the nearest, uses the wrong arc/range edge,
+    // cleaves through cover, or drops the point-blank zero-offset edge diverges on one target.
+    let mc = |label: &str| v.melee_cleave.iter().find(|c| c.label == label).unwrap();
+    let d2 = |o: Vec2| (o.x as i64).pow(2) + (o.y as i64).pow(2);
+    // Cross-check every target: struck IS exactly damage>0, and a struck (surviving) target took
+    // EXACTLY melee_damage while a missed one took 0 — a twin using the ranged `damage` here diverges.
+    for c in &v.melee_cleave {
+        for t in &c.targets {
+            assert_eq!(t.struck, t.damage > 0, "{}: struck is exactly damage>0", c.label);
+            assert_eq!(t.damage, if t.struck { c.melee_damage } else { 0 }, "{}: a struck target takes exactly melee_damage, a missed one 0", c.label);
+        }
+    }
+    // The cleave: BOTH in-arc+range enemies are struck (a nearest-only beam strikes only the
+    // closer), at DISTINCT distances; the in-range-out-of-arc and in-arc-out-of-range enemies are
+    // each missed — the arc and range bounds pinned independently.
+    let cleave = mc("cleave_strikes_all_in_arc_and_range");
+    assert_eq!(cleave.targets.iter().map(|t| t.struck).collect::<Vec<_>>(), vec![true, true, false, false], "both in-arc+range enemies are cleaved; the out-of-arc and out-of-range are not");
+    assert!(cleave.targets.iter().filter(|t| t.struck).count() >= 2, "a cleave strikes MORE than one — a nearest-only twin strikes just one");
+    // Recompute each verdict's geometry, so the labels are not taken on faith.
+    let range2 = (cleave.melee_range as i64).pow(2);
+    let (near, far, behind, beyond) = (&cleave.targets[0], &cleave.targets[1], &cleave.targets[2], &cleave.targets[3]);
+    assert!(d2(near.offset) <= range2 && d2(far.offset) <= range2 && d2(near.offset) != d2(far.offset), "both struck enemies are in range, at distinct distances (nearest-only fails)");
+    assert!(d2(behind.offset) <= range2 && behind.offset.x < 0, "the out-of-arc enemy is IN range (only the arc excluded it) and directly behind");
+    assert!(d2(beyond.offset) > range2 && beyond.offset.y == 0, "the out-of-range enemy is dead-ahead (only the range excluded it)");
+    // Point-blank exactly on the shooter, facing WEST (away): the zero-offset in_fov edge strikes
+    // it regardless of facing.
+    let pb = mc("point_blank_on_shooter_struck_facing_away");
+    assert_eq!(pb.targets.len(), 1);
+    assert_eq!(pb.targets[0].offset, Vec2 { x: 0, y: 0 }, "the point-blank enemy is exactly on the shooter");
+    assert!(pb.targets[0].struck, "a coincident enemy is struck regardless of facing (the in_fov zero-offset edge)");
+    assert_ne!(pb.facing, EAST, "...and the shooter faces AWAY — facing did not gate the coincident hit");
+    // Line of sight: same dead-ahead geometry, the wall is the only difference — the enemy behind
+    // it is not struck (no cut-through-cover), the one in FRONT of it is.
+    let los = mc("behind_blocker_not_struck");
+    assert!(!los.blockers.is_empty(), "the LOS case carries its wall");
+    let (front, back) = (&los.targets[0], &los.targets[1]);
+    assert!(front.struck && !back.struck, "the enemy in front of the wall is cleaved, the one behind it is not");
+    assert!(d2(back.offset) <= (los.melee_range as i64).pow(2) && back.offset.y == 0, "the shielded enemy is in range AND dead-ahead — only the wall stopped the cleave");
+    let wall = &los.blockers[0];
+    assert!(front.offset.x < wall.min.x && back.offset.x > wall.max.x, "the wall sits past the struck enemy but between the shooter and the shielded one");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
