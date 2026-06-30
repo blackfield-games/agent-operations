@@ -5321,7 +5321,7 @@ fn score_credit_case(label: &str, mode: WeaponMode, raw: u16, friendly_fire: boo
     m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
     m.pawns[1].health = target_health;
     let score_before = m.pawns[0].score;
-    let health_before = m.pawns[1].health;
+    let (shield_before, health_before) = (m.pawns[1].shield, m.pawns[1].health);
     match mode {
         WeaponMode::Hitscan => m.resolve_fire(0),
         WeaponMode::Melee => m.resolve_melee(0),
@@ -5343,7 +5343,10 @@ fn score_credit_case(label: &str, mode: WeaponMode, raw: u16, friendly_fire: boo
         target_team,
         score_before,
         score_after: m.pawns[0].score,
-        damage: health_before - m.pawns[1].health,
+        // The effective damage the sink dealt = the pools actually removed (shield-first absorb +
+        // health overflow), exactly what the credit uses — not just the health delta, so a future
+        // shielded case still has `damage == credit`. Mirrors shield_absorb_case's `effective`.
+        damage: (shield_before - m.pawns[1].shield) + (health_before - m.pawns[1].health),
         target_alive: m.pawns[1].alive,
     }
 }
