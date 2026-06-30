@@ -3961,9 +3961,14 @@ pub struct MatchOutcomeCase {
 /// shielded enemy (the recorded `target_shield`, `raw > shield > 0`) pins that the credit is the
 /// FULL effective — the absorbed shield PLUS the health spill — not just the health portion, the
 /// one place `shield_absorption`'s absorb/overflow split feeds the credit on top. v37 brackets
-/// that with the FULL-ABSORB credit (`raw <= shield`, zero health spill): the credit is the
-/// absorbed shield ALONE, so a twin that gated the credit on health-damage (scoring only when
-/// health drops) credits `dealt` right on the v35 spill case yet credits 0 here.
+/// that with the strict FULL-ABSORB credit (`raw < shield`, the shield SURVIVES, zero health spill):
+/// the credit is the absorbed shield ALONE, so a twin that gated the credit on health-damage (scoring
+/// only when health drops) credits `dealt` right on the v35 spill case yet credits 0 here. v38 pins
+/// the EXACT-DRAIN seam BETWEEN them (`raw == shield`): the shield is drained to PRECISELY 0 (the WHOLE
+/// shield consumed, unlike v37 where it survives) yet ZERO health spills (unlike v35), and the credit
+/// is the whole shield — the `raw == shield` boundary `shield_absorption`'s v29 case pins for the POOL
+/// split, here pinned for the CREDIT, so a twin that double-credits a shield it breaks exactly, or
+/// spills the breaking hit to health, diverges here alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoreCreditCase {
     pub label: String,
