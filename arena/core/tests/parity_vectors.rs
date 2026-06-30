@@ -805,6 +805,43 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(air.trajectory[0].0 < air.start_z + JUMP_VELOCITY, "z was NOT re-boosted by a second launch impulse");
     assert!(air.trajectory[0].1 < JUMP_VELOCITY, "...and z_vel was not reset to the launch impulse");
 
+    // Overshoot landing-snap (v30): at a non-dividing gravity the descent crosses z==0 BETWEEN ticks —
+    // the raw integration nz = z + z_vel at the tick before landing is STRICTLY NEGATIVE, and step()'s
+    // nz<=0 clamp snaps the POSITION to EXACTLY 0 with z_vel cleared. The g==480 cases land at nz==0
+    // exactly, so z==nz==0 there and the snap is invisible; this case makes it load-bearing — a twin
+    // that records the negative nz instead of clamping to 0 diverges only here (the <=/< boundary
+    // itself is already pinned by the fall_damage landings).
+    let over = jc("overshoot_landing_snaps_to_zero");
+    assert_eq!((over.start_z, over.start_z_vel), (0, 0), "the overshoot arc launches from rest on the ground");
+    assert_ne!(over.gravity, arc.gravity, "...at a gravity distinct from the clean-landing g==480 cases");
+    let over_land = over.landing_tick.expect("the overshoot arc lands") as usize;
+    // THE discriminator: the raw integration of the last airborne (z, z_vel) crosses STRICTLY below
+    // the ground — the snap is what pulls it back to 0, not a coincidental nz==0 landing.
+    let (pre_z, pre_vel) = over.trajectory[over_land - 1];
+    assert!(pre_z > 0, "the tick before landing is still airborne (z > 0)");
+    let raw_nz = pre_z as i64 + pre_vel as i64;
+    assert!(
+        raw_nz < 0,
+        "the descent OVERSHOOTS: z + z_vel crosses strictly below the ground (unlike every g==480 case, where nz lands at exactly 0)",
+    );
+    assert_eq!(over.trajectory[over_land], (0, 0), "the overshoot snaps to EXACTLY z==0 with z_vel cleared — not the negative nz");
+    assert!(over.trajectory[..over_land].iter().all(|&(z, _)| z > 0), "z stays strictly above ground until the snap");
+    // The whole trajectory still replays the reference semi-implicit Euler bit-for-bit — same recompute
+    // as the grounded arc, but here the closing nz<=0 branch fires on a NEGATIVE nz, not an exact 0.
+    let mut over_expected = Vec::new();
+    let (mut z, mut z_vel) = (0i64, JUMP_VELOCITY as i64);
+    loop {
+        let nz = z + z_vel;
+        if nz <= 0 {
+            over_expected.push((0i32, 0i32));
+            break;
+        }
+        z = nz;
+        z_vel -= over.gravity as i64;
+        over_expected.push((z as i32, z_vel as i32));
+    }
+    assert_eq!(over.trajectory, over_expected, "the overshoot arc matches the semi-implicit Euler recomputation through the snapped landing");
+
     // Shield absorption (v19): one weapon hit splits via the shield-first sink — absorbed =
     // min(raw, shield) drains the shield FIRST, the overflow (raw - absorbed) spills to health
     // clamped, and the effective is the pools actually removed (never the raw when the hit
