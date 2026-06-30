@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v33",
+  "domain": "blackfield/arena/parity-vectors/v34",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2858,6 +2858,7 @@
     {
       "label": "memory_off_vanishes_at_once",
       "perception_memory_ticks": 0,
+      "blockers": [],
       "timeline": [
         {
           "live_pos": {
@@ -2888,6 +2889,7 @@
     {
       "label": "last_known_freezes_then_decays",
       "perception_memory_ticks": 3,
+      "blockers": [],
       "timeline": [
         {
           "live_pos": {
@@ -2948,6 +2950,7 @@
     {
       "label": "resight_refreshes_and_resets",
       "perception_memory_ticks": 2,
+      "blockers": [],
       "timeline": [
         {
           "live_pos": {
@@ -2998,6 +3001,79 @@
         {
           "live_pos": {
             "x": 45000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        }
+      ]
+    },
+    {
+      "label": "occluded_behind_wall_freezes_then_decays",
+      "perception_memory_ticks": 3,
+      "blockers": [
+        {
+          "min": {
+            "x": 10000,
+            "y": -3000
+          },
+          "max": {
+            "x": 11000,
+            "y": 3000
+          },
+          "height": 0
+        }
+      ],
+      "timeline": [
+        {
+          "live_pos": {
+            "x": 5000,
+            "y": 0
+          },
+          "in_sight": true,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 15000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": {
+            "x": 5000,
+            "y": 0
+          }
+        },
+        {
+          "live_pos": {
+            "x": 15000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": {
+            "x": 5000,
+            "y": 0
+          }
+        },
+        {
+          "live_pos": {
+            "x": 15000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 15000,
+            "y": 0
+          },
+          "in_sight": false,
+          "remembered_pos": null
+        },
+        {
+          "live_pos": {
+            "x": 15000,
             "y": 0
           },
           "in_sight": false,

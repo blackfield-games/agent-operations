@@ -3870,6 +3870,11 @@ pub struct PerceptionMemoryTick {
 pub struct PerceptionMemoryCase {
     pub label: String,
     pub perception_memory_ticks: u16,
+    /// Vision blockers in the world (empty on a range-loss case). An occlusion-loss case
+    /// places a wall so the target is lost by a BROKEN SIGHTLINE while still in range — the
+    /// loss cause a twin must reproduce, since the timeline alone cannot show why an in-range
+    /// target stopped being perceived.
+    pub blockers: Vec<Blocker>,
     /// Seat 0's view of seat 1 after each `step`, one entry per scripted tick.
     pub timeline: Vec<PerceptionMemoryTick>,
 }
@@ -4731,7 +4736,7 @@ pub struct ParityVectors {
 /// scored a timeout as a blanket draw, diverges. The new field is `None` on every hand-set entry and the
 /// case records outcome pools (placement/score), not a new committed digest, so this is pure coverage —
 /// no committed match hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v33";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v34";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5613,10 +5618,10 @@ fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u
 /// `perception_memory_ticks`, recording seat 0's `observe` view of seat 1 after each step.
 /// Reads the live/echo state off the public `observe` surface only, never the internal
 /// `seat_memory`, so the timeline is exactly what a twin reproduces.
-fn perception_memory_case(label: &str, window: u16, target_path: Vec<Vec2>) -> PerceptionMemoryCase {
+fn perception_memory_case(label: &str, window: u16, blockers: Vec<Blocker>, target_path: Vec<Vec2>) -> PerceptionMemoryCase {
     let rules = Rules { perception_memory_ticks: window, spawn_jitter: 0, ..Default::default() };
     let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
-    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, blockers.clone(), 1);
     m.pawns[0].pos = Vec2::ZERO;
     m.pawns[0].facing = EAST;
     let timeline = target_path
@@ -5630,7 +5635,7 @@ fn perception_memory_case(label: &str, window: u16, target_path: Vec<Vec2>) -> P
             PerceptionMemoryTick { live_pos, in_sight, remembered_pos }
         })
         .collect();
-    PerceptionMemoryCase { label: label.to_string(), perception_memory_ticks: window, timeline }
+    PerceptionMemoryCase { label: label.to_string(), perception_memory_ticks: window, blockers, timeline }
 }
 
 /// Build a match-outcome case: construct a match from the `(seat, team, alive, score)`
@@ -6647,18 +6652,33 @@ pub fn parity_vectors() -> ParityVectors {
             let seen_a = Vec2 { x: 5 * POSITION_SCALE, y: 0 }; // 5 m, inside the 40 m range
             let seen_b = Vec2 { x: 8 * POSITION_SCALE, y: 0 }; // 8 m, a DIFFERENT in-range sighting
             let out = Vec2 { x: 45 * POSITION_SCALE, y: 0 }; // 45 m, beyond range -> lost
+            // Occlusion-loss geometry: a wall at x in [10 m, 11 m] sits BETWEEN the observer (origin)
+            // and a target that steps from 5 m (in front, clear sightline) to 15 m (behind it). 15 m
+            // is well inside the 40 m range, so the ONLY reason sight breaks is the broken sightline.
+            let wall = Blocker {
+                min: Vec2 { x: 10 * POSITION_SCALE, y: -3 * POSITION_SCALE },
+                max: Vec2 { x: 11 * POSITION_SCALE, y: 3 * POSITION_SCALE },
+                height: 0,
+            };
+            let behind = Vec2 { x: 15 * POSITION_SCALE, y: 0 }; // 15 m: in range, but BEHIND the wall
             vec![
                 // Off (the default window 0): a target seen then lost is NEVER remembered — no
                 // echo ever surfaces, byte-identical to exclusion-only perception.
-                perception_memory_case("memory_off_vanishes_at_once", 0, vec![seen_a, out, out]),
+                perception_memory_case("memory_off_vanishes_at_once", 0, Vec::new(), vec![seen_a, out, out]),
                 // Freeze + decay (window 3): once lost, observe surfaces the LAST PERCEIVED
                 // position (frozen at seen_a, NOT the live `out` it moved to) for the window, then
                 // drops it — the exact decay tick pinned by when the echo goes None.
-                perception_memory_case("last_known_freezes_then_decays", 3, vec![seen_a, out, out, out, out, out]),
+                perception_memory_case("last_known_freezes_then_decays", 3, Vec::new(), vec![seen_a, out, out, out, out, out]),
                 // Refresh + reset (window 2): the echo freezes at seen_a, a re-sighting at seen_b
                 // REFRESHES the echo to seen_b AND resets the countdown, then it decays from seen_b —
                 // a second decay restarting from the full window, not a stale first freeze.
-                perception_memory_case("resight_refreshes_and_resets", 2, vec![seen_a, out, seen_b, out, out, out]),
+                perception_memory_case("resight_refreshes_and_resets", 2, Vec::new(), vec![seen_a, out, seen_b, out, out, out]),
+                // Occlusion loss (window 3): the target steps from 5 m (seen) to 15 m BEHIND the wall,
+                // staying in range — so the loss CAUSE is occlusion, not distance. The echo still
+                // freezes at the last-seen 5 m and decays on the SAME countdown as the range-loss case
+                // above: the loss cause does not change the memory lifetime. A twin that dropped an
+                // occluded ghost early, never made it, or decayed occlusion differently diverges here.
+                perception_memory_case("occluded_behind_wall_freezes_then_decays", 3, vec![wall], vec![seen_a, behind, behind, behind, behind, behind]),
             ]
         },
         outcomes: vec![
