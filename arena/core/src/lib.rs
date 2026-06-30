@@ -3813,7 +3813,12 @@ pub struct MeleeTarget {
 /// zero-offset edge); an enemy in range but outside the arc, or in the arc but beyond
 /// range, or behind a `Blocker` on the sightline, is NOT struck. A twin that strikes only
 /// the nearest, that uses the wrong arc width or range edge, that cleaves through cover,
-/// or that drops the point-blank edge diverges on at least one target. Targets are
+/// or that drops the point-blank edge diverges on at least one target. The arc WIDTH itself
+/// is pinned by the v32 `arc_seam_strikes_one_octant_off_misses_two` case: an enemy one octant
+/// off the facing (45°, [`circular_octant_distance`] `1`) is struck while one two octants off
+/// (90°, distance `2`) is missed — both in range with a clear sightline — so a twin with
+/// [`MELEE_ARC_SPREAD`] `0` (facing octant only) or `2` (a too-wide cone) diverges where the
+/// distance-0/distance-4 cases cannot tell them apart. Targets are
 /// collected in seat order THEN damaged, so the same-tick multi-hit is deterministic.
 /// Distinct from the `hits` category (the nearest-only ranged beam) and from `knockback`
 /// (the post-hit shove this swing also applies, gated on `knockback_horizontal`).
