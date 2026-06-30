@@ -4353,6 +4353,7 @@ pub struct ParityVectors {
     /// credit shared by `resolve_fire` / `resolve_melee` / the projectile sink. The
     /// `shield_absorption` category pins the split that produces `dealt`; this pins the credit on top.
     pub score_credit: Vec<ScoreCreditCase>,
+    pub action_clamp: Vec<ActionClampCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4486,9 +4487,19 @@ pub struct ParityVectors {
 /// sink, so the enemy case repeats across all three modes. The credit reads off pawn `score`, no
 /// `canonical_encoding` field moved, so this is pure coverage (no committed match hash moves) — the
 /// `shield_absorption` category pins the split that PRODUCES `dealt`, never the credit a twin that
-/// scores the raw, rewards a team hit, or damages an ally under friendly-fire-off would get wrong.
+/// scores the raw, rewards a team hit, or damages an ally under friendly-fire-off would get wrong;
+/// bumped to v25 for the ACTION CLAMP — a new `action_clamp` category pins [`ActionIntent::clamped`],
+/// the canonical anti-god-mode move-intent normalization every implementation shares: an in-range
+/// request passes through untouched (the `<=` cap is inclusive), an overlong one is L2-normalized to
+/// a magnitude of at most [`MOVE_INTENT_SCALE`] (integer sqrt, direction preserved, never rounding UP
+/// past the cap), the `{i32::MIN, i32::MIN}` overflow input is clamped (NOT wrapped through at
+/// god-mode speed, the attack the `u64` widening defeats), and `aim`/`buttons` pass through verbatim.
+/// The clamp is a pure function recorded as the move-vector pools, no `canonical_encoding` field
+/// moved, so this is pure coverage — the `moves` category drives a whole `step` and pins the
+/// resulting POSITION but only ever from ALREADY-IN-RANGE intents, never the magnitude clamp a twin
+/// that skips it, sums the squares in `i64`, or clamps component-wise would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v24";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v25";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5385,6 +5396,31 @@ fn score_credit_case(label: &str, mode: WeaponMode, raw: u16, friendly_fire: boo
     }
 }
 
+/// The released-button state — the move-clamp cases vary only `move_dir`, so they share this.
+const NO_BUTTONS: ActionButtons = ActionButtons { fire: false, jump: false, ability: false, reload: false };
+
+/// Build an action-clamp case: run one raw `(move_dir, aim, buttons)` request through the REAL
+/// [`ActionIntent::clamped`] and record the raw input, the full clamped intent, and the squared
+/// magnitudes — the anti-god-mode normalization a twin reproduces, isolated from any `step`/position
+/// clamp. The squares widen to `u64` BEFORE summing (the clamp's own overflow guard), so the
+/// `{i32::MIN, i32::MIN}` input's `raw_mag_sq` is the honest `2⁶³`, not a wrapped `i64`.
+fn action_clamp_case(label: &str, move_dir: Vec2, aim: Bam, buttons: ActionButtons) -> ActionClampCase {
+    let clamped = ActionIntent { move_dir, aim, buttons }.clamped();
+    let cap = MOVE_INTENT_SCALE as i64;
+    ActionClampCase {
+        label: label.to_string(),
+        move_dir,
+        aim,
+        buttons,
+        clamped_move_dir: clamped.move_dir,
+        clamped_aim: clamped.aim,
+        clamped_buttons: clamped.buttons,
+        raw_mag_sq: (move_dir.x as i64 * move_dir.x as i64) as u64 + (move_dir.y as i64 * move_dir.y as i64) as u64,
+        cap_mag_sq: (cap * cap) as u64,
+        was_clamped: clamped.move_dir != move_dir,
+    }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -6069,6 +6105,25 @@ pub fn parity_vectors() -> ParityVectors {
             // so the trio pins that resolve_fire / resolve_melee / the projectile sink agree.
             score_credit_case("enemy_melee_credits_effective", WeaponMode::Melee, 25, false, 1, 100),
             score_credit_case("enemy_projectile_credits_effective", WeaponMode::Projectile, 25, false, 1, 100),
+        ],
+        action_clamp: vec![
+            // A sub-cap diagonal (mag² 720_000 < cap² 1_000_000) is in range and passes through
+            // untouched — the clamp only ever shrinks an over-budget vector, never grows or rotates one.
+            action_clamp_case("in_range_diagonal_passes_unchanged", Vec2 { x: 600, y: 600 }, EAST, NO_BUTTONS),
+            // Exactly at the cap on an axis (mag² == cap²): the `<=` bound is INCLUSIVE, so a
+            // max-speed request is honored, not clamped. A twin using `<` needlessly shrinks it.
+            action_clamp_case("at_cap_axis_passes_unchanged", Vec2 { x: MOVE_INTENT_SCALE, y: 0 }, EAST, NO_BUTTONS),
+            // A 2×-cap DIAGONAL (mag² 8_000_000) L2-normalizes to (707, 707) — mag² 999_698 ≤ cap²,
+            // the diagonal preserved. A component-wise (L∞) clamp would yield (1000, 1000) at mag²
+            // 2_000_000, ABOVE the cap, so this discriminates the Euclidean normalize from a box clamp.
+            action_clamp_case("overlong_diagonal_normalizes_to_cap", Vec2 { x: 2000, y: 2000 }, EAST, NO_BUTTONS),
+            // THE attack: {i32::MIN, i32::MIN}. The square-sum is 2⁶³ (`i64::MAX + 1`). A twin that
+            // sums in i64 wraps to a negative value, the `mag² <= cap²` test passes, and the god-mode
+            // vector flies through unclamped. The real clamp widens to u64 and normalizes to (-707, -707).
+            action_clamp_case("overflow_input_clamps_without_wrapping", Vec2 { x: i32::MIN, y: i32::MIN }, EAST, NO_BUTTONS),
+            // The clamp touches ONLY move_dir: an overlong move with a live aim + pressed buttons keeps
+            // both verbatim, so a twin that drops aim/buttons while normalizing the move diverges here.
+            action_clamp_case("overlong_keeps_aim_and_buttons", Vec2 { x: 5000, y: 0 }, WEST, ActionButtons { fire: true, jump: true, ability: false, reload: false }),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

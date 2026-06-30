@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v24",
+  "domain": "blackfield/arena/parity-vectors/v25",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2921,6 +2921,148 @@
       "score_after": 25,
       "damage": 25,
       "target_alive": true
+    }
+  ],
+  "action_clamp": [
+    {
+      "label": "in_range_diagonal_passes_unchanged",
+      "move_dir": {
+        "x": 600,
+        "y": 600
+      },
+      "aim": 0,
+      "buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "clamped_move_dir": {
+        "x": 600,
+        "y": 600
+      },
+      "clamped_aim": 0,
+      "clamped_buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "raw_mag_sq": 720000,
+      "cap_mag_sq": 1000000,
+      "was_clamped": false
+    },
+    {
+      "label": "at_cap_axis_passes_unchanged",
+      "move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "aim": 0,
+      "buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "clamped_move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "clamped_aim": 0,
+      "clamped_buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "raw_mag_sq": 1000000,
+      "cap_mag_sq": 1000000,
+      "was_clamped": false
+    },
+    {
+      "label": "overlong_diagonal_normalizes_to_cap",
+      "move_dir": {
+        "x": 2000,
+        "y": 2000
+      },
+      "aim": 0,
+      "buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "clamped_move_dir": {
+        "x": 707,
+        "y": 707
+      },
+      "clamped_aim": 0,
+      "clamped_buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "raw_mag_sq": 8000000,
+      "cap_mag_sq": 1000000,
+      "was_clamped": true
+    },
+    {
+      "label": "overflow_input_clamps_without_wrapping",
+      "move_dir": {
+        "x": -2147483648,
+        "y": -2147483648
+      },
+      "aim": 0,
+      "buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "clamped_move_dir": {
+        "x": -707,
+        "y": -707
+      },
+      "clamped_aim": 0,
+      "clamped_buttons": {
+        "fire": false,
+        "jump": false,
+        "ability": false,
+        "reload": false
+      },
+      "raw_mag_sq": 9223372036854775808,
+      "cap_mag_sq": 1000000,
+      "was_clamped": true
+    },
+    {
+      "label": "overlong_keeps_aim_and_buttons",
+      "move_dir": {
+        "x": 5000,
+        "y": 0
+      },
+      "aim": 32768,
+      "buttons": {
+        "fire": true,
+        "jump": true,
+        "ability": false,
+        "reload": false
+      },
+      "clamped_move_dir": {
+        "x": 1000,
+        "y": 0
+      },
+      "clamped_aim": 32768,
+      "clamped_buttons": {
+        "fire": true,
+        "jump": true,
+        "ability": false,
+        "reload": false
+      },
+      "raw_mag_sq": 25000000,
+      "cap_mag_sq": 1000000,
+      "was_clamped": true
     }
   ],
   "matches": [
