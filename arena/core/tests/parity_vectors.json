@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v35",
+  "domain": "blackfield/arena/parity-vectors/v36",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2772,7 +2772,8 @@
           "struck": false,
           "damage": 0
         }
-      ]
+      ],
+      "shooter_score": 100
     },
     {
       "label": "point_blank_on_shooter_struck_facing_away",
@@ -2789,7 +2790,8 @@
           "struck": true,
           "damage": 50
         }
-      ]
+      ],
+      "shooter_score": 50
     },
     {
       "label": "behind_blocker_not_struck",
@@ -2826,7 +2828,8 @@
           "struck": false,
           "damage": 0
         }
-      ]
+      ],
+      "shooter_score": 50
     },
     {
       "label": "arc_seam_strikes_one_octant_off_misses_two",
@@ -2851,7 +2854,8 @@
           "struck": false,
           "damage": 0
         }
-      ]
+      ],
+      "shooter_score": 50
     }
   ],
   "perception_memory": [

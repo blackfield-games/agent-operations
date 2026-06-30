@@ -3834,6 +3834,13 @@ pub struct MeleeCleaveCase {
     /// between the shooter and one target.
     pub blockers: Vec<Blocker>,
     pub targets: Vec<MeleeTarget>,
+    /// The shooter's score AFTER the swing. `resolve_melee` credits each non-friendly cleaved
+    /// hit SEPARATELY (`if !friendly { score += dealt }`, once per struck target), so a swing
+    /// that cleaves several enemies credits the SUM of their dealt damage — not just the nearest
+    /// and not a flat per-swing bonus. Every cleave target sits on its own team, so the sum spans
+    /// every struck target; the `score_credit` category (v24/v35) pins the SINGLE-hit credit on a
+    /// 2-pawn match, so this is the one place the credit is pinned SUMMED across a multi-hit swing.
+    pub shooter_score: i32,
 }
 
 /// One tick of seat 0's view of the target (seat 1) in a [`PerceptionMemoryCase`], read
@@ -4769,8 +4776,16 @@ pub struct ParityVectors {
 /// (15), so the credit is the full effective 25, NOT just the 15 health portion. `ScoreCreditCase` gains a
 /// `target_shield` field (0 on every existing entry) so a twin reproduces the shielded setup; the field defaults
 /// 0 and the case records the credit/effective pools, not a new committed digest, so this is pure coverage — no
-/// committed match hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v35";
+/// committed match hash moves. Bumped to v36 EXTENDING the `melee_cleave` category with the SUMMED multi-cleave
+/// credit: `resolve_melee` credits each non-friendly cleaved hit separately, so a swing that cleaves two enemies
+/// credits the SUM of both — but the category recorded only the struck set + per-target damage, never the
+/// shooter's score, and `score_credit` (v24/v35) only ever hits ONE target, so the summed credit was unpinned
+/// cross-impl (a twin that credited only the nearest cleaved enemy stayed green). `MeleeCleaveCase` gains a
+/// `shooter_score` field recording the post-swing score; the existing `cleave_strikes_all_in_arc_and_range` case
+/// already cleaves two enemies (50 each) so its score is 100, the single-strike cases 50. The field is pure
+/// coverage (it records the credit pool, not a new committed digest) — no committed match hash moves. Each is a
+/// deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v36";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5644,7 +5659,17 @@ fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u
             MeleeTarget { offset, struck: damage > 0, damage }
         })
         .collect();
-    MeleeCleaveCase { label: label.to_string(), facing, melee_range, melee_damage, blockers, targets }
+    // The swing credited each struck enemy in turn (resolve_melee's per-hit `score += dealt`),
+    // so this is the SUM across the cleave — recorded so a twin that credits only the nearest is caught.
+    MeleeCleaveCase {
+        label: label.to_string(),
+        facing,
+        melee_range,
+        melee_damage,
+        blockers,
+        targets,
+        shooter_score: m.pawns[0].score,
+    }
 }
 
 /// Build a perception-memory case: seat 0 (at the origin, facing EAST, full-circle FOV)
