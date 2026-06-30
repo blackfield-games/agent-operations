@@ -4694,9 +4694,18 @@ pub struct ParityVectors {
 /// only proof; the new `PickupCase.recollect` field records the second `(before, after)`. A one-shot
 /// twin (collected once, never re-grants) leaves the second grant empty. The new field is `None` on
 /// every existing entry and the case reuses existing `Rules` fields (no `canonical_encoding` field
-/// moved), so this is pure coverage — no committed match hash moves. Each is a deliberate convention
-/// change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v31";
+/// moved), so this is pure coverage — no committed match hash moves.
+/// Bumped to v32 EXTENDING the `melee_cleave` category with the arc-WIDTH seam: [`Match::resolve_melee`]
+/// gates each hit through [`in_fov`] at the fixed [`MELEE_ARC_SPREAD`] (`1` — the facing octant ±1, a
+/// ~135° cone), but every existing melee case places enemies at octant distance `0` (dead ahead) or `4`
+/// (directly behind), so the spread BOUNDARY (distance `<= 1` in, `2` out) is unpinned — a twin hardcoding
+/// `spread 0` (facing octant only) or `spread 2` strikes/misses every existing case identically. One case
+/// at `EAST` with an NE enemy at 45° (octant 1, distance 1 → struck) and an N enemy at 90° (octant 2,
+/// distance 2 → missed), both inside the 2 m reach with a clear sightline, pins `MELEE_ARC_SPREAD == 1`
+/// exactly: a `spread 0` twin drops the NE strike, a `spread 2` twin adds the N strike. The case reuses
+/// the existing builder + `Rules` fields (no `canonical_encoding` field moved), so this is pure coverage —
+/// no committed match hash moves. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v32";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6560,6 +6569,24 @@ pub fn parity_vectors() -> ParityVectors {
                     vec![
                         Vec2 { x: 500, y: 0 },  // in front of the wall -> struck
                         Vec2 { x: 1500, y: 0 }, // behind the wall -> not struck
+                    ],
+                ),
+                // Arc WIDTH (MELEE_ARC_SPREAD == 1): an NE enemy at exactly 45 deg (bearing octant 1,
+                // ONE octant off the EAST facing -> distance 1, INSIDE the +/-1 arc) is struck while
+                // an N enemy at 90 deg (octant 2 -> distance 2, just OUTSIDE) is missed -- both ~1 to
+                // 1.4 m, well within the 2 m reach with clear sight, so ONLY the arc excludes the N
+                // one. Every other case sits at distance 0 (dead ahead) or 4 (behind), so a twin with
+                // the wrong constant -- spread 0 (facing octant only, drops the NE) or spread 2
+                // (strikes the N) -- stays green on them yet diverges here: this nails spread == 1.
+                melee_cleave_case(
+                    "arc_seam_strikes_one_octant_off_misses_two",
+                    EAST,
+                    range,
+                    50,
+                    Vec::new(),
+                    vec![
+                        Vec2 { x: POSITION_SCALE, y: POSITION_SCALE }, // 45 deg NE: octant 1, distance 1 -> struck
+                        Vec2 { x: 0, y: POSITION_SCALE },              // 90 deg N:  octant 2, distance 2 -> missed
                     ],
                 ),
             ]

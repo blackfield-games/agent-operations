@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v31",
+  "domain": "blackfield/arena/parity-vectors/v32",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2822,6 +2822,31 @@
           "offset": {
             "x": 1500,
             "y": 0
+          },
+          "struck": false,
+          "damage": 0
+        }
+      ]
+    },
+    {
+      "label": "arc_seam_strikes_one_octant_off_misses_two",
+      "facing": 0,
+      "melee_range": 2000,
+      "melee_damage": 50,
+      "blockers": [],
+      "targets": [
+        {
+          "offset": {
+            "x": 1000,
+            "y": 1000
+          },
+          "struck": true,
+          "damage": 50
+        },
+        {
+          "offset": {
+            "x": 0,
+            "y": 1000
           },
           "struck": false,
           "damage": 0
