@@ -1210,6 +1210,63 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // before phase, or tick before seat, would report the wrong reason for the same action.
     assert_eq!(reason("precedence_not_live_precedes_wrong_seat"), Some("NotLive"), "not-live is reported before wrong-seat");
     assert_eq!(reason("precedence_wrong_seat_precedes_stale_tick"), Some("WrongSeat"), "wrong-seat is reported before stale-tick");
+
+    // Observation shape (v27): Match::observe is the parity-bounded slice an agent acts on — its OWN
+    // full state (the one place private HUD state appears) plus only the entities it perceives, each
+    // carrying ONLY position/facing-class fields. This pins the two behavioral conventions the proto
+    // wire-shape test can't: the cooldown/dash NEXT-ACTION off-by-one and the anti-omniscience
+    // per-entity bound. A twin exposing the raw cooldown, dropping an own field, or leaking an enemy's
+    // private state diverges.
+    let obs = |label: &str| v.observe.iter().find(|c| c.label == label).unwrap();
+    // THE off-by-one, recomputed INDEPENDENT of observe: the exposed cooldown/dash is ALWAYS the raw
+    // pawn value's saturating_sub(1), so the agent's ready predicate is the clean `== 0`. Every case
+    // carries a bounded-latency deadline and a canonically ordered visible set.
+    for c in &v.observe {
+        assert_eq!(c.cooldown, c.raw_cooldown.saturating_sub(1), "{}: the exposed cooldown is the raw pawn cooldown's next-action saturating_sub(1)", c.label);
+        assert_eq!(c.dash_cooldown, c.raw_dash_cooldown.saturating_sub(1), "{}: the exposed dash cooldown carries the same next-action adjustment", c.label);
+        assert!(c.deadline_micros > 0, "{}: the observation carries the bounded-latency deadline", c.label);
+        assert!(c.visible.windows(2).all(|w| w[0].entity_id <= w[1].entity_id), "{}: the visible set is in ascending entity_id order (canonical, replay-stable)", c.label);
+    }
+    // Full own-state exposure: every own scalar is surfaced at its live value — a twin that dropped a
+    // field or reported max-health as current diverges. No enemy -> empty visible.
+    let own = obs("own_state_full_exposure");
+    assert!(own.visible.is_empty(), "the lone observer perceives no entity");
+    assert_eq!((own.health, own.max_health, own.shield, own.ammo, own.score), (70, 100, 40, 20, 15), "every own combat scalar is surfaced at its live value");
+    assert!(own.health < own.max_health, "a damaged observer's LIVE health is exposed, not its max");
+    assert_eq!((own.velocity, own.z, own.z_vel), (Vec2 { x: 300, y: -200 }, 500, 250), "the own kinematics (velocity, elevation, vertical velocity) are surfaced");
+    // The cooldown/dash off-by-one via a GENUINE fire + dash: one real step armed cooldown to
+    // fire_cooldown (6) and dash_cooldown to the rule (8); observe exposes the next-action 5 and 7. A
+    // twin exposing the raw value mis-times every shot/dash. raw N > 0 makes the decrement load-bearing.
+    let cd = obs("cooldown_exposed_as_next_action");
+    assert_eq!((cd.raw_cooldown, cd.cooldown), (6, 5), "the genuine fire armed the default fire_cooldown 6, exposed as the next-action 5");
+    assert_eq!((cd.raw_dash_cooldown, cd.dash_cooldown), (8, 7), "the genuine dash armed the rule's dash_cooldown 8, exposed as the next-action 7");
+    assert!(cd.raw_cooldown > 0 && cd.raw_dash_cooldown > 0, "both raw cooldowns are armed (>0), so the saturating_sub(1) is load-bearing, not a trivial 0->0");
+    assert_eq!(cd.ammo, 29, "the real fire drew one round from the full mag (30 -> 29)");
+    // The anti-omniscience per-entity bound: a visible enemy carries ONLY position/facing (+id/kind/
+    // team/z/in_los); the OWN state carries the private HUD the enemy entry never does. A single
+    // own-state case passes a twin that leaks enemy health; this one doesn't.
+    let ve = obs("visible_enemy_position_only");
+    assert!(ve.health > 0 && ve.ammo > 0 && ve.shield > 0, "the OWN state carries the private HUD (health, ammo, shield) — the side of the bound that IS exposed");
+    assert_eq!(ve.visible.len(), 1, "exactly the one perceivable enemy is visible");
+    let enemy = ve.visible.iter().find(|e| e.entity_id == 1).expect("the enemy is perceived");
+    assert_eq!((enemy.kind, enemy.team), (arena_proto::EntityKind::Player, 1), "the enemy entry exposes its kind + team");
+    assert_eq!((enemy.position, enemy.facing, enemy.in_line_of_sight), (Vec2 { x: 2000, y: 0 }, WEST, true), "the enemy entry exposes its perceivable position + facing, flagged in line of sight");
+    // The bound made explicit at the vector level: the recorded enemy entry serializes with NO
+    // private-state key, the same contract arena_proto::visible_entity_exposes_no_hidden_state pins on
+    // the source type — so a twin reading this golden has no enemy health/ammo/cooldown to fill.
+    let enemy_json = serde_json::to_value(enemy).unwrap();
+    for forbidden in ["health", "ammo", "cooldown", "dash_cooldown", "shield", "score", "velocity", "z_vel", "max_health"] {
+        assert!(enemy_json.get(forbidden).is_none(), "the visible enemy entry must not leak private field `{forbidden}`");
+    }
+    // Own-vs-visible divergence on z_vel: the airborne observer exposes its OWN live z_vel (its jump/
+    // landing commitment), but the visible airborne enemy carries position + z (perceivable) yet NO
+    // z_vel. z is perceivable (a player sees how high another is); z_vel is the own-only x-ray.
+    let air = obs("observer_midair_exposes_own_z_vel");
+    assert_eq!((air.z, air.z_vel), (1200, 1100), "the airborne observer's OWN live elevation + vertical velocity are exposed");
+    let foe = air.visible.iter().find(|e| e.entity_id == 1).expect("the airborne enemy is perceived");
+    assert_eq!((foe.position, foe.z), (Vec2 { x: 2000, y: 0 }, 600), "the enemy's perceivable position + elevation ARE exposed");
+    let foe_json = serde_json::to_value(foe).unwrap();
+    assert!(foe_json.get("z_vel").is_none() && foe_json.get("velocity").is_none(), "the enemy entry never carries its velocity or z_vel — the kinematic x-ray the bound excludes");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
