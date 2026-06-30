@@ -4662,8 +4662,18 @@ pub struct ParityVectors {
 /// `full_absorb` (raw < shield) and `partial_absorb` (raw > shield) cases straddle but never land on —
 /// a `<=` / `<` off-by-one twin (spilling 1 to health, or leaving 1 shield) diverges only at the seam.
 /// The case reuses existing `Rules` fields (no `canonical_encoding` field moved), so this is pure
-/// coverage — no committed match hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v29";
+/// coverage — no committed match hash moves.
+/// Bumped to v30 EXTENDING the `jumps` category with the between-tick overshoot landing-snap at a
+/// non-dividing gravity: every existing jump case uses gravity 480, which divides the arc so the
+/// descent lands at EXACTLY `nz == 0` — the `nz <= 0` clamp's overshoot path (the raw integration
+/// `z + z_vel` going strictly NEGATIVE between ticks, snapped to `z == 0` with `z_vel` cleared) is
+/// exercised only by a single-impl unit test, never pinned cross-impl. One case at gravity 500
+/// (which does not divide the arc) lands on a raw `nz == -300`, so a twin that records the negative
+/// `nz` instead of snapping the position to `0` diverges only here (the `<=`/`<` boundary itself is
+/// already pinned by the `fall_damage` landings). The case reuses existing `Rules` fields (no
+/// `canonical_encoding` field moved), so this is pure coverage — no committed match hash moves. Each
+/// is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v30";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6355,6 +6365,13 @@ pub fn parity_vectors() -> ParityVectors {
                 // only a grounded pawn jumps. Started at the post-launch state
                 // (JUMP_VELOCITY, JUMP_VELOCITY - g), so its trajectory is the grounded arc's tail.
                 jump_case("air_jump_does_not_relaunch", g, JUMP_VELOCITY, JUMP_VELOCITY - g, true, 12),
+                // Overshoot landing-snap: gravity 500 does NOT divide the arc, so the descent crosses
+                // the ground BETWEEN ticks — the raw integration nz = z + z_vel goes STRICTLY NEGATIVE
+                // (1000 + (-1300) = -300) and step()'s nz<=0 clamp snaps the POSITION to EXACTLY 0. The
+                // g=480 cases above land at nz==0, so z==nz==0 there and the snap is invisible; here it
+                // is load-bearing — a twin that records the negative nz instead of clamping to 0 diverges
+                // only on this case. Apex 2100, lands on the 6th tick (index 5).
+                jump_case("overshoot_landing_snaps_to_zero", 500, 0, 0, false, 12),
             ]
         },
         shield_absorption: vec![

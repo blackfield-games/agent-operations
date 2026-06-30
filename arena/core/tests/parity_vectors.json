@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v29",
+  "domain": "blackfield/arena/parity-vectors/v30",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2268,6 +2268,41 @@
       ],
       "apex_z": 2160,
       "landing_tick": 4
+    },
+    {
+      "label": "overshoot_landing_snaps_to_zero",
+      "gravity": 500,
+      "start_z": 0,
+      "start_z_vel": 0,
+      "hold_jump": false,
+      "trajectory": [
+        [
+          1200,
+          700
+        ],
+        [
+          1900,
+          200
+        ],
+        [
+          2100,
+          -300
+        ],
+        [
+          1800,
+          -800
+        ],
+        [
+          1000,
+          -1300
+        ],
+        [
+          0,
+          0
+        ]
+      ],
+      "apex_z": 2100,
+      "landing_tick": 5
     }
   ],
   "shield_absorption": [
