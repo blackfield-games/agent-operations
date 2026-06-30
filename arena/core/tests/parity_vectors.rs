@@ -9,7 +9,7 @@
 
 use arena_core::{
     expected_score_bp, parity_vectors, rating_delta, AimMode, MatchOutcome, ParityVectors,
-    PerceptionVerdict, PickupCase, ScoreCreditCase, ShieldAbsorbCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY,
+    PerceptionMemoryCase, PerceptionVerdict, PickupCase, Rules, ScoreCreditCase, ShieldAbsorbCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY,
     RATING_DIFF_CAP, RATING_SCALE,
 };
 use arena_proto::{PickupKind, Vec2};
@@ -1150,6 +1150,33 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(refr.timeline[3].remembered_pos, Some(second_seen), "t3: lost again -> the echo REFRESHED to the new sighting, not the stale first one");
     assert_ne!(second_seen, first_seen, "the two sightings are at distinct positions, so the refresh is observable");
     assert_eq!(refr.timeline[4].remembered_pos, None, "t4: the refreshed echo decays after the RESET countdown");
+    // Occlusion loss (v34): the target is lost behind a WALL while STILL in range — the loss CAUSE is
+    // occlusion, not distance — yet the echo freezes at the last-seen position and decays on the SAME
+    // countdown as the range-loss case. A twin that dropped an occluded ghost early, never made it, or
+    // used a different decay window for occlusion than for range diverges only here.
+    let occl = pm("occluded_behind_wall_freezes_then_decays");
+    assert!(!occl.blockers.is_empty(), "the occlusion case places a vision blocker between observer and target");
+    let occ_seen = occl.timeline[0].live_pos;
+    let occ_lost = occl.timeline[1].live_pos;
+    // Loss cause is occlusion, NOT range: the lost target stays WITHIN perception range, while the
+    // range-loss case's lost target is BEYOND it — so here the only reason sight breaks is the wall.
+    // Distance is computed inline because the file's `within` helper is shadowed by a local binding
+    // earlier in this function.
+    let range = Rules::default().perception_range as i64;
+    let dist2 = |p: Vec2| (p.x as i64).pow(2) + (p.y as i64).pow(2);
+    assert!(dist2(occ_lost) < range * range, "the occluded target stays in range — it is lost by the wall, not by distance");
+    assert!(dist2(decay.timeline[1].live_pos) > range * range, "the range-loss target, by contrast, is lost by leaving range");
+    // Freeze: the tick after it is occluded, observe surfaces the FROZEN last-seen position — never the
+    // live, still-in-range position it moved to behind the wall — flagged out of sight.
+    assert!(occl.timeline[0].in_sight, "t0: the target is in sight (clear sightline, in range)");
+    assert_eq!(occl.timeline[1].remembered_pos, Some(occ_seen), "t1: occluded -> the echo holds the FROZEN last-seen position");
+    assert_ne!(occ_lost, occ_seen, "...and the target actually moved behind the wall, so the echo is stale, not the live pos");
+    assert_eq!(occl.timeline[2].remembered_pos, Some(occ_seen), "t2: still within the window -> still the frozen echo");
+    assert!(occl.timeline[3..].iter().all(|t| t.remembered_pos.is_none()), "t3 on: past the window -> decayed and stays gone");
+    // Decay parity: the occlusion-loss ghost decays at the EXACT SAME tick offset as the range-loss
+    // ghost — the loss cause does not change the memory lifetime (same window, same countdown).
+    let first_gone = |c: &PerceptionMemoryCase| c.timeline.iter().position(|t| !t.in_sight && t.remembered_pos.is_none());
+    assert_eq!(first_gone(occl), first_gone(decay), "occlusion-loss and range-loss decay the ghost at the identical tick offset");
 
     // Match-outcome placement (v23): teams rank by survivors first, then total team score; a
     // team's seats share one placement, and (survivors, score)-tied teams share a placement with
