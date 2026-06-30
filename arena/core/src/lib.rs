@@ -3621,9 +3621,13 @@ pub struct DashCase {
 /// [`PickupKind::Ammo`] refills capped at [`Rules::mag_size`], a [`PickupKind::Shield`]
 /// grants shield capped at [`Rules::max_shield`] — when the pawn centre is within
 /// [`Rules::pickup_radius`], after which the pickup goes dormant for
-/// [`Rules::pickup_respawn_cooldown`] ticks then reactivates. This pins the EFFECT, the
-/// CAP, the radius GATE, and the respawn timing — none of which the match-level
-/// `pickup_collected` digest case (which only binds the layout into the hash) exercises.
+/// [`Rules::pickup_respawn_cooldown`] ticks then reactivates. A pawn STILL on the pad when the
+/// pickup reactivates re-collects it the same tick (`process_pickups` respawns THEN collects), so
+/// the effect is granted a SECOND time — recorded in [`recollect`](PickupCase::recollect) (v31).
+/// The respawn case moves the pawn off the pad and so never lands that re-collect; this one keeps it
+/// on. This pins the EFFECT, the CAP, the radius GATE, the respawn timing, and the re-collect reuse —
+/// none of which the match-level `pickup_collected` digest case (which only binds the layout into the
+/// hash) exercises.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickupCase {
     pub label: String,
