@@ -9,7 +9,7 @@
 
 use arena_core::{
     expected_score_bp, parity_vectors, rating_delta, AimMode, MatchOutcome, ParityVectors,
-    PerceptionVerdict, PickupCase, ShieldAbsorbCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY,
+    PerceptionVerdict, PickupCase, ScoreCreditCase, ShieldAbsorbCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY,
     RATING_DIFF_CAP, RATING_SCALE,
 };
 use arena_proto::{PickupKind, Vec2};
@@ -1073,6 +1073,56 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let team1_total: i32 = tm.seats.iter().filter(|s| s.team == 1).map(|s| s.score).sum();
     assert!(team0_total > team1_total, "team 0's SUMMED score (60) outranks the lone seat (50) — a per-seat-score twin (30<50) would invert the placement");
     assert_eq!(tm.seats.iter().filter(|s| s.team == 0).count(), 2, "team 0 has the two seats whose scores summed to decide it");
+
+    // Score credit (v24): a weapon hit credits the shooter the EFFECTIVE damage it dealt — the
+    // clamped apply_hp_damage return, so an overkill credits the hp removed (< raw) — but ONLY on
+    // an enemy. A friendly hit (same team, friendly_fire-gated) deals real damage yet credits zero;
+    // an ally under friendly-fire-off is never selected, so it takes no damage at all. A twin that
+    // credits the raw, rewards a team hit, or damages an ally under friendly-fire-off diverges.
+    let scr = |label: &str| v.score_credit.iter().find(|c| c.label == label).unwrap();
+    // THE discriminator: recompute the credit from team + damage, INDEPENDENT of the sim —
+    // credited == the damage dealt on an enemy, 0 on a teammate — and the effective damage never
+    // exceeds the raw (the clamp). A raw-crediting (caught by the overkill, damage != raw) or a
+    // friendly-rewarding twin fails one of these.
+    for c in &v.score_credit {
+        let credited = c.score_after - c.score_before;
+        let friendly = c.target_team == c.shooter_team;
+        assert_eq!(credited, if friendly { 0 } else { c.damage as i32 }, "{}: an enemy hit credits the effective damage, a team hit credits zero", c.label);
+        assert!(c.damage <= c.raw, "{}: the effective damage is clamped to the pools present, never exceeding the raw", c.label);
+    }
+    // Enemy survivor: a non-lethal hit credits the whole raw (damage == raw here) and the target
+    // lives — pairs with the overkill case (damage < raw) to fix the credit is `dealt`, not `raw`.
+    let surv = scr("enemy_hitscan_credits_effective");
+    assert!(surv.target_alive && surv.damage == surv.raw, "the survivor took the full raw and lived");
+    assert_eq!(surv.score_after - surv.score_before, surv.damage as i32, "...credited exactly the damage dealt");
+    // Overkill: a lethal hit credits the CLAMPED hp removed, strictly < the overcommitted raw, and
+    // downs the target. A twin that credits the raw over-scores the kill (100 vs the real 30).
+    let over = scr("enemy_lethal_overkill_credits_clamped");
+    assert!(!over.target_alive, "the overkill downs the target");
+    assert!(over.damage < over.raw, "the effective hp removed is strictly less than the overcommitted raw");
+    assert_eq!(over.score_after - over.score_before, over.damage as i32, "the credit is the clamped hp, not the raw");
+    // Friendly vs ally — same team + raw, only the flag differs: with friendly_fire ON the hit
+    // lands (real damage) yet credits ZERO; with it OFF the ally is never selected, so damage is 0
+    // (the zero credit there is no-hit, not a scored-then-zeroed hit).
+    let (fr, ally) = (scr("friendly_hitscan_under_ff_credits_zero"), scr("ally_hitscan_ff_off_no_damage_no_credit"));
+    assert_eq!(fr.target_team, fr.shooter_team, "the friendly target shares the shooter's team");
+    assert_eq!((ally.target_team, ally.raw), (fr.target_team, fr.raw), "the ally shares the friendly case's team + raw — only the flag differs");
+    assert!(fr.friendly_fire && !ally.friendly_fire, "the only difference is the friendly_fire flag");
+    assert!(fr.damage > 0 && fr.score_after == fr.score_before, "the friendly hit dealt real damage but credited zero");
+    assert!(ally.damage == 0 && ally.score_after == ally.score_before, "the ally under friendly-fire-off took no damage — never selected, not scored-then-zeroed");
+    // Shared credit across modes: the SAME enemy hit (raw 25, 100-hp survivor) credits IDENTICALLY
+    // through hitscan, melee, and the projectile sink — each carries its own `if !friendly` credit
+    // line, so a twin that scores one mode differently diverges here.
+    let (h, ml, pj) = (scr("enemy_hitscan_credits_effective"), scr("enemy_melee_credits_effective"), scr("enemy_projectile_credits_effective"));
+    assert_eq!(
+        (h.weapon_mode, ml.weapon_mode, pj.weapon_mode),
+        (WeaponMode::Hitscan, WeaponMode::Melee, WeaponMode::Projectile),
+        "the trio covers all three weapon modes",
+    );
+    let credit = |c: &ScoreCreditCase| (c.raw, c.damage, c.score_after - c.score_before, c.target_alive);
+    assert_eq!(credit(h), credit(ml), "hitscan and melee credit the same enemy hit identically — the shared convention");
+    assert_eq!(credit(ml), credit(pj), "melee and projectile credit the same enemy hit identically — the shared convention");
+    assert_eq!(credit(h), (25, 25, 25, true), "the shared enemy hit credits 25 (the damage dealt) and the target lives");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
