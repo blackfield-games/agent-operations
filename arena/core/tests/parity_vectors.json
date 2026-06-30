@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v32",
+  "domain": "blackfield/arena/parity-vectors/v33",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3024,7 +3024,8 @@
           "score": 100,
           "placement": 2
         }
-      ]
+      ],
+      "timeout": null
     },
     {
       "label": "score_breaks_survivor_tie",
@@ -3043,7 +3044,8 @@
           "score": 50,
           "placement": 1
         }
-      ]
+      ],
+      "timeout": null
     },
     {
       "label": "exact_tie_shares_placement",
@@ -3069,7 +3071,8 @@
           "score": 10,
           "placement": 3
         }
-      ]
+      ],
+      "timeout": null
     },
     {
       "label": "team_shares_placement_summed_score",
@@ -3095,6 +3098,30 @@
           "score": 50,
           "placement": 2
         }
+      ],
+      "timeout": null
+    },
+    {
+      "label": "timeout_at_max_ticks_ranks_survivors",
+      "seats": [
+        {
+          "seat": 0,
+          "team": 0,
+          "alive": true,
+          "score": 5,
+          "placement": 1
+        },
+        {
+          "seat": 1,
+          "team": 1,
+          "alive": true,
+          "score": 0,
+          "placement": 2
+        }
+      ],
+      "timeout": [
+        8,
+        8
       ]
     }
   ],

@@ -3904,6 +3904,12 @@ pub struct MatchOutcomeCase {
     pub label: String,
     /// Every seat's end-state + assigned placement, ascending by seat.
     pub seats: Vec<SeatPlacement>,
+    /// The `(final_tick, max_ticks)` of a REAL match stepped to the `max_ticks` cap with both
+    /// teams alive (the v33 timeout case): `final_tick == max_ticks` proves the match ended on the
+    /// `tick >= max_ticks` TIMEOUT branch of `maybe_finish`, not a team wipe — the only outcomes
+    /// case that exercises WHEN a match ends, not just the placement of a hand-set end-state.
+    /// `None` for every hand-set case (which calls `outcomes()` without running a match).
+    pub timeout: Option<(u64, u64)>,
 }
 
 /// A pinned score-credit case (domain v24): seat 0 lands ONE point-blank `weapon_mode` hit
@@ -4709,8 +4715,18 @@ pub struct ParityVectors {
 /// distance 2 → missed), both inside the 2 m reach with a clear sightline, pins `MELEE_ARC_SPREAD == 1`
 /// exactly: a `spread 0` twin drops the NE strike, a `spread 2` twin adds the N strike. The case reuses
 /// the existing builder + `Rules` fields (no `canonical_encoding` field moved), so this is pure coverage —
+/// no committed match hash moves.
+/// Bumped to v33 EXTENDING the `outcomes` category with the max_ticks TIMEOUT end-condition: every
+/// existing outcomes case calls `outcomes()` on a HAND-SET end-state, so the question of WHEN a match
+/// ends — the `tick >= max_ticks` branch of `maybe_finish`, fired with both teams still alive — was
+/// unpinned (the `matches` digests all end by team wipe). One case steps a REAL 2-seat free-for-all idle
+/// to `max_ticks` so both survive to the cap, recording the placement set (the surviving leader ranked
+/// first by score) AND, in the new `MatchOutcomeCase.timeout` field, the `(final_tick, max_ticks)` proving
+/// `final_tick == max_ticks` (the timeout, not a wipe). A twin that ended a tick early/late on the cap, or
+/// scored a timeout as a blanket draw, diverges. The new field is `None` on every hand-set entry and the
+/// case records outcome pools (placement/score), not a new committed digest, so this is pure coverage —
 /// no committed match hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v32";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v33";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5628,7 +5644,33 @@ fn match_outcome_case(label: &str, seats: Vec<(SeatId, TeamId, bool, i32)>) -> M
         .into_iter()
         .map(|o| SeatPlacement { seat: o.seat, team: o.team, alive: o.alive_at_end, score: o.score, placement: o.placement })
         .collect();
-    MatchOutcomeCase { label: label.to_string(), seats }
+    MatchOutcomeCase { label: label.to_string(), seats, timeout: None }
+}
+
+/// Build a max_ticks-TIMEOUT outcome case: step a REAL 2-seat free-for-all (each seat its own
+/// team) with idle intents to the `max_ticks` cap. Neither pawn acts, so both survive and the
+/// match ends on the `tick >= max_ticks` branch of [`Match::maybe_finish`] — a TIMEOUT, not a team
+/// wipe — and [`Match::outcomes`] ranks the two surviving seats by score. Seat 0's `leader_score`
+/// is seeded before the run (as [`match_outcome_case`] seeds its end-states) and, with no damage
+/// dealt, persists unchanged to the cap, so the survivor ranking is discriminating rather than a
+/// 0-0 tie. Records the placement set AND the `(final_tick, max_ticks)` proving the end was the cap.
+fn timeout_outcome_case(label: &str, max_ticks: u64, leader_score: i32) -> MatchOutcomeCase {
+    let config = MatchConfig { max_ticks, ..parity_config(2) };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), config, Rules::default(), roster, Vec::new(), 1);
+    // Seat 0 leads on score; both idle, so neither takes damage and the seeded score holds to the cap.
+    m.pawns[0].score = leader_score;
+    let idle: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    while m.phase() == MatchPhase::Live {
+        m.step(&idle);
+    }
+    let final_tick = m.result.as_ref().expect("a timed-out match has a result").final_tick;
+    let seats = m
+        .outcomes()
+        .into_iter()
+        .map(|o| SeatPlacement { seat: o.seat, team: o.team, alive: o.alive_at_end, score: o.score, placement: o.placement })
+        .collect();
+    MatchOutcomeCase { label: label.to_string(), seats, timeout: Some((final_tick, max_ticks)) }
 }
 
 /// Build a score-credit case: place the shooter (seat 0, team 0) at the origin facing EAST and
@@ -6629,6 +6671,13 @@ pub fn parity_vectors() -> ParityVectors {
             // survivor tie (each team has 1 survivor) — so the team total, not a single seat's
             // score, decides, and the dead teammate still shares the placement.
             match_outcome_case("team_shares_placement_summed_score", vec![(0, 0, true, 30), (1, 0, false, 30), (2, 1, true, 50)]),
+            // TIMEOUT at the cap (v33): a REAL 2-seat FFA stepped idle to max_ticks=8 — neither
+            // pawn acts, so both SURVIVE and the match ends on the tick>=max_ticks branch (NOT a
+            // wipe), with final_tick==8. outcomes() then ranks the two survivors by score: seat 0
+            // (seeded score 5) is placement 1, seat 1 (score 0) placement 2. Every other outcomes
+            // case is a hand-set end-state that never runs a match, so a twin that ended a tick
+            // early/late on the cap, or treated a timeout as a blanket draw, stays green on them.
+            timeout_outcome_case("timeout_at_max_ticks_ranks_survivors", 8, 5),
         ],
         score_credit: vec![
             // Enemy hit credits the EFFECTIVE damage: a 25 hit on a 100-hp enemy survivor scores
