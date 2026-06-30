@@ -743,6 +743,28 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // an uncollected one stays active.
     assert_eq!(heal.active_timeline, vec![false], "a collected single-step pickup is dormant after");
     assert_eq!(outside.active_timeline, vec![true], "an uncollected pickup stays active");
+    // Re-collect on the pad (v31): a pawn that STAYS on the pad re-collects the pickup the tick it
+    // respawns and is healed AGAIN. process_pickups respawns THEN collects in one tick, so the
+    // reactivation is consumed the same tick (the active flag never reads true) — the SECOND grant is
+    // the only proof. A one-shot-pickup twin (collected once, never re-grants) records no second heal.
+    let recollect = pu("recollect_on_pad_after_respawn_heals_again");
+    assert!(recollect.collected, "the first collection consumes the pickup");
+    let (rb, ra) = recollect.recollect.expect("the re-collect case records a second collection");
+    assert_eq!(recollect.after, recollect.before + recollect.amount, "the FIRST collection grants the full amount");
+    assert_eq!(ra, rb + recollect.amount, "the SECOND collection grants the full amount AGAIN after the respawn");
+    assert!(recollect.after > recollect.before && ra > rb, "both grants are non-zero — two distinct collections, not one");
+    assert!(ra <= recollect.cap, "the re-collected grant still clamps to the cap");
+    // The pawn never left, so the reactivation is consumed the SAME tick it fires: the active flag is
+    // dormant throughout — re-collection is proven by the second grant, NOT the flag. The off-pad
+    // respawn case is the complement: same window length, but it observes the reactivation (flag ends
+    // true) and records no second collection.
+    assert_eq!(
+        recollect.active_timeline.len(),
+        usize::from(recollect.respawn_cooldown) + 1,
+        "the on-pad timeline spans the collection tick plus the full cooldown window — as the off-pad case",
+    );
+    assert!(recollect.active_timeline.iter().all(|&a| !a), "on the pad the reactivation is re-collected the same tick it fires — the active flag never reads true");
+    assert_eq!(respawn.recollect, None, "the off-pad respawn case records a single collection — the recollect field discriminates the two");
 
     // Jump arc (v18): a grounded jump press launches z to JUMP_VELOCITY, then semi-implicit Euler
     // (z += z_vel BEFORE z_vel -= gravity) integrates the arc to a clean z==0 landing; with gravity
