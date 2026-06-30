@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v35");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v36");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -1110,6 +1110,23 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(!n.struck && d2(n.offset) <= arc_range2, "the two-octant-off N enemy is MISSED yet in range — only the arc excluded it; a spread-2 twin would strike it");
     // Both in range, no cover, so the struck/missed split is the arc WIDTH alone — nailing spread == 1.
     assert_ne!(ne.struck, n.struck, "the in/out split across the one-vs-two-octant boundary pins MELEE_ARC_SPREAD == 1 exactly");
+    // Summed credit (v36): resolve_melee credits each non-friendly cleaved hit SEPARATELY, so the
+    // shooter's score is the SUM across the struck enemies — every cleave target sits on its own
+    // team, so the sum spans them all. The two-enemy cleave scores 100 (both 50-damage hits), the
+    // single-strike cases 50; a twin that credited only the nearest cleaved enemy, the biggest, or a
+    // flat per-swing bonus records 50 on the cleave and reddens here. The score_credit (v24/v35)
+    // single-hit cases can't catch a mis-summed multi-cleave — this is the one place it is pinned.
+    let struck_sum = cleave.targets.iter().filter(|t| t.struck).map(|t| t.damage as i32).sum::<i32>();
+    let max_single = cleave.targets.iter().filter(|t| t.struck).map(|t| t.damage as i32).max().unwrap();
+    assert_eq!(cleave.shooter_score, struck_sum, "the cleave credits the SUM of every struck enemy's damage, not a single hit");
+    assert_eq!(cleave.shooter_score, 2 * cleave.melee_damage as i32, "...two 50-damage hits score 100");
+    assert!(cleave.shooter_score > max_single, "...strictly MORE than any single cleaved hit — the credit SUMS, it does not credit only the nearest/biggest");
+    // The single-strike cases credit exactly their one struck enemy — the credit scales with the
+    // struck count, not a flat per-swing constant, and a target that was NOT struck (occluded, out
+    // of arc) scores nothing.
+    assert_eq!(pb.shooter_score, pb.melee_damage as i32, "the point-blank single strike credits exactly one hit");
+    assert_eq!(los.shooter_score, los.melee_damage as i32, "the LOS case credits only the enemy in front of the wall — the occluded one scores nothing");
+    assert_eq!(arc.shooter_score, arc.melee_damage as i32, "the arc-seam case credits only the in-arc NE enemy — the out-of-arc N scores nothing");
 
     // Perception memory (v22): a lost target's LAST PERCEIVED position is surfaced (frozen,
     // out-of-sight-flagged) for the window then dropped; a re-sighting refreshes the echo and
