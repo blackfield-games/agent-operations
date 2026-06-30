@@ -3749,8 +3749,11 @@ pub struct ShieldAbsorbCase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FireCycleCase {
     pub label: String,
-    /// The weapon mode under test — `Hitscan` for the whole category, so the shot lands
-    /// the same tick it discharges (`fired` reads off the instant hit).
+    /// The weapon mode under test. The fire GATE (`ammo -= 1; cooldown = fire_cooldown`,
+    /// and the empty-mag refusal) is shared by `Hitscan` and `Projectile` — only the
+    /// resolution differs (instant hit vs a spawned travelling shot) — so the category
+    /// pins the discharge cadence for BOTH: the projectile cases run the same params as a
+    /// hitscan twin and must record a byte-identical timeline.
     pub weapon_mode: WeaponMode,
     pub fire_cooldown: u16,
     pub mag_size: u16,
@@ -3758,9 +3761,11 @@ pub struct FireCycleCase {
     /// every recorded tick.
     pub reload_tick: Option<u16>,
     /// `(fired, ammo, cooldown)` after each `step`, from tick `0` through the last —
-    /// `fired` is whether seat 0's shot connected this tick (the point-blank target's
-    /// health dropped). Pinning the whole timeline (not a single shot) fixes the gate
-    /// tick-for-tick, so an off-by-one twin records a different fired-cadence.
+    /// `fired` is whether seat 0 DISCHARGED a round this tick (drew one from the magazine).
+    /// For `Hitscan` the hit also lands this tick; for `Projectile` the shot launches now
+    /// and the hit lands later as it travels, so reading the discharge (not the hit) pins
+    /// the cadence independent of flight. Pinning the whole timeline (not a single shot)
+    /// fixes the gate tick-for-tick, so an off-by-one twin records a different fire cadence.
     pub timeline: Vec<(bool, u16, u16)>,
 }
 
@@ -5397,12 +5402,18 @@ fn fire_cycle_case(label: &str, mode: WeaponMode, fire_cooldown: u16, mag_size: 
     };
     let mut timeline = Vec::new();
     for t in 0..ticks {
-        let hp_before = m.pawns[1].health;
+        let ammo_before = m.pawns[0].ammo;
         let press = if reload_tick == Some(t) { reload } else { fire };
         let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
         intents.insert(0, press);
         m.step(&intents);
-        let fired = m.pawns[1].health < hp_before;
+        // `fired` is the DISCHARGE — a round drawn from the magazine — not the hit: a
+        // reload refills (ammo rises) and an empty/cooling press is inert (ammo holds), so
+        // only a discharge drops `ammo`. For Hitscan the hit also lands this tick (so this is
+        // byte-identical to the old point-blank health-drop probe); for Projectile the shot
+        // launches now and the hit lands later as it travels, so the cadence is pinned
+        // independent of flight — the mode-shared discharge gate is what this category fixes.
+        let fired = m.pawns[0].ammo < ammo_before;
         timeline.push((fired, m.pawns[0].ammo, m.pawns[0].cooldown));
     }
     FireCycleCase { label: label.to_string(), weapon_mode: mode, fire_cooldown, mag_size, reload_tick, timeline }
