@@ -989,6 +989,46 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(d2(back.offset) <= (los.melee_range as i64).pow(2) && back.offset.y == 0, "the shielded enemy is in range AND dead-ahead — only the wall stopped the cleave");
     let wall = &los.blockers[0];
     assert!(front.offset.x < wall.min.x && back.offset.x > wall.max.x, "the wall sits past the struck enemy but between the shooter and the shielded one");
+
+    // Perception memory (v22): a lost target's LAST PERCEIVED position is surfaced (frozen,
+    // out-of-sight-flagged) for the window then dropped; a re-sighting refreshes the echo and
+    // resets the countdown; the default-off window remembers nothing. A twin that leaks an
+    // occluded entity's live position, mis-counts the decay, or never refreshes diverges.
+    let pm = |label: &str| v.perception_memory.iter().find(|c| c.label == label).unwrap();
+    // Invariant for every case: a remembered echo is NEVER the live position the unseen target
+    // moved to, and a tick is never both live-visible AND a stale echo (live and echo exclusive).
+    for c in &v.perception_memory {
+        for t in &c.timeline {
+            assert!(!(t.in_sight && t.remembered_pos.is_some()), "{}: a tick is never both live-visible AND a stale echo", c.label);
+            if let Some(p) = t.remembered_pos {
+                assert_ne!(p, t.live_pos, "{}: the echo is the FROZEN last-seen pos, never the live (unseen) one", c.label);
+            }
+        }
+    }
+    // Off (window 0): no echo EVER — byte-identical to exclusion-only perception.
+    let off = pm("memory_off_vanishes_at_once");
+    assert_eq!(off.perception_memory_ticks, 0);
+    assert!(off.timeline.iter().all(|t| t.remembered_pos.is_none()), "memory off remembers nothing");
+    assert!(off.timeline[0].in_sight && !off.timeline[1].in_sight, "the target was seen (t0) then lost (t1) — yet no echo surfaced");
+    // Freeze + decay (window 3): the echo freezes at the last-seen pos for a bounded run, then
+    // decays to None and stays gone — the exact decay tick pinned.
+    let decay = pm("last_known_freezes_then_decays");
+    let last_seen_pos = decay.timeline[0].live_pos; // the position at the last in-sight tick
+    assert!(decay.timeline[0].in_sight, "t0: the target is in sight");
+    assert_eq!(decay.timeline[1].remembered_pos, Some(last_seen_pos), "t1: lost -> the echo holds the frozen last-seen position");
+    assert_eq!(decay.timeline[2].remembered_pos, Some(last_seen_pos), "t2: still within the window -> still the frozen echo");
+    assert_ne!(decay.timeline[1].live_pos, last_seen_pos, "...and the target has actually MOVED away (the echo is stale, not live)");
+    assert_eq!(decay.timeline[3].remembered_pos, None, "t3: past the window -> the echo has decayed");
+    assert!(decay.timeline[3..].iter().all(|t| t.remembered_pos.is_none()), "once decayed it stays gone (bounded memory, not a permanent x-ray)");
+    // Refresh + reset (window 2): a re-sighting refreshes the echo position AND restarts the decay.
+    let refr = pm("resight_refreshes_and_resets");
+    let first_seen = refr.timeline[0].live_pos;
+    let second_seen = refr.timeline[2].live_pos;
+    assert_eq!(refr.timeline[1].remembered_pos, Some(first_seen), "t1: the first lost echo holds the first sighting");
+    assert!(refr.timeline[2].in_sight, "t2: the target is RE-SIGHTED (live again)");
+    assert_eq!(refr.timeline[3].remembered_pos, Some(second_seen), "t3: lost again -> the echo REFRESHED to the new sighting, not the stale first one");
+    assert_ne!(second_seen, first_seen, "the two sightings are at distinct positions, so the refresh is observable");
+    assert_eq!(refr.timeline[4].remembered_pos, None, "t4: the refreshed echo decays after the RESET countdown");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
