@@ -1029,6 +1029,50 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(refr.timeline[3].remembered_pos, Some(second_seen), "t3: lost again -> the echo REFRESHED to the new sighting, not the stale first one");
     assert_ne!(second_seen, first_seen, "the two sightings are at distinct positions, so the refresh is observable");
     assert_eq!(refr.timeline[4].remembered_pos, None, "t4: the refreshed echo decays after the RESET countdown");
+
+    // Match-outcome placement (v23): teams rank by survivors first, then total team score; a
+    // team's seats share one placement, and (survivors, score)-tied teams share a placement with
+    // the next distinct team skipping the gap (competition ranking) — the lowest seat is only a
+    // sort tiebreak. A twin that ranks score before survivors, splits a tie, or sums a team wrong
+    // diverges.
+    let oc = |label: &str| v.outcomes.iter().find(|c| c.label == label).unwrap();
+    // Invariant for every case: seats are ascending by seat, and seats on the SAME team always
+    // share a placement (teammates never contend as rivals).
+    for c in &v.outcomes {
+        assert!(c.seats.windows(2).all(|w| w[0].seat < w[1].seat), "{}: seats are ascending by seat", c.label);
+        for a in &c.seats {
+            for b in &c.seats {
+                if a.team == b.team {
+                    assert_eq!(a.placement, b.placement, "{}: teammates share a placement", c.label);
+                }
+            }
+        }
+    }
+    // Survivors dominate score: the ALIVE low-scorer (seat 0, score 0) outranks the DEAD
+    // high-scorer (seat 1, score 100) — a score-first twin inverts this.
+    let dom = oc("survivors_dominate_score");
+    assert!(dom.seats[0].alive && dom.seats[0].score == 0 && dom.seats[0].placement == 1, "the live nobody places first");
+    assert!(!dom.seats[1].alive && dom.seats[1].score == 100 && dom.seats[1].placement == 2, "the dead hero places second despite the higher score");
+    // Score breaks a survivor tie: both alive, so the higher score takes first.
+    let st = oc("score_breaks_survivor_tie");
+    assert!(st.seats.iter().all(|s| s.alive), "both seats survive (a survivor tie)");
+    assert_eq!(st.seats[1].placement, 1, "the higher-scoring survivor (seat 1) places first");
+    assert_eq!(st.seats[0].placement, 2, "the lower-scoring survivor (seat 0) places second");
+    // Exact tie SHARES a placement; the next distinct team skips the gap (competition ranking).
+    let sh = oc("exact_tie_shares_placement");
+    assert_eq!(sh.seats[0].score, sh.seats[1].score, "seats 0 and 1 are tied on (alive, score)");
+    assert_eq!((sh.seats[0].placement, sh.seats[1].placement), (1, 1), "...so they SHARE placement 1");
+    assert_eq!(sh.seats[2].placement, 3, "the next seat is placement 3 — the tie skipped the gap (there is no placement 2)");
+    // Team grouping + SUMMED score is decisive: team 0's two seats (one alive, one dead) sum to 60
+    // and share placement 1, beating the lone team-1 seat (50) on a survivor tie.
+    let tm = oc("team_shares_placement_summed_score");
+    assert_eq!((tm.seats[0].placement, tm.seats[1].placement), (1, 1), "team 0's two seats share placement 1");
+    assert!(!tm.seats[1].alive, "...including the DEAD teammate (seat 1) — teammates share regardless of survival");
+    assert_eq!(tm.seats[2].placement, 2, "the lone team-1 seat (seat 2) places second");
+    let team0_total: i32 = tm.seats.iter().filter(|s| s.team == 0).map(|s| s.score).sum();
+    let team1_total: i32 = tm.seats.iter().filter(|s| s.team == 1).map(|s| s.score).sum();
+    assert!(team0_total > team1_total, "team 0's SUMMED score (60) outranks the lone seat (50) — a per-seat-score twin (30<50) would invert the placement");
+    assert_eq!(tm.seats.iter().filter(|s| s.team == 0).count(), 2, "team 0 has the two seats whose scores summed to decide it");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
