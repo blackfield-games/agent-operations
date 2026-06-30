@@ -1194,6 +1194,18 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let team1_total: i32 = tm.seats.iter().filter(|s| s.team == 1).map(|s| s.score).sum();
     assert!(team0_total > team1_total, "team 0's SUMMED score (60) outranks the lone seat (50) — a per-seat-score twin (30<50) would invert the placement");
     assert_eq!(tm.seats.iter().filter(|s| s.team == 0).count(), 2, "team 0 has the two seats whose scores summed to decide it");
+    // TIMEOUT at the cap (v33): the ONLY outcomes case that runs a REAL match — every other is a
+    // hand-set end-state, so none pins WHEN a match ends. A 2-seat FFA stepped idle to max_ticks=8
+    // ends on maybe_finish's tick>=max_ticks branch (both alive, NOT a wipe) with
+    // final_tick==max_ticks, and outcomes() ranks the survivors by score. A twin that ended a tick
+    // early/late on the cap, or drew a timeout, diverges; mutating the `>=` to `>` shifts final_tick to 9.
+    let to = oc("timeout_at_max_ticks_ranks_survivors");
+    let (final_tick, max_ticks) = to.timeout.expect("the timeout case records (final_tick, max_ticks)");
+    assert_eq!(final_tick, max_ticks, "the match ended EXACTLY at the cap — the tick>=max_ticks timeout, not a tick early or late");
+    assert_eq!(v.outcomes.iter().filter(|c| c.timeout.is_some()).count(), 1, "exactly one outcomes case is a real timed-out match; the others are hand-set end-states (timeout None)");
+    assert!(to.seats.iter().all(|s| s.alive), "BOTH seats survive to the cap — it was a TIMEOUT, not a team wipe (a wipe ends before max_ticks with a dead seat)");
+    assert_eq!((to.seats[0].score, to.seats[0].placement), (5, 1), "the higher-scoring survivor (seat 0) places first at the timeout");
+    assert_eq!((to.seats[1].score, to.seats[1].placement), (0, 2), "the lower-scoring survivor (seat 1) places second — survivors ranked by score, not drawn");
 
     // Score credit (v24): a weapon hit credits the shooter the EFFECTIVE damage it dealt — the
     // clamped apply_hp_damage return, so an overkill credits the hp removed (< raw) — but ONLY on
