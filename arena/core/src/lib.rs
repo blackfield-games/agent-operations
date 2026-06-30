@@ -16,7 +16,7 @@
 //! one of those would make a replay diverge and break grading.
 
 use arena_proto::{
-    check_version, Action, ActionError, ActionIntent, Bam, Blocker, MatchConfig, MatchPhase,
+    check_version, Action, ActionButtons, ActionError, ActionIntent, Bam, Blocker, MatchConfig, MatchPhase,
     MatchResult, Observation, PickupKind, PickupSpawn, ReplayRecord, SeatAction, SeatId,
     SeatOutcome, TeamId, TickRecord, Vec2, VersionMismatch, MOVE_INTENT_SCALE, POSITION_SCALE,
     PROTOCOL_VERSION,
@@ -3915,6 +3915,40 @@ pub struct ScoreCreditCase {
     pub damage: u16,
     /// Whether the target survived the hit (`health > 0`).
     pub target_alive: bool,
+}
+
+/// A pinned action-clamp case (domain v25): one [`ActionIntent::clamped`] call — the canonical
+/// anti-god-mode move-intent clamp every implementation (this Rust arena and the UE5 server) shares
+/// so a player's or agent's raw, untrusted `move_dir` request is normalized to a magnitude of at
+/// most [`MOVE_INTENT_SCALE`] before it can ever become velocity. Records the raw request, the full
+/// clamped intent, and the squared magnitudes so a twin's clamp is checked directly. Distinct from
+/// the `moves` category, which only ever drives ALREADY-IN-RANGE intents through a whole `step` and
+/// pins the resulting POSITION (the arena-bounds clamp); this isolates the magnitude normalization
+/// itself — the overlong request and the `{i32::MIN, i32::MIN}` overflow input a `moves` case never
+/// reaches, which a twin that summed the squares in `i64` (wrapping past `i64::MAX`) would wave
+/// through at god-mode speed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionClampCase {
+    pub label: String,
+    /// The raw, untrusted move request — a client/agent can send any `i32` vector.
+    pub move_dir: Vec2,
+    pub aim: Bam,
+    pub buttons: ActionButtons,
+    /// `move_dir` after [`ActionIntent::clamped`]: magnitude capped at [`MOVE_INTENT_SCALE`],
+    /// direction preserved (within integer truncation), equal to `move_dir` when already in range.
+    pub clamped_move_dir: Vec2,
+    /// `aim` after the clamp — the clamp passes it through verbatim, so this MUST equal `aim`
+    /// (a twin that mangles aim while normalizing the move diverges here).
+    pub clamped_aim: Bam,
+    /// `buttons` after the clamp — passed through verbatim, so this MUST equal `buttons`.
+    pub clamped_buttons: ActionButtons,
+    /// The raw request's squared magnitude (`x² + y²` widened to `u64` so the
+    /// `{i32::MIN, i32::MIN}` attacker input is recorded honestly, not as a wrapped value).
+    pub raw_mag_sq: u64,
+    /// The cap squared (`MOVE_INTENT_SCALE²`); the clamped result's squared magnitude never exceeds it.
+    pub cap_mag_sq: u64,
+    /// `true` when the clamp moved the vector (`clamped_move_dir != move_dir`) — an overlong request.
+    pub was_clamped: bool,
 }
 
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
