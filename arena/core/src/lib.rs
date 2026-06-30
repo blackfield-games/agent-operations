@@ -3651,6 +3651,12 @@ pub struct PickupCase {
     /// respawn case (`[false.., true]`, stepped `respawn_cooldown + 1` ticks with the pawn
     /// moved off the pad so the reactivation is not instantly re-collected).
     pub active_timeline: Vec<bool>,
+    /// The `(stat_before, stat_after)` of a SECOND collection after the pickup respawns, for the
+    /// re-collect case where the pawn STAYS on the pad: `process_pickups` respawns THEN collects in
+    /// one tick, so the reactivation is consumed the same tick (the `active_timeline` never reads
+    /// `true`) and the renewed effect — a second non-zero grant — is the only proof of re-collection.
+    /// `None` for every single-collection case (it never re-collects).
+    pub recollect: Option<(u16, u16)>,
 }
 
 /// A pinned vertical-jump-arc case (domain v18): a single pawn (seat 0) under a given
@@ -4675,9 +4681,18 @@ pub struct ParityVectors {
 /// (which does not divide the arc) lands on a raw `nz == -300`, so a twin that records the negative
 /// `nz` instead of snapping the position to `0` diverges only here (the `<=`/`<` boundary itself is
 /// already pinned by the `fall_damage` landings). The case reuses existing `Rules` fields (no
-/// `canonical_encoding` field moved), so this is pure coverage — no committed match hash moves. Each
-/// is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v30";
+/// `canonical_encoding` field moved), so this is pure coverage — no committed match hash moves.
+/// Bumped to v31 EXTENDING the `pickups` category with re-collect-after-respawn: the v17 respawn
+/// case moves the pawn OFF the pad to isolate the reactivation flip, so the REUSE invariant — a
+/// pawn STILL on the pad re-collects the respawned pickup and is granted the effect a SECOND time —
+/// was unpinned. `process_pickups` respawns THEN collects in one tick, so the reactivation is
+/// consumed the same tick (the `active_timeline` never reads `true`) and the renewed effect is the
+/// only proof; the new `PickupCase.recollect` field records the second `(before, after)`. A one-shot
+/// twin (collected once, never re-grants) leaves the second grant empty. The new field is `None` on
+/// every existing entry and the case reuses existing `Rules` fields (no `canonical_encoding` field
+/// moved), so this is pure coverage — no committed match hash moves. Each is a deliberate convention
+/// change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v31";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5080,6 +5095,71 @@ fn pickup_case(
         cap,
         collected,
         active_timeline,
+        recollect: None,
+    }
+}
+
+/// Build a re-collect-after-respawn case: seat 0 stands ON the pad, collects the pickup (the first
+/// grant in `before`/`after`), is re-wounded to `rewound_to` while STAYING on the pad, then rides
+/// the full `pickup_respawn_cooldown`. `process_pickups` respawns THEN collects in one tick, so the
+/// instant the cooldown elapses the on-pad pawn re-collects and re-heals — the SECOND grant,
+/// recorded in `recollect`. The `active_timeline` stays all `false` (the reactivation is consumed
+/// the same tick it fires), so the renewed effect, not the active flag, proves the re-collection.
+fn pickup_recollect_case(label: &str, kind: PickupKind, pos: Vec2, amount: u16, before: u16, rewound_to: u16, rules: Rules) -> PickupCase {
+    let bounds = Vec2 { x: 50_000, y: 50_000 };
+    let config = MatchConfig { tick_hz: 30, max_ticks: 3600, bounds, seats: 2 };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let spawn = PickupSpawn { kind, position: pos, amount };
+    let mut m = Match::new_with_pickups(parity_match_id(), config, rules, roster, Vec::new(), vec![spawn], 1);
+    m.pawns[0].pos = pos;
+    // Seat 1 idles at the far corner so the match stays Live and only seat 0 can collect.
+    m.pawns[1].pos = bounds;
+    let set_stat = |m: &mut Match, v: u16| match kind {
+        PickupKind::Health => m.pawns[0].health = v,
+        PickupKind::Ammo => m.pawns[0].ammo = v,
+        PickupKind::Shield => m.pawns[0].shield = v,
+    };
+    let stat = |m: &Match| match kind {
+        PickupKind::Health => m.pawns[0].health,
+        PickupKind::Ammo => m.pawns[0].ammo,
+        PickupKind::Shield => m.pawns[0].shield,
+    };
+    let cap = match kind {
+        PickupKind::Health => m.pawns[0].max_health,
+        PickupKind::Ammo => m.rules.mag_size,
+        PickupKind::Shield => m.rules.max_shield,
+    };
+    let radius = m.rules.pickup_radius;
+    let respawn_cooldown = m.rules.pickup_respawn_cooldown;
+    let intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    set_stat(&mut m, before);
+    m.step(&intents);
+    let after = stat(&m);
+    let collected = !m.pickups[0].active;
+    let mut active_timeline = vec![m.pickups[0].active];
+    // Re-wound ON the pad, then ride the whole cooldown — the pawn never leaves, so the reactivation
+    // is re-collected the same tick it fires (respawn-then-collect), granting the effect again.
+    set_stat(&mut m, rewound_to);
+    let recollect_before = stat(&m);
+    for _ in 0..respawn_cooldown {
+        m.step(&intents);
+        active_timeline.push(m.pickups[0].active);
+    }
+    let recollect_after = stat(&m);
+    PickupCase {
+        label: label.to_string(),
+        kind,
+        start: pos,
+        pickup_pos: pos,
+        amount,
+        radius,
+        respawn_cooldown,
+        before,
+        after,
+        cap,
+        collected,
+        active_timeline,
+        recollect: Some((recollect_before, recollect_after)),
     }
 }
 
@@ -6350,6 +6430,11 @@ pub fn parity_vectors() -> ParityVectors {
                 // Respawn: collect on tick 1, then (pawn off the pad) dormant through the 3-tick
                 // cooldown and collectable again -- stepped cooldown+1 ticks to observe reactivation.
                 pickup_case("collected_pickup_respawns_after_cooldown", PickupKind::Health, origin, origin, 40, 50, base, 4),
+                // Re-collect on the pad: collect (50->90), re-wound to 20 WITHOUT leaving, then ride
+                // the 3-tick cooldown -- the respawn-then-collect re-heals (20->60) the same tick the
+                // pickup reactivates, so the active flag never reads true yet the effect lands TWICE.
+                // A one-shot-pickup twin (collected once, never re-grants) leaves the second heal at 0.
+                pickup_recollect_case("recollect_on_pad_after_respawn_heals_again", PickupKind::Health, origin, 40, 50, 20, base),
             ]
         },
         jumps: {

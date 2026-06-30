@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v30",
+  "domain": "blackfield/arena/parity-vectors/v31",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2037,7 +2037,8 @@
       "collected": true,
       "active_timeline": [
         false
-      ]
+      ],
+      "recollect": null
     },
     {
       "label": "heal_at_cap_no_overheal",
@@ -2059,7 +2060,8 @@
       "collected": true,
       "active_timeline": [
         false
-      ]
+      ],
+      "recollect": null
     },
     {
       "label": "ammo_refills_and_clamps_to_mag_size",
@@ -2081,7 +2083,8 @@
       "collected": true,
       "active_timeline": [
         false
-      ]
+      ],
+      "recollect": null
     },
     {
       "label": "shield_clamps_to_max_shield",
@@ -2103,7 +2106,8 @@
       "collected": true,
       "active_timeline": [
         false
-      ]
+      ],
+      "recollect": null
     },
     {
       "label": "just_inside_radius_collects",
@@ -2125,7 +2129,8 @@
       "collected": true,
       "active_timeline": [
         false
-      ]
+      ],
+      "recollect": null
     },
     {
       "label": "just_outside_radius_no_collect",
@@ -2147,7 +2152,8 @@
       "collected": false,
       "active_timeline": [
         true
-      ]
+      ],
+      "recollect": null
     },
     {
       "label": "collected_pickup_respawns_after_cooldown",
@@ -2172,6 +2178,36 @@
         false,
         false,
         true
+      ],
+      "recollect": null
+    },
+    {
+      "label": "recollect_on_pad_after_respawn_heals_again",
+      "kind": "health",
+      "start": {
+        "x": 0,
+        "y": 0
+      },
+      "pickup_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "amount": 40,
+      "radius": 1000,
+      "respawn_cooldown": 3,
+      "before": 50,
+      "after": 90,
+      "cap": 100,
+      "collected": true,
+      "active_timeline": [
+        false,
+        false,
+        false,
+        false
+      ],
+      "recollect": [
+        20,
+        60
       ]
     }
   ],
