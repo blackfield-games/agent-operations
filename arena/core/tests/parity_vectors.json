@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v28",
+  "domain": "blackfield/arena/parity-vectors/v29",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2278,6 +2278,17 @@
       "shield_before": 100,
       "health_before": 100,
       "shield_after": 60,
+      "health_after": 100,
+      "effective": 40,
+      "alive": true
+    },
+    {
+      "label": "raw_equals_shield_exact_drain_no_spill",
+      "weapon_mode": "hitscan",
+      "raw": 40,
+      "shield_before": 40,
+      "health_before": 100,
+      "shield_after": 0,
       "health_after": 100,
       "effective": 40,
       "alive": true

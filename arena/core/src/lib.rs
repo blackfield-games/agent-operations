@@ -4651,8 +4651,15 @@ pub struct ParityVectors {
 /// projectiles a separate cooldown or a free shot diverges), and a `fire_cooldown == 0` case pins that a
 /// zero-cooldown weapon discharges every tick until the magazine alone stops it. No `canonical_encoding`
 /// field moved (the cases reuse existing `Rules` fields), so this is pure coverage — no committed match
-/// hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v28";
+/// hash moves.
+/// Bumped to v29 EXTENDING the `shield_absorption` category with the `raw == shield` exact-drain seam:
+/// a hit whose raw EXACTLY equals `shield_before` drains the shield to precisely 0 and spills NO health
+/// (`to_health = min(raw - absorbed, health) = min(0, health) = 0`), the unique boundary the
+/// `full_absorb` (raw < shield) and `partial_absorb` (raw > shield) cases straddle but never land on —
+/// a `<=` / `<` off-by-one twin (spilling 1 to health, or leaving 1 shield) diverges only at the seam.
+/// The case reuses existing `Rules` fields (no `canonical_encoding` field moved), so this is pure
+/// coverage — no committed match hash moves. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v29";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6350,6 +6357,12 @@ pub fn parity_vectors() -> ParityVectors {
             // Full absorb: a 100-shield pawn eats a 40 hit entirely — shield 100->60, health
             // untouched at 100, effective 40 (all absorbed).
             shield_absorb_case("full_absorb_no_health_loss", WeaponMode::Hitscan, 40, 100, 100),
+            // Exact-drain seam (raw == shield): a 40-shield pawn eats a 40 hit — the shield depletes to
+            // EXACTLY 0 and to_health = min(40 - 40, 100) = 0, so NO overflow spills; effective 40,
+            // health untouched at 100, the target alive. The boundary full_absorb (raw < shield) and
+            // partial_absorb (raw > shield) straddle but never land on — where a <= / < off-by-one twin
+            // (spilling 1 to health, or leaving 1 shield) diverges.
+            shield_absorb_case("raw_equals_shield_exact_drain_no_spill", WeaponMode::Hitscan, 40, 40, 100),
             // Partial absorb: a 30-shield pawn takes a 50 hit — shield drains to 0, the 20
             // overflow spills to health (100->80), effective 50 (the whole raw landed).
             shield_absorb_case("partial_absorb_overflow_to_health", WeaponMode::Hitscan, 50, 30, 100),
