@@ -3740,9 +3740,13 @@ pub struct ShieldAbsorbCase {
 /// `mag_size` and `cooldown` to `fire_cooldown` (so the next shot waits out the
 /// cooldown). A twin that cools down a tick early (fires too fast), decrements ammo
 /// without discharging, fires on an empty mag, or refills past `mag_size` diverges on at
-/// least one tick. `fired` is read off the point-blank target taking damage — a shot
-/// DISCHARGED ⇔ it connected at point blank — so the timeline cross-checks the ammo drain
-/// against an ACTUAL hit, not a bare counter. Distinct from the `pickups` category, whose
+/// least one tick. `fired` is the DISCHARGE — a round drawn from the magazine (the `ammo`
+/// delta), mode-agnostic — not the hit: byte-identical to the old point-blank health-drop
+/// probe for the Hitscan cases (a point-blank shot discharges and connects the same tick)
+/// yet equally valid for a `Projectile` whose hit lands later as it travels, so v28 extends
+/// the category across both ranged modes (Projectile cases pin a byte-identical cadence to
+/// their Hitscan twins) and the `fire_cooldown == 0` degenerate (a shot every tick until the
+/// magazine alone stops it). Distinct from the `pickups` category, whose
 /// Ammo pickup refills a magazine but pins neither the cooldown gate nor the per-shot
 /// drain, and from the match-level `matches`, which fire full games but never pin the
 /// cycle itself.
@@ -5389,8 +5393,9 @@ fn shield_absorb_case(label: &str, mode: WeaponMode, raw: u16, shield_before: u1
 /// Build a fire-rate-cycle case: seat 0 holds fire (or reloads on `reload_tick`) for
 /// `ticks` ticks under (`fire_cooldown`, `mag_size`) against a point-blank dummy that
 /// survives the window, recording `(fired, ammo, cooldown)` after each step. `fired` is
-/// read off the target taking damage — a point-blank Hitscan shot connects the same tick
-/// it discharges — so the timeline cross-checks the ammo drain against an actual hit.
+/// the DISCHARGE — a round drawn from the magazine (the `ammo` delta) — read mode-agnostically:
+/// a Hitscan hit lands the same tick it discharges, a Projectile launches now and connects
+/// later, but both draw one round here, so the cadence is pinned independent of flight.
 fn fire_cycle_case(label: &str, mode: WeaponMode, fire_cooldown: u16, mag_size: u16, reload_tick: Option<u16>, ticks: u16) -> FireCycleCase {
     let rules = Rules { weapon_mode: mode, fire_cooldown, mag_size, spawn_jitter: 0, ..Default::default() };
     let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
