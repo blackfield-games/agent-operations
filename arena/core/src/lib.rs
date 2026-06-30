@@ -3945,7 +3945,11 @@ pub struct MatchOutcomeCase {
 /// split that PRODUCES `dealt` but never the credit on top; from the fall-kill attribution
 /// (domain v13), which credits a lethal FALL to the launcher via [`Match::credit_fall_kill`]
 /// (the same `dealt as i32` + team gate, but not a direct weapon hit); and from `knockback`,
-/// the post-hit impulse that is never scored.
+/// the post-hit impulse that is never scored. v35 adds the SHIELDED-enemy credit: every case
+/// above hits a shield-0 target where the credit equals the health removed, so a hit on a
+/// shielded enemy (the recorded `target_shield`, `raw > shield > 0`) pins that the credit is the
+/// FULL effective — the absorbed shield PLUS the health spill — not just the health portion, the
+/// one place `shield_absorption`'s absorb/overflow split feeds the credit on top.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoreCreditCase {
     pub label: String,
