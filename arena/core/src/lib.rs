@@ -3874,6 +3874,49 @@ pub struct MatchOutcomeCase {
     pub seats: Vec<SeatPlacement>,
 }
 
+/// A pinned score-credit case (domain v24): seat 0 lands ONE point-blank `weapon_mode` hit
+/// on a single target (seat 1) and the shooter's `score` delta is recorded against the
+/// effective damage the hit dealt. This pins the credit convention every weapon path shares:
+/// a hit on an ENEMY (different team) credits the shooter EXACTLY the effective `dealt` —
+/// the clamped [`Match::apply_hp_damage`] return (the shield+health actually removed), NOT the
+/// raw and NOT a flat per-kill bonus — so an overkill credits the CLAMPED hp (strictly `< raw`,
+/// the target downed), a kill worth what it removed not what it threw. A FRIENDLY hit (a
+/// same-team target, reachable only under [`Rules::friendly_fire`]) deals real damage yet
+/// credits ZERO — a team hit is never rewarded. With `friendly_fire` OFF a same-team target is
+/// never even SELECTED, so it takes no damage at all and trivially credits nothing (the ally
+/// case shares the friendly case's geometry — only the flag differs — isolating that the zero
+/// credit there is no-damage, not a scored-then-zeroed hit). The same `if !friendly { score +=
+/// dealt }` line lives independently in [`Match::resolve_fire`], [`Match::resolve_melee`], and
+/// the projectile sink ([`Match::advance_projectiles`]), so the enemy-survivor case is repeated
+/// across all three modes to pin that they agree. A twin that credits the raw (over-scoring an
+/// overkill), rewards a friendly hit, scores a kill flat, or lets an ally take damage under
+/// friendly-fire-off diverges. Distinct from `shield_absorption`, which pins the absorb/overflow
+/// split that PRODUCES `dealt` but never the credit on top; from the fall-kill attribution
+/// (domain v13), which credits a lethal FALL to the launcher via [`Match::credit_fall_kill`]
+/// (the same `dealt as i32` + team gate, but not a direct weapon hit); and from `knockback`,
+/// the post-hit impulse that is never scored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScoreCreditCase {
+    pub label: String,
+    pub weapon_mode: WeaponMode,
+    /// Whether [`Rules::friendly_fire`] was on — a same-team target is SELECTED (and so damaged)
+    /// only under this flag, so it gates whether the ally case lands a hit at all.
+    pub friendly_fire: bool,
+    /// The weapon's raw damage before absorption (`Rules::damage` for hitscan/projectile,
+    /// `Rules::melee_damage` for melee — set equal here so the mode never changes the raw).
+    pub raw: u16,
+    pub shooter_team: TeamId,
+    /// The target's team — equal to `shooter_team` for a friendly/ally case, distinct for an enemy.
+    pub target_team: TeamId,
+    pub score_before: i32,
+    pub score_after: i32,
+    /// The effective damage the hit dealt (the target's health+shield loss), clamped to the
+    /// pools present — what an ENEMY hit credits, so an overkill's `damage` is `< raw`.
+    pub damage: u16,
+    /// Whether the target survived the hit (`health > 0`).
+    pub target_alive: bool,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -4269,6 +4312,13 @@ pub struct ParityVectors {
     /// (competition ranking). The input the `rating_deltas` / `field_deltas` categories settle
     /// from, never pinned in isolation until now.
     pub outcomes: Vec<MatchOutcomeCase>,
+    /// score-credit cases (domain v24): seat 0's `score` delta from ONE point-blank hit, pinning
+    /// that a weapon credits the shooter the EFFECTIVE damage dealt (clamped, so an overkill
+    /// credits `< raw`) only on an ENEMY, that a friendly hit deals damage but credits zero, and
+    /// that an ally under friendly-fire-off takes no damage at all — the same `if !friendly`
+    /// credit shared by `resolve_fire` / `resolve_melee` / the projectile sink. The
+    /// `shield_absorption` category pins the split that produces `dealt`; this pins the credit on top.
+    pub score_credit: Vec<ScoreCreditCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4392,9 +4442,19 @@ pub struct ParityVectors {
 /// a tie. The placement is constructed directly (not a fired match), so this is pure coverage (no
 /// committed match hash moves) — the `rating_deltas` / `field_deltas` categories settle the ELO
 /// FROM placements, never pin the placement rule a twin that ranks score-before-survivors, splits
-/// a tie, or sums a team wrong would get wrong.
+/// a tie, or sums a team wrong would get wrong;
+/// bumped to v24 for the SCORE CREDIT — a new `score_credit` category pins what one point-blank
+/// hit adds to the shooter's `score`: the EFFECTIVE damage dealt (the clamped [`Match::apply_hp_damage`]
+/// return, so an overkill credits the hp removed, strictly `< raw`) and ONLY on an enemy — a
+/// friendly hit (same team, `friendly_fire`-gated) deals damage but credits zero, and an ally
+/// under friendly-fire-off takes no damage at all. The same `if !friendly { score += dealt }` line
+/// lives independently in [`Match::resolve_fire`], [`Match::resolve_melee`], and the projectile
+/// sink, so the enemy case repeats across all three modes. The credit reads off pawn `score`, no
+/// `canonical_encoding` field moved, so this is pure coverage (no committed match hash moves) — the
+/// `shield_absorption` category pins the split that PRODUCES `dealt`, never the credit a twin that
+/// scores the raw, rewards a team hit, or damages an ally under friendly-fire-off would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v23";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v24";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5243,6 +5303,51 @@ fn match_outcome_case(label: &str, seats: Vec<(SeatId, TeamId, bool, i32)>) -> M
     MatchOutcomeCase { label: label.to_string(), seats }
 }
 
+/// Build a score-credit case: place the shooter (seat 0, team 0) at the origin facing EAST and
+/// one target (seat 1) point-blank at x:1500 on `target_team`, under `friendly_fire` and a
+/// `raw`-damage weapon, fire ONE `mode` hit through the real combat path, and record the
+/// shooter's `score` delta against the target's health loss. Mirrors `shield_absorb_case`'s
+/// geometry (same seats, same point-blank line) so the only thing under test is the credit, not
+/// the hit detection. The friendly/ally pair shares this geometry (`target_team == 0`) and differs
+/// only on the flag: with it on the ally is hit (damage, zero credit), with it off the ally is
+/// never selected (no damage, zero credit).
+fn score_credit_case(label: &str, mode: WeaponMode, raw: u16, friendly_fire: bool, target_team: TeamId, target_health: u16) -> ScoreCreditCase {
+    let shooter_team: TeamId = 0;
+    let rules = Rules { weapon_mode: mode, damage: raw, melee_damage: raw, friendly_fire, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, shooter_team), parity_seat(1, target_team)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+    m.pawns[1].health = target_health;
+    let score_before = m.pawns[0].score;
+    let health_before = m.pawns[1].health;
+    match mode {
+        WeaponMode::Hitscan => m.resolve_fire(0),
+        WeaponMode::Melee => m.resolve_melee(0),
+        WeaponMode::Projectile => {
+            m.spawn_projectile(0);
+            let mut age = 0u16;
+            while !m.projectiles.is_empty() && age < MAX_PROJECTILE_LIFETIME {
+                m.advance_projectiles();
+                age += 1;
+            }
+        }
+    }
+    ScoreCreditCase {
+        label: label.to_string(),
+        weapon_mode: mode,
+        friendly_fire,
+        raw,
+        shooter_team,
+        target_team,
+        score_before,
+        score_after: m.pawns[0].score,
+        damage: health_before - m.pawns[1].health,
+        target_alive: m.pawns[1].alive,
+    }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -5906,6 +6011,27 @@ pub fn parity_vectors() -> ParityVectors {
             // survivor tie (each team has 1 survivor) — so the team total, not a single seat's
             // score, decides, and the dead teammate still shares the placement.
             match_outcome_case("team_shares_placement_summed_score", vec![(0, 0, true, 30), (1, 0, false, 30), (2, 1, true, 50)]),
+        ],
+        score_credit: vec![
+            // Enemy hit credits the EFFECTIVE damage: a 25 hit on a 100-hp enemy survivor scores
+            // +25 (the hp removed), the target lives. Here damage == raw, so it pairs with the
+            // overkill case (where damage < raw) to fix that the credit is `dealt`, not `raw`.
+            score_credit_case("enemy_hitscan_credits_effective", WeaponMode::Hitscan, 25, false, 1, 100),
+            // Overkill credits the CLAMPED hp, not the raw: a 100 hit on a 30-hp enemy downs it and
+            // scores +30 (the pool actually removed), strictly < the overcommitted raw 100. A twin
+            // that credits the raw over-scores the kill.
+            score_credit_case("enemy_lethal_overkill_credits_clamped", WeaponMode::Hitscan, 100, false, 1, 30),
+            // Friendly hit (same team) under friendly_fire ON deals real damage (25) but credits
+            // ZERO — a team hit is never rewarded. Shares the ally case's geometry; only the flag differs.
+            score_credit_case("friendly_hitscan_under_ff_credits_zero", WeaponMode::Hitscan, 25, true, 0, 100),
+            // Ally (same team) with friendly_fire OFF is never SELECTED: no damage at all, zero
+            // credit. The zero here is no-hit, not a scored-then-zeroed hit (damage == 0 proves it).
+            score_credit_case("ally_hitscan_ff_off_no_damage_no_credit", WeaponMode::Hitscan, 25, false, 0, 100),
+            // The SAME enemy hit (raw 25, 100-hp survivor) through melee and projectile credits
+            // IDENTICALLY to hitscan — each mode carries its own `if !friendly { score += dealt }`,
+            // so the trio pins that resolve_fire / resolve_melee / the projectile sink agree.
+            score_credit_case("enemy_melee_credits_effective", WeaponMode::Melee, 25, false, 1, 100),
+            score_credit_case("enemy_projectile_credits_effective", WeaponMode::Projectile, 25, false, 1, 100),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

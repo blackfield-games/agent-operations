@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v23");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v24");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the

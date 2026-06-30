@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v23",
+  "domain": "blackfield/arena/parity-vectors/v24",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2847,6 +2847,80 @@
           "placement": 2
         }
       ]
+    }
+  ],
+  "score_credit": [
+    {
+      "label": "enemy_hitscan_credits_effective",
+      "weapon_mode": "hitscan",
+      "friendly_fire": false,
+      "raw": 25,
+      "shooter_team": 0,
+      "target_team": 1,
+      "score_before": 0,
+      "score_after": 25,
+      "damage": 25,
+      "target_alive": true
+    },
+    {
+      "label": "enemy_lethal_overkill_credits_clamped",
+      "weapon_mode": "hitscan",
+      "friendly_fire": false,
+      "raw": 100,
+      "shooter_team": 0,
+      "target_team": 1,
+      "score_before": 0,
+      "score_after": 30,
+      "damage": 30,
+      "target_alive": false
+    },
+    {
+      "label": "friendly_hitscan_under_ff_credits_zero",
+      "weapon_mode": "hitscan",
+      "friendly_fire": true,
+      "raw": 25,
+      "shooter_team": 0,
+      "target_team": 0,
+      "score_before": 0,
+      "score_after": 0,
+      "damage": 25,
+      "target_alive": true
+    },
+    {
+      "label": "ally_hitscan_ff_off_no_damage_no_credit",
+      "weapon_mode": "hitscan",
+      "friendly_fire": false,
+      "raw": 25,
+      "shooter_team": 0,
+      "target_team": 0,
+      "score_before": 0,
+      "score_after": 0,
+      "damage": 0,
+      "target_alive": true
+    },
+    {
+      "label": "enemy_melee_credits_effective",
+      "weapon_mode": "melee",
+      "friendly_fire": false,
+      "raw": 25,
+      "shooter_team": 0,
+      "target_team": 1,
+      "score_before": 0,
+      "score_after": 25,
+      "damage": 25,
+      "target_alive": true
+    },
+    {
+      "label": "enemy_projectile_credits_effective",
+      "weapon_mode": "projectile",
+      "friendly_fire": false,
+      "raw": 25,
+      "shooter_team": 0,
+      "target_team": 1,
+      "score_before": 0,
+      "score_after": 25,
+      "damage": 25,
+      "target_alive": true
     }
   ],
   "matches": [
