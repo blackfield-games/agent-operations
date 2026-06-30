@@ -4426,12 +4426,16 @@ pub struct ParityVectors {
     /// weapon modes, byte-identical to the per-site clamp when shieldless — which the
     /// `knockback` category (post-hit impulse) never pins.
     pub shield_absorption: Vec<ShieldAbsorbCase>,
-    /// fire-rate-cycle cases (domain v20): seat 0 holds the fire button under a configured
-    /// ([`Rules::fire_cooldown`], [`Rules::mag_size`]) and the per-tick `(fired, ammo,
-    /// cooldown)` is recorded — pinning that a held fire lands ONE shot per
-    /// `fire_cooldown`-tick window draining ammo by one per shot, an empty-mag fire is
-    /// refused, and a reload refills to exactly `mag_size` while arming the cooldown. Pins the
-    /// cadence the `pickups` Ammo refill and the full `matches` exercise but never fix.
+    /// fire-rate-cycle cases (domain v20, extended v28): seat 0 holds the fire button under a
+    /// configured ([`Rules::fire_cooldown`], [`Rules::mag_size`]) and the per-tick `(fired, ammo,
+    /// cooldown)` is recorded — pinning that a held fire lands ONE shot per `fire_cooldown`-tick
+    /// window draining ammo by one per shot, an empty-mag fire is refused, and a reload refills to
+    /// exactly `mag_size` while arming the cooldown. Pins the cadence the `pickups` Ammo refill and
+    /// the full `matches` exercise but never fix. v28 extends it across the OTHER ranged mode and
+    /// the degenerate cooldown: the fire GATE is mode-shared in [`Match::step`], so a `Projectile`
+    /// case run with a hitscan twin's params records a byte-identical discharge cadence (only the
+    /// resolution — a travelling shot vs an instant hit — differs), and a `fire_cooldown == 0`
+    /// weapon discharges every tick until the magazine alone stops it.
     pub fire_cycle: Vec<FireCycleCase>,
     /// melee-cleave cases (domain v21): one [`Match::resolve_melee`] swing strikes EVERY
     /// eligible target (alive enemy within `melee_range`, inside the [`MELEE_ARC_SPREAD`] arc,
@@ -4636,8 +4640,15 @@ pub struct ParityVectors {
 /// committed match hash moves) — the `perception` category pins WHICH entities are visible (the id
 /// set) but never the own-state exposure, the cooldown off-by-one, nor the per-entity field bound a
 /// twin that exposes the raw cooldown, drops an own field, or leaks an enemy's private state would get wrong.
-/// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v27";
+/// Bumped to v28 EXTENDING the `fire_cycle` category across the second ranged mode and the degenerate
+/// cooldown: the fire GATE (`ammo -= 1; cooldown = fire_cooldown`, and the empty-mag refusal) is shared
+/// by Hitscan and Projectile in [`Match::step`] — only the resolution differs — so a `Projectile` case
+/// run with a hitscan twin's params records a BYTE-IDENTICAL discharge cadence (a twin that gave
+/// projectiles a separate cooldown or a free shot diverges), and a `fire_cooldown == 0` case pins that a
+/// zero-cooldown weapon discharges every tick until the magazine alone stops it. No `canonical_encoding`
+/// field moved (the cases reuse existing `Rules` fields), so this is pure coverage — no committed match
+/// hash moves. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v28";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6365,6 +6376,21 @@ pub fn parity_vectors() -> ParityVectors {
             // refills to exactly mag_size (2) and the cooldown arms to fire_cooldown (2), so the
             // tick-6 fire is still cooling and the first post-reload shot lands at tick 7.
             fire_cycle_case("reload_refills_to_mag_size_then_fires", WeaponMode::Hitscan, 2, 2, Some(5), 9),
+            // PROJECTILE held fire, SAME params as held_fire_one_shot_per_cooldown_window: the
+            // fire gate (`ammo -= 1; cooldown = fire_cooldown`) is mode-shared in Match::step, so
+            // the discharge cadence is byte-IDENTICAL to its hitscan twin even though each shot
+            // travels rather than hitting instantly — a twin that gave projectiles a separate
+            // cooldown or a free (no-ammo) shot records a different timeline here.
+            fire_cycle_case("projectile_cadence_matches_hitscan", WeaponMode::Projectile, 3, 6, None, 10),
+            // PROJECTILE mag-dry, SAME params as mag_dry_then_empty_fire_refused: the empty-mag
+            // refusal (`_ => {}`) is the SAME arm for both ranged modes, so a projectile empties at
+            // ticks 0, 2 then refuses every held fire identically — ammo pinned at 0, cooldown idle.
+            fire_cycle_case("projectile_empty_mag_refused", WeaponMode::Projectile, 2, 2, None, 7),
+            // fire_cooldown == 0 degenerate: a discharge sets cooldown to 0 and the tick-start
+            // saturating_sub keeps it 0, so the gate is open EVERY tick — a shot every tick until
+            // the 3-round mag empties at tick 2, after which the ammo==0 gate alone refuses. Pins
+            // that a zero-cooldown weapon is bounded by the magazine, not a phantom one-tick floor.
+            fire_cycle_case("zero_cooldown_fires_every_tick_until_dry", WeaponMode::Hitscan, 0, 3, None, 6),
         ],
         melee_cleave: {
             let range = 2 * POSITION_SCALE; // 2 m default reach

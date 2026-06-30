@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v27",
+  "domain": "blackfield/arena/parity-vectors/v28",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2504,6 +2504,148 @@
           false,
           1,
           1
+        ]
+      ]
+    },
+    {
+      "label": "projectile_cadence_matches_hitscan",
+      "weapon_mode": "projectile",
+      "fire_cooldown": 3,
+      "mag_size": 6,
+      "reload_tick": null,
+      "timeline": [
+        [
+          true,
+          5,
+          3
+        ],
+        [
+          false,
+          5,
+          2
+        ],
+        [
+          false,
+          5,
+          1
+        ],
+        [
+          true,
+          4,
+          3
+        ],
+        [
+          false,
+          4,
+          2
+        ],
+        [
+          false,
+          4,
+          1
+        ],
+        [
+          true,
+          3,
+          3
+        ],
+        [
+          false,
+          3,
+          2
+        ],
+        [
+          false,
+          3,
+          1
+        ],
+        [
+          true,
+          2,
+          3
+        ]
+      ]
+    },
+    {
+      "label": "projectile_empty_mag_refused",
+      "weapon_mode": "projectile",
+      "fire_cooldown": 2,
+      "mag_size": 2,
+      "reload_tick": null,
+      "timeline": [
+        [
+          true,
+          1,
+          2
+        ],
+        [
+          false,
+          1,
+          1
+        ],
+        [
+          true,
+          0,
+          2
+        ],
+        [
+          false,
+          0,
+          1
+        ],
+        [
+          false,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "label": "zero_cooldown_fires_every_tick_until_dry",
+      "weapon_mode": "hitscan",
+      "fire_cooldown": 0,
+      "mag_size": 3,
+      "reload_tick": null,
+      "timeline": [
+        [
+          true,
+          2,
+          0
+        ],
+        [
+          true,
+          1,
+          0
+        ],
+        [
+          true,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          0
         ]
       ]
     }
