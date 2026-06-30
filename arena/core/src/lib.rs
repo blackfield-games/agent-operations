@@ -3665,11 +3665,15 @@ pub struct PickupCase {
 /// default) the press is inert, the trajectory stays flat at `0`, and the match is
 /// byte-identical to a 2D one (`landing_tick` is `None`, `apex_z` is `0`). A jump pressed
 /// mid-air (`start_z > 0`) does NOT re-launch — only a grounded pawn jumps — so a held-jump
-/// air case rides the EXISTING arc unchanged. A twin that uses a different launch impulse,
-/// integrates in the wrong order (off-by-one at apex/landing), allows an air-jump, or
-/// mishandles the `z == 0` snap fails the matching case. Distinct from the `fall_damage` /
-/// `knockback` / `z_occupancy` categories, which USE `z` yet pin landing-damage / impulse /
-/// occupancy, never the rising arc itself.
+/// air case rides the EXISTING arc unchanged. When `gravity` does not divide the arc (v30, the
+/// `overshoot_landing_snaps_to_zero` case at gravity 500) the descent crosses the ground BETWEEN
+/// ticks — the raw `z + z_vel` goes strictly NEGATIVE and the `nz <= 0` clamp snaps the position
+/// back to exactly `0`, the boundary the clean-landing gravity-480 cases (which land at `nz == 0`)
+/// never exercise. A twin that uses a different launch impulse, integrates in the wrong order
+/// (off-by-one at apex/landing), allows an air-jump, or records the negative `nz` instead of
+/// snapping it to `0` fails the matching case. Distinct from the `fall_damage` / `knockback` /
+/// `z_occupancy` categories, which USE `z` yet pin landing-damage / impulse / occupancy, never the
+/// rising arc itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JumpCase {
     pub label: String,
