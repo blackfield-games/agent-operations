@@ -3819,8 +3819,12 @@ pub struct MeleeTarget {
 /// (90°, distance `2`) is missed — both in range with a clear sightline — so a twin with
 /// [`MELEE_ARC_SPREAD`] `0` (facing octant only) or `2` (a too-wide cone) diverges where the
 /// distance-0/distance-4 cases cannot tell them apart. Targets are
-/// collected in seat order THEN damaged, so the same-tick multi-hit is deterministic.
-/// Distinct from the `hits` category (the nearest-only ranged beam) and from `knockback`
+/// collected in seat order THEN damaged, so the same-tick multi-hit is deterministic. The v36
+/// `shooter_score` field pins the swing's SCORE credit: `resolve_melee` credits each non-friendly
+/// struck target separately, so a swing cleaving two enemies credits the SUM (the `cleave` case's
+/// two 50-damage hits score 100, the single-strike cases 50) — a twin that credited only the
+/// nearest cleaved enemy diverges here while the `score_credit` (v24/v35) single-hit cases can't
+/// catch it. Distinct from the `hits` category (the nearest-only ranged beam) and from `knockback`
 /// (the post-hit shove this swing also applies, gated on `knockback_horizontal`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeleeCleaveCase {
