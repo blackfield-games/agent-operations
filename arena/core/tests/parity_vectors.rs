@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v36");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v37");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -1313,6 +1313,20 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(shld.damage, absorbed + spill, "the credit is the FULL effective: absorbed shield + health spill");
     assert!(shld.damage > spill, "...strictly MORE than the health portion alone — the absorbed shield is credited, not dropped");
     assert_eq!(shld.score_after - shld.score_before, shld.damage as i32, "...and that full effective is exactly what scores");
+    // Full absorb (v37): a hit FULLY absorbed by the shield (raw 10 <= shield 20) credits the
+    // absorbed shield ALONE — zero health spills, yet the credit is the absorbed 10. The v35 case
+    // above spills to health (raw > shield); this brackets it at raw <= shield. A twin that gated the
+    // credit on health-damage (scoring only when health drops) credits dealt right on v35 yet scores
+    // 0 here — so this case alone catches it.
+    let fa = scr("enemy_full_absorb_credits_shield");
+    let fa_absorbed = fa.raw.min(fa.target_shield);
+    let fa_spill = fa.raw - fa_absorbed;
+    assert!(fa.raw <= fa.target_shield, "the hit is FULLY absorbed (raw <= shield)");
+    assert_eq!(fa_spill, 0, "...no health spills — the shield covers the whole hit");
+    assert!(fa_absorbed > 0, "...but the shield DID absorb real damage");
+    assert!(fa.target_alive, "the target survives untouched on health");
+    assert_eq!(fa.damage, fa_absorbed, "the credit is the absorbed shield ALONE — zero health removed");
+    assert_eq!(fa.score_after - fa.score_before, fa_absorbed as i32, "...and that absorbed shield is exactly what scores — a twin crediting only health damage would score 0 here");
 
     // Action clamp (v25): ActionIntent::clamped() is the canonical anti-god-mode move-intent clamp.
     // An in-range request passes through untouched; an overlong one is L2-normalized to a magnitude
