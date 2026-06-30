@@ -3951,6 +3951,43 @@ pub struct ActionClampCase {
     pub was_clamped: bool,
 }
 
+/// A pinned action-ingest case (domain v26): one [`Match::ingest`] call — the server-authoritative
+/// gate every action crosses before it is simulated (the "validated action" half of the Gateway
+/// contract). It rejects with one of six [`RejectReason`]s in a FIXED order (version → not-live →
+/// wrong-match → wrong-seat → stale-tick → down-seat) and on accept returns the clamped intent. The
+/// gate carries the named arena security invariants: an agent may act only for ITS OWN seat
+/// (`WrongSeat`), only for the CURRENT tick (`StaleTick` — no stale/future replay), and only while
+/// ALIVE on a LIVE match. Records the scenario (the claim vs the server's state) and the outcome
+/// (accept + clamped move, or the reject reason) so a twin's gate is checked decision-for-decision —
+/// the six rejections are pinned only by internal unit tests today, never as a cross-impl vector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionIngestCase {
+    pub label: String,
+    /// The seat the connection is authenticated as (the first arg to [`Match::ingest`]).
+    pub auth_seat: SeatId,
+    /// The seat the action envelope CLAIMS — `WrongSeat` when it differs from `auth_seat`.
+    pub claimed_seat: SeatId,
+    /// The match's current tick (the only tick an action may answer).
+    pub current_tick: u64,
+    /// The tick the action answers — `StaleTick` when it differs from `current_tick` (past OR future).
+    pub claimed_tick: u64,
+    /// Whether the action named THIS match — `WrongMatch` when false.
+    pub claimed_own_match: bool,
+    /// Whether the action's protocol version matched this build — `Version` when false.
+    pub version_ok: bool,
+    /// Whether the match was `Live` — `NotLive` when false (no action is simulated off-phase).
+    pub phase_live: bool,
+    /// Whether the authenticated seat's pawn was alive — `SeatDown` when false (a corpse cannot act).
+    pub seat_alive: bool,
+    /// `true` when [`Match::ingest`] returned `Ok` — every gate passed.
+    pub accepted: bool,
+    /// The [`RejectReason`] variant name on reject (`"WrongSeat"`, `"StaleTick"`, …), `None` on accept.
+    pub reject_reason: Option<String>,
+    /// The clamped intent's `move_dir` on accept — the gate returns the SAME clamp the `action_clamp`
+    /// category pins (here an overlong 3-4-5 request → `(600, 800)`), `None` on reject.
+    pub clamped_move_dir: Option<Vec2>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
