@@ -3764,6 +3764,46 @@ pub struct FireCycleCase {
     pub timeline: Vec<(bool, u16, u16)>,
 }
 
+/// One target's outcome in a [`MeleeCleaveCase`] swing: where it stood relative to the
+/// shooter, whether the cleave struck it, and the health it lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeleeTarget {
+    /// The target's position relative to the shooter (who stands at the origin).
+    pub offset: Vec2,
+    pub struck: bool,
+    /// `health_before - health_after` — `melee_damage` when struck, `0` when missed.
+    pub damage: u16,
+}
+
+/// A pinned melee-cleave case (domain v21): one seat-0 swing of [`Match::resolve_melee`]
+/// against several target seats at configured offsets, recording per-target whether the
+/// cleave struck it and the damage it took. Unlike the nearest-only beam, a melee swing
+/// strikes EVERY eligible target — an alive enemy (`friendly_fire`-gated) within
+/// `melee_range` (planar squared), inside the frontal arc ([`in_fov`] of `facing` with
+/// [`MELEE_ARC_SPREAD`]), AND with a clear sightline ([`has_line_of_sight`]) — so a
+/// `targets` vector pins the FULL struck set a twin must reproduce, not a single total. A
+/// point-blank enemy exactly on the shooter is struck regardless of facing (the `in_fov`
+/// zero-offset edge); an enemy in range but outside the arc, or in the arc but beyond
+/// range, or behind a `Blocker` on the sightline, is NOT struck. A twin that strikes only
+/// the nearest, that uses the wrong arc width or range edge, that cleaves through cover,
+/// or that drops the point-blank edge diverges on at least one target. Targets are
+/// collected in seat order THEN damaged, so the same-tick multi-hit is deterministic.
+/// Distinct from the `hits` category (the nearest-only ranged beam) and from `knockback`
+/// (the post-hit shove this swing also applies, gated on `knockback_horizontal`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeleeCleaveCase {
+    pub label: String,
+    /// The shooter's facing (the arc is centered here) — `EAST` for the cleave/range/LOS
+    /// cases, `WEST` for the point-blank case (struck despite facing away).
+    pub facing: Bam,
+    pub melee_range: i32,
+    pub melee_damage: u16,
+    /// Sightline blockers in the match — empty except the LOS case, where a wall sits
+    /// between the shooter and one target.
+    pub blockers: Vec<Blocker>,
+    pub targets: Vec<MeleeTarget>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -4140,6 +4180,12 @@ pub struct ParityVectors {
     /// refused, and a reload refills to exactly `mag_size` while arming the cooldown. Pins the
     /// cadence the `pickups` Ammo refill and the full `matches` exercise but never fix.
     pub fire_cycle: Vec<FireCycleCase>,
+    /// melee-cleave cases (domain v21): one [`Match::resolve_melee`] swing strikes EVERY
+    /// eligible target (alive enemy within `melee_range`, inside the [`MELEE_ARC_SPREAD`] arc,
+    /// with a clear sightline), recording per-target struck + damage — pinning the FULL cleave
+    /// set, the arc/range/LOS exclusions, and the point-blank zero-offset edge a nearest-only
+    /// `hits` twin would get wrong.
+    pub melee_cleave: Vec<MeleeCleaveCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4234,9 +4280,19 @@ pub struct ParityVectors {
 /// folded into `canonical_encoding`, so this is pure coverage (no committed match hash moves) —
 /// the `pickups` Ammo refill caps a magazine but pins neither the cooldown gate nor the per-shot
 /// drain, and the full `matches` fire whole games yet never fix the cycle a twin that cools down
-/// a tick early, fires on empty, or refills past `mag_size` would get wrong.
+/// a tick early, fires on empty, or refills past `mag_size` would get wrong;
+/// bumped to v21 for the MELEE CLEAVE — a new `melee_cleave` category pins that one
+/// [`Match::resolve_melee`] swing strikes EVERY eligible target (alive enemy within `melee_range`,
+/// inside the [`MELEE_ARC_SPREAD`] frontal arc, with a clear sightline), not just the nearest:
+/// it records per-target struck + damage so the FULL cleave set is pinned, with an in-range-but-
+/// out-of-arc miss and an in-arc-but-out-of-range miss bounding the arc and range independently, a
+/// point-blank zero-offset enemy struck regardless of facing, and a behind-a-`Blocker` target NOT
+/// struck. `melee_range`/`melee_damage` were already folded into `canonical_encoding`, so this is
+/// pure coverage (no committed match hash moves) — the `hits` category pins the nearest-only ranged
+/// beam, never the multi-target arc a twin that cleaves through cover or strikes only one would
+/// get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v20";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v21";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5012,6 +5068,35 @@ fn fire_cycle_case(label: &str, mode: WeaponMode, fire_cooldown: u16, mag_size: 
     FireCycleCase { label: label.to_string(), weapon_mode: mode, fire_cooldown, mag_size, reload_tick, timeline }
 }
 
+/// Build a melee-cleave case: place the shooter (seat 0) at the origin facing `facing`,
+/// each target seat at its `offsets[i]`, swing once via `resolve_melee` (NOT step —
+/// mirror `knockback_case`, so no cooldown/seat-order gating confounds the readout), and
+/// record per-target struck + damage. Each target is on its own team (an enemy of the
+/// shooter), so the whole cleave fires. `knockback_horizontal` is the default 0, so the
+/// post-hit shove is a no-op and the recorded `offset` stays the spawn position.
+fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u16, blockers: Vec<Blocker>, offsets: Vec<Vec2>) -> MeleeCleaveCase {
+    let seats = (offsets.len() + 1) as u8;
+    let rules = Rules { weapon_mode: WeaponMode::Melee, melee_range, melee_damage, spawn_jitter: 0, ..Default::default() };
+    let roster: Vec<_> = (0..seats).map(|s| parity_seat(s as SeatId, s as TeamId)).collect();
+    let mut m = Match::new(parity_match_id(), parity_config(seats), rules, roster, blockers.clone(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = facing;
+    for (i, &off) in offsets.iter().enumerate() {
+        m.pawns[i + 1].pos = off;
+    }
+    let before: Vec<u16> = (1..=offsets.len()).map(|i| m.pawns[i].health).collect();
+    m.resolve_melee(0);
+    let targets = offsets
+        .iter()
+        .enumerate()
+        .map(|(i, &offset)| {
+            let damage = before[i] - m.pawns[i + 1].health;
+            MeleeTarget { offset, struck: damage > 0, damage }
+        })
+        .collect();
+    MeleeCleaveCase { label: label.to_string(), facing, melee_range, melee_damage, blockers, targets }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -5602,6 +5687,46 @@ pub fn parity_vectors() -> ParityVectors {
             // tick-6 fire is still cooling and the first post-reload shot lands at tick 7.
             fire_cycle_case("reload_refills_to_mag_size_then_fires", WeaponMode::Hitscan, 2, 2, Some(5), 9),
         ],
+        melee_cleave: {
+            let range = 2 * POSITION_SCALE; // 2 m default reach
+            vec![
+                // The cleave: two enemies inside the frontal arc + range are BOTH struck (a
+                // nearest-only beam twin strikes only the closer), at distinct distances; a third
+                // in range but directly BEHIND (out of arc) and a fourth dead-ahead but BEYOND
+                // range are each missed — the arc and range bounds pinned independently.
+                melee_cleave_case(
+                    "cleave_strikes_all_in_arc_and_range",
+                    EAST,
+                    range,
+                    50,
+                    Vec::new(),
+                    vec![
+                        Vec2 { x: POSITION_SCALE, y: 100 }, // ~1 m ahead, in arc + range -> struck
+                        Vec2 { x: 1800, y: 0 },             // 1.8 m dead ahead, in range -> struck
+                        Vec2 { x: -POSITION_SCALE, y: 0 },  // 1 m behind: in range, OUT of arc -> miss
+                        Vec2 { x: 3 * POSITION_SCALE, y: 0 }, // 3 m dead ahead: in arc, OUT of range -> miss
+                    ],
+                ),
+                // Point-blank exactly on the shooter, who faces WEST (away): the in_fov zero-offset
+                // edge strikes it regardless of facing — a twin that bearing-tests a coincident
+                // target the wrong way drops this hit.
+                melee_cleave_case("point_blank_on_shooter_struck_facing_away", WEST, range, 50, Vec::new(), vec![Vec2::ZERO]),
+                // Line of sight: a wall at x[700,800] sits between the shooter and a dead-ahead
+                // enemy at 1.5 m (NOT struck — the cleave can't cut through cover) while a nearer
+                // enemy at 0.5 m IN FRONT of the wall is struck — only the sightline differs.
+                melee_cleave_case(
+                    "behind_blocker_not_struck",
+                    EAST,
+                    range,
+                    50,
+                    vec![Blocker { min: Vec2 { x: 700, y: -300 }, max: Vec2 { x: 800, y: 300 }, height: 0 }],
+                    vec![
+                        Vec2 { x: 500, y: 0 },  // in front of the wall -> struck
+                        Vec2 { x: 1500, y: 0 }, // behind the wall -> not struck
+                    ],
+                ),
+            ]
+        },
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
