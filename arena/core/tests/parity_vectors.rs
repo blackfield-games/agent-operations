@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v27");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v28");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -946,6 +946,38 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(reload.timeline[5], (false, reload.mag_size, reload.fire_cooldown), "the reload refills to EXACTLY mag_size and arms the cooldown — no shot on the reload tick");
     assert!(!reload.timeline[6].0, "the tick after a reload is still cooling down — no fire yet");
     assert_eq!(reload.timeline[7], (true, reload.mag_size - 1, reload.fire_cooldown), "the first post-reload shot lands once the cooldown clears, draining the refilled mag");
+
+    // Projectile fire-cadence (v28): the fire GATE (`ammo -= 1; cooldown = fire_cooldown`, and the
+    // empty-mag `_ => {}` refusal) is shared by Hitscan and Projectile in Match::step — only the
+    // resolution (an instant hit vs a spawned travelling shot) differs — so a Projectile case run with
+    // a Hitscan twin's params records a BYTE-IDENTICAL discharge timeline. `fired` is the discharge
+    // (the magazine draw), so the projectile's later-landing hit never shifts the cadence. A twin that
+    // gave projectiles a separate cooldown, a free (no-ammo) shot, or a different empty-mag gate diverges.
+    assert_eq!(fc("projectile_cadence_matches_hitscan").weapon_mode, WeaponMode::Projectile, "the cadence twin is the projectile mode");
+    assert_eq!(
+        fc("projectile_cadence_matches_hitscan").timeline,
+        fc("held_fire_one_shot_per_cooldown_window").timeline,
+        "a projectile held-fire discharges on the SAME cadence as its hitscan twin — the gate is mode-shared",
+    );
+    assert_eq!(
+        fc("projectile_empty_mag_refused").timeline,
+        fc("mag_dry_then_empty_fire_refused").timeline,
+        "a projectile empties its mag and refuses every empty fire identically to its hitscan twin",
+    );
+
+    // fire_cooldown == 0 degenerate (v28): a discharge sets cooldown to 0 and the tick-start
+    // saturating_sub keeps it 0, so the gate is open EVERY tick — a shot every tick until the 3-round
+    // mag empties at tick 2, after which the ammo==0 gate alone refuses. A twin that armed a phantom
+    // one-tick floor (firing every OTHER tick) or kept firing past empty diverges.
+    let zero = fc("zero_cooldown_fires_every_tick_until_dry");
+    assert_eq!((zero.fire_cooldown, zero.mag_size), (0, 3));
+    let zero_fires: Vec<usize> = zero.timeline.iter().enumerate().filter(|(_, &(f, ..))| f).map(|(i, _)| i).collect();
+    assert_eq!(zero_fires, vec![0, 1, 2], "a zero-cooldown weapon fires every tick until the magazine empties — not every other tick");
+    assert!(zero.timeline.iter().all(|&(_, _, c)| c == 0), "fire_cooldown 0 never arms the cooldown — the gate stays open every tick");
+    assert_eq!(zero.timeline.iter().map(|&(_, a, _)| a).collect::<Vec<_>>(), vec![2, 1, 0, 0, 0, 0], "ammo drains one per tick to 0 then holds — the magazine is the only bound");
+    for &(fired, ammo, _) in &zero.timeline[3..] {
+        assert!(!fired && ammo == 0, "once the mag is empty the zero-cooldown fire is refused on emptiness alone");
+    }
 
     // Melee cleave (v21): one swing strikes EVERY eligible target (alive enemy within melee_range,
     // inside the MELEE_ARC_SPREAD frontal arc, with a clear sightline), each for melee_damage — not
