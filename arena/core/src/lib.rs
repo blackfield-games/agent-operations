@@ -3960,7 +3960,10 @@ pub struct MatchOutcomeCase {
 /// above hits a shield-0 target where the credit equals the health removed, so a hit on a
 /// shielded enemy (the recorded `target_shield`, `raw > shield > 0`) pins that the credit is the
 /// FULL effective — the absorbed shield PLUS the health spill — not just the health portion, the
-/// one place `shield_absorption`'s absorb/overflow split feeds the credit on top.
+/// one place `shield_absorption`'s absorb/overflow split feeds the credit on top. v37 brackets
+/// that with the FULL-ABSORB credit (`raw <= shield`, zero health spill): the credit is the
+/// absorbed shield ALONE, so a twin that gated the credit on health-damage (scoring only when
+/// health drops) credits `dealt` right on the v35 spill case yet credits 0 here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoreCreditCase {
     pub label: String,
