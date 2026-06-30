@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v22",
+  "domain": "blackfield/arena/parity-vectors/v23",
   "protocol_version": 1,
   "spawns": [
     {
@@ -2753,6 +2753,98 @@
           },
           "in_sight": false,
           "remembered_pos": null
+        }
+      ]
+    }
+  ],
+  "outcomes": [
+    {
+      "label": "survivors_dominate_score",
+      "seats": [
+        {
+          "seat": 0,
+          "team": 0,
+          "alive": true,
+          "score": 0,
+          "placement": 1
+        },
+        {
+          "seat": 1,
+          "team": 1,
+          "alive": false,
+          "score": 100,
+          "placement": 2
+        }
+      ]
+    },
+    {
+      "label": "score_breaks_survivor_tie",
+      "seats": [
+        {
+          "seat": 0,
+          "team": 0,
+          "alive": true,
+          "score": 10,
+          "placement": 2
+        },
+        {
+          "seat": 1,
+          "team": 1,
+          "alive": true,
+          "score": 50,
+          "placement": 1
+        }
+      ]
+    },
+    {
+      "label": "exact_tie_shares_placement",
+      "seats": [
+        {
+          "seat": 0,
+          "team": 0,
+          "alive": true,
+          "score": 50,
+          "placement": 1
+        },
+        {
+          "seat": 1,
+          "team": 1,
+          "alive": true,
+          "score": 50,
+          "placement": 1
+        },
+        {
+          "seat": 2,
+          "team": 2,
+          "alive": true,
+          "score": 10,
+          "placement": 3
+        }
+      ]
+    },
+    {
+      "label": "team_shares_placement_summed_score",
+      "seats": [
+        {
+          "seat": 0,
+          "team": 0,
+          "alive": true,
+          "score": 30,
+          "placement": 1
+        },
+        {
+          "seat": 1,
+          "team": 0,
+          "alive": false,
+          "score": 30,
+          "placement": 1
+        },
+        {
+          "seat": 2,
+          "team": 1,
+          "alive": true,
+          "score": 50,
+          "placement": 2
         }
       ]
     }

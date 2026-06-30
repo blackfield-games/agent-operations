@@ -3842,6 +3842,38 @@ pub struct PerceptionMemoryCase {
     pub timeline: Vec<PerceptionMemoryTick>,
 }
 
+/// One seat's settled outcome in a [`MatchOutcomeCase`]: its configured
+/// `(team, alive, score)` end-state and the `placement` [`Match::outcomes`] assigned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatPlacement {
+    pub seat: SeatId,
+    pub team: TeamId,
+    pub alive: bool,
+    pub score: i32,
+    /// The 1-based placement (best == 1); teams tied on `(survivors, total score)` share a
+    /// placement and the next distinct team's placement skips the gap (competition ranking).
+    pub placement: u16,
+}
+
+/// A pinned match-outcome case (domain v23): a constructed end-state (seats with configured
+/// `team` / `alive` / `score`) run through [`Match::outcomes`], recording the placement each
+/// seat is assigned. This pins the ranking a twin must reproduce: teams rank by SURVIVORS
+/// first (a live low-scorer outranks a dead high-scorer), then by TOTAL team score (the SUM
+/// over the team's seats), and a team's seats SHARE one placement (teammates never contend);
+/// teams tied on `(survivors, total score)` SHARE a placement and the next distinct team
+/// skips the gap (competition ranking). The lowest seat is only a deterministic SORT
+/// tiebreak — it never splits a `(survivors, score)` tie into distinct placements. A twin
+/// that ranks score before survivors, that splits a tie, that ranks teammates as rivals, or
+/// that sums a team's score wrong diverges. This placement is the input the ranked-rating
+/// delta (the `rating_deltas` / `field_deltas` categories) settles from, never pinned in
+/// isolation until now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchOutcomeCase {
+    pub label: String,
+    /// Every seat's end-state + assigned placement, ascending by seat.
+    pub seats: Vec<SeatPlacement>,
+}
+
 /// A pinned pawn-occupancy case (domain v11): a single mover (seat 0) takes one `step`
 /// with `move_dir` while an obstacle pawn (seat 1) sits at `obstacle` and
 /// [`Rules::pawn_radius`] is `pawn_radius`, and the mover's resulting position is
@@ -4231,6 +4263,12 @@ pub struct ParityVectors {
     /// the countdown, and that the default-off window remembers nothing. The `perception`
     /// category pins the live verdicts; this pins the stale-echo decay/refresh it never does.
     pub perception_memory: Vec<PerceptionMemoryCase>,
+    /// match-outcome cases (domain v23): a constructed end-state run through
+    /// [`Match::outcomes`], pinning the per-seat placement ranking — survivors first, then
+    /// total team score, teammates and `(survivors, score)`-tied teams sharing a placement
+    /// (competition ranking). The input the `rating_deltas` / `field_deltas` categories settle
+    /// from, never pinned in isolation until now.
+    pub outcomes: Vec<MatchOutcomeCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -4345,9 +4383,18 @@ pub struct ParityVectors {
 /// folded into `canonical_encoding`, so this is pure coverage (no committed match hash moves) —
 /// the `perception` category pins the live range/cone/LOS verdicts, never the stale-echo decay a
 /// twin that leaks an occluded entity's live position, mis-counts the decay, or never refreshes
-/// would get wrong.
+/// would get wrong;
+/// bumped to v23 for the MATCH-OUTCOME PLACEMENT — a new `outcomes` category pins the per-seat
+/// placement [`Match::outcomes`] assigns from an end-state: teams rank by SURVIVORS, then TOTAL
+/// team score (summed over the team's seats), a team's seats SHARE one placement, and teams tied
+/// on `(survivors, total score)` SHARE a placement with the next distinct team skipping the gap
+/// (competition ranking) — the lowest seat is only a deterministic sort tiebreak, never splitting
+/// a tie. The placement is constructed directly (not a fired match), so this is pure coverage (no
+/// committed match hash moves) — the `rating_deltas` / `field_deltas` categories settle the ELO
+/// FROM placements, never pin the placement rule a twin that ranks score-before-survivors, splits
+/// a tie, or sums a team wrong would get wrong.
 /// Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v22";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v23";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5177,6 +5224,25 @@ fn perception_memory_case(label: &str, window: u16, target_path: Vec<Vec2>) -> P
     PerceptionMemoryCase { label: label.to_string(), perception_memory_ticks: window, timeline }
 }
 
+/// Build a match-outcome case: construct a match from the `(seat, team, alive, score)`
+/// roster (seats given in ascending order), set each pawn's end-state directly, and run
+/// the REAL `Match::outcomes` to record the placement each seat is assigned.
+fn match_outcome_case(label: &str, seats: Vec<(SeatId, TeamId, bool, i32)>) -> MatchOutcomeCase {
+    let n = seats.len() as u8;
+    let roster: Vec<_> = seats.iter().map(|&(seat, team, _, _)| parity_seat(seat, team)).collect();
+    let mut m = Match::new(parity_match_id(), parity_config(n), Rules::default(), roster, Vec::new(), 1);
+    for (i, &(_, _, alive, score)) in seats.iter().enumerate() {
+        m.pawns[i].alive = alive;
+        m.pawns[i].score = score;
+    }
+    let seats = m
+        .outcomes()
+        .into_iter()
+        .map(|o| SeatPlacement { seat: o.seat, team: o.team, alive: o.alive_at_end, score: o.score, placement: o.placement })
+        .collect();
+    MatchOutcomeCase { label: label.to_string(), seats }
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -5825,6 +5891,22 @@ pub fn parity_vectors() -> ParityVectors {
                 perception_memory_case("resight_refreshes_and_resets", 2, vec![seen_a, out, seen_b, out, out, out]),
             ]
         },
+        outcomes: vec![
+            // Survivors dominate score (FFA): the ALIVE seat 0 (score 0) outranks the DEAD seat 1
+            // (score 100) — a live nobody beats a dead hero. A score-first twin inverts this.
+            match_outcome_case("survivors_dominate_score", vec![(0, 0, true, 0), (1, 1, false, 100)]),
+            // Score breaks a survivor tie (FFA): both alive, so the higher score (seat 1, 50) takes
+            // first and the lower (seat 0, 10) second.
+            match_outcome_case("score_breaks_survivor_tie", vec![(0, 0, true, 10), (1, 1, true, 50)]),
+            // Exact tie SHARES a placement (FFA): seats 0 and 1 tie on (alive, score 50) -> both
+            // placement 1; seat 2 (score 10) is placement 3, skipping the gap (competition ranking).
+            match_outcome_case("exact_tie_shares_placement", vec![(0, 0, true, 50), (1, 1, true, 50), (2, 2, true, 10)]),
+            // Team grouping + SUMMED score is decisive: team 0's two seats (one alive, one dead)
+            // sum to 60 and SHARE placement 1, beating the lone team-1 seat 2 (score 50) on a
+            // survivor tie (each team has 1 survivor) — so the team total, not a single seat's
+            // score, decides, and the dead teammate still shares the placement.
+            match_outcome_case("team_shares_placement_summed_score", vec![(0, 0, true, 30), (1, 0, false, 30), (2, 1, true, 50)]),
+        ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
