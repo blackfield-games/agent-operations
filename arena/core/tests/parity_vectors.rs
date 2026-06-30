@@ -830,6 +830,17 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(full.health_after, full.health_before, "a fully-absorbed hit costs no health");
     assert!(full.shield_after < full.shield_before && full.shield_after > 0, "the shield drained but was not depleted");
     assert_eq!(full.effective, full.raw, "all of the raw was absorbed");
+    // Exact-drain seam (v29): raw == shield_before — the shield depletes to EXACTLY 0 (like
+    // partial_absorb) yet NO health spills (like full_absorb), the unique combination neither bracket
+    // case hits. to_health = min(raw - absorbed, health) = min(0, health) = 0, so the whole raw is
+    // absorbed and the target survives. A twin with a <= / < off-by-one at the shield-break boundary
+    // (spilling 1 to health, or leaving 1 shield) diverges only here.
+    let seam = sc("raw_equals_shield_exact_drain_no_spill");
+    assert_eq!(seam.raw, seam.shield_before, "the seam case fires raw == shield exactly");
+    assert_eq!(seam.shield_after, 0, "the shield depletes to EXACTLY 0 at the seam");
+    assert_eq!(seam.health_after, seam.health_before, "no overflow spills to health when raw == shield");
+    assert_eq!(seam.effective, seam.raw, "the whole raw landed — fully absorbed, none wasted past the shield");
+    assert!(seam.alive, "an exact-drain hit that costs no health leaves the target alive");
     // Partial absorb: the shield depleted to 0 and the overflow cost health; the whole raw landed.
     let part = sc("partial_absorb_overflow_to_health");
     assert_eq!(part.shield_after, 0, "a partial absorb depletes the shield");
