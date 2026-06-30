@@ -1091,6 +1091,25 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(d2(back.offset) <= (los.melee_range as i64).pow(2) && back.offset.y == 0, "the shielded enemy is in range AND dead-ahead — only the wall stopped the cleave");
     let wall = &los.blockers[0];
     assert!(front.offset.x < wall.min.x && back.offset.x > wall.max.x, "the wall sits past the struck enemy but between the shooter and the shielded one");
+    // Arc WIDTH (v32): the seam that pins MELEE_ARC_SPREAD == 1 (octant distance <= 1 in, 2 out).
+    // Every other melee case sits at octant distance 0 (dead ahead) or 4 (behind), so a twin with the
+    // wrong arc constant strikes/misses them identically — this case alone separates spread 0/1/2. An
+    // NE enemy at exactly 45° (one octant off the EAST facing → distance 1) is STRUCK and an N enemy
+    // at 90° (two octants off → distance 2) is MISSED, both well within range with a clear sightline,
+    // so ONLY the arc width separates them: a spread-0 twin (facing octant only) drops the NE strike,
+    // a spread-2 twin adds the N strike.
+    let arc = mc("arc_seam_strikes_one_octant_off_misses_two");
+    assert!(arc.blockers.is_empty(), "the arc-seam case carries no wall — the arc is the only gate");
+    let (ne, n) = (&arc.targets[0], &arc.targets[1]);
+    let arc_range2 = (arc.melee_range as i64).pow(2);
+    // The struck enemy is the exact NE diagonal (x == y > 0): one octant off EAST → distance 1.
+    assert!(ne.offset.x == ne.offset.y && ne.offset.x > 0, "the struck enemy is the exact NE diagonal (one octant off the facing)");
+    assert!(ne.struck && d2(ne.offset) <= arc_range2, "the one-octant-off NE enemy is struck AND in range — a spread-0 twin (facing octant only) would drop it");
+    // The missed enemy is the exact N axis (x == 0, y > 0): two octants off EAST → distance 2.
+    assert!(n.offset.x == 0 && n.offset.y > 0, "the missed enemy is the exact N axis (two octants off the facing)");
+    assert!(!n.struck && d2(n.offset) <= arc_range2, "the two-octant-off N enemy is MISSED yet in range — only the arc excluded it; a spread-2 twin would strike it");
+    // Both in range, no cover, so the struck/missed split is the arc WIDTH alone — nailing spread == 1.
+    assert_ne!(ne.struck, n.struck, "the in/out split across the one-vs-two-octant boundary pins MELEE_ARC_SPREAD == 1 exactly");
 
     // Perception memory (v22): a lost target's LAST PERCEIVED position is surfaced (frozen,
     // out-of-sight-flagged) for the window then dropped; a re-sighting refreshes the echo and
