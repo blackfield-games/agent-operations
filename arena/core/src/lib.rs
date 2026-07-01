@@ -4900,7 +4900,7 @@ pub struct ParityVectors {
 /// the real `proj.z` (reporting the flight altitude) reddens ONLY this case; every grounded observe case stays
 /// byte-identical. It APPENDS to the `observe` array (the five existing entries and every other category stay
 /// byte-identical), so no committed match hash moves — a deliberate convention every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v43";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v44";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6305,6 +6305,33 @@ fn observed_airborne_projectile_case(label: &str) -> ObservationCase {
     observation_case_from(label, &m)
 }
 
+/// Build the out-of-range-projectile exclusion case: an ENEMY fires a shot that flies
+/// BEYOND the observer's perception range, so `observe` EXCLUDES it under the SAME range
+/// bound a pawn is held to — while the enemy Player, sitting just inside range, IS
+/// perceived. [`observed_projectile_case`] (v42) pins that an IN-view shot is surfaced;
+/// this pins the complementary exclusion for a projectile's OWN out-of-bound position,
+/// closing the "surface every live projectile" shortcut (a free incoming-fire radar) that
+/// would pass every in-view case and the pawn-only `perception` category. The observer keeps
+/// the full default cone, so RANGE is the sole active bound here — isolated from the cone
+/// facet [`observed_pickup_case`] pins for a pickup and the LOS facet the occlusion cases
+/// pin — and the perceived enemy Player proves the observer CAN see that region: the shot is
+/// dropped for being out of range, not because the whole bearing is blind.
+fn observed_enemy_projectile_out_of_range_case(label: &str) -> ObservationCase {
+    let rules = Rules { weapon_mode: WeaponMode::Projectile, spawn_jitter: 0, ..Default::default() };
+    // Observer (seat 0, team 0) at the origin; enemy (seat 1, team 1) at 39 m — just inside the
+    // 40 m perception range, so it IS perceived — firing AWAY (east) so its shot clears the
+    // range in the spawn+advance tick (39 m + the 2 m/tick projectile speed = 41 m > 40 m) and
+    // never approaches the observer, leaving the observer unharmed and the match Live.
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    m.pawns[1].pos = Vec2 { x: 39 * POSITION_SCALE, y: 0 };
+    m.pawns[1].facing = EAST;
+    m.step(&BTreeMap::from([(1, parity_intent(Vec2::ZERO, EAST, true))]));
+    observation_case_from(label, &m)
+}
+
 /// Build the active-pickup observation case: three world pickups probe the pickup half
 /// of the perception bound. One sits underfoot and is COLLECTED this idle tick (it goes
 /// dormant, so it is EXCLUDED and its respawn timer never leaks); one sits dead ahead in
@@ -7255,6 +7282,12 @@ pub fn parity_vectors() -> ParityVectors {
             // still reports that projectile at ground z 0 — a dodger reads WHERE a shot is on
             // the plane, never how high it flies. The grounded case above can't pin this.
             observed_airborne_projectile_case("visible_airborne_projectile_reported_at_ground_z"),
+            // The complementary exclusion: a projectile OUT of the perception bound (here out
+            // of range) is NOT surfaced — its position never leaks — under the same range gate
+            // a pawn rides, while the enemy that fired it IS perceived. Closes the "surface
+            // every live projectile" shortcut (a free incoming-fire radar) that would pass every
+            // in-view case and the pawn-only perception category.
+            observed_enemy_projectile_out_of_range_case("out_of_range_enemy_projectile_excluded"),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

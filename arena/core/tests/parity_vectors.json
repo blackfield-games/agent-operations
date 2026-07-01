@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v43",
+  "domain": "blackfield/arena/parity-vectors/v44",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3982,6 +3982,47 @@
           "team": 0,
           "position": {
             "x": 2000,
+            "y": 0
+          },
+          "z": 0,
+          "facing": 0,
+          "in_line_of_sight": true
+        }
+      ]
+    },
+    {
+      "label": "out_of_range_enemy_projectile_excluded",
+      "seat": 0,
+      "team": 0,
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "z": 0,
+      "z_vel": 0,
+      "facing": 0,
+      "velocity": {
+        "x": 0,
+        "y": 0
+      },
+      "health": 100,
+      "max_health": 100,
+      "shield": 0,
+      "ammo": 30,
+      "cooldown": 0,
+      "dash_cooldown": 0,
+      "score": 0,
+      "alive": true,
+      "raw_cooldown": 0,
+      "raw_dash_cooldown": 0,
+      "deadline_micros": 50000,
+      "visible": [
+        {
+          "entity_id": 1,
+          "kind": "player",
+          "team": 1,
+          "position": {
+            "x": 39000,
             "y": 0
           },
           "z": 0,
