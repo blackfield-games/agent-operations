@@ -492,6 +492,7 @@ def run_local_match(
     aim_mode: str = "octant",
     friendly_fire: bool = False,
     gravity: int = 0,
+    starting_ticks: int = 0,
     weapon_mode: str = "hitscan",
     vertical_hit_tolerance: int = 0,
     fall_damage: int = 0,
@@ -607,6 +608,16 @@ def run_local_match(
     core — a silent footgun — so they are rejected loudly, mirroring the harness fence). Default `0`
     adds no token — byte-identical argv. Gravity alone changes only the observable `z` arc, not a
     hit outcome, until the separate `vertical_hit_tolerance` knob couples `z` into combat.
+
+    Pass `starting_ticks` (a pre-live countdown length) to open the match in the `Starting`
+    phase for that many ticks before it goes `Live`: the harness broadcasts a Starting
+    observation each tick (carrying `starting_remaining`, no reply read) via `pump_starting`,
+    so a countdown-aware policy reads the countdown through `on_starting` while the client
+    sends nothing until `Live`. Forwarded as `--starting-ticks <n>` (value-flag, like
+    `gravity`) on BOTH paths via `MatchParams.rules`, only when nonzero. `starting_ticks` is
+    outside `canonical_encoding`, so a countdown match's `replay_hash` is byte-identical to
+    the no-countdown one — the pre-live delay is digest-inert. Default `0` opens `Live` at
+    tick 0 and adds no token — byte-identical argv.
 
     Pass `weapon_mode` (`"hitscan"`, `"projectile"`, or `"melee"`) to pick how a fire resolves:
     `"hitscan"` (the default) is the instant beam, `"projectile"` spawns a travelling shot that
@@ -1161,6 +1172,10 @@ def run_local_match(
         # Same shape as --fov: a value-flag magnitude on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (physics off) adds no token — byte-identical argv.
         argv += ["--gravity", str(gravity)]
+    if starting_ticks:
+        # Same shape as --gravity: a value-flag count on both paths (the matchmaker carries it via
+        # MatchParams.rules). Default 0 (open Live directly) adds no token — byte-identical argv.
+        argv += ["--starting-ticks", str(starting_ticks)]
     if weapon_mode != "hitscan":
         # Same shape as --aim-mode: a named-enum value-flag on both paths (the matchmaker carries
         # it via MatchParams.rules). Default "hitscan" adds no token — byte-identical argv.

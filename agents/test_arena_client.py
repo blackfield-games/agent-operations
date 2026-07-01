@@ -1530,6 +1530,35 @@ def test_run_local_match_forwards_map_as_one_argv_token_and_omits_it_by_default(
     assert argv[argv.index("--map") + 1] == "reference"  # set: the key is the one next token
 
 
+def test_run_local_match_forwards_starting_ticks_and_omits_it_by_default(monkeypatch):
+    # starting_ticks forwards --starting-ticks <n> as a value-flag when nonzero; omitted (0),
+    # no --starting-ticks appears, so an existing caller's argv is byte-identical (the match
+    # opens Live at tick 0). Captured without a harness by stubbing the gateway before it spawns.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--starting-ticks" not in captured["argv"]  # omitted: byte-identical argv
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, starting_ticks=3)
+    argv = captured["argv"]
+    assert argv[argv.index("--starting-ticks") + 1] == "3"  # set: the count is the one next token
+
+
 def test_run_local_match_selects_a_named_arena_and_surfaces_its_geometry():
     # arena="reference" plays the match under the reference arena: each seat's Start frame
     # carries the central occluder + the two health pickups, read back via starts=. The
