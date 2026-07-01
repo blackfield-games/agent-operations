@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v38",
+  "domain": "blackfield/arena/parity-vectors/v39",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3322,6 +3322,32 @@
       "damage": 20,
       "target_alive": true,
       "target_shield": 20
+    },
+    {
+      "label": "friendly_melee_under_ff_credits_zero",
+      "weapon_mode": "melee",
+      "friendly_fire": true,
+      "raw": 25,
+      "shooter_team": 0,
+      "target_team": 0,
+      "score_before": 0,
+      "score_after": 0,
+      "damage": 25,
+      "target_alive": true,
+      "target_shield": 0
+    },
+    {
+      "label": "friendly_projectile_under_ff_credits_zero",
+      "weapon_mode": "projectile",
+      "friendly_fire": true,
+      "raw": 25,
+      "shooter_team": 0,
+      "target_team": 0,
+      "score_before": 0,
+      "score_after": 0,
+      "damage": 25,
+      "target_alive": true,
+      "target_shield": 0
     }
   ],
   "action_clamp": [

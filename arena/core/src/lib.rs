@@ -4809,9 +4809,15 @@ pub struct ParityVectors {
 /// and the credit is the whole shield. `shield_absorption`'s v29 case pins this `raw == shield` boundary for
 /// the POOL split but never the credit. One case hits a shielded enemy at `raw 20 == shield 20` (100 hp):
 /// absorbed 20, no spill, the credit is 20 with the target untouched on health. No struct change (`target_shield`
-/// exists from v35) — just the appended case, so this is pure coverage and no committed match hash moves. Each
-/// is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v38";
+/// exists from v35) — just the appended case, so this is pure coverage and no committed match hash moves. Bumped
+/// to v39 COMPLETING the friendly zero-credit gate across all three weapon sinks: the enemy credit is pinned for
+/// hitscan, melee, AND projectile (the `enemy_*_credits_effective` trio), but the friendly ZERO-credit only for
+/// hitscan (`friendly_hitscan_under_ff_credits_zero`), leaving `resolve_melee`'s and `advance_projectiles`' OWN
+/// `if !friendly` credit lines unpinned. Two cases fire a same-team hit under `friendly_fire` through melee and
+/// projectile (`raw 25`, 100 hp): each deals real damage (25) yet credits ZERO. No struct change (`score_credit_case`
+/// already threads mode + friendly_fire + target_team) — just the two appended cases, so this is pure coverage and
+/// no committed match hash moves. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v39";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6839,6 +6845,15 @@ pub fn parity_vectors() -> ParityVectors {
             // pins it for the CREDIT — a twin that double-credits a shield it breaks exactly, or spills
             // the breaking hit to health, diverges here alone.
             score_credit_case("enemy_exact_drain_credits_shield", WeaponMode::Hitscan, 20, false, 1, 100, 20),
+            // Friendly zero-credit across the OTHER two sinks (v39): a same-team hit under
+            // friendly_fire ON deals real damage (25) yet credits ZERO through MELEE and PROJECTILE
+            // too — completing the friendly gate the way the enemy trio (hitscan/melee/projectile)
+            // spans all three modes. friendly_hitscan_under_ff_credits_zero pins only resolve_fire's
+            // `if !friendly`; resolve_melee and the projectile sink each carry their OWN copy, so a
+            // twin that zeroes a friendly hitscan yet credits a friendly melee/projectile hit stays
+            // green on every case above and diverges only here.
+            score_credit_case("friendly_melee_under_ff_credits_zero", WeaponMode::Melee, 25, true, 0, 100, 0),
+            score_credit_case("friendly_projectile_under_ff_credits_zero", WeaponMode::Projectile, 25, true, 0, 100, 0),
         ],
         action_clamp: vec![
             // A sub-cap diagonal (mag² 720_000 < cap² 1_000_000) is in range and passes through
