@@ -16,7 +16,8 @@
 //!
 //! Protocol, per seat, exactly as arena-01 defines it:
 //!   server -> Challenge ; agent -> Join ; server -> Welcome, Start ;
-//!   then each tick  server -> Observe ; agent -> Act|Leave ;
+//!   during the pre-live countdown  server -> Observe (`phase == Starting`, broadcast — no reply) ;
+//!   then each Live tick  server -> Observe ; agent -> Act|Leave ;
 //!   and at the end  server -> End(MatchResult).
 
 use std::cell::RefCell;
@@ -1325,25 +1326,43 @@ fn settle_field_match(
 /// silently diverging.
 const DEV_MOCK_K: i32 = 32;
 
-/// Pump a formed, live match to its end: each tick, observe every seat, read each
-/// seat's Act (the server-authoritative `ingest` forfeits a rejected action), step,
-/// then emit the terminal result to every seat. The single gameplay loop both the
-/// direct and matchmade paths share — every rule still lives in `arena-core`; this is
-/// transport only. Returns the canonical [`MatchResult`].
+/// Stream the pre-live countdown a `starting_ticks > 0` match opens in. Each Starting
+/// tick, broadcast every seat's observation (so an agent — or a spectator — sees
+/// `phase == Starting` and the countdown running) then advance it with `step(&empty)`,
+/// until the core flips to `Live`. Two properties this transport must hold:
+///
+/// - The countdown is driven by the SERVER clock, never agent input: Starting
+///   observations are one-way (an agent replies only once it sees `phase == Live`, since
+///   `ingest` refuses every pre-live action as `NotLive`), and `step` runs the pure
+///   countdown with no intents, so no pawn moves before GO and a silent or slow agent can
+///   never stall the countdown.
+/// - A no-countdown match opens `Live`, so the loop never runs — byte-identical to the
+///   pre-countdown pump (no Starting frame is emitted at all).
+fn pump_starting(m: &mut Match, n: u8, out: &mut impl Write) {
+    while m.phase() == MatchPhase::Starting {
+        for seat in 0..n {
+            emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
+        }
+        out.flush().expect("flush starting observations");
+        m.step(&BTreeMap::new());
+    }
+}
+
+/// Pump a formed, live match to its end: stream the pre-live countdown ([`pump_starting`]),
+/// then each Live tick observe every seat, read each seat's Act (the server-authoritative
+/// `ingest` forfeits a rejected action), step, and emit the terminal result to every seat.
+/// The single gameplay loop both the direct and matchmade paths share — every rule still
+/// lives in `arena-core`; this is transport only. Returns the canonical [`MatchResult`].
 fn pump_to_end(
     m: &mut Match,
     n: u8,
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
 ) -> MatchResult {
-    // Pre-live countdown: the core opens a `starting_ticks > 0` match in Starting. Burn it down
-    // with no agent I/O — actions are refused pre-live, so the seats exchange nothing — leaving the
-    // Live loop below to open at tick 0. With no countdown (the default) the match opens Live and
-    // this loop never runs, byte-identical to the pre-countdown pump; surfacing Starting to the
-    // agents (observations during the countdown) is a separate slice.
-    while m.phase() == MatchPhase::Starting {
-        m.step(&BTreeMap::new());
-    }
+    // Pre-live countdown: stream the Starting phase to the agents, then enter the Live loop
+    // (which opens at tick 0). With no countdown (the default) the match opens Live and this
+    // is a no-op — byte-identical to the pre-countdown pump.
+    pump_starting(m, n, out);
     while m.phase() == MatchPhase::Live {
         for seat in 0..n {
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
