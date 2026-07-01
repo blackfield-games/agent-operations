@@ -4875,8 +4875,20 @@ pub struct ParityVectors {
 /// `knockback_horizontal` + `gravity` all on and pins its pop + shove IDENTICAL to the enemy `pop_and_shove_compose`
 /// — the physics is team-blind, only the credit is team-gated. `KnockbackCase` gains `friendly_fire` (the rule that
 /// selected the ally) — appended, `false` on every existing entry, so the golden adds the key additively with no
-/// committed match hash move. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v41";
+/// committed match hash move. Bumped to v42 ADDING two `observe` cases that pin the NON-PLAYER visible entities:
+/// `observe` surfaces an in-flight projectile AND an active pickup as NEUTRAL entities under the SAME
+/// range+cone+LOS bound a pawn is held to, but every existing observe case perceives only PLAYER entities, so the
+/// projectile/pickup exposure was pinned NOWHERE cross-impl — a twin that omitted incoming shots (an agent cannot
+/// dodge), reported a projectile with its shooter's team (leaking allegiance), surfaced a DORMANT pickup (leaking
+/// respawn timing), or carried a pickup's kind/amount/timer stayed green. `visible_projectile_is_neutral_heading_only`
+/// fires one projectile-mode shot from a team-1 observer and pins its own in-flight shot reported as a neutral
+/// (team 0) Projectile carrying ONLY position + travel heading; `visible_pickup_active_only_neutral_bounded` places
+/// three pads — one collected this idle tick (dormant ⇒ EXCLUDED), one ahead in-cone (active ⇒ the one visible
+/// Pickup), one behind the facing (in range but out of the cone ⇒ EXCLUDED) — plus an idle enemy so the frame spans
+/// a Player and a Pickup in canonical ascending-id order. Both cases only APPEND to the `observe` array (the four
+/// existing entries and every other category stay byte-identical), so no committed match hash moves. Each is a
+/// deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v42";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6227,6 +6239,62 @@ fn observation_case_from(label: &str, m: &Match) -> ObservationCase {
     }
 }
 
+/// Build the in-flight-projectile observation case: a lone observer fires ONE
+/// projectile-mode shot and observes its own shot mid-flight. The observer sits on
+/// team 1 so the neutral report is discriminating — a projectile carries its shooter's
+/// team internally ([`Match::spawn_projectile`] copies `s.team`), so reporting `team 0`
+/// is only a real convention when the shooter is NOT team 0. The shot spawns at the
+/// origin and the same-tick advance flies it one step into the observer's forward cone,
+/// where `observe` surfaces it as a neutral [`EntityKind::Projectile`] carrying only its
+/// position and travel heading — never its shooter, team, or shot index.
+fn observed_projectile_case(label: &str) -> ObservationCase {
+    let rules = Rules { weapon_mode: WeaponMode::Projectile, spawn_jitter: 0, ..Default::default() };
+    let mut m = Match::new(parity_match_id(), parity_config(1), rules, vec![parity_seat(0, 1)], Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    m.step(&BTreeMap::from([(0, parity_intent(Vec2::ZERO, EAST, true))]));
+    observation_case_from(label, &m)
+}
+
+/// Build the active-pickup observation case: three world pickups probe the pickup half
+/// of the perception bound. One sits underfoot and is COLLECTED this idle tick (it goes
+/// dormant, so it is EXCLUDED and its respawn timer never leaks); one sits dead ahead in
+/// range + cone (ACTIVE, the one visible [`EntityKind::Pickup`], carrying only its
+/// position — no kind, amount, or timer); one sits behind the facing (in range but out of
+/// the narrow cone, EXCLUDED — an out-of-bound entity's position never appears). A
+/// perceived idle enemy shares the frame so the visible set spans two entity kinds in the
+/// canonical ascending-id order (a Player id below the pickup id space).
+fn observed_pickup_case(label: &str) -> ObservationCase {
+    let rules = Rules {
+        fov_octant_spread: 1,
+        perception_range: 30 * POSITION_SCALE,
+        pickup_radius: 1000,
+        pickup_respawn_cooldown: 3,
+        spawn_jitter: 0,
+        ..Default::default()
+    };
+    let pickups = vec![
+        PickupSpawn { kind: PickupKind::Health, position: Vec2::ZERO, amount: 25 },
+        PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x: 5000, y: 0 }, amount: 8 },
+        PickupSpawn { kind: PickupKind::Shield, position: Vec2 { x: -5000, y: 0 }, amount: 10 },
+    ];
+    let mut m = Match::new_with_pickups(
+        parity_match_id(),
+        parity_config(2),
+        rules,
+        vec![parity_seat(0, 0), parity_seat(1, 1)],
+        Vec::new(),
+        pickups,
+        1,
+    );
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    m.pawns[0].health = 50; // wounded, so the underfoot Health pad is genuinely collected
+    m.pawns[1].pos = Vec2 { x: 3000, y: 0 }; // an idle enemy, in range + cone, off every pad
+    m.step(&BTreeMap::from([]));
+    observation_case_from(label, &m)
+}
+
 /// Build a z-aware-occlusion case: test the one sightline against the one wall and
 /// record whether it is occluded — the predicate the twin reproduces.
 fn vision_over_cover_case(label: &str, from: Vec2, from_z: i32, to: Vec2, to_z: i32, blocker: Blocker) -> VisionOverCoverCase {
@@ -7127,6 +7195,12 @@ pub fn parity_vectors() -> ParityVectors {
                     ..ObserveScenario::baseline()
                 },
             ),
+            // The NON-PLAYER visible entities, under the IDENTICAL range+cone+LOS bound a
+            // pawn is held to: an in-flight projectile and an active pickup are perceivable
+            // world objects, each reported NEUTRAL (team 0) and carrying only position (+ a
+            // projectile's travel heading) — never a shooter, kind, amount, or respawn timer.
+            observed_projectile_case("visible_projectile_is_neutral_heading_only"),
+            observed_pickup_case("visible_pickup_active_only_neutral_bounded"),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),

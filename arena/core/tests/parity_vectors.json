@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v41",
+  "domain": "blackfield/arena/parity-vectors/v42",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3851,6 +3851,100 @@
           },
           "z": 600,
           "facing": 32768,
+          "in_line_of_sight": true
+        }
+      ]
+    },
+    {
+      "label": "visible_projectile_is_neutral_heading_only",
+      "seat": 0,
+      "team": 1,
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "z": 0,
+      "z_vel": 0,
+      "facing": 0,
+      "velocity": {
+        "x": 0,
+        "y": 0
+      },
+      "health": 100,
+      "max_health": 100,
+      "shield": 0,
+      "ammo": 29,
+      "cooldown": 5,
+      "dash_cooldown": 0,
+      "score": 0,
+      "alive": true,
+      "raw_cooldown": 6,
+      "raw_dash_cooldown": 0,
+      "deadline_micros": 50000,
+      "visible": [
+        {
+          "entity_id": 65536,
+          "kind": "projectile",
+          "team": 0,
+          "position": {
+            "x": 2000,
+            "y": 0
+          },
+          "z": 0,
+          "facing": 0,
+          "in_line_of_sight": true
+        }
+      ]
+    },
+    {
+      "label": "visible_pickup_active_only_neutral_bounded",
+      "seat": 0,
+      "team": 0,
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "z": 0,
+      "z_vel": 0,
+      "facing": 0,
+      "velocity": {
+        "x": 0,
+        "y": 0
+      },
+      "health": 75,
+      "max_health": 100,
+      "shield": 0,
+      "ammo": 30,
+      "cooldown": 0,
+      "dash_cooldown": 0,
+      "score": 0,
+      "alive": true,
+      "raw_cooldown": 0,
+      "raw_dash_cooldown": 0,
+      "deadline_micros": 50000,
+      "visible": [
+        {
+          "entity_id": 1,
+          "kind": "player",
+          "team": 1,
+          "position": {
+            "x": 3000,
+            "y": 0
+          },
+          "z": 0,
+          "facing": 32768,
+          "in_line_of_sight": true
+        },
+        {
+          "entity_id": 16777217,
+          "kind": "pickup",
+          "team": 0,
+          "position": {
+            "x": 5000,
+            "y": 0
+          },
+          "z": 0,
+          "facing": 0,
           "in_line_of_sight": true
         }
       ]
