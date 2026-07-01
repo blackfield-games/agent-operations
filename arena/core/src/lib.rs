@@ -3968,7 +3968,12 @@ pub struct MatchOutcomeCase {
 /// shield consumed, unlike v37 where it survives) yet ZERO health spills (unlike v35), and the credit
 /// is the whole shield — the `raw == shield` boundary `shield_absorption`'s v29 case pins for the POOL
 /// split, here pinned for the CREDIT, so a twin that double-credits a shield it breaks exactly, or
-/// spills the breaking hit to health, diverges here alone.
+/// spills the breaking hit to health, diverges here alone. v39 completes the FRIENDLY zero-credit
+/// across those same three sinks: the enemy credit is repeated across hitscan/melee/projectile, but the
+/// friendly ZERO-credit was pinned for hitscan alone — so a same-team hit under `friendly_fire` is fired
+/// through melee and projectile too, each dealing real damage yet crediting zero, pinning that
+/// `resolve_melee`'s and `advance_projectiles`' own `if !friendly` gate skips a friendly the same way
+/// `resolve_fire`'s does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScoreCreditCase {
     pub label: String,
