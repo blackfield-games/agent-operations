@@ -4899,7 +4899,17 @@ pub struct ParityVectors {
 /// (> 0) — and pins the observed projectile at `z 0` while the observer's own z is live-positive. A twin that leaked
 /// the real `proj.z` (reporting the flight altitude) reddens ONLY this case; every grounded observe case stays
 /// byte-identical. It APPENDS to the `observe` array (the five existing entries and every other category stay
-/// byte-identical), so no committed match hash moves — a deliberate convention every twin must follow.
+/// byte-identical), so no committed match hash moves — a deliberate convention every twin must follow. Bumped to v44
+/// EXTENDING the `observe` category with the COMPLEMENTARY out-of-bound projectile exclusion: v42/v43 pin that an
+/// IN-view shot IS surfaced, but a projectile's OWN out-of-bound position was pinned NOWHERE — every projectile rides
+/// the same `perceives()` range+cone+LOS gate a pawn does, yet a twin that surfaced EVERY live projectile (a free
+/// incoming-fire radar) passed every in-view case and the pawn-only `perception` category. One appended case
+/// (`out_of_range_enemy_projectile_excluded`) has an enemy 39 m out — just inside the 40 m range, so PERCEIVED — fire
+/// a shot that clears the range in the spawn+advance tick; observe surfaces the enemy Player but EXCLUDES its
+/// now-out-of-range shot, the perceived shooter proving the observer CAN see that bearing (the drop is a range bound,
+/// not a blind spot). A surface-all-projectiles twin adds the shot and reddens ONLY this case (`visible.len()` 1→2).
+/// It APPENDS to the `observe` array (the six existing entries and every other category stay byte-identical), so no
+/// committed match hash moves — a deliberate convention every twin must follow.
 const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v44";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
