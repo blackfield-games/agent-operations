@@ -492,10 +492,12 @@ def _start_frame() -> dict:
     }
 
 
-def _observe_frame(tick: int = 0, seat: int = 0, alive: bool = True, deadline: int = 50_000) -> dict:
+def _observe_frame(tick: int = 0, seat: int = 0, alive: bool = True, deadline: int = 50_000,
+                   phase: str = "live", starting_remaining: int = 0) -> dict:
     return {
         "type": "observe", "protocol_version": proto.PROTOCOL_VERSION, "match_id": FIXED_MATCH,
-        "seat": seat, "tick": tick, "phase": "live", "deadline_micros": deadline,
+        "seat": seat, "tick": tick, "phase": phase, "starting_remaining": starting_remaining,
+        "deadline_micros": deadline,
         "own": {"seat": seat, "team": 0, "position": {"x": 0, "y": 0}, "z": 0, "z_vel": 0, "facing": 0,
                 "velocity": {"x": 0, "y": 0}, "health": 100, "max_health": 100, "shield": 0, "ammo": 30, "cooldown": 0, "dash_cooldown": 0, "score": 0, "alive": alive},
         "visible": [],
@@ -705,6 +707,28 @@ def test_hookless_policy_runs_unchanged():
     result = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 0.0])).run(_fixed_policy)
     assert result is not None
     assert any(f["type"] == "act" for f in t.sent)  # it still made its decision
+
+
+def test_sends_no_reply_during_the_starting_countdown():
+    # The harness pump_starting broadcasts the pre-live countdown WITHOUT reading a
+    # reply, so the SDK must answer nothing until Live — else the pre-live Act sits in
+    # the pipe and is consumed as the stale first Live action, desyncing the match. Two
+    # Starting frames then a Live one draw EXACTLY ONE act (the Live tick); dropping the
+    # phase guard yields three (the mutation proof).
+    from arena_client.sdk import ArenaClient
+
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(phase="starting", starting_remaining=2),
+               _observe_frame(phase="starting", starting_remaining=1),
+               _observe_frame(phase="live"),
+               _end_frame()]
+    t = MockTransport(inbound)
+    result = ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 4)).run(_fixed_policy)
+
+    assert result is not None
+    acts = [f for f in t.sent if f["type"] == "act"]
+    assert len(acts) == 1, "exactly one reply — the Live tick, not the two Starting frames"
+    assert acts[0]["tick"] == 0  # the Live tick-0 action, with no pre-live leak ahead of it
 
 
 def test_static_geometry_never_rides_the_parity_bounded_observation():

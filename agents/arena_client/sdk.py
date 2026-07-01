@@ -238,7 +238,9 @@ class ArenaClient:
 
     def poll(self, policy: Policy) -> MatchResult | None:
         """Process exactly one inbound frame. Returns the MatchResult on End (and
-        marks the client done), else None. Connects lazily on first call."""
+        marks the client done), else None. Connects lazily on first call. A pre-live
+        (Starting-countdown) observation is informational and draws no reply — the
+        client answers only once the match is Live."""
         if not self.connected:
             self.connect()
         if not self._started:
@@ -263,6 +265,13 @@ class ArenaClient:
         raise ProtocolError(f"unexpected mid-match frame {type(msg).__name__}")
 
     def _respond(self, obs: Observation, policy: Policy) -> None:
+        if obs.phase != "live":
+            # Pre-live (the Starting countdown): the server broadcasts the observation
+            # without reading a reply (the arena harness pump_starting), so an Act here
+            # would sit in the pipe and be consumed as the stale first Live action,
+            # desyncing the match. A pre-live observation is informational — the policy
+            # is not ticked and nothing is sent until the match is Live.
+            return
         if not obs.own.alive:
             # A corpse's action is rejected (SeatDown); answer with a passive hold so
             # a lock-step transport stays in frame, and never fire.
