@@ -1514,6 +1514,7 @@ impl Match {
             seat,
             tick: self.tick,
             phase: self.phase,
+            starting_remaining: self.starting_remaining,
             deadline_micros: self.rules.action_deadline_micros,
             own: arena_proto::SelfState {
                 seat: me.seat,
