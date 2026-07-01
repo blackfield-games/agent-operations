@@ -762,6 +762,116 @@ def test_starting_countdown_surfaces_to_a_countdown_aware_policy():
     assert len(acts) == 1, "still exactly one Live reply"
 
 
+def test_match_result_surfaces_to_a_result_aware_policy_exactly_once():
+    # The terminal MatchResult is surfaced to a result-aware policy via on_match_end
+    # (mirroring on_match_start/on_starting) so a stateful policy can close its own loop.
+    # It fires EXACTLY ONCE — not per tick — and receives the SAME canonical object run()
+    # returns. Two ticks are scripted, so a per-tick (wrong) firing would surface as more
+    # than one recorded result. Dropping the dispatch empties `ended` (the mutation proof).
+    from arena_client.sdk import ArenaClient
+
+    class _ResultAware:
+        def __init__(self):
+            self.ended: list[MatchResult] = []
+
+        def on_match_end(self, result):
+            self.ended.append(result)
+
+        def __call__(self, _obs):
+            return _intent(0, 0)
+
+    pol = _ResultAware()
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0), _observe_frame(tick=1), _end_frame()]
+    result = ArenaClient(MockTransport(inbound), agent_id="a", clock=FakeClock([0.0] * 6)).run(pol)
+
+    assert len(pol.ended) == 1, "on_match_end fires exactly once at match end, not per tick"
+    assert pol.ended[0] is result, "the hook receives the SAME canonical result run() returns"
+
+
+def test_on_match_end_never_fires_on_a_mid_match_reject():
+    # on_match_end fires ONLY for the terminal MatchResult, never for a mid-match Reject
+    # (an action rejection — sdk.py appends it to `rejections` and reads on). A stream with
+    # a Reject BEFORE the end still fires the hook exactly once (the true end), and the
+    # Reject is still processed — proof the dispatch keys off the MatchResult frame alone.
+    from arena_client.sdk import ArenaClient
+
+    class _ResultAware:
+        def __init__(self):
+            self.ended: list[MatchResult] = []
+
+        def on_match_end(self, result):
+            self.ended.append(result)
+
+        def __call__(self, _obs):
+            return _intent(0, 0)
+
+    pol = _ResultAware()
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0), {"type": "reject", "reason": "stale tick"},
+               _observe_frame(tick=1), _end_frame()]
+    c = ArenaClient(MockTransport(inbound), agent_id="a", clock=FakeClock([0.0] * 8))
+    c.run(pol)
+
+    assert len(pol.ended) == 1, "the Reject did not fire on_match_end; only the terminal result did"
+    assert c.rejections == ["stale tick"], "the mid-match Reject was still processed"
+
+
+def test_partial_hook_policy_without_on_match_end_runs_unchanged():
+    # Each hook is INDEPENDENTLY getattr-guarded: a policy that defines on_match_start but
+    # NOT on_match_end runs a full match to End with no AttributeError, and run() still
+    # returns the result. Proves the new hook's guard is per-attribute, not all-or-nothing.
+    from arena_client.sdk import ArenaClient
+
+    class _StartOnly:
+        def __init__(self):
+            self.started = False
+
+        def on_match_start(self, _ms):
+            self.started = True
+
+        def __call__(self, _obs):
+            return _intent(0, 0)
+
+    pol = _StartOnly()
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(),
+                       _observe_frame(), _end_frame()])
+    result = ArenaClient(t, agent_id="a", clock=FakeClock([0.0, 0.0])).run(pol)
+
+    assert result is not None
+    assert pol.started, "on_match_start still fired"
+    assert any(f["type"] == "act" for f in t.sent), "the per-tick decision is untouched"
+
+
+def test_lifecycle_hooks_fire_in_order_start_then_decisions_then_end():
+    # The full lifecycle fires in order: on_match_start (once, before any decision) →
+    # per-tick decisions → on_match_end (once, after the last decision). A recorder logs
+    # each moment so an out-of-order or interleaved end (e.g. dispatched before the final
+    # decision) would surface as a wrong sequence.
+    from arena_client.sdk import ArenaClient
+
+    class _Recorder:
+        def __init__(self):
+            self.order: list[str] = []
+
+        def on_match_start(self, _ms):
+            self.order.append("start")
+
+        def on_match_end(self, _result):
+            self.order.append("end")
+
+        def __call__(self, _obs):
+            self.order.append("decide")
+            return _intent(0, 0)
+
+    pol = _Recorder()
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(tick=0), _observe_frame(tick=1), _end_frame()]
+    ArenaClient(MockTransport(inbound), agent_id="a", clock=FakeClock([0.0] * 6)).run(pol)
+
+    assert pol.order == ["start", "decide", "decide", "end"], "start once first, end once last"
+
+
 def test_static_geometry_never_rides_the_parity_bounded_observation():
     # FM1 (parity): the static map is surfaced ONCE at Start, never on the per-tick
     # Observation — the security boundary. A blockers field on an Observation is
