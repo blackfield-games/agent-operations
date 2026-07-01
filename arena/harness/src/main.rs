@@ -3231,6 +3231,59 @@ mod tests {
     }
 
     #[test]
+    fn pump_starting_streams_the_countdown_then_opens_live() {
+        // A starting_ticks=N match opens in Starting; pump_starting broadcasts every seat's
+        // observation (phase=Starting, tick pinned at 0) for exactly N ticks then flips to Live
+        // at tick 0 — driven by the server clock (no agent input read), applying no action.
+        let mut m = build_direct_match(&Args { starting_ticks: 2, ..direct_args(2, "reference", 0) }, 2);
+        assert_eq!(m.phase(), MatchPhase::Starting, "the countdown match opens in Starting");
+        let before = [m.observe(0).own.position, m.observe(1).own.position];
+
+        let mut out: Vec<u8> = Vec::new();
+        pump_starting(&mut m, 2, &mut out);
+
+        // The countdown elapsed to Live at tick 0, no pawn moved pre-live (a Starting step runs
+        // the pure countdown with empty intents).
+        assert_eq!(m.phase(), MatchPhase::Live, "the countdown flips to Live");
+        assert_eq!(m.tick(), 0, "Live opens at tick 0 — the countdown never advanced the tick");
+        assert_eq!(
+            [m.observe(0).own.position, m.observe(1).own.position],
+            before,
+            "no pawn moved during the countdown"
+        );
+
+        // Exactly N ticks × n seats Starting observations were broadcast, each phase=Starting at
+        // tick 0, in seat order — a spectator/agent connected during the countdown sees it run.
+        let text = String::from_utf8(out).expect("utf8 transcript");
+        let frames: Vec<serde_json::Value> =
+            text.lines().map(|l| serde_json::from_str(l).expect("frame json")).collect();
+        assert_eq!(frames.len(), 2 * 2, "N=2 countdown ticks × 2 seats = 4 Starting observations");
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f["seat"].as_u64(), Some((i % 2) as u64), "observations cycle in seat order 0,1,0,1");
+            // GatewayMsg is internally tagged (`type`), so the Observation fields sit flat on the frame.
+            let obs = &f["frame"];
+            assert_eq!(obs["type"], "observe", "each Starting frame is an Observe");
+            assert_eq!(obs["phase"], "starting", "every broadcast frame carries phase=Starting");
+            assert_eq!(obs["tick"].as_u64(), Some(0), "the countdown observations all sit at tick 0");
+        }
+    }
+
+    #[test]
+    fn pump_starting_is_a_no_op_without_a_countdown() {
+        // The default: a starting_ticks=0 match opens Live, so pump_starting emits NOTHING and
+        // steps nothing — byte-identical to the pre-countdown pump (no Starting frame at all).
+        let mut m = build_direct_match(&direct_args(2, "reference", 0), 2);
+        assert_eq!(m.phase(), MatchPhase::Live, "no countdown opens directly in Live");
+
+        let mut out: Vec<u8> = Vec::new();
+        pump_starting(&mut m, 2, &mut out);
+
+        assert!(out.is_empty(), "a no-countdown match emits no Starting observation");
+        assert_eq!(m.phase(), MatchPhase::Live, "the match stays Live");
+        assert_eq!(m.tick(), 0, "and at tick 0 — pump_starting did not step it");
+    }
+
+    #[test]
     fn direct_match_threads_vertical_hit_tolerance_into_rules() {
         // FM1 (default drift): no --vertical-hit-tolerance is 0 — combat planar, z ignored in hit
         // resolution, byte-identical to the pre-flag harness (and its replay digest). The z-coupled
