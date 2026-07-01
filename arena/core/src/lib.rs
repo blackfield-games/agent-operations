@@ -4329,7 +4329,15 @@ pub struct VerticalHitCase {
 /// from the shooter (gated on `knockback_horizontal > 0` ALONE — no gravity); the shooter
 /// never recoils or moves. A twin that drops either impulse, signs it the wrong way, applies
 /// it to the shooter, or ignores a gate fails the matching case. All other tuning is
-/// [`Rules::default`].
+/// [`Rules::default`]. The v41 `friendly_target_popped_and_shoved_like_an_enemy` case records
+/// this same compose hit on the shooter's OWN teammate under [`Rules::friendly_fire`] (the
+/// `friendly_fire` field flags it): the ally is struck for the full damage and popped + shoved to
+/// the IDENTICAL `z_vel`/position as the enemy `pop_and_shove_compose` — the knockback rides on
+/// damage dealt / survival, NOT the `if !friendly` gate that zeroes the SCORE, so the physical
+/// effect is TEAM-BLIND. Every other case rosters an enemy (`friendly_fire` off), so a twin that
+/// mirrored the credit gate onto the shove/pop (leaving a friendly unmoved) passes them all; only
+/// the friendly case separates it. The credit ZERO for that same friendly hit is pinned by
+/// `score_credit` (v39) and `melee_cleave` (v40) — this pins the effect, they pin the credit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnockbackCase {
     pub label: String,
