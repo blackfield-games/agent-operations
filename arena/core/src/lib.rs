@@ -5625,6 +5625,53 @@ fn knockback_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocit
     }
 }
 
+/// Build a friendly-fire knockback case: like [`knockback_case`] but with `friendly_fire` ON and
+/// the target on the SHOOTER's OWN team (seat 1 on team 0). Under `friendly_fire` the same-team
+/// target IS selected into the hit set, so it takes the full hit — and because the knockback rides
+/// on damage dealt / survival with NO team check ([`knock_back_horizontal`] and the [`damage_pawn`]
+/// `z_vel` pop), the ally is popped and shoved EXACTLY like an enemy even though the hit credits no
+/// score. Pins the knockback as TEAM-BLIND, the one thing every enemy-target [`knockback_case`]
+/// cannot separate; the credit side of the same friendly hit is pinned by `score_credit`/`melee_cleave`.
+fn knockback_ff_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocity: i32, knockback_horizontal: i32) -> KnockbackCase {
+    let rules = Rules { weapon_mode: mode, gravity, knockback_velocity, knockback_horizontal, friendly_fire: true, spawn_jitter: 0, ..Default::default() };
+    let shooter = Vec2::ZERO;
+    let target = Vec2 { x: 1500, y: 0 };
+    // Seat 1 on team 0 — the shooter's OWN team, so the hit is friendly (only reachable/selected
+    // because friendly_fire is ON).
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 0)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = shooter;
+    m.pawns[0].facing = EAST;
+    m.pawns[1].pos = target;
+    let before = m.pawns[1].health;
+    match mode {
+        WeaponMode::Hitscan => m.resolve_fire(0),
+        WeaponMode::Melee => m.resolve_melee(0),
+        WeaponMode::Projectile => {
+            m.spawn_projectile(0);
+            let mut age = 0u16;
+            while !m.projectiles.is_empty() && age < MAX_PROJECTILE_LIFETIME {
+                m.advance_projectiles();
+                age += 1;
+            }
+        }
+    }
+    KnockbackCase {
+        label: label.to_string(),
+        weapon_mode: mode,
+        gravity,
+        knockback_velocity,
+        knockback_horizontal,
+        damage: before - m.pawns[1].health,
+        target_z_vel: m.pawns[1].z_vel,
+        shooter_z_vel: m.pawns[0].z_vel,
+        target_pos: m.pawns[1].pos,
+        shooter_pos: m.pawns[0].pos,
+        target_alive: m.pawns[1].alive,
+        friendly_fire: true,
+    }
+}
+
 /// Build a shield-absorption case: grant the target (seat 1) `shield_before` / `health_before`,
 /// fire ONE point-blank `mode` hit of `raw` damage through the REAL combat path, and record
 /// how the shield-first sink split it. `Rules::damage` AND `Rules::melee_damage` are both set
@@ -6534,6 +6581,12 @@ pub fn parity_vectors() -> ParityVectors {
             // Both axes compose on ONE hit: gravity+knockback pop it up AND the horizontal
             // shove pushes it east — a twin that fires only one fails this case.
             knockback_case("pop_and_shove_compose", WeaponMode::Hitscan, 60, 800, 800),
+            // Friendly-target knockback (v41): the SAME compose tuning, but the target is the
+            // shooter's OWN teammate under friendly_fire. The ally is struck for real and popped +
+            // shoved IDENTICALLY to the enemy compose case — the knockback rides on damage dealt,
+            // NOT on the `if !friendly` gate that zeroes its score. A twin that mirrored the credit
+            // gate onto the shove/pop leaves the ally unmoved; every other case is an enemy.
+            knockback_ff_case("friendly_target_popped_and_shoved_like_an_enemy", WeaponMode::Hitscan, 60, 800, 800),
         ],
         pawn_collisions: {
             // A 1 m body at x=5 m; movers approach east along the x-axis at 1 m/tick.

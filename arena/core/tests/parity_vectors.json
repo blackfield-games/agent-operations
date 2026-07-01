@@ -1377,6 +1377,26 @@
       },
       "target_alive": true,
       "friendly_fire": false
+    },
+    {
+      "label": "friendly_target_popped_and_shoved_like_an_enemy",
+      "weapon_mode": "hitscan",
+      "gravity": 60,
+      "knockback_velocity": 800,
+      "knockback_horizontal": 800,
+      "damage": 25,
+      "target_z_vel": 800,
+      "shooter_z_vel": 0,
+      "target_pos": {
+        "x": 2300,
+        "y": 0
+      },
+      "shooter_pos": {
+        "x": 0,
+        "y": 0
+      },
+      "target_alive": true,
+      "friendly_fire": true
     }
   ],
   "pawn_collisions": [
