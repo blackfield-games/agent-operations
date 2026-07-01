@@ -1428,6 +1428,117 @@ async def test_run_must_not_npc_gate_degrades_on_a_missing_npc_layer(tmp_path):
     assert _route_back_target(verdict) == "npc"
 
 
+# ---- must_not -> interiors: the frontier "no enclosed interiors" rule (interior_volumes) ----
+#
+# The director DECLARES intent:must_not = interior_volumes (the "no enclosed interiors"
+# frontier rule the validator docstring names) but — unlike every other intent — NO
+# specialist consumes it, so there is nothing to HONOR and, until this gate, nothing
+# VERIFIED it. It is therefore a pure VERIFY gate: reject any well-formed layer that
+# declares an enclosed interior (the enclosedInterior=true marker) when the director
+# forbade interior_volumes, naming the authoring specialist. No specialist emits the
+# marker today, so it is additive (a correct world is byte-identical accepted) and silent
+# without the intent — defense-in-depth against a tampered/desynced/future layer.
+
+
+def _interior_body(default_prim: str = "Structures") -> str:
+    """A well-formed layer declaring an enclosed-interior volume via the
+    `enclosedInterior=true` marker. No specialist emits this today, so it models the
+    tampered/desynced/future layer the interiors gate must catch when the director forbids
+    interior_volumes. Well-formed (magic + defaultPrim) so it clears the well-formedness
+    gate and reaches the intent gate; it carries no triangle-metric fields, so the
+    per-specialist triangle self-consistency gates degrade-skip it (no false reject)."""
+    return (
+        f'#usda 1.0\n(\n    defaultPrim = "{default_prim}"\n)\n\n'
+        f'def Xform "{default_prim}"\n{{\n'
+        '    def Cube "Bunker"\n    {\n        custom bool enclosedInterior = true\n    }\n}\n'
+    )
+
+
+async def test_run_interiors_gate_accepts_a_frontier_world_without_the_marker(tmp_path):
+    # FM1 (additive / no self-trigger): the director declares interior_volumes (its own
+    # layer literally carries the "interior_volumes" string) but no layer declares the
+    # enclosedInterior marker — the gate must stay silent and NOT self-trigger off the
+    # director's declaration. The world validates exactly as before the gate existed. Only
+    # interior_volumes is declared, so no sibling must_not gate (dense_vegetation/civilians)
+    # muddies the result.
+    layers = _set_with(tmp_path, {"director": _director_body(must_not="interior_volumes")})
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert "director" not in verdict.failing_specialists
+
+
+async def test_run_rejects_an_enclosed_interior_in_a_frontier_region_and_routes_to_the_author(tmp_path):
+    # FM2 (false accept): the director forbids interior_volumes but the prop layer declares
+    # an enclosed interior — a tampered/desynced/future layer. The gate must reject it, name
+    # prop (the author, the route-back target), and key the message off intent:must_not, NEVER
+    # the pipeline-earlier "director" (which would misroute the text-scan fallback).
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="interior_volumes"),
+        "prop": _interior_body("Props"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:must_not" in i and "enclosedInterior" in i and "prop" in i for i in verdict.issues)
+    assert "prop" in verdict.failing_specialists
+    assert "director" not in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "prop"
+    assert _route_back_target(verdict) == "prop"
+
+
+async def test_run_interiors_gate_routes_to_the_earliest_of_several_offenders(tmp_path):
+    # FM2 (earliest route-back): two layers smuggle an interior — terrain (pipeline-earlier)
+    # and prop. Both are named, and the supervisor repairs the earliest (terrain) first, so an
+    # upstream cause is fixed before its downstream replay.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="interior_volumes"),
+        "terrain": _interior_body("TerrainInterior"),
+        "prop": _interior_body("PropInterior"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert {"terrain", "prop"} <= set(verdict.failing_specialists)
+    assert _route_back_target(verdict) == "terrain"
+
+
+async def test_run_interiors_gate_dormant_when_the_director_omits_interior_volumes(tmp_path):
+    # FM3 (over-reach): a NON-frontier region — the director's must_not names other tokens but
+    # NOT interior_volumes — with a layer that declares an enclosed interior must stay ACCEPTED.
+    # Interiors are forbidden only where the frontier rule is declared (a premium hub is legal).
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_not="civilians"),
+        "prop": _interior_body("Props"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_interiors_gate_dormant_without_any_must_not(tmp_path):
+    # FM3 (over-reach): the director seeds NO must_not at all, so the gate cannot fire — even a
+    # layer declaring an enclosed interior validates. A bare marker with no declaration is not a
+    # violation.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(),
+        "prop": _interior_body("Props"),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_interiors_gate_degrades_on_a_missing_director(tmp_path):
+    # FM4 (degrade, no crash / no double-report): the director layer is gone, so _director_intent
+    # returns [] and the interiors gate cannot read the declaration — it must stay silent (raise
+    # nothing through the final gate) even though prop carries the marker. The missing-specialist
+    # gate rejects and attributes director; the interiors gate contributes no issue.
+    verdict = await validator.run(
+        _brief(),
+        _set_with_missing(tmp_path, {"prop": _interior_body("Props")}, missing="director"),
+        layers_root=tmp_path,
+    )
+    assert not verdict.accepted
+    assert "director" in verdict.failing_specialists
+    assert not any("enclosedInterior" in i for i in verdict.issues)
+
+
 # ---- lighting loop: the Atmosphere must be driven by the director's recognized beats ----
 #
 # The director DECLARES intent:beats (a free-form mood line) and lighting HONORS it by
