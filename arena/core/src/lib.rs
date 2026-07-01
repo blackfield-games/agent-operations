@@ -3800,6 +3800,11 @@ pub struct MeleeTarget {
     pub struck: bool,
     /// `health_before - health_after` — `melee_damage` when struck, `0` when missed.
     pub damage: u16,
+    /// The target is on the SHOOTER's own team (an ally). `false` on every enemy target;
+    /// `true` only in the friendly-fire cleave case, where an ally is struck for real damage
+    /// yet its hit adds nothing to the shooter's score (`resolve_melee`'s per-hit `if !friendly`
+    /// gate). A parity-golden field, not sim state.
+    pub friendly: bool,
 }
 
 /// A pinned melee-cleave case (domain v21): one seat-0 swing of [`Match::resolve_melee`]
@@ -3845,6 +3850,11 @@ pub struct MeleeCleaveCase {
     /// every struck target; the `score_credit` category (v24/v35) pins the SINGLE-hit credit on a
     /// 2-pawn match, so this is the one place the credit is pinned SUMMED across a multi-hit swing.
     pub shooter_score: i32,
+    /// `friendly_fire` was ON for this swing. `false` on every all-enemy case; `true` only for the
+    /// v40 mixed case, where the cleave also strikes a same-team ally. The flag is recorded so a
+    /// twin reproduces the rule that selected the ally — under `friendly_fire` off a same-team
+    /// target is never in the hit set, so the per-target credit gate could not be exercised.
+    pub friendly_fire: bool,
 }
 
 /// One tick of seat 0's view of the target (seat 1) in a [`PerceptionMemoryCase`], read
@@ -4821,8 +4831,18 @@ pub struct ParityVectors {
 /// `if !friendly` credit lines unpinned. Two cases fire a same-team hit under `friendly_fire` through melee and
 /// projectile (`raw 25`, 100 hp): each deals real damage (25) yet credits ZERO. No struct change (`score_credit_case`
 /// already threads mode + friendly_fire + target_team) — just the two appended cases, so this is pure coverage and
-/// no committed match hash moves. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v39";
+/// no committed match hash moves. Bumped to v40 EXTENDING the `melee_cleave` category with the PER-TARGET friendly
+/// credit gate INSIDE the cleave loop: v36 pinned the SUMMED credit across an all-enemy cleave and v39 the zero
+/// credit for a LONE friendly (a 2-pawn `score_credit` hit), but every `melee_cleave` case rosters its targets on
+/// distinct teams (all enemies, `friendly_fire` off), so `resolve_melee`'s per-hit `if !friendly` gate never ran
+/// its friendly branch WITHIN a multi-hit swing — a twin that gated the credit PER-SWING (any friendly hit zeroes
+/// the whole swing) or credited every struck target stayed green on the summed case (no ally) and the lone-ally
+/// case (no enemy). One case cleaves TWO enemies + ONE same-team ally under `friendly_fire`: all three are struck
+/// for the full `melee_damage`, yet the shooter scores only the two enemies (`2×`), not the ally's equal damage.
+/// `MeleeTarget` gains `friendly` (which struck targets are allies) and `MeleeCleaveCase` gains `friendly_fire`
+/// (the rule that selected the ally) — both appended, `false` on every existing entry, so the golden adds the two
+/// keys additively with no committed match hash move. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v40";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5693,7 +5713,7 @@ fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u
         .enumerate()
         .map(|(i, &offset)| {
             let damage = before[i] - m.pawns[i + 1].health;
-            MeleeTarget { offset, struck: damage > 0, damage }
+            MeleeTarget { offset, struck: damage > 0, damage, friendly: false }
         })
         .collect();
     // The swing credited each struck enemy in turn (resolve_melee's per-hit `score += dealt`),
@@ -5706,6 +5726,7 @@ fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u
         blockers,
         targets,
         shooter_score: m.pawns[0].score,
+        friendly_fire: false,
     }
 }
 
