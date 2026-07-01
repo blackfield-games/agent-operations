@@ -1120,6 +1120,13 @@ fn replay_into(
         record.replay.pickups.clone(),
         record.replay.seed,
     );
+    // Burn the pre-live Starting countdown silently before the opening frame: a
+    // countdown is invisible to the scored tick stream (and the digest), so the feed
+    // opens at Live tick 0 exactly as a no-countdown match. A no-countdown record is
+    // already Live, so this is a no-op.
+    while m.phase() == MatchPhase::Starting {
+        m.step(&BTreeMap::new());
+    }
     // The opening-tick broadcast, then one after every SIMULATED tick. The loop breaks
     // at the terminal phase, so a record `verify` accepts with canonical post-terminal
     // tick padding (scanned but never simulated — `replay_match` breaks there too)
@@ -2652,6 +2659,43 @@ mod tests {
         assert_eq!(ids, vec![0, 1], "the broadcast shows the whole roster");
         // Deterministic: replaying the same record twice yields identical frames.
         assert_eq!(frames, replay_frames(&record).unwrap(), "replay is deterministic");
+    }
+
+    #[test]
+    fn replay_streams_a_countdown_record_identically_to_no_countdown() {
+        // A pre-live countdown is invisible to the scored stream, so a spectator feed
+        // opens at Live tick 0 exactly as a no-countdown match: the countdown burns
+        // silently before the first frame, never truncating the feed to the opening
+        // Starting frame nor shifting the Live tick numbering.
+        let countdown_record = |starting_ticks: u32| -> MatchRecord {
+            let config = MatchConfig {
+                tick_hz: 30,
+                max_ticks: 5,
+                bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+                seats: 2,
+            };
+            let seats = vec![
+                SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
+                SeatInfo { seat: 1, team: 1, controller: "0xbbbb".into() },
+            ];
+            let rules = Rules { starting_ticks, ..Default::default() };
+            let mut m = Match::new(FIXED_ID.parse().unwrap(), config, rules, seats, Vec::new(), 42);
+            while m.phase() != MatchPhase::Ended {
+                m.step(&BTreeMap::new());
+            }
+            m.to_record().expect("a finished match yields a record")
+        };
+
+        let counted = replay_frames(&countdown_record(4)).expect("a countdown record replays");
+        let plain = replay_frames(&countdown_record(0)).expect("a no-countdown record replays");
+        assert_eq!(counted, plain, "the countdown is invisible to the spectator feed");
+        assert_eq!(counted.first().unwrap().tick, 0, "the feed opens at Live tick 0");
+        assert_eq!(
+            counted.first().unwrap().phase,
+            MatchPhase::Live,
+            "the opening frame is Live, not the pre-live Starting state",
+        );
+        assert_eq!(counted.last().unwrap().phase, MatchPhase::Ended);
     }
 
     #[test]
