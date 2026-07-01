@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v44",
+  "domain": "blackfield/arena/parity-vectors/v45",
   "protocol_version": 1,
   "spawns": [
     {
@@ -4028,6 +4028,86 @@
           "z": 0,
           "facing": 0,
           "in_line_of_sight": true
+        }
+      ]
+    }
+  ],
+  "starting_phase": [
+    {
+      "label": "countdown_of_three_holds_then_opens",
+      "starting_ticks": 3,
+      "timeline": [
+        {
+          "phase": "starting",
+          "starting_remaining": 3,
+          "tick": 0
+        },
+        {
+          "phase": "starting",
+          "starting_remaining": 2,
+          "tick": 0
+        },
+        {
+          "phase": "starting",
+          "starting_remaining": 1,
+          "tick": 0
+        },
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 0
+        },
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 1
+        },
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 2
+        }
+      ]
+    },
+    {
+      "label": "countdown_of_one_flips_on_first_step",
+      "starting_ticks": 1,
+      "timeline": [
+        {
+          "phase": "starting",
+          "starting_remaining": 1,
+          "tick": 0
+        },
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 0
+        },
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 1
+        }
+      ]
+    },
+    {
+      "label": "no_countdown_opens_live_at_construction",
+      "starting_ticks": 0,
+      "timeline": [
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 0
+        },
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 1
+        },
+        {
+          "phase": "live",
+          "starting_remaining": 0,
+          "tick": 2
         }
       ]
     }

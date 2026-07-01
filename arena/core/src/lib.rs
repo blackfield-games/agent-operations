@@ -4552,6 +4552,43 @@ pub struct FieldDeltaCase {
     pub deltas: Vec<SeatDelta>,
 }
 
+/// One sample in a [`StartingPhaseCase`] timeline: the match's [`MatchPhase`], the
+/// ticks left in the pre-live countdown, and the simulated `tick`, captured at
+/// construction and after each [`Match::step`]. During [`Starting`] the `tick` is
+/// pinned at `0` (the countdown runs no sim) while `starting_remaining` counts down;
+/// once [`Live`] the countdown is spent (`0`) and the `tick` advances.
+///
+/// [`Starting`]: MatchPhase::Starting
+/// [`Live`]: MatchPhase::Live
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartingPhaseSample {
+    pub phase: MatchPhase,
+    pub starting_remaining: u32,
+    pub tick: u64,
+}
+
+/// A pinned Starting-phase countdown case (domain v45): the phase timeline of a match
+/// built with [`Rules::starting_ticks`]. The [`timeline`](StartingPhaseCase::timeline)
+/// records `(phase, starting_remaining, tick)` at construction then after each step, so a
+/// positive countdown reads [`Starting`] for EXACTLY `starting_ticks` samples (`tick` held
+/// at `0`, `starting_remaining` counting `N..0`) before flipping to [`Live`] on the step
+/// that zeroes the counter — after which the `tick` advances from `0`. A twin that skipped
+/// the countdown (opened [`Live`]), mistimed the flip (one step early/late), or advanced
+/// the tick during [`Starting`] (simulated a Live tick before GO) records a different
+/// timeline. The `starting_ticks == 0` control opens [`Live`] at construction, pinning the
+/// countdown as OPT-IN. This is a pre-live phase-lifecycle category, NOT a replay-digest
+/// input — [`Rules::starting_ticks`] is deliberately outside `canonical_encoding`, so no
+/// committed match hash moves.
+///
+/// [`Starting`]: MatchPhase::Starting
+/// [`Live`]: MatchPhase::Live
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartingPhaseCase {
+    pub label: String,
+    pub starting_ticks: u32,
+    pub timeline: Vec<StartingPhaseSample>,
+}
+
 /// The canonical cross-implementation parity-vector set — the conformance spec
 /// the UE5 twin must reproduce. Self-determining and byte-stable: serialize it
 /// and the bytes are the contract.
@@ -4682,6 +4719,17 @@ pub struct ParityVectors {
     /// entities are visible; this pins the observation SHAPE — the own exposure, the off-by-one, and
     /// the anti-omniscience per-entity bound — that the proto wire-shape test pins only structurally.
     pub observe: Vec<ObservationCase>,
+    /// starting-phase countdown cases (domain v45): the `(phase, starting_remaining, tick)`
+    /// timeline of a match built with [`Rules::starting_ticks`] — [`Starting`] for exactly N
+    /// steps (tick pinned at 0) then [`Live`] (tick advancing from 0), plus a zero-countdown
+    /// control that opens [`Live`] at construction. Pins the pre-live lifecycle the proto
+    /// declares (`Lobby → Starting → Live → Ended`) so a twin cannot skip the countdown,
+    /// mistime the flip, or simulate a tick before GO. `starting_ticks` is outside
+    /// `canonical_encoding`, so this moves no committed match hash.
+    ///
+    /// [`Starting`]: MatchPhase::Starting
+    /// [`Live`]: MatchPhase::Live
+    pub starting_phase: Vec<StartingPhaseCase>,
     pub matches: Vec<MatchCase>,
 }
 
@@ -5004,8 +5052,18 @@ pub struct ParityVectors {
 /// now-out-of-range shot, the perceived shooter proving the observer CAN see that bearing (the drop is a range bound,
 /// not a blind spot). A surface-all-projectiles twin adds the shot and reddens ONLY this case (`visible.len()` 1→2).
 /// It APPENDS to the `observe` array (the six existing entries and every other category stay byte-identical), so no
-/// committed match hash moves — a deliberate convention every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v44";
+/// committed match hash moves — a deliberate convention every twin must follow. Bumped to v45 for the STARTING-PHASE
+/// COUNTDOWN — a new `starting_phase` category pins the pre-live lifecycle the proto declares (`Lobby → Starting →
+/// Live → Ended`) but no golden exercised: a match built with [`Rules::starting_ticks`] opens in `Starting` and
+/// `step` counts it down to `Live`. Three cases record the `(phase, starting_remaining, tick)` timeline — a 3-tick
+/// countdown (Starting for exactly 3 samples with the tick pinned at 0, then the flip to Live on the 3rd step, then
+/// Live ticks advancing), the 1-tick boundary, and a 0-tick control that opens Live at construction. A twin that
+/// skipped the countdown, mistimed the flip, or advanced the tick during Starting (simulated a Live tick before GO)
+/// records a different timeline and reddens ONLY this category. `starting_ticks` is DELIBERATELY outside
+/// `canonical_encoding` (the sole documented exception — a pre-live delay leaves the scored tick stream, and thus every
+/// `replay_hash`, byte-identical), so this is a new phase-lifecycle category that moves NO committed match hash — a
+/// deliberate convention every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v45";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5899,6 +5957,32 @@ fn fire_cycle_case(label: &str, mode: WeaponMode, fire_cooldown: u16, mag_size: 
         timeline.push((fired, m.pawns[0].ammo, m.pawns[0].cooldown));
     }
     FireCycleCase { label: label.to_string(), weapon_mode: mode, fire_cooldown, mag_size, reload_tick, timeline }
+}
+
+/// Build a Starting-phase countdown case: construct a two-seat match with `starting_ticks`,
+/// then record the `(phase, starting_remaining, tick)` at construction and after each of
+/// `steps` empty steps. The two seats sit far apart on opposing teams and never fire, so the
+/// match stays [`Live`](MatchPhase::Live) across the whole recorded window and only the
+/// phase/countdown timeline is exercised — no combat confounds the readout. Mirrors
+/// [`fire_cycle_case`]'s per-step timeline recording; deterministic (fixed seed/roster, no
+/// RNG in the countdown), so the serialized set is byte-identical across runs.
+fn starting_phase_case(label: &str, starting_ticks: u32, steps: u32) -> StartingPhaseCase {
+    let rules = Rules { starting_ticks, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[1].pos = Vec2 { x: 30_000, y: 0 };
+    let sample = |m: &Match| StartingPhaseSample {
+        phase: m.phase(),
+        starting_remaining: m.starting_remaining,
+        tick: m.tick(),
+    };
+    let mut timeline = vec![sample(&m)];
+    for _ in 0..steps {
+        m.step(&BTreeMap::new());
+        timeline.push(sample(&m));
+    }
+    StartingPhaseCase { label: label.to_string(), starting_ticks, timeline }
 }
 
 /// Build a melee-cleave case: place the shooter (seat 0) at the origin facing `facing`,
@@ -7393,6 +7477,19 @@ pub fn parity_vectors() -> ParityVectors {
             // every live projectile" shortcut (a free incoming-fire radar) that would pass every
             // in-view case and the pawn-only perception category.
             observed_enemy_projectile_out_of_range_case("out_of_range_enemy_projectile_excluded"),
+        ],
+        starting_phase: vec![
+            // A 3-tick countdown: Starting for exactly 3 samples (construction + 2 steps,
+            // tick pinned at 0, remaining 3..1), the flip to Live on the 3rd step (still
+            // tick 0 — that step runs no sim), then Live ticks advancing from 0.
+            starting_phase_case("countdown_of_three_holds_then_opens", 3, 5),
+            // The boundary: a 1-tick countdown is Starting at construction, Live after the
+            // first step (which zeroes the counter at tick 0), then advancing.
+            starting_phase_case("countdown_of_one_flips_on_first_step", 1, 2),
+            // The opt-in control: a 0-tick countdown opens Live AT CONSTRUCTION (remaining 0)
+            // and advances the tick from the first step — byte-identical to every other
+            // category's default match, proving the countdown is off unless configured.
+            starting_phase_case("no_countdown_opens_live_at_construction", 0, 2),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
