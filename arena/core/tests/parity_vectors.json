@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v42",
+  "domain": "blackfield/arena/parity-vectors/v43",
   "protocol_version": 1,
   "spawns": [
     {
@@ -3941,6 +3941,47 @@
           "team": 0,
           "position": {
             "x": 5000,
+            "y": 0
+          },
+          "z": 0,
+          "facing": 0,
+          "in_line_of_sight": true
+        }
+      ]
+    },
+    {
+      "label": "visible_airborne_projectile_reported_at_ground_z",
+      "seat": 0,
+      "team": 1,
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "z": 1920,
+      "z_vel": 240,
+      "facing": 0,
+      "velocity": {
+        "x": 0,
+        "y": 0
+      },
+      "health": 100,
+      "max_health": 100,
+      "shield": 0,
+      "ammo": 29,
+      "cooldown": 5,
+      "dash_cooldown": 0,
+      "score": 0,
+      "alive": true,
+      "raw_cooldown": 6,
+      "raw_dash_cooldown": 0,
+      "deadline_micros": 50000,
+      "visible": [
+        {
+          "entity_id": 65536,
+          "kind": "projectile",
+          "team": 0,
+          "position": {
+            "x": 2000,
             "y": 0
           },
           "z": 0,

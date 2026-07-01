@@ -4887,8 +4887,20 @@ pub struct ParityVectors {
 /// Pickup), one behind the facing (in range but out of the cone ⇒ EXCLUDED) — plus an idle enemy so the frame spans
 /// a Player and a Pickup in canonical ascending-id order. Both cases only APPEND to the `observe` array (the four
 /// existing entries and every other category stay byte-identical), so no committed match hash moves. Each is a
-/// deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v42";
+/// deliberate convention change every twin must follow. Bumped to v43 EXTENDING the `observe` category with the
+/// AIRBORNE-projectile z-flatten: v42's `visible_projectile_is_neutral_heading_only` fires from a GROUNDED observer
+/// (z 0), so the projectile's launch z is 0 and observe's hardcoded `z: 0` report is trivially correct — the
+/// flat-report convention was pinned NOWHERE against a non-zero launch elevation. `spawn_projectile` copies the
+/// shooter's `z` (`proj.z = s.z`), so a shot fired by a mid-jump pawn flies at that non-zero z, yet observe STILL
+/// reports it at ground `z 0` (a dodger reads WHERE a shot is on the plane, never how high it flies — the shot's
+/// flight altitude is trajectory info an agent must not perceive). One appended case
+/// (`visible_airborne_projectile_reported_at_ground_z`) jumps the lone team-1 observer (gravity on) and fires from
+/// mid-arc — own z climbs PAST `JUMP_VELOCITY` before the shot, so the shot's internal z is that airborne launch z
+/// (> 0) — and pins the observed projectile at `z 0` while the observer's own z is live-positive. A twin that leaked
+/// the real `proj.z` (reporting the flight altitude) reddens ONLY this case; every grounded observe case stays
+/// byte-identical. It APPENDS to the `observe` array (the five existing entries and every other category stay
+/// byte-identical), so no committed match hash moves — a deliberate convention every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v43";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6256,6 +6268,43 @@ fn observed_projectile_case(label: &str) -> ObservationCase {
     observation_case_from(label, &m)
 }
 
+/// Build the AIRBORNE-projectile observation case: the same lone team-1 observer as
+/// [`observed_projectile_case`], but it JUMPS first (gravity on) and fires from mid-arc, so
+/// the shot's launch elevation ([`spawn_projectile`](Match::spawn_projectile) copies the
+/// shooter's `z`) is NON-zero — yet `observe` STILL reports the projectile at ground `z 0`.
+/// The grounded builder can't discriminate this: there `proj.z == 0`, so the flat report is
+/// trivially correct. Here the observer presses jump (z rises to [`JUMP_VELOCITY`]) then
+/// takes one plain airborne tick so z climbs PAST the launch height (genuine mid-flight, not
+/// the launch instant) before the shot. Because z-integration precedes fire within a tick,
+/// `spawn_projectile` copies the post-rise z, so the shot's internal `z` equals the
+/// observer's own z at the fire tick (> 0) — the flat report flattens the flight altitude
+/// away. A twin that leaked the real `proj.z` would reveal how high the shot flies and
+/// reddens ONLY this case; every grounded observe case stays byte-identical.
+fn observed_airborne_projectile_case(label: &str) -> ObservationCase {
+    let rules = Rules { weapon_mode: WeaponMode::Projectile, gravity: 480, spawn_jitter: 0, ..Default::default() };
+    // Seat 1 idles far out of perception range (x 45_000 > the 40_000 default range) on a
+    // distinct team, PURELY so the two-team match stays Live across both ticks — a lone seat
+    // wins and Ends after tick 0, before the mid-arc fire. It is never perceived, so the
+    // observer's frame is the shot alone.
+    let roster = vec![parity_seat(0, 1), parity_seat(1, 0)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    m.pawns[1].pos = Vec2 { x: 45_000, y: 0 };
+    let jump = ActionIntent {
+        move_dir: Vec2::ZERO,
+        aim: EAST,
+        buttons: arena_proto::ActionButtons { fire: false, jump: true, ability: false, reload: false },
+    };
+    // Launch (z -> JUMP_VELOCITY), then a plain airborne tick so z climbs PAST the launch
+    // height before the shot. z-integration precedes fire within a tick, so spawn_projectile
+    // copies the post-rise z and the shot flies at a genuine mid-arc elevation, not the
+    // launch instant.
+    m.step(&BTreeMap::from([(0, jump)]));
+    m.step(&BTreeMap::from([(0, parity_intent(Vec2::ZERO, EAST, true))]));
+    observation_case_from(label, &m)
+}
+
 /// Build the active-pickup observation case: three world pickups probe the pickup half
 /// of the perception bound. One sits underfoot and is COLLECTED this idle tick (it goes
 /// dormant, so it is EXCLUDED and its respawn timer never leaks); one sits dead ahead in
@@ -7201,6 +7250,11 @@ pub fn parity_vectors() -> ParityVectors {
             // projectile's travel heading) — never a shooter, kind, amount, or respawn timer.
             observed_projectile_case("visible_projectile_is_neutral_heading_only"),
             observed_pickup_case("visible_pickup_active_only_neutral_bounded"),
+            // The flat-report convention against a NON-zero launch elevation: an observer that
+            // jumps and fires from mid-arc launches a shot at its own airborne z, yet observe
+            // still reports that projectile at ground z 0 — a dodger reads WHERE a shot is on
+            // the plane, never how high it flies. The grounded case above can't pin this.
+            observed_airborne_projectile_case("visible_airborne_projectile_reported_at_ground_z"),
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
