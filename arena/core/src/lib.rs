@@ -4351,6 +4351,14 @@ pub struct KnockbackCase {
     pub shooter_pos: Vec2,
     /// Whether the target survived the hit (a corpse is never launched or shoved).
     pub target_alive: bool,
+    /// `friendly_fire` was ON for this hit. `false` on every enemy case; `true` only for the v41
+    /// friendly-target case, where the struck pawn is the shooter's OWN teammate. Recorded so a
+    /// twin reproduces the rule that SELECTED the ally into the hit set — under `friendly_fire` off
+    /// a same-team target is never struck, so the TEAM-BLINDNESS of the knockback (it pops and
+    /// shoves a friendly exactly like an enemy, though the hit credits no score) could not be
+    /// exercised. The credit side of that same friendly hit is pinned by `score_credit` (v39) and
+    /// `melee_cleave` (v40); this pins the physical effect.
+    pub friendly_fire: bool,
 }
 
 /// A pinned z-aware-occlusion case: a sightline from `(from, from_z)` to `(to, to_z)`
@@ -4848,8 +4856,19 @@ pub struct ParityVectors {
 /// for the full `melee_damage`, yet the shooter scores only the two enemies (`2×`), not the ally's equal damage.
 /// `MeleeTarget` gains `friendly` (which struck targets are allies) and `MeleeCleaveCase` gains `friendly_fire`
 /// (the rule that selected the ally) — both appended, `false` on every existing entry, so the golden adds the two
-/// keys additively with no committed match hash move. Each is a deliberate convention change every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v40";
+/// keys additively with no committed match hash move. Bumped to v41 EXTENDING the `knockback` category with the
+/// friendly-target PHYSICAL effect: `resolve_fire`/`resolve_melee` credit a hit through the `if !friendly` gate but
+/// apply the knockback — the `knock_back_horizontal` shove and the `damage_pawn` `z_vel` pop — to a struck SURVIVOR
+/// gated on damage dealt / survival ALONE, no team check, so a same-team target under `friendly_fire` is popped +
+/// shoved exactly like an enemy while the hit credits ZERO score. Every `knockback_case` rosters an enemy
+/// (`parity_seat(1, 1)`, `friendly_fire` off), so that team-blind effect never ran on a friendly; `fall_kill` pins
+/// the CREDIT side of a friendly launch (a same-team launch-into-a-lethal-fall credits no one) but NOT the physical
+/// shove/pop. One case strikes a same-team target under `friendly_fire` with `knockback_velocity` +
+/// `knockback_horizontal` + `gravity` all on and pins its pop + shove IDENTICAL to the enemy `pop_and_shove_compose`
+/// — the physics is team-blind, only the credit is team-gated. `KnockbackCase` gains `friendly_fire` (the rule that
+/// selected the ally) — appended, `false` on every existing entry, so the golden adds the key additively with no
+/// committed match hash move. Each is a deliberate convention change every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v41";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -5602,6 +5621,7 @@ fn knockback_case(label: &str, mode: WeaponMode, gravity: i32, knockback_velocit
         target_pos: m.pawns[1].pos,
         shooter_pos: m.pawns[0].pos,
         target_alive: m.pawns[1].alive,
+        friendly_fire: false,
     }
 }
 
