@@ -437,6 +437,24 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     );
     assert!(both.target_z_vel > 0 && both.target_pos.x > launched.target_pos.x, "neither axis is dropped when both are armed");
 
+    // Friendly-target knockback (v41): a same-team target struck under friendly_fire is popped AND
+    // shoved IDENTICALLY to an enemy — the knockback rides on damage dealt / survival, NOT on the
+    // `if !friendly` gate that zeroes the score. Every other knockback case is an enemy
+    // (friendly_fire off), so a twin that mirrored the credit gate onto the shove/pop passes them
+    // all; only this case, compared field-for-field against the enemy `both`, separates it. The
+    // credit-ZERO for the same friendly hit is pinned by score_credit (v39) / melee_cleave (v40).
+    let ff = kb("friendly_target_popped_and_shoved_like_an_enemy");
+    assert!(ff.friendly_fire, "the friendly case ran with friendly_fire ON so the ally was SELECTED into the hit set");
+    assert!(!both.friendly_fire, "the enemy compose case is friendly_fire OFF — the two differ ONLY by the target's team");
+    assert!(ff.damage > 0, "the ally took REAL damage — friendly_fire is not a no-op skip (a friendly_fire-off ally is never even hit)");
+    assert_eq!(ff.damage, both.damage, "the ally took the SAME damage as the enemy — the hit itself is team-blind");
+    assert_eq!(ff.target_z_vel, ff.knockback_velocity, "the ally is popped up by exactly knockback_velocity — the vertical launch ignores team");
+    assert_eq!(ff.target_z_vel, both.target_z_vel, "...identical to the enemy pop (team-blind)");
+    assert_eq!(ff.target_pos, both.target_pos, "the ally is shoved to the SAME position as the enemy — the horizontal shove ignores team");
+    assert!(ff.target_pos.x > launched.target_pos.x, "...genuinely shoved east, NOT left in place — a twin that gated the shove on !friendly leaves the ally unmoved");
+    assert!(ff.target_alive, "the ally survived (a corpse is neither popped nor shoved)");
+    assert_eq!(ff.shooter_z_vel, 0, "the shove never recoils the shooter, friendly target or not");
+
     // Pawn-body occupancy (v11): under a positive pawn_radius a move whose swept path
     // would enter another alive pawn's body is refused — pawns are obstacles in the
     // shared slide path. OFF (radius 0) they overlap (the byte-identical default); ON,
