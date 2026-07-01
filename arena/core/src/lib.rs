@@ -6177,6 +6177,15 @@ fn observation_case(label: &str, s: ObserveScenario) -> ObservationCase {
         m.pawns[0].ammo = s.ammo;
         m.pawns[0].score = s.score;
     }
+    observation_case_from(label, &m)
+}
+
+/// Record one real `observe(0)` call on `m` as an [`ObservationCase`] — the seat's own
+/// state scalars, the bounded-latency `deadline_micros`, the RAW cooldowns (the
+/// off-by-one discriminator the exposed value is derived from), and the per-entity
+/// bounded visible set. Shared by [`observation_case`] and the non-player-entity observe
+/// builders, so every observe vector records the identical surface a twin exposes.
+fn observation_case_from(label: &str, m: &Match) -> ObservationCase {
     let raw_cooldown = m.pawns[0].cooldown;
     let raw_dash_cooldown = m.pawns[0].dash_cooldown;
     let obs = m.observe(0);
