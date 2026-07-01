@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v42");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v43");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -1581,6 +1581,23 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // (not sorted per-kind): the perceived Player id sits below the pickup id space.
     let player = loot.visible.iter().find(|e| e.kind == EntityKind::Player).expect("the idle enemy is perceived as a Player");
     assert!(player.entity_id < pk.entity_id, "the Player id sorts below the Pickup id — canonical cross-kind ascending order");
+
+    // Airborne-projectile z-flatten (v43): the flat-report convention pinned against a
+    // NON-zero launch elevation. The grounded case above fires from z 0 (proj.z == 0, so the
+    // ground-z report is trivially correct); here the observer jumps and fires from mid-arc,
+    // so the shot's internal z is the observer's non-zero z at the fire tick — yet observe
+    // STILL reports it at z 0. A dodger reads WHERE a shot is on the plane, never how high it
+    // flies. A twin leaking the real proj.z (z: proj.z) reddens ONLY this case; every grounded
+    // observe case stays green.
+    let shot_air = obs("visible_airborne_projectile_reported_at_ground_z");
+    assert!(shot_air.z > 0 && shot_air.z_vel > 0, "the observer fired from GENUINE mid-flight — its own z and z_vel are both live-positive at the fire tick");
+    assert!(shot_air.z > JUMP_VELOCITY, "the shot was fired PAST the launch height (mid-arc), not at the launch instant — so proj.z is unambiguously a non-zero flight elevation, evidenced by the shooter's own recorded z");
+    let air_proj: Vec<_> = shot_air.visible.iter().filter(|e| e.kind == EntityKind::Projectile).collect();
+    assert_eq!(air_proj.len(), 1, "the airborne shot IS perceived (else the z assertion is vacuous) — the distant idle enemy stays out of range, so the shot is the lone visible entity");
+    let ap = air_proj[0];
+    assert_eq!(ap.team, 0, "the airborne shot is still reported NEUTRAL (team 0) — the launch elevation changes nothing about the allegiance bound");
+    assert_eq!(ap.z, 0, "THE PIN: the airborne shot is reported at GROUND z 0 despite a non-zero launch elevation (the shooter's own z > JUMP_VELOCITY) — observe flattens the flight altitude, never leaks the trajectory");
+    assert!(ap.position.x > shot_air.position.x && ap.facing == EAST && ap.in_line_of_sight, "the shot is perceived ahead of the observer on its EAST travel heading, in sight");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
