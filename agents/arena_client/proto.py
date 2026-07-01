@@ -173,6 +173,10 @@ class Observation(_Wire):
     seat: U8
     tick: U64
     phase: Phase
+    # Ticks left in the Starting countdown before the match goes Live (the live counter
+    # during Starting, 0 once Live/Ended). serde(default)=0 on the Rust side, so a frame
+    # written before the field existed decodes to a done-counting-down observation.
+    starting_remaining: U32 = 0
     deadline_micros: U32
     own: SelfState
     visible: list[VisibleEntity]
