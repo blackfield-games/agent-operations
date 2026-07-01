@@ -463,18 +463,68 @@ fn backoff_delay(consecutive_failures: u32, max_secs: u64) -> Duration {
     Duration::from_secs(secs.min(max_secs))
 }
 
-/// Render a single offered job, then `Accept` + `Submit` it over the socket.
+/// Estimate render progress as a percentage of the job's deadline elapsed.
 ///
-/// While the render is in progress, a periodic heartbeat is sent to the
-/// coordinator every `heartbeat_secs` seconds (`.max(1)` guards against a
-/// zero-second interval panicking `tokio::time::interval`). The coordinator
-/// bumps `started_at` on each heartbeat so the deadline reaper measures the
-/// window from the last sign of life rather than from dispatch. A job that
-/// keeps heartbeating is making progress and won't be reaped; a silent earner
-/// still hits the deadline.
+/// The renderer is opaque — a single future with no work-progress channel — so the
+/// only signal available for a mid-render heartbeat is wall-clock elapsed against the
+/// job's `deadline_secs`, the same window the coordinator's deadline reaper measures.
+/// Capped at 99: 100 means "done", which the `Submit` (not a heartbeat) signals, so a
+/// render running past its deadline reports 99, never 100+. A zero-deadline job reports
+/// 0 and never divides by zero.
+fn estimate_progress(elapsed_secs: u64, deadline_secs: u32) -> u8 {
+    if deadline_secs == 0 {
+        return 0;
+    }
+    (elapsed_secs.saturating_mul(100) / deadline_secs as u64).min(99) as u8
+}
+
+/// Drive `render_fut` to completion while emitting a heartbeat every `heartbeat_secs`
+/// seconds (`.max(1)` guards against a zero-second interval panicking
+/// `tokio::time::interval`). The coordinator bumps `started_at` on each heartbeat so the
+/// deadline reaper measures the window from the last sign of life rather than from
+/// dispatch, and each beat carries a live [`estimate_progress`] reading (elapsed vs
+/// `deadline_secs`) so `/stats in_flight_progress_pct_avg` tracks real progress instead
+/// of the constant it reported before. Returns the rendered bytes.
 ///
-/// The stub `runner::render` returns instantly, so for stub jobs no heartbeat
-/// fires mid-render — that is correct; this mechanism is for slow real renders.
+/// The stub `runner::render` returns instantly, so for stub jobs no heartbeat fires
+/// mid-render (the loop breaks on the first poll) — that is correct; this mechanism is
+/// for slow real renders.
+async fn render_with_heartbeats<S, F>(
+    ws: &mut S,
+    job_id: Uuid,
+    deadline_secs: u32,
+    heartbeat_secs: u64,
+    render_fut: F,
+) -> Result<Vec<u8>>
+where
+    S: SinkExt<WsMessage> + Unpin,
+    <S as futures_util::Sink<WsMessage>>::Error: std::error::Error + Send + Sync + 'static,
+    F: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    tokio::pin!(render_fut);
+    let started = tokio::time::Instant::now();
+    let mut hb = tokio::time::interval(Duration::from_secs(heartbeat_secs.max(1)));
+    hb.tick().await; // consume the immediate first tick so the first beat is one interval in
+    loop {
+        tokio::select! {
+            res = &mut render_fut => break res.context("render failed"),
+            _ = hb.tick() => {
+                let progress = estimate_progress(started.elapsed().as_secs(), deadline_secs);
+                let beat = EarnerMsg::Heartbeat { job_id: Some(job_id), progress_pct: progress };
+                ws.send(WsMessage::text(serde_json::to_string(&beat)?))
+                    .await
+                    .map_err(|e| anyhow!(e))
+                    .context("sending Heartbeat")?;
+                tracing::debug!(job_id = %job_id, progress_pct = progress, "heartbeat sent");
+            }
+        }
+    }
+}
+
+/// Render a single offered job, then `Accept` + `Submit` it over the socket. The
+/// render runs concurrently with a progress-carrying heartbeat (see
+/// [`render_with_heartbeats`]) so a slow render keeps signalling life and is not
+/// reaped mid-flight.
 async fn handle_offer<S>(
     ws: &mut S,
     session: &Session,
@@ -517,27 +567,17 @@ where
     .map_err(|e| anyhow!(e))
     .context("sending Accept")?;
 
-    // Run the render concurrently with a periodic heartbeat sender. The
-    // coordinator bumps `started_at` on each beat, so a job making progress
-    // is never reaped by the deadline reaper; a silent earner still hits the
+    // Run the render concurrently with a progress-carrying heartbeat so a job making
+    // progress is never reaped by the deadline reaper; a silent earner still hits the
     // original window.
-    let render_fut = runner::render(&job);
-    tokio::pin!(render_fut);
-    let mut hb = tokio::time::interval(Duration::from_secs(heartbeat_secs.max(1)));
-    hb.tick().await; // consume the immediate first tick so the first beat is one interval in
-    let output = loop {
-        tokio::select! {
-            res = &mut render_fut => break res.context("render failed")?,
-            _ = hb.tick() => {
-                let beat = EarnerMsg::Heartbeat { job_id: Some(job.id), progress_pct: 0 };
-                ws.send(WsMessage::text(serde_json::to_string(&beat)?))
-                    .await
-                    .map_err(|e| anyhow!(e))
-                    .context("sending Heartbeat")?;
-                tracing::debug!(job_id = %job.id, "heartbeat sent");
-            }
-        }
-    };
+    let output = render_with_heartbeats(
+        ws,
+        job.id,
+        job.deadline_secs,
+        heartbeat_secs,
+        runner::render(&job),
+    )
+    .await?;
 
     let mut hasher = Sha256::new();
     hasher.update(&output);
@@ -1673,6 +1713,72 @@ mod tests {
             msg.len(),
             MAX_INBOUND_FRAME_BYTES + 1,
             "baseline decodes the exact frame the cap rejected — so the cap is the discriminator",
+        );
+    }
+
+    #[test]
+    fn estimate_progress_is_elapsed_over_deadline_capped_at_99() {
+        // elapsed/deadline as a percent: 0 at the start, 50 at the half, CAPPED at 99
+        // at/after the deadline — 100 is reserved for "done", which Submit signals, so a
+        // heartbeat never claims completion.
+        assert_eq!(estimate_progress(0, 100), 0, "no time elapsed -> 0");
+        assert_eq!(estimate_progress(50, 100), 50, "half the deadline -> 50");
+        assert_eq!(estimate_progress(99, 100), 99);
+        assert_eq!(estimate_progress(100, 100), 99, "at the deadline caps at 99, not 100");
+        assert_eq!(estimate_progress(10_000, 100), 99, "past the deadline stays capped at 99");
+    }
+
+    #[test]
+    fn estimate_progress_guards_zero_deadline_and_overflow() {
+        // A zero-deadline job reports 0 rather than dividing by zero, and a pathological
+        // elapsed cannot overflow the *100 or wrap the u8 (saturating mul, then cap 99).
+        assert_eq!(estimate_progress(30, 0), 0, "zero deadline -> 0, no divide-by-zero");
+        assert_eq!(estimate_progress(u64::MAX, 1), 99, "saturating + capped, no overflow/panic");
+    }
+
+    #[test]
+    fn estimate_progress_is_monotonic_non_decreasing_in_elapsed() {
+        let mut prev = 0u8;
+        for elapsed in [0u64, 5, 10, 25, 50, 75, 100, 200, 1_000] {
+            let p = estimate_progress(elapsed, 100);
+            assert!(p >= prev, "progress must not decrease as elapsed grows ({p} < {prev})");
+            prev = p;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn render_with_heartbeats_reports_progress_from_elapsed_over_deadline() {
+        // The heartbeat beat branch — never exercised before this slice (every
+        // handle_offer test pairs an instant render with a 3600s interval, so no beat
+        // ever fired). A never-completing render lets beats fire under virtual time:
+        // deadline 100s, 20s interval => beats at elapsed 20/40/60s => progress 20/40/60.
+        // The old hardcoded `progress_pct: 0` would emit all zeros; a wrong denominator
+        // would emit wrong values. A virtual sleep bounds the drive so the test ends.
+        let mut sink = RecordingSink::default();
+        let job_id = Uuid::new_v4();
+        let render = std::future::pending::<Result<Vec<u8>>>();
+        tokio::select! {
+            _ = render_with_heartbeats(&mut sink, job_id, 100, 20, render) => {
+                unreachable!("a pending render never completes")
+            }
+            _ = tokio::time::sleep(Duration::from_secs(65)) => {}
+        }
+
+        let progresses: Vec<u8> = sink
+            .sent
+            .iter()
+            .map(|f| match decode_frame(f) {
+                EarnerMsg::Heartbeat { job_id: jid, progress_pct } => {
+                    assert_eq!(jid, Some(job_id), "each beat names the rendering job");
+                    progress_pct
+                }
+                other => panic!("expected only Heartbeat frames mid-render, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            progresses,
+            vec![20, 40, 60],
+            "each beat reports elapsed/deadline progress, not the old hardcoded 0",
         );
     }
 }
