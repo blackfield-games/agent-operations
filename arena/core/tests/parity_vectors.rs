@@ -12,7 +12,7 @@ use arena_core::{
     PerceptionMemoryCase, PerceptionVerdict, PickupCase, Rules, ScoreCreditCase, ShieldAbsorbCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY,
     RATING_DIFF_CAP, RATING_SCALE,
 };
-use arena_proto::{EntityKind, PickupKind, Vec2};
+use arena_proto::{EntityKind, MatchPhase, PickupKind, Vec2};
 
 const EAST: u16 = 0;
 const WEST: u16 = 0x8000;
@@ -1617,6 +1617,62 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         !bounded.visible.iter().any(|e| e.kind == EntityKind::Projectile),
         "THE PIN: the enemy's shot, having flown past the 40 m perception range, is NOT surfaced — an out-of-bound projectile is excluded under the same range gate a pawn rides, its position never leaking (a surface-all-projectiles twin would add it here, reddening ONLY this case)"
     );
+
+    // Starting-phase countdown (v45): the pre-live lifecycle the proto declares
+    // (Lobby → Starting → Live → Ended) but no golden exercised. A positive starting_ticks
+    // match opens in Starting and step counts it down to Live — Starting for EXACTLY N
+    // samples (the tick pinned at 0 while the countdown runs no sim), the flip on the step
+    // that zeroes the counter (still tick 0), then Live ticks advancing from 0. A twin that
+    // skipped the countdown, mistimed the flip, or advanced the tick during Starting records
+    // a different timeline; every OTHER category runs starting_ticks 0 (Live from
+    // construction), so a countdown-timing bug reddens ONLY these cases.
+    let sp = |label: &str| v.starting_phase.iter().find(|c| c.label == label).unwrap();
+
+    let three = sp("countdown_of_three_holds_then_opens");
+    assert_eq!(three.starting_ticks, 3, "the primary case configures a 3-tick countdown");
+    // The leading Starting run is EXACTLY starting_ticks samples, each at tick 0 with the
+    // counter decrementing 3..1 — a twin that opened Live early or advanced the tick here diverges.
+    let starting: Vec<_> = three.timeline.iter().take_while(|s| s.phase == MatchPhase::Starting).collect();
+    assert_eq!(starting.len(), 3, "Starting holds for EXACTLY starting_ticks samples — not one fewer (early flip) or more (stuck)");
+    for (i, s) in starting.iter().enumerate() {
+        assert_eq!(s.tick, 0, "the countdown never advances the simulated tick — Live must still open at tick 0");
+        assert_eq!(s.starting_remaining as usize, 3 - i, "the counter decrements N..1 across the Starting run");
+    }
+    // The flip: the 4th sample is the FIRST Live one, STILL at tick 0 (that step ran the pure
+    // countdown, no sim) with the counter spent — the load-bearing "Live opens at tick 0" pin.
+    let flip = &three.timeline[3];
+    assert_eq!(
+        (flip.phase, flip.starting_remaining, flip.tick),
+        (MatchPhase::Live, 0, 0),
+        "the flip to Live lands on the Nth step, at tick 0, counter spent — never a tick early/late"
+    );
+    // Only AFTER the flip do the Live ticks advance — a twin that simulated a tick during
+    // Starting would already be past 0 here.
+    assert_eq!((three.timeline[4].phase, three.timeline[4].tick), (MatchPhase::Live, 1), "the first real Live step advances the tick to 1");
+    assert_eq!((three.timeline[5].phase, three.timeline[5].tick), (MatchPhase::Live, 2), "Live ticks then advance 1, 2, … normally");
+
+    // The boundary: a 1-tick countdown is Starting at construction, Live after the first step.
+    let one = sp("countdown_of_one_flips_on_first_step");
+    assert_eq!(one.timeline[0].phase, MatchPhase::Starting, "a 1-tick countdown opens in Starting");
+    assert_eq!(
+        (one.timeline[1].phase, one.timeline[1].tick),
+        (MatchPhase::Live, 0),
+        "it flips to Live on the FIRST step, at tick 0 — never Live one step early"
+    );
+
+    // The opt-in control: a 0-tick countdown opens Live AT CONSTRUCTION (remaining 0) and
+    // advances the tick from the first step — byte-identical to every other category's default
+    // match. A twin that always inserted a countdown reddens ONLY here (its sample[0] would be
+    // Starting), proving the countdown is off unless configured.
+    let none = sp("no_countdown_opens_live_at_construction");
+    assert_eq!(none.starting_ticks, 0, "the control has no countdown");
+    assert_eq!(
+        (none.timeline[0].phase, none.timeline[0].starting_remaining, none.timeline[0].tick),
+        (MatchPhase::Live, 0, 0),
+        "a zero countdown opens Live at construction — the countdown is OPT-IN"
+    );
+    assert_eq!((none.timeline[1].phase, none.timeline[1].tick), (MatchPhase::Live, 1), "with no countdown the tick advances from the very first step");
+    assert!(none.timeline.iter().all(|s| s.phase == MatchPhase::Live), "the control is Live throughout — never Starting");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
