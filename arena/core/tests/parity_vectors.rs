@@ -12,7 +12,7 @@ use arena_core::{
     PerceptionMemoryCase, PerceptionVerdict, PickupCase, Rules, ScoreCreditCase, ShieldAbsorbCase, WeaponMode, DASH_DISTANCE, JUMP_VELOCITY,
     RATING_DIFF_CAP, RATING_SCALE,
 };
-use arena_proto::{PickupKind, Vec2};
+use arena_proto::{EntityKind, PickupKind, Vec2};
 
 const EAST: u16 = 0;
 const WEST: u16 = 0x8000;
@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v41");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v42");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -1552,6 +1552,35 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!((foe.position, foe.z), (Vec2 { x: 2000, y: 0 }, 600), "the enemy's perceivable position + elevation ARE exposed");
     let foe_json = serde_json::to_value(foe).unwrap();
     assert!(foe_json.get("z_vel").is_none() && foe_json.get("velocity").is_none(), "the enemy entry never carries its velocity or z_vel — the kinematic x-ray the bound excludes");
+
+    // Non-player visible entities (v42): observe surfaces the world's neutral objects — an
+    // in-flight projectile and an active pickup — under the SAME range+cone+LOS bound a pawn
+    // is held to, carrying no allegiance or private state. A twin that dropped them (an agent
+    // can't dodge or loot), leaked a shooter's team, or surfaced a dormant pad diverges.
+    let shot = obs("visible_projectile_is_neutral_heading_only");
+    assert_eq!(shot.team, 1, "the observer that fired the shot is team 1 — so a neutral projectile report is a real discriminator");
+    let projectiles: Vec<_> = shot.visible.iter().filter(|e| e.kind == EntityKind::Projectile).collect();
+    assert_eq!(projectiles.len(), 1, "the observer perceives its own in-flight shot as the one visible entity");
+    let p = projectiles[0];
+    assert_eq!(p.team, 0, "the projectile is reported NEUTRAL (team 0), NOT its team-1 shooter's team — no allegiance leak");
+    assert!(p.entity_id >= (1 << 16), "a projectile id sits in the projectile id space (PROJECTILE_ID_BASE = 1<<16), above the pawn seat ids");
+    assert_eq!(p.facing, EAST, "the shot carries its TRAVEL heading (east), the only kinematic a dodger reads");
+    assert!(p.position.x > shot.position.x && p.z == 0 && p.in_line_of_sight, "the level shot is perceived ahead of the observer, at ground z, in sight");
+
+    let loot = obs("visible_pickup_active_only_neutral_bounded");
+    let pickups: Vec<_> = loot.visible.iter().filter(|e| e.kind == EntityKind::Pickup).collect();
+    assert_eq!(pickups.len(), 1, "only the active, in-cone pad is perceived — the collected (dormant) and rear (out-of-cone) pads are excluded");
+    let pk = pickups[0];
+    assert_eq!(pk.entity_id, (1 << 24) + 1, "the perceived pad is the ahead one (PICKUP_ID_BASE + config index 1), NOT the dormant [0] or the out-of-cone rear [2]");
+    assert_eq!((pk.team, pk.facing, pk.z), (0, 0, 0), "a pickup is neutral (team 0), has no facing, and sits at ground z");
+    let pk_json = serde_json::to_value(pk).unwrap();
+    for hidden in ["amount", "respawn_in", "pickup_kind", "active"] {
+        assert!(pk_json.get(hidden).is_none(), "a visible pickup must never leak its `{hidden}` — the effect kind, amount, and respawn timer are private world state");
+    }
+    // Two entity kinds in one frame prove the visible set is canonically ordered ACROSS kinds
+    // (not sorted per-kind): the perceived Player id sits below the pickup id space.
+    let player = loot.visible.iter().find(|e| e.kind == EntityKind::Player).expect("the idle enemy is perceived as a Player");
+    assert!(player.entity_id < pk.entity_id, "the Player id sorts below the Pickup id — canonical cross-kind ascending order");
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
