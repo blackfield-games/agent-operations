@@ -1127,6 +1127,30 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(pb.shooter_score, pb.melee_damage as i32, "the point-blank single strike credits exactly one hit");
     assert_eq!(los.shooter_score, los.melee_damage as i32, "the LOS case credits only the enemy in front of the wall — the occluded one scores nothing");
     assert_eq!(arc.shooter_score, arc.melee_damage as i32, "the arc-seam case credits only the in-arc NE enemy — the out-of-arc N scores nothing");
+    // Friendly-in-cleave credit (v40): with friendly_fire ON, a swing that cleaves an enemy AND a
+    // same-team ally strikes BOTH for real damage yet credits ONLY the enemy — resolve_melee's
+    // per-hit `if !friendly` gate fires PER TARGET inside the cleave loop, not per-swing. The v36
+    // summed case (all enemies, no ally) and the v39 score_credit friendly cases (a lone ally, no
+    // enemy) between them can't catch a twin that gates the credit per-swing (any friendly hit
+    // zeroes the whole swing) or credits every struck target — only this mixed case separates them.
+    let ffc = mc("cleave_enemy_and_ally_credits_enemy_only");
+    assert!(ffc.friendly_fire, "the mixed cleave runs with friendly_fire ON so the ally is SELECTED into the hit set");
+    let enemies: Vec<_> = ffc.targets.iter().filter(|t| !t.friendly).collect();
+    let allies: Vec<_> = ffc.targets.iter().filter(|t| t.friendly).collect();
+    assert_eq!((enemies.len(), allies.len()), (2, 1), "two enemies + one ally — the two-enemy sum is what separates credit-enemy from credit-ally");
+    assert!(ffc.targets.iter().all(|t| t.struck), "all three are struck — the ally was hit for real, not skipped");
+    for a in &allies {
+        assert_eq!(a.damage, ffc.melee_damage, "the ally took the FULL melee_damage — friendly_fire deals real damage, it is not a no-op skip");
+    }
+    let enemy_sum = enemies.iter().map(|t| t.damage as i32).sum::<i32>();
+    let struck_total = ffc.targets.iter().map(|t| t.damage as i32).sum::<i32>();
+    // The score is the enemy sum ALONE: strictly less than the full struck total (rules out
+    // credit-every-target) and strictly more than one melee_damage (rules out per-swing-zero and
+    // credit-only-the-ally after a `!friendly` -> `friendly` flip).
+    assert_eq!(ffc.shooter_score, enemy_sum, "the swing credits ONLY the two enemies — the ally's equal damage scores nothing");
+    assert_eq!(ffc.shooter_score, 2 * ffc.melee_damage as i32, "...exactly the two 50-damage enemy hits (100)");
+    assert!(ffc.shooter_score < struck_total, "...strictly LESS than the total struck damage (150) — a twin crediting every struck target diverges");
+    assert!(ffc.shooter_score > ffc.melee_damage as i32, "...yet strictly MORE than one hit — a twin zeroing the whole swing on any friendly (0) or crediting only the ally (50) diverges");
 
     // Perception memory (v22): a lost target's LAST PERCEIVED position is surfaced (frozen,
     // out-of-sight-flagged) for the window then dropped; a re-sighting refreshes the echo and
