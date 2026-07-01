@@ -28,3 +28,6 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+# test-util (not in tokio's "full") enables start_paused virtual time so the
+# heartbeat-progress test drives beats deterministically without real waits.
+tokio = { workspace = true, features = ["test-util"] }
