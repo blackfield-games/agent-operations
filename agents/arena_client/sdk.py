@@ -68,11 +68,21 @@ class StatefulPolicy(Protocol):
 
     `on_starting` is the second optional hook: it fires for each pre-live
     (phase==Starting) countdown observation, which draws no reply — a policy uses it to
-    read `starting_remaining` and prepare for GO, never to act. Both hooks are
-    getattr-guarded, so a plain callable with neither runs unchanged."""
+    read `starting_remaining` and prepare for GO, never to act.
+
+    `on_match_end` is the third optional hook: it fires EXACTLY ONCE with the terminal
+    `MatchResult` when the match ends — the canonical outcome (final standings, own
+    score) every seat receives. It closes the lifecycle (start → starting → live → end)
+    for a stateful/learning policy that must observe its own result in-band to adapt,
+    which the SDK already receives but otherwise only hands back to the caller of
+    `run`/`poll`. All three hooks are getattr-guarded, so a plain callable with none of
+    them runs unchanged and the parity boundary is untouched (each hook carries only
+    map layout, the pre-live counter, or the public result — never a live private
+    field)."""
 
     def on_match_start(self, start: MatchStart) -> None: ...
     def on_starting(self, obs: Observation) -> None: ...
+    def on_match_end(self, result: MatchResult) -> None: ...
     def __call__(self, obs: Observation) -> ActionIntent: ...
 
 
@@ -244,9 +254,10 @@ class ArenaClient:
 
     def poll(self, policy: Policy) -> MatchResult | None:
         """Process exactly one inbound frame. Returns the MatchResult on End (and
-        marks the client done), else None. Connects lazily on first call. A pre-live
-        (Starting-countdown) observation is informational and draws no reply — the
-        client answers only once the match is Live."""
+        marks the client done, surfacing the result to a policy's `on_match_end`),
+        else None. Connects lazily on first call. A pre-live (Starting-countdown)
+        observation is informational and draws no reply — the client answers only
+        once the match is Live."""
         if not self.connected:
             self.connect()
         if not self._started:
@@ -259,8 +270,16 @@ class ArenaClient:
                 on_start(MatchStart(blockers=list(self.blockers), pickup_points=list(self.pickup_points)))
         msg = decode_gateway(self.transport.recv())
         if isinstance(msg, MatchResult):
+            # Terminal frame: record it, then surface the canonical outcome to a policy
+            # that wants it (a stateful/learning policy closing its own loop) via the
+            # same optional getattr-guarded hook as on_match_start/on_starting. Fires
+            # exactly once — poll sets `done`, so run() and the multiplexed driver stop
+            # polling this seat after the result lands.
             self.result = msg
             self.done = True
+            on_end = getattr(policy, "on_match_end", None)
+            if callable(on_end):
+                on_end(msg)
             return msg
         if isinstance(msg, Reject):
             self.rejections.append(msg.reason)
