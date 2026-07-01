@@ -2891,6 +2891,12 @@ pub trait Policy {
 pub fn run_match(mut m: Match, policies: &mut [Box<dyn Policy>]) -> Match {
     let seat_ids: Vec<SeatId> = m.seats().iter().map(|s| s.seat).collect();
     assert_eq!(policies.len(), seat_ids.len(), "one policy per roster seat");
+    // Burn the pre-live Starting countdown before policies act — actions are
+    // refused pre-live, so there is no agent I/O to drive here, just the delay.
+    // A no-countdown match is already Live, so this is a no-op.
+    while m.phase() == MatchPhase::Starting {
+        m.step(&BTreeMap::new());
+    }
     while m.phase() == MatchPhase::Live {
         let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
         for (idx, &seat) in seat_ids.iter().enumerate() {
@@ -2910,7 +2916,18 @@ pub fn run_match(mut m: Match, policies: &mut [Box<dyn Policy>]) -> Match {
 /// freshly built with the same match id, config, rules, roster, and seed as the
 /// recorded match (so spawns match); feeding the recorded post-clamp intents back
 /// through [`step`](Match::step) reproduces the original result bit-for-bit.
+///
+/// A countdown match ([`Rules::starting_ticks`] > 0) opens in [`Starting`] with no
+/// ticks recorded for the countdown, so it is first stepped down to [`Live`] before
+/// the recorded Live tick stream replays — the countdown length rides in `m`'s
+/// rules, not the tick stream, so the re-run reaches tick 0 exactly as the original.
+///
+/// [`Starting`]: MatchPhase::Starting
+/// [`Live`]: MatchPhase::Live
 pub fn replay_match(mut m: Match, replay: &ReplayRecord) -> Match {
+    while m.phase() == MatchPhase::Starting {
+        m.step(&BTreeMap::new());
+    }
     for tr in &replay.ticks {
         if m.phase() != MatchPhase::Live {
             break;
@@ -7956,6 +7973,35 @@ mod tests {
             m.result().unwrap().replay_hash.clone()
         };
         assert_eq!(played(0), played(7), "a countdown leaves the scored replay_hash byte-identical");
+    }
+
+    #[test]
+    fn a_countdown_record_verifies_and_matches_the_no_countdown_hash() {
+        // The authoritative round-trip: run_match drives a Starting match through the
+        // countdown to Ended, and MatchRecord::verify — rebuilding from the full Rules,
+        // so it re-opens in Starting — burns the countdown down and re-runs to the SAME
+        // result and hash. The countdown rides in the record's Rules, not its tick
+        // stream, so the verified hash equals the no-countdown record's.
+        let record = |starting_ticks: u32| -> MatchRecord {
+            let rules = Rules {
+                starting_ticks,
+                spawn_radius: 2 * POSITION_SCALE,
+                spawn_jitter: 0,
+                ..Default::default()
+            };
+            let m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(Seeker), Box::new(Seeker)];
+            run_match(m, &mut policies).to_record().expect("a finished match yields a record")
+        };
+
+        let countdown = record(3);
+        let verified = countdown.verify().expect("a countdown record verifies from itself alone");
+        assert_eq!(verified, countdown.result, "verify reproduces the recorded result");
+        assert_eq!(
+            countdown.result.replay_hash,
+            record(0).result.replay_hash,
+            "the countdown leaves the record's replay_hash byte-identical",
+        );
     }
 
     #[test]
