@@ -7880,6 +7880,100 @@ mod tests {
         Action { protocol_version: PROTOCOL_VERSION, match_id: m.match_id(), seat, tick: m.tick(), intent }
     }
 
+    fn countdown_match(starting_ticks: u32) -> Match {
+        let rules = Rules { starting_ticks, ..Default::default() };
+        Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1)
+    }
+
+    #[test]
+    fn a_match_with_no_countdown_opens_live_at_tick_zero() {
+        // The default (starting_ticks 0) opens directly in Live — byte-identical to
+        // every match built before the countdown existed.
+        let m = new_match(1);
+        assert_eq!(m.phase(), MatchPhase::Live);
+        assert_eq!(m.tick(), 0);
+    }
+
+    #[test]
+    fn a_starting_countdown_holds_pre_live_then_opens_at_tick_zero() {
+        // starting_ticks N keeps the match in Starting for EXACTLY N steps, then Live.
+        // The countdown never advances `tick`, so Live still opens at tick 0.
+        let mut m = countdown_match(3);
+        assert_eq!(m.phase(), MatchPhase::Starting, "opens in Starting under a positive countdown");
+        assert_eq!(m.tick(), 0, "the countdown does not advance the tick counter");
+
+        for left in [2u32, 1] {
+            m.step(&BTreeMap::new());
+            assert_eq!(m.phase(), MatchPhase::Starting, "still counting down ({left} to go)");
+            assert_eq!(m.tick(), 0, "still pre-live at tick 0");
+        }
+
+        m.step(&BTreeMap::new()); // the 3rd countdown step drives the counter to 0
+        assert_eq!(m.phase(), MatchPhase::Live, "the countdown elapses to Live on the Nth step");
+        assert_eq!(m.tick(), 0, "Live opens at tick 0");
+    }
+
+    #[test]
+    fn a_single_tick_countdown_flips_to_live_on_the_first_step() {
+        // The boundary: starting_ticks 1 is Starting at construction, Live after one step.
+        let mut m = countdown_match(1);
+        assert_eq!(m.phase(), MatchPhase::Starting);
+        m.step(&BTreeMap::new());
+        assert_eq!(m.phase(), MatchPhase::Live);
+    }
+
+    #[test]
+    fn no_action_is_simulated_during_the_starting_countdown() {
+        // While Starting, ingest refuses actions (NotLive) and step applies no intent,
+        // so an agent cannot move or fire before GO. Prove the pawn is byte-identical
+        // across a Starting step even when handed a full-speed move intent.
+        let mut m = countdown_match(2);
+        let mover = intent(Vec2 { x: 3000, y: 4000 }, 0x4000, false);
+
+        let a = action_at(&m, 0, mover);
+        assert_eq!(m.ingest(0, &a), Err(RejectReason::NotLive), "ingest refuses actions pre-live");
+
+        let before = m.observe(0).own.position;
+        let mut intents = BTreeMap::new();
+        intents.insert(0u8, mover);
+        m.step(&intents);
+        assert_eq!(m.phase(), MatchPhase::Starting, "one countdown step consumed, still Starting");
+        assert_eq!(m.observe(0).own.position, before, "no pawn moved during the countdown");
+    }
+
+    #[test]
+    fn the_countdown_is_invisible_to_the_scored_replay() {
+        // The additivity claim: a countdown is a pure pre-live delay. Two matches that
+        // differ ONLY in starting_ticks, run to Ended under the same (empty) action
+        // stream, produce the IDENTICAL replay_hash — so the digest never moves.
+        let played = |starting_ticks: u32| -> String {
+            let rules = Rules { starting_ticks, ..Default::default() };
+            let cfg = MatchConfig { max_ticks: 8, ..config(2) };
+            let mut m = Match::new(MID.parse().unwrap(), cfg, rules, two_seats(), Vec::new(), 1);
+            while m.phase() != MatchPhase::Ended {
+                m.step(&BTreeMap::new());
+            }
+            m.result().unwrap().replay_hash.clone()
+        };
+        assert_eq!(played(0), played(7), "a countdown leaves the scored replay_hash byte-identical");
+    }
+
+    #[test]
+    fn starting_ticks_is_omitted_from_serialization_when_zero() {
+        // skip_serializing_if keeps a no-countdown Rules byte-identical to a pre-field
+        // one; a countdown Rules carries the field; an absent field defaults to 0.
+        let default_json = serde_json::to_value(Rules::default()).unwrap();
+        assert!(default_json.get("starting_ticks").is_none(), "a 0 countdown is omitted");
+
+        let countdown = Rules { starting_ticks: 5, ..Default::default() };
+        assert_eq!(serde_json::to_value(countdown).unwrap()["starting_ticks"], 5);
+
+        let mut v = serde_json::to_value(Rules::default()).unwrap();
+        v.as_object_mut().unwrap().remove("starting_ticks");
+        let back: Rules = serde_json::from_value(v).unwrap();
+        assert_eq!(back.starting_ticks, 0, "absent starting_ticks defaults to 0");
+    }
+
     fn step_with(m: &mut Match, intents: &[(SeatId, ActionIntent)]) {
         let map: BTreeMap<SeatId, ActionIntent> = intents.iter().copied().collect();
         m.step(&map);
