@@ -8056,6 +8056,37 @@ mod tests {
     }
 
     #[test]
+    fn observe_surfaces_the_starting_countdown_then_zero_at_live() {
+        // The agent-facing readout: an observation taken during Starting reports the
+        // remaining countdown, decrementing each step, and reads exactly 0 on the first
+        // Live observation — so an agent that reads phase == Starting can time GO. Every
+        // seat sees the same counter; it is match state, not a per-seat secret.
+        let mut m = countdown_match(3);
+        assert_eq!(m.observe(0).starting_remaining, 3, "opens reporting the full countdown");
+        assert_eq!(m.observe(1).starting_remaining, 3, "the same counter for every seat");
+
+        for left in [2u32, 1] {
+            m.step(&BTreeMap::new());
+            assert_eq!(m.phase(), MatchPhase::Starting);
+            assert_eq!(m.observe(0).starting_remaining, left, "the readout tracks the live counter");
+        }
+
+        m.step(&BTreeMap::new()); // the 3rd step drives the counter to 0 and flips to Live
+        assert_eq!(m.phase(), MatchPhase::Live);
+        assert_eq!(m.observe(0).starting_remaining, 0, "exactly 0 on the first Live observation");
+    }
+
+    #[test]
+    fn observe_reports_zero_starting_remaining_without_a_countdown() {
+        // A match that opens directly in Live (the default) reports 0 from tick 0 — the
+        // readout is inert for every match built before the countdown existed, so no
+        // phantom countdown ever appears.
+        let m = new_match(1);
+        assert_eq!(m.phase(), MatchPhase::Live);
+        assert_eq!(m.observe(0).starting_remaining, 0);
+    }
+
+    #[test]
     fn a_single_tick_countdown_flips_to_live_on_the_first_step() {
         // The boundary: starting_ticks 1 is Starting at construction, Live after one step.
         let mut m = countdown_match(1);
