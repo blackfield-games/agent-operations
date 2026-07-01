@@ -6268,7 +6268,7 @@ fn observed_projectile_case(label: &str) -> ObservationCase {
     observation_case_from(label, &m)
 }
 
-/// Build the AIRBORNE-projectile observation case: the same lone team-1 observer as
+/// Build the AIRBORNE-projectile observation case: the same team-1 observer as
 /// [`observed_projectile_case`], but it JUMPS first (gravity on) and fires from mid-arc, so
 /// the shot's launch elevation ([`spawn_projectile`](Match::spawn_projectile) copies the
 /// shooter's `z`) is NON-zero — yet `observe` STILL reports the projectile at ground `z 0`.
