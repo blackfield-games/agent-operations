@@ -1598,6 +1598,25 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(ap.team, 0, "the airborne shot is still reported NEUTRAL (team 0) — the launch elevation changes nothing about the allegiance bound");
     assert_eq!(ap.z, 0, "THE PIN: the airborne shot is reported at GROUND z 0 despite a non-zero launch elevation (the shooter's own z > JUMP_VELOCITY) — observe flattens the flight altitude, never leaks the trajectory");
     assert!(ap.position.x > shot_air.position.x && ap.facing == EAST && ap.in_line_of_sight, "the shot is perceived ahead of the observer on its EAST travel heading, in sight");
+
+    // Out-of-bound projectile exclusion (v44): the COMPLEMENT of the in-view cases above.
+    // An enemy 39 m out — just inside the 40 m perception range, so it IS perceived — fires a
+    // shot that clears the range in the spawn+advance tick. observe surfaces the enemy Player
+    // but must EXCLUDE its now-out-of-range shot under the SAME range gate a pawn rides. A twin
+    // that surfaced every live projectile (a free incoming-fire radar) would add the shot here
+    // and redden ONLY this case; every in-view projectile case (its shot IN bound) stays green.
+    let bounded = obs("out_of_range_enemy_projectile_excluded");
+    assert_eq!(bounded.visible.len(), 1, "the observer perceives EXACTLY the enemy Player — no other entity enters the frame");
+    let seen = &bounded.visible[0];
+    assert_eq!(
+        (seen.kind, seen.entity_id, seen.position),
+        (EntityKind::Player, 1, Vec2 { x: 39_000, y: 0 }),
+        "the one perceived entity is the enemy shooter at 39 m, just inside the 40 m range — proof the observer CAN see that bearing, so an excluded shot is a real range discriminator, not a blind spot"
+    );
+    assert!(
+        !bounded.visible.iter().any(|e| e.kind == EntityKind::Projectile),
+        "THE PIN: the enemy's shot, having flown past the 40 m perception range, is NOT surfaced — an out-of-bound projectile is excluded under the same range gate a pawn rides, its position never leaking (a surface-all-projectiles twin would add it here, reddening ONLY this case)"
+    );
 }
 
 /// Rewrite the committed golden from the current core. Ignored in CI; run it
