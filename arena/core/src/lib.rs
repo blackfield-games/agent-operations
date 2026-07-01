@@ -2590,6 +2590,13 @@ pub enum ReplayError {
     /// scan and the re-run. The bound is a generous backstop, far above any real
     /// match — not a gameplay limit.
     TooManyTicks { ticks: usize, max: usize },
+    /// The record's [`Rules::starting_ticks`] pre-live countdown is longer than the
+    /// verifier will burn. `verify` re-runs the countdown (stepping the fresh match
+    /// out of `Starting`), so an attacker-controlled record claiming a huge countdown
+    /// is a CPU-DoS of no-op steps; it is rejected here, before the re-run. A generous
+    /// backstop, far above any real countdown (seconds at the tick rate) — not a
+    /// gameplay limit.
+    TooManyStartingTicks { starting_ticks: u32, max: u32 },
     /// The roster is larger than the verifier will process. Combat is O(seats²) per
     /// re-run tick, so an oversized roster is a CPU-DoS; it is rejected before the
     /// roster scan and the re-run. A generous backstop, far above any real match.
@@ -2647,6 +2654,9 @@ impl std::fmt::Display for ReplayError {
             }
             ReplayError::TooManyTicks { ticks, max } => {
                 write!(f, "invalid replay: {ticks} recorded ticks exceeds the verifier budget of {max}")
+            }
+            ReplayError::TooManyStartingTicks { starting_ticks, max } => {
+                write!(f, "invalid replay: {starting_ticks}-tick countdown exceeds the verifier budget of {max}")
             }
             ReplayError::TooManySeats { seats, max } => {
                 write!(f, "invalid replay: roster of {seats} seats exceeds the verifier budget of {max}")
@@ -2707,6 +2717,13 @@ pub const MAX_REPLAY_BLOCKERS: usize = 1024;
 /// above any real arena's item count — a DoS backstop, not a gameplay limit.
 pub const MAX_REPLAY_PICKUPS: usize = 256;
 
+/// Verifier cost backstop: the longest pre-live [`Rules::starting_ticks`] countdown
+/// [`MatchRecord::verify`] will burn. `verify` re-runs the countdown to reach `Live`,
+/// so a record claiming a huge countdown is a CPU-DoS of no-op steps; it is rejected
+/// before the re-run. Far above any real countdown — seconds at the tick rate, e.g.
+/// ~150 ticks for a 5 s countdown at 30 Hz — a DoS backstop, not a gameplay limit.
+pub const MAX_REPLAY_STARTING_TICKS: u32 = 100_000;
+
 impl MatchRecord {
     /// Re-derive the match from this record ALONE and confirm it is a faithful,
     /// self-consistent commitment: the inputs (`config`, `rules`, and the
@@ -2753,6 +2770,16 @@ impl MatchRecord {
             return Err(ReplayError::TooManyTicks {
                 ticks: self.replay.ticks.len(),
                 max: MAX_REPLAY_TICKS,
+            });
+        }
+        // The pre-live countdown is re-run to reach Live (`replay_match` steps the
+        // fresh match out of Starting), so a record claiming a huge `starting_ticks`
+        // is a CPU-DoS of no-op steps just like an oversized tick stream — bound it
+        // here, before the re-run, from the same untrusted `self.rules`.
+        if self.rules.starting_ticks > MAX_REPLAY_STARTING_TICKS {
+            return Err(ReplayError::TooManyStartingTicks {
+                starting_ticks: self.rules.starting_ticks,
+                max: MAX_REPLAY_STARTING_TICKS,
             });
         }
         if self.replay.blockers.len() > MAX_REPLAY_BLOCKERS {
@@ -11547,6 +11574,31 @@ mod tests {
         filler.actions.clear();
         at.replay.ticks.resize(MAX_REPLAY_TICKS, filler);
         assert!(!matches!(at.verify(), Err(ReplayError::TooManyTicks { .. })));
+    }
+
+    #[test]
+    fn verify_rejects_an_over_budget_countdown() {
+        // A crafted record claiming a huge pre-live countdown is rejected BEFORE the
+        // re-run, which would otherwise burn one no-op step per countdown tick — the
+        // same CPU-DoS an oversized tick stream is. starting_ticks is outside
+        // canonical_encoding, so raising it on a built record leaves rules_commit
+        // consistent: the budget guard is the ONLY thing that trips.
+        let good = play(1).to_record().unwrap();
+        let mut r = good.clone();
+        r.rules.starting_ticks = MAX_REPLAY_STARTING_TICKS + 1;
+        assert_eq!(
+            r.verify(),
+            Err(ReplayError::TooManyStartingTicks {
+                starting_ticks: MAX_REPLAY_STARTING_TICKS + 1,
+                max: MAX_REPLAY_STARTING_TICKS,
+            }),
+        );
+
+        // Boundary: exactly at the cap is NOT a budget rejection (the guard is `>`,
+        // not `>=`) — the countdown is invisible to the digest, so it re-runs clean.
+        let mut at = good.clone();
+        at.rules.starting_ticks = MAX_REPLAY_STARTING_TICKS;
+        assert!(!matches!(at.verify(), Err(ReplayError::TooManyStartingTicks { .. })));
     }
 
     #[test]
