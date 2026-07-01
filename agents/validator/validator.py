@@ -2,7 +2,9 @@
 
   - NVIDIA Omni Asset Validator (schema, geometry, materials, performance)
   - Style classifier (embed render against moodboard anchors, cosine sim ≥ threshold)
-  - Playability gates (no enclosed interiors in frontier, spawn reachability)
+  - Playability gates: no enclosed interiors in a frontier region (enforced — the
+    intent gate rejects an `enclosedInterior` marker when the director forbids
+    `interior_volumes`); spawn reachability (deferred — needs a navmesh)
 
 This stub runs the cheapest checks inline. Real impl shells out to
 `omni.asset_validator` and a sidecar style-classifier service via MCP.
@@ -52,6 +54,19 @@ ROLE_METRICS: dict[str, set[str]] = {
 # USD text layers must begin with this cookie; pxr refuses to open a file without
 # it and the engine silently skips a sublayer it cannot parse.
 USDA_MAGIC = "#usda"
+
+# The director's intent:must_not token that forbids enclosed interiors — the frontier
+# "no enclosed interiors" rule the module docstring names. A prim declares itself an
+# enclosed-interior volume with the boolean marker below (biome's vegetationCapped
+# idiom); the intent gate rejects any well-formed layer carrying it when the director
+# declared this token. No specialist authors interiors today, so the marker appears in
+# no current layer — the gate is a pure additive no-op until one does (or a
+# tampered/desynced layer smuggles one in): defense-in-depth, not a new producer contract.
+INTERIOR_INTENT = "interior_volumes"
+
+# Matches `custom bool enclosedInterior = true` at any inter-token spacing — the marker a
+# prim carries to declare an enclosed interior. Mirrors biome's `vegetationCapped = true`.
+ENCLOSED_INTERIOR_RE = re.compile(r"\benclosedInterior\s*=\s*true\b")
 
 # A USD prim declaration: a specifier, an optional type name, a quoted prim name.
 # Drives the structural composition-conflict scan when usd-core isn't installed.
@@ -340,7 +355,7 @@ def _intent_attributions(
     wrongly includes ``civilian`` passes membership but is caught here, and an empty roster
     (factions silent) still bars a tampered civilian pick.
 
-    The lighting loop closes the fourth and last intent (``intent:beats``): lighting turns
+    The lighting loop closes the fourth intent (``intent:beats``): lighting turns
     the director's free-form mood line into atmospheric fog and, for every beat it MODELS,
     emits a ``def Volume "Atmosphere"`` whose ``drivenBy`` lists those recognized tokens.
     The gate recomputes the recognized set with lighting's OWN ``_recognized_beats`` (so it
@@ -355,6 +370,18 @@ def _intent_attributions(
     line with no modeled keyword imposes no atmosphere, so the pre-beats palette validates),
     and density is checked ONLY on the ``drivenBy``-correct branch (a wrong ``drivenBy`` is the
     single violation, never also a density complaint), holding the same FM1/FM2/FM3 contract.
+
+    The interiors loop closes the FIFTH intent (``intent:must_not = interior_volumes`` — the
+    "no enclosed interiors" frontier rule): the ONE director intent no specialist consumes
+    (biome/npc punt it) and, until now, no gate verified. It is therefore a pure VERIFY
+    gate — when the director declared ``interior_volumes``, any well-formed layer carrying
+    the ``enclosedInterior=true`` marker is rejected, named by its authoring specialist off
+    ``intent:must_not`` so the supervisor routes the fix back (pipeline-earliest of several).
+    No specialist emits the marker today, so it is additive (a correct world is byte-identical
+    accepted) and silent without the intent (a non-frontier region may legitimately carry
+    interiors) — defense-in-depth against a tampered/desynced/future layer, not a producer
+    desync check like the four above (there is no producer helper to re-derive), holding the
+    same FM1/FM2/FM3 contract.
     """
     out: list[tuple[str, str]] = []
 
@@ -512,6 +539,37 @@ def _intent_attributions(
                         f"the {expected:.2f} its recognized beats {recognized} sum to "
                         f"(a stale or tampered fog magnitude); re-run lighting",
                     ))
+
+    # The must_not->interiors gate closes the FIFTH intent — the "no enclosed interiors"
+    # frontier rule (intent:must_not = interior_volumes) the module docstring lists as a
+    # playability gate but which, unlike every other intent, NO specialist consumes and
+    # (until now) NO gate verified. It is the ONE director intent with no producer: biome
+    # and npc explicitly punt interior_volumes as another specialist's constraint, and
+    # nothing authors interiors today. So this is a pure VERIFY gate — defense-in-depth
+    # against a tampered/desynced/future layer that declares an enclosed-interior volume
+    # (the `enclosedInterior=true` marker) in a region the director marked off-limits.
+    # Fires ONLY when the director DECLARED interior_volumes: a non-frontier region that
+    # omits it may legitimately carry interiors (a premium hub), so a bare marker with no
+    # declaration is not a violation. Each offender is named by the AUTHORING specialist
+    # (route-back target) so the supervisor repairs whoever emitted it — pipeline-earliest
+    # wins when several layers carry it — and the message keys off intent:must_not, never
+    # the word "director" (pipeline-earlier), so the text-scan fallback agrees with the
+    # structured attribution. Additive: no current well-formed layer carries the marker,
+    # so a correct world is byte-identical accepted, and the gate is silent without the
+    # intent. Scans the WELL-FORMED `layers` only (a missing/malformed layer is already
+    # rejected + attributed above, so this never double-reports), reading each through
+    # `_layer_text` so a file that vanished after the well-formedness check degrades to a
+    # skip rather than raising through the final gate (FM3).
+    if INTERIOR_INTENT in _director_intent(layers, layers_root, "must_not"):
+        for layer in layers:
+            text = _layer_text(layers, layer.specialist, layers_root)
+            if text is not None and ENCLOSED_INTERIOR_RE.search(text):
+                out.append((
+                    layer.specialist,
+                    f"intent:must_not unmet: {layer.specialist} layer declares an enclosed "
+                    f"interior (enclosedInterior=true) but intent:must_not forbids "
+                    f"interior_volumes (the frontier rule); re-run {layer.specialist}",
+                ))
     return out
 
 
