@@ -636,6 +636,26 @@ pub struct Rules {
     /// [`canonical_encoding`](Rules::canonical_encoding) so the digest binds it.
     #[serde(default)]
     pub pawn_height: i32,
+    /// Ticks the match spends in [`MatchPhase::Starting`] — a pre-live spawn
+    /// countdown — before it opens to [`Live`](MatchPhase::Live). `0` (the default)
+    /// opens the match directly in `Live` at tick 0, byte-identical to every match
+    /// built before this field existed. While Starting no action is simulated and
+    /// the `tick` counter does not advance, so the scored Live tick stream — and
+    /// thus the `replay_hash` — is identical for any countdown length.
+    ///
+    /// Deliberately NOT folded into [`canonical_encoding`](Rules::canonical_encoding),
+    /// the sole exception to the "every field binds the digest" rule: the countdown
+    /// is a pre-live setup delay that leaves the scored simulation untouched, and
+    /// [`MatchRecord::verify`](crate::MatchRecord::verify) reconstructs it from the
+    /// embedded `Rules` (not the `rules_commit` bytes), so binding it would only
+    /// churn every committed hash for no integrity gain.
+    ///
+    /// Omitted from serialization when `0` (the near-universal case), so a record or
+    /// parity golden written without a countdown stays byte-identical and
+    /// `serde(default)` fills the `0` back on read — the field surfaces in serialized
+    /// form only for a match that actually configures a countdown.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub starting_ticks: u32,
 }
 
 /// The `serde(default)` for [`Rules::fov_octant_spread`]: full circle, so a record
@@ -643,6 +663,13 @@ pub struct Rules {
 /// perception it actually ran under (not the narrowest cone `u8::default()` would give).
 fn full_circle_fov() -> u8 {
     4
+}
+
+/// `serde` `skip_serializing_if` predicate for the opt-in [`Rules::starting_ticks`]:
+/// a zero countdown is the near-universal case, omitted so pre-countdown records and
+/// parity goldens serialize byte-identically (`serde(default)` fills the `0` on read).
+fn u32_is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Default for Rules {
@@ -681,6 +708,7 @@ impl Default for Rules {
             fall_damage: 0, // a hard landing deals no damage by default — every landing safe
             fall_damage_threshold: 0, // inert while fall_damage is 0 (the feature's off default)
             pawn_height: 0, // pawn occupancy is planar by default — z ignored, bodies are columns
+            starting_ticks: 0, // match opens directly in Live — no pre-live countdown by default
         }
     }
 }
@@ -1120,6 +1148,13 @@ pub struct Match {
     seat_memory: Vec<BTreeMap<u32, Remembered>>,
     tick: u64,
     phase: MatchPhase,
+    /// Ticks left in the [`MatchPhase::Starting`] countdown. Initialised to
+    /// [`Rules::starting_ticks`]; each [`step`](Match::step) taken while Starting
+    /// decrements it — without advancing `tick` or recording a [`TickRecord`] — and
+    /// the phase flips to [`Live`](MatchPhase::Live) when it reaches 0. Always 0 once
+    /// Live, so a no-countdown match never touches it. Derived from the recorded
+    /// `Rules` on replay — never itself recorded.
+    starting_remaining: u32,
     seed: u64,
     /// The accepted (post-clamp) action stream, one record per simulated tick —
     /// the deterministic replay.
@@ -1235,7 +1270,12 @@ impl Match {
             pickups: live_pickups,
             seat_memory: (0..n).map(|_| BTreeMap::new()).collect(),
             tick: 0,
-            phase: MatchPhase::Live,
+            phase: if rules.starting_ticks > 0 {
+                MatchPhase::Starting
+            } else {
+                MatchPhase::Live
+            },
+            starting_remaining: rules.starting_ticks,
             seed,
             ticks: Vec::new(),
             result: None,
@@ -1695,6 +1735,17 @@ impl Match {
     ///
     /// [`Ended`]: MatchPhase::Ended
     pub fn step(&mut self, intents: &BTreeMap<SeatId, ActionIntent>) {
+        // Pre-live countdown: a Starting match burns one countdown tick per step —
+        // intents are ignored, `tick` does not advance, and no TickRecord is written —
+        // then opens to Live when the counter reaches 0. So Live always begins at
+        // tick 0 and the scored tick stream is identical for any countdown length.
+        if self.phase == MatchPhase::Starting {
+            self.starting_remaining = self.starting_remaining.saturating_sub(1);
+            if self.starting_remaining == 0 {
+                self.phase = MatchPhase::Live;
+            }
+            return;
+        }
         if self.phase != MatchPhase::Live {
             return;
         }
