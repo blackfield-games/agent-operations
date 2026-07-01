@@ -731,6 +731,37 @@ def test_sends_no_reply_during_the_starting_countdown():
     assert acts[0]["tick"] == 0  # the Live tick-0 action, with no pre-live leak ahead of it
 
 
+def test_starting_countdown_surfaces_to_a_countdown_aware_policy():
+    # A countdown-aware policy reads each pre-live observation via on_starting (mirroring
+    # on_match_start) so it can time GO off starting_remaining. The hook fires once per
+    # Starting frame with the LIVE countdown and NEVER for the Live tick (else seen would
+    # end in 0), and the policy still draws exactly one Live act.
+    from arena_client.sdk import ArenaClient
+
+    class _Countdown:
+        def __init__(self):
+            self.seen: list[int] = []
+
+        def on_starting(self, obs):
+            self.seen.append(obs.starting_remaining)
+
+        def __call__(self, _obs):
+            return _intent(0, 0)
+
+    pol = _Countdown()
+    inbound = [_challenge_frame(), _welcome_frame(), _start_frame(),
+               _observe_frame(phase="starting", starting_remaining=2),
+               _observe_frame(phase="starting", starting_remaining=1),
+               _observe_frame(phase="live"),
+               _end_frame()]
+    t = MockTransport(inbound)
+    ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 4)).run(pol)
+
+    assert pol.seen == [2, 1], "on_starting fires per Starting frame with the live counter, not for Live"
+    acts = [f for f in t.sent if f["type"] == "act"]
+    assert len(acts) == 1, "still exactly one Live reply"
+
+
 def test_static_geometry_never_rides_the_parity_bounded_observation():
     # FM1 (parity): the static map is surfaced ONCE at Start, never on the per-tick
     # Observation — the security boundary. A blockers field on an Observation is

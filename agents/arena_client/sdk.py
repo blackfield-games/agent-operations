@@ -64,9 +64,15 @@ class StatefulPolicy(Protocol):
     geometry the per-tick parity-bounded `Observation` deliberately omits. The hook is
     OPTIONAL: a plain `Policy` callable without it runs unchanged, and the per-tick
     decision still depends only on the `Observation` (the parity boundary is untouched —
-    `on_match_start` carries no live state, only the layout a human sees on the map)."""
+    `on_match_start` carries no live state, only the layout a human sees on the map).
+
+    `on_starting` is the second optional hook: it fires for each pre-live
+    (phase==Starting) countdown observation, which draws no reply — a policy uses it to
+    read `starting_remaining` and prepare for GO, never to act. Both hooks are
+    getattr-guarded, so a plain callable with neither runs unchanged."""
 
     def on_match_start(self, start: MatchStart) -> None: ...
+    def on_starting(self, obs: Observation) -> None: ...
     def __call__(self, obs: Observation) -> ActionIntent: ...
 
 
@@ -269,8 +275,12 @@ class ArenaClient:
             # Pre-live (the Starting countdown): the server broadcasts the observation
             # without reading a reply (the arena harness pump_starting), so an Act here
             # would sit in the pipe and be consumed as the stale first Live action,
-            # desyncing the match. A pre-live observation is informational — the policy
-            # is not ticked and nothing is sent until the match is Live.
+            # desyncing the match. A pre-live observation is informational — surface it
+            # to a countdown-aware policy (which reads `starting_remaining` to time GO)
+            # via the same optional hook as on_match_start, but send nothing until Live.
+            on_starting = getattr(policy, "on_starting", None)
+            if callable(on_starting):
+                on_starting(obs)
             return
         if not obs.own.alive:
             # A corpse's action is rejected (SeatDown); answer with a passive hold so
