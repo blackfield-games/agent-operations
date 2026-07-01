@@ -106,7 +106,60 @@
         "phase": "live",
         "protocol_version": 1,
         "seat": 0,
+        "starting_remaining": 0,
         "tick": 128,
+        "type": "observe",
+        "visible": [
+          {
+            "entity_id": 7,
+            "facing": 16384,
+            "in_line_of_sight": true,
+            "kind": "player",
+            "position": {
+              "x": 1000,
+              "y": -2000
+            },
+            "team": 2,
+            "z": 0
+          }
+        ]
+      }
+    },
+    {
+      "label": "observe_starting",
+      "direction": "server_to_agent",
+      "exact_reencode": true,
+      "frame": {
+        "deadline_micros": 50000,
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "own": {
+          "alive": true,
+          "ammo": 30,
+          "cooldown": 5,
+          "dash_cooldown": 3,
+          "facing": 16384,
+          "health": 100,
+          "max_health": 100,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "score": 12,
+          "seat": 0,
+          "shield": 40,
+          "team": 1,
+          "velocity": {
+            "x": 0,
+            "y": 0
+          },
+          "z": 0,
+          "z_vel": 250
+        },
+        "phase": "starting",
+        "protocol_version": 1,
+        "seat": 0,
+        "starting_remaining": 90,
+        "tick": 0,
         "type": "observe",
         "visible": [
           {

@@ -314,6 +314,16 @@ pub struct Observation {
     pub seat: SeatId,
     pub tick: u64,
     pub phase: MatchPhase,
+    /// Ticks left in the [`Starting`](MatchPhase::Starting) countdown before the match
+    /// opens to [`Live`](MatchPhase::Live): the live counter while `phase` is `Starting`,
+    /// and `0` in every other phase (a `Live`/`Ended` match is not counting down). An
+    /// agent that reads `phase == Starting` uses this to time its first move — GO lands
+    /// in `starting_remaining` ticks. This is an agent-facing view field, NOT part of
+    /// `canonical_encoding` or the replay digest, so surfacing it moves no `replay_hash`.
+    /// `#[serde(default)]` so a frame encoded before the field existed decodes to `0`,
+    /// which is exactly its value once `Live` — the back-compat default matches reality.
+    #[serde(default)]
+    pub starting_remaining: u32,
     /// Microseconds the agent has to return an [`Action`] for this tick before
     /// the tick is forfeited on its behalf. Server-set; the bounded-latency
     /// invariant.
@@ -666,6 +676,7 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
         seat: 0,
         tick: 128,
         phase: MatchPhase::Live,
+        starting_remaining: 0,
         deadline_micros: 50_000,
         own: SelfState {
             seat: 0,
@@ -693,6 +704,16 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
             facing: 0x4000,
             in_line_of_sight: true,
         }],
+    };
+    // A Starting-phase observation pins `starting_remaining` NON-default (it is 0 on the
+    // Live `observe` frame), so the golden carries the countdown field and the Python
+    // `extra=forbid` decode sees it. Starting sits at tick 0 — the pre-live countdown
+    // burns no scored ticks — with the roster locked and actions not yet simulated.
+    let observation_starting = Observation {
+        tick: 0,
+        phase: MatchPhase::Starting,
+        starting_remaining: 90,
+        ..observation.clone()
     };
     let action = Action {
         protocol_version: PROTOCOL_VERSION,
@@ -752,6 +773,7 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
             }),
         ),
         case("observe", ServerToAgent, true, sv(&GatewayMsg::Observe(observation))),
+        case("observe_starting", ServerToAgent, true, sv(&GatewayMsg::Observe(observation_starting))),
         case("end", ServerToAgent, true, sv(&GatewayMsg::End(result))),
         case(
             "join",
@@ -1703,7 +1725,7 @@ mod tests {
         let json = serde_json::to_value(&obs).unwrap();
         assert_eq!(
             object_keys(&json),
-            ["deadline_micros", "match_id", "own", "phase", "protocol_version", "seat", "tick", "visible"],
+            ["deadline_micros", "match_id", "own", "phase", "protocol_version", "seat", "starting_remaining", "tick", "visible"],
             "Observation gained or lost a top-level field — omniscient state must never appear"
         );
         for forbidden in ["all_pawns", "entities", "world", "world_state", "pawns"] {
@@ -1722,6 +1744,7 @@ mod tests {
             "seat": 0,
             "tick": 128,
             "phase": "live",
+            "starting_remaining": 0,
             "deadline_micros": 50_000,
             "own": {
                 "seat": 0, "team": 1,
@@ -1737,7 +1760,27 @@ mod tests {
             }]
         });
         let parsed: Observation = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(parsed.starting_remaining, 0, "a Live observation is done counting down");
         assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "Observation wire shape drifted");
+
+        // A Starting-phase observation round-trips its live countdown byte-for-byte...
+        let mut starting = canonical.clone();
+        {
+            let o = starting.as_object_mut().unwrap();
+            o["phase"] = "starting".into();
+            o["starting_remaining"] = serde_json::json!(90);
+        }
+        let parsed_starting: Observation = serde_json::from_value(starting.clone()).unwrap();
+        assert_eq!(parsed_starting.phase, MatchPhase::Starting);
+        assert_eq!(parsed_starting.starting_remaining, 90);
+        assert_eq!(serde_json::to_value(&parsed_starting).unwrap(), starting, "Starting observation wire shape drifted");
+
+        // ...and a frame written before the field existed (key omitted) decodes to 0 via
+        // serde(default) — a pre-countdown server's observation reads as already-Live.
+        let mut legacy = canonical.clone();
+        legacy.as_object_mut().unwrap().remove("starting_remaining");
+        let parsed_legacy: Observation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed_legacy.starting_remaining, 0, "an omitted starting_remaining defaults to 0");
     }
 
     #[test]
@@ -2277,6 +2320,7 @@ mod tests {
             seat: 0,
             tick: 128,
             phase: MatchPhase::Live,
+            starting_remaining: 0,
             deadline_micros: 50_000,
             own: SelfState {
                 seat: 0,
