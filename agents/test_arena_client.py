@@ -1581,6 +1581,42 @@ def test_run_local_match_selects_a_named_arena_and_surfaces_its_geometry():
     assert empty[0].blockers == [] and empty[0].pickup_points == []
 
 
+def test_run_local_match_streams_the_starting_countdown_to_a_policy():
+    # The end-to-end proof of the Starting-phase agent path against the REAL harness (not
+    # MockTransport): starting_ticks=3 opens the match in Starting for 3 ticks. The harness
+    # pump_starting broadcasts each pre-live observation with NO reply read, so a
+    # countdown-aware policy reads the decrementing starting_remaining via on_starting while
+    # the SDK sends nothing — the phase!=live guard and the hook, proven against pump_starting.
+    # The countdown is digest-inert (outside canonical_encoding), so the match resolves to the
+    # SAME replay_hash as the no-countdown run driven by the identical Live-phase policy.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    class _Countdown(BaselinePolicy):
+        def __init__(self):
+            super().__init__()
+            self.countdown: list[int] = []
+
+        def on_starting(self, obs):
+            self.countdown.append(obs.starting_remaining)
+
+    seed = 24680
+    match_id = "33333333-4444-4555-8666-777777777777"
+    pols = {0: _Countdown(), 1: _Countdown()}
+    counted = run_local_match(harness, [0, 1], pols, seed=seed, match_id=match_id, starting_ticks=3)
+
+    # Each seat saw the full countdown 3,2,1 broadcast per Starting tick, never 0 (the flip is Live).
+    assert pols[0].countdown == [3, 2, 1], "seat 0 read the live pre-live countdown via on_starting"
+    assert pols[1].countdown == [3, 2, 1], "seat 1 read the same broadcast countdown"
+
+    # The countdown is a digest-inert pre-live delay: the no-countdown run under the same seat
+    # policies (identical Live actions) carries the byte-identical replay_hash.
+    plain = run_local_match(harness, [0, 1], {0: BaselinePolicy(), 1: BaselinePolicy()},
+                            seed=seed, match_id=match_id)
+    assert counted[0].replay_hash == plain[0].replay_hash, "the countdown moves no replay_hash"
+    assert 0 < counted[0].final_tick < 3600 and counted[0] == counted[1]
+
+
 def test_run_matchmade_named_arena_surfaces_geometry_on_the_agent_path():
     # --map reaches the --mode (matchmaker) path too: an Agent-mode match under the
     # reference arena surfaces the same cover + pickups to each ranked seat.
