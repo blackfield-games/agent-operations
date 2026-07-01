@@ -124,6 +124,13 @@ struct Args {
     /// its own gravity leaves combat planar (outcome-identical): it unblocks the z-combat family
     /// for a configured deployment, but is not a HIT determinant until `vertical_hit_tolerance > 0`.
     gravity: i32,
+    /// Pre-live spawn-countdown length (`Rules::starting_ticks`): `0` (the default) opens the match
+    /// directly in `Live` at tick 0, byte-identical to the pre-countdown harness (and its replay
+    /// digest, which the countdown never touches). A positive value opens the match in `Starting`
+    /// and the pump burns that many countdown ticks — no action simulated, `tick` held at 0 —
+    /// before `Live`. Set by `--starting-ticks` as a non-negative count. Applies to BOTH the direct
+    /// and `--mode` paths through [`rules_from`] via [`MatchParams::rules`].
+    starting_ticks: u32,
     /// How a fire press resolves (`Rules::weapon_mode`): `hitscan` is an instant beam that lands
     /// the tick it is fired (the default), `projectile` spawns a traveling shot that hits only
     /// when its swept path crosses a body on a later (or point-blank) tick, and `melee` is a
@@ -477,6 +484,12 @@ fn parse_gravity(value: &str) -> i32 {
     i32::try_from(magnitude).expect("--gravity exceeds the i32 range")
 }
 
+/// Parse a `--starting-ticks` value to the non-negative pre-live countdown length. A `u32` parse
+/// rejects a negative outright — a countdown counts down, so a negative is meaningless.
+fn parse_starting_ticks(value: &str) -> u32 {
+    value.parse().expect("--starting-ticks is a non-negative integer (pre-live countdown ticks)")
+}
+
 /// Parse a `--vertical-hit-tolerance` value to the non-negative `z` band that gates a hit, the
 /// same u32-then-i32 fence as [`parse_gravity`]: a negative would invert the `|z|` comparison and a
 /// value past `i32::MAX` would wrap the band, so both abort before any spawn.
@@ -677,6 +690,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut aim_mode = AimMode::Octant;
     let mut friendly_fire = false;
     let mut gravity: i32 = 0;
+    let mut starting_ticks: u32 = 0;
     let mut weapon_mode = WeaponMode::Hitscan;
     let mut vertical_hit_tolerance: i32 = 0;
     let mut fall_damage: u16 = 0;
@@ -771,6 +785,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--aim-mode" => aim_mode = parse_aim_mode(&it.next().expect("--aim-mode needs a value")),
             "--friendly-fire" => friendly_fire = true,
             "--gravity" => gravity = parse_gravity(&it.next().expect("--gravity needs a value")),
+            "--starting-ticks" => {
+                starting_ticks = parse_starting_ticks(&it.next().expect("--starting-ticks needs a value"))
+            }
             "--weapon-mode" => {
                 weapon_mode = parse_weapon_mode(&it.next().expect("--weapon-mode needs a value"))
             }
@@ -923,6 +940,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         aim_mode,
         friendly_fire,
         gravity,
+        starting_ticks,
         weapon_mode,
         vertical_hit_tolerance,
         fall_damage,
@@ -1318,6 +1336,14 @@ fn pump_to_end(
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
 ) -> MatchResult {
+    // Pre-live countdown: the core opens a `starting_ticks > 0` match in Starting. Burn it down
+    // with no agent I/O — actions are refused pre-live, so the seats exchange nothing — leaving the
+    // Live loop below to open at tick 0. With no countdown (the default) the match opens Live and
+    // this loop never runs, byte-identical to the pre-countdown pump; surfacing Starting to the
+    // agents (observations during the countdown) is a separate slice.
+    while m.phase() == MatchPhase::Starting {
+        m.step(&BTreeMap::new());
+    }
     while m.phase() == MatchPhase::Live {
         for seat in 0..n {
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
@@ -1695,6 +1721,7 @@ fn rules_from(args: &Args) -> Rules {
         aim_mode: args.aim_mode,
         friendly_fire: args.friendly_fire,
         gravity: args.gravity,
+        starting_ticks: args.starting_ticks,
         weapon_mode: args.weapon_mode,
         vertical_hit_tolerance: args.vertical_hit_tolerance,
         fall_damage: args.fall_damage,
@@ -2477,6 +2504,7 @@ mod tests {
             aim_mode: AimMode::Octant,
             friendly_fire: false,
             gravity: 0,
+            starting_ticks: 0,
             weapon_mode: WeaponMode::Hitscan,
             vertical_hit_tolerance: 0,
             fall_damage: 0,
@@ -2568,6 +2596,7 @@ mod tests {
             aim_mode: AimMode::Octant,
             friendly_fire: false,
             gravity: 0,
+            starting_ticks: 0,
             weapon_mode: WeaponMode::Hitscan,
             vertical_hit_tolerance: 0,
             fall_damage: 0,
@@ -3138,6 +3167,48 @@ mod tests {
             .into_formed()
             .expect("forms");
         assert_eq!(off.rules().gravity, 0, "no --gravity: the matchmaker forms vertical physics off");
+    }
+
+    #[test]
+    fn direct_match_threads_starting_ticks_and_opens_in_starting() {
+        // FM1 (default drift): no --starting-ticks is 0 — the match opens directly in Live at tick
+        // 0, byte-identical to the pre-countdown harness. The countdown BEHAVIOR (N steps then Live)
+        // is arena-core's own test; here we pin the wiring via rules() + phase().
+        let plain = build_direct_match(&direct_args(2, "reference", 0), 2);
+        assert_eq!(plain.rules().starting_ticks, 0, "no --starting-ticks is 0");
+        assert_eq!(plain.phase(), MatchPhase::Live, "no countdown opens directly in Live");
+
+        let counted = build_direct_match(&Args { starting_ticks: 3, ..direct_args(2, "reference", 0) }, 2);
+        assert_eq!(counted.rules().starting_ticks, 3, "--starting-ticks 3 threads the count into Rules");
+        assert_eq!(counted.phase(), MatchPhase::Starting, "a positive countdown opens the match in Starting");
+    }
+
+    #[test]
+    fn build_matchmaker_threads_starting_ticks_into_a_matchmade_match() {
+        // FM3 (path skew): --starting-ticks must reach the --mode path too. build_matchmaker carries
+        // it via MatchParams.rules (the same rules_from both paths share), so a MATCHMADE match
+        // forms under it.
+        let mm = build_matchmaker(&Args { starting_ticks: 4, ..direct_args(2, "", 0) }, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(formed.rules().starting_ticks, 4, "the matchmaker forms under --starting-ticks 4");
+    }
+
+    #[test]
+    fn starting_ticks_flag_parses_and_defaults_off() {
+        // The parse-level twin of the threading test: --starting-ticks consumes its value; absent
+        // it defaults to 0 (no countdown).
+        let parsed =
+            parse_args_from(["--starting-ticks", "5", "--seats", "3"].into_iter().map(String::from));
+        assert_eq!(parsed.starting_ticks, 5, "--starting-ticks 5 parses its value");
+        assert_eq!(parsed.seats, 3, "the value was consumed, so --seats 3 still parsed");
+
+        let none = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(none.starting_ticks, 0, "no --starting-ticks defaults to 0");
     }
 
     #[test]
