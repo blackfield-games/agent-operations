@@ -3829,8 +3829,15 @@ pub struct MeleeTarget {
 /// struck target separately, so a swing cleaving two enemies credits the SUM (the `cleave` case's
 /// two 50-damage hits score 100, the single-strike cases 50) — a twin that credited only the
 /// nearest cleaved enemy diverges here while the `score_credit` (v24/v35) single-hit cases can't
-/// catch it. Distinct from the `hits` category (the nearest-only ranged beam) and from `knockback`
-/// (the post-hit shove this swing also applies, gated on `knockback_horizontal`).
+/// catch it. The v40 `cleave_enemy_and_ally_credits_enemy_only` case pins that credit as PER-TARGET
+/// inside the cleave: with `friendly_fire` on the swing also strikes a same-team ally (recorded by
+/// the target's `friendly` flag), and the ally takes the full `melee_damage` yet adds NOTHING to
+/// `shooter_score` — two enemies + one ally score 100, not 150 and not 0. Every other case rosters
+/// its targets on distinct teams (all enemies, `friendly_fire` off), so a twin that gated the credit
+/// PER-SWING (any friendly hit zeroes the whole swing) or credited every struck target stays green
+/// on them and the lone-ally `score_credit` cases; only the mixed case separates them. Distinct from
+/// the `hits` category (the nearest-only ranged beam) and from `knockback` (the post-hit shove this
+/// swing also applies, gated on `knockback_horizontal`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeleeCleaveCase {
     pub label: String,
