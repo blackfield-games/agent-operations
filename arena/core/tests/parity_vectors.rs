@@ -1300,6 +1300,29 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(credit(h), credit(ml), "hitscan and melee credit the same enemy hit identically — the shared convention");
     assert_eq!(credit(ml), credit(pj), "melee and projectile credit the same enemy hit identically — the shared convention");
     assert_eq!(credit(h), (25, 25, 25, true), "the shared enemy hit credits 25 (the damage dealt) and the target lives");
+    // Friendly zero-credit across all three sinks (v39): the enemy trio above pins the POSITIVE credit
+    // across hitscan/melee/projectile; this pins the ZERO credit across the same three. A same-team hit
+    // under friendly_fire deals real damage through EVERY sink yet scores nothing — resolve_fire,
+    // resolve_melee, and advance_projectiles each carry their own `if !friendly` gate. The hitscan
+    // friendly case (fr) was pinned at v24; the melee + projectile ones complete it, so a twin that
+    // zeroes a friendly hitscan yet forgets the gate in the melee or projectile sink (crediting the
+    // friendly hit there) diverges only here.
+    let (fr_m, fr_p) = (scr("friendly_melee_under_ff_credits_zero"), scr("friendly_projectile_under_ff_credits_zero"));
+    assert_eq!(
+        (fr.weapon_mode, fr_m.weapon_mode, fr_p.weapon_mode),
+        (WeaponMode::Hitscan, WeaponMode::Melee, WeaponMode::Projectile),
+        "the friendly-zero trio covers all three weapon sinks",
+    );
+    for f in [fr, fr_m, fr_p] {
+        assert_eq!(f.target_team, f.shooter_team, "friendly {:?}: the target shares the shooter's team", f.weapon_mode);
+        assert!(f.friendly_fire, "friendly {:?}: friendly_fire is ON, so the same-team hit is SELECTED", f.weapon_mode);
+        assert!(f.damage > 0, "friendly {:?}: the hit dealt REAL damage — the friendly was struck, not skipped", f.weapon_mode);
+        assert_eq!(f.score_after, f.score_before, "friendly {:?}: ...yet credited ZERO — the sink's own `if !friendly` gate fired", f.weapon_mode);
+        assert!(f.target_alive, "friendly {:?}: the 25 hit on 100 hp is non-lethal, the target lives", f.weapon_mode);
+    }
+    // The friendly melee/projectile hit deals the SAME real damage as its ENEMY twin (25), yet the enemy
+    // credits it and the friendly does not — the credit is gated on TEAM, not on damage dealt.
+    assert_eq!((fr_m.damage, fr_p.damage), (ml.damage, pj.damage), "a friendly melee/projectile hit deals the same damage as the enemy one — only the credit differs");
     // Shielded enemy (v35): a hit on a SHIELDED target credits the FULL effective — the absorbed
     // shield PLUS the health spill — not just the health portion. raw 25 > shield 10 > 0, so the hit
     // drains the shield (10) AND spills to health (15); the credit is 25, and the absorbed 10 is part
