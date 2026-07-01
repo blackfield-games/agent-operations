@@ -5730,6 +5730,52 @@ fn melee_cleave_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u
     }
 }
 
+/// Build a friendly-fire melee-cleave case: like [`melee_cleave_case`] but with `friendly_fire`
+/// ON and one or more targets on the SHOOTER's own team (allies). Each `(offset, ally)` pair
+/// places an ally on team 0 (the shooter's) or an enemy on its own distinct seat team. Under
+/// `friendly_fire` the same-team targets ARE selected into the hit set, so an ally is struck for
+/// the full `melee_damage` — but `resolve_melee`'s per-hit `if !friendly` gate credits ONLY the
+/// enemies, so `shooter_score` sums the enemy damage alone even though every target was struck.
+/// Pins the friendly credit gate as PER-TARGET inside the cleave loop, the one thing the all-enemy
+/// summed case ([`melee_cleave_case`]) and the lone-ally `score_credit` cases cannot separate.
+fn melee_cleave_ff_case(label: &str, facing: Bam, melee_range: i32, melee_damage: u16, targets: Vec<(Vec2, bool)>) -> MeleeCleaveCase {
+    let seats = (targets.len() + 1) as u8;
+    let rules = Rules { weapon_mode: WeaponMode::Melee, melee_range, melee_damage, friendly_fire: true, spawn_jitter: 0, ..Default::default() };
+    let roster: Vec<_> = (0..seats)
+        .map(|s| {
+            // Seat 0 is the shooter (team 0); each target is on team 0 if an ally, else its own seat team.
+            let team = if s == 0 || targets[(s - 1) as usize].1 { 0 } else { s as TeamId };
+            parity_seat(s as SeatId, team)
+        })
+        .collect();
+    let mut m = Match::new(parity_match_id(), parity_config(seats), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = facing;
+    for (i, &(off, _)) in targets.iter().enumerate() {
+        m.pawns[i + 1].pos = off;
+    }
+    let before: Vec<u16> = (1..=targets.len()).map(|i| m.pawns[i].health).collect();
+    m.resolve_melee(0);
+    let out_targets = targets
+        .iter()
+        .enumerate()
+        .map(|(i, &(offset, ally))| {
+            let damage = before[i] - m.pawns[i + 1].health;
+            MeleeTarget { offset, struck: damage > 0, damage, friendly: ally }
+        })
+        .collect();
+    MeleeCleaveCase {
+        label: label.to_string(),
+        facing,
+        melee_range,
+        melee_damage,
+        blockers: Vec::new(),
+        targets: out_targets,
+        shooter_score: m.pawns[0].score,
+        friendly_fire: true,
+    }
+}
+
 /// Build a perception-memory case: seat 0 (at the origin, facing EAST, full-circle FOV)
 /// watches seat 1 walk through `target_path` — one position per tick — under
 /// `perception_memory_ticks`, recording seat 0's `observe` view of seat 1 after each step.
@@ -6767,6 +6813,24 @@ pub fn parity_vectors() -> ParityVectors {
                     vec![
                         Vec2 { x: POSITION_SCALE, y: POSITION_SCALE }, // 45 deg NE: octant 1, distance 1 -> struck
                         Vec2 { x: 0, y: POSITION_SCALE },              // 90 deg N:  octant 2, distance 2 -> missed
+                    ],
+                ),
+                // Friendly-in-cleave credit (v40): with friendly_fire ON, one swing cleaves TWO enemies
+                // (1 m + 1.5 m dead ahead) AND a same-team ally (1.8 m), all three inside the arc + 2 m
+                // range with clear sight, so ALL are struck for the full 50. The shooter scores ONLY the
+                // two enemies (100), NOT the ally's equal 50 — resolve_melee's per-hit `if !friendly`
+                // gate fires PER TARGET inside the cleave. A twin that zeroes the whole swing because a
+                // friendly was hit (0), or credits every struck target (150), diverges only here: the
+                // all-enemy summed case has no ally and the lone-ally score_credit case has no enemy.
+                melee_cleave_ff_case(
+                    "cleave_enemy_and_ally_credits_enemy_only",
+                    EAST,
+                    range,
+                    50,
+                    vec![
+                        (Vec2 { x: POSITION_SCALE, y: 0 }, false), // 1 m enemy -> struck + credited
+                        (Vec2 { x: 1500, y: 0 }, false),           // 1.5 m enemy -> struck + credited
+                        (Vec2 { x: 1800, y: 0 }, true),            // 1.8 m ALLY -> struck (FF on), NOT credited
                     ],
                 ),
             ]

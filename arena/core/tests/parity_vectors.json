@@ -2869,6 +2869,44 @@
       ],
       "shooter_score": 50,
       "friendly_fire": false
+    },
+    {
+      "label": "cleave_enemy_and_ally_credits_enemy_only",
+      "facing": 0,
+      "melee_range": 2000,
+      "melee_damage": 50,
+      "blockers": [],
+      "targets": [
+        {
+          "offset": {
+            "x": 1000,
+            "y": 0
+          },
+          "struck": true,
+          "damage": 50,
+          "friendly": false
+        },
+        {
+          "offset": {
+            "x": 1500,
+            "y": 0
+          },
+          "struck": true,
+          "damage": 50,
+          "friendly": false
+        },
+        {
+          "offset": {
+            "x": 1800,
+            "y": 0
+          },
+          "struck": true,
+          "damage": 50,
+          "friendly": true
+        }
+      ],
+      "shooter_score": 100,
+      "friendly_fire": true
     }
   ],
   "perception_memory": [
