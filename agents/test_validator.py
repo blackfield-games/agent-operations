@@ -1295,6 +1295,94 @@ async def test_run_capped_biome_magnitude_tracks_the_cap_in_lock_step(tmp_path):
     assert not off.accepted
 
 
+# ---- biome UNCAPPED scatter COUNT vs the brief: the else-branch twin of the cap magnitude ----
+#
+# The cap magnitude check above pins instanceCount to the brief ONLY under a vegetationCapped
+# marker; an UNCAPPED region's count is a deterministic function of the brief too (biome.run emits
+# _scatter_count(brief.biome, region, None)), yet nothing pinned it — a stale/tampered count with a
+# consistent triangles metric passes the triangle + budget gates and ships an under/over-scattered
+# world accepted. These pin the uncapped re-derivation, gated on NOT-capped so the cap magnitude
+# gate keeps sole ownership of the capped case. _capped_biome_set(capped=False, caps=False) builds
+# an uncapped world (no capping director, no marker), carrying the count as BOTH instanceCount and a
+# matching triangles metric with the optimizer re-synced — so only the count re-derivation varies.
+
+
+async def test_run_accepts_an_uncapped_biome_whose_count_matches_the_brief(tmp_path):
+    # FM1: no capping director, biome emits the region-true uncapped scatter — the gate re-derives
+    # the same count off the brief and accepts.
+    verdict = await validator.run(
+        _brief(),
+        _capped_biome_set(tmp_path, count=_UNCAPPED_COUNT, capped=False, caps=False),
+        layers_root=tmp_path,
+    )
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_rejects_an_uncapped_biome_carrying_a_tampered_count(tmp_path):
+    # FM2 (false accept — the exploit): a count changed in isolation, with a CONSISTENT triangles
+    # metric AND a re-synced optimizer body (so the triangle + budget gates stay silent), ships an
+    # under-scattered region. Only the brief re-derivation sees it: rejected, routed back to biome,
+    # the message naming instanceCount and both the tampered and the expected count.
+    tampered = _UNCAPPED_COUNT + 1
+    verdict = await validator.run(
+        _brief(),
+        _capped_biome_set(tmp_path, count=tampered, capped=False, caps=False),
+        layers_root=tmp_path,
+    )
+    assert not verdict.accepted
+    assert any(
+        "instanceCount" in i and str(tampered) in i and str(_UNCAPPED_COUNT) in i
+        for i in verdict.issues
+    )
+    assert "biome" in verdict.failing_specialists
+    # names no pipeline-earlier specialist, so the text-scan fallback agrees and routes to biome.
+    assert _failing_specialist(verdict.issues) == "biome"
+    assert _route_back_target(verdict) == "biome"
+
+
+async def test_run_uncapped_count_not_checked_under_a_capping_director(tmp_path):
+    # FM3 (no double-report / no false-reject): under a capping director the cap magnitude gate owns
+    # the count. A correctly-capped region carries _CAPPED_COUNT (strictly below _UNCAPPED_COUNT), so
+    # the uncapped re-derivation MUST be gated off here — ungated it would expect _UNCAPPED_COUNT and
+    # false-reject the correctly-capped count.
+    assert _CAPPED_COUNT != _UNCAPPED_COUNT
+    verdict = await validator.run(
+        _brief(), _capped_biome_set(tmp_path, count=_CAPPED_COUNT), layers_root=tmp_path
+    )
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_skips_an_uncapped_biome_with_no_instance_count(tmp_path):
+    # FM3 (degrade): the body declares no instanceCount (the placeholder shape other gates' fixtures
+    # use) — field-presence is the well-formedness gate's concern, so the count re-derivation skips
+    # (returns []) and the world validates.
+    verdict = await validator.run(
+        _brief(),
+        _capped_biome_set(tmp_path, count=None, capped=False, caps=False),
+        layers_root=tmp_path,
+    )
+    assert verdict.accepted, verdict.issues
+
+
+async def test_run_uncapped_count_tracks_the_brief_in_lock_step(tmp_path):
+    # FM4 (vocabulary/algorithm desync): the expectation IS biome._scatter_count(cap None)'s output —
+    # the exact uncapped count accepts, that count off-by-one rejects. A copied density or a
+    # re-implemented jitter would drift from biome and either false-reject a legit count or miss the
+    # desync.
+    ok = await validator.run(
+        _brief(),
+        _capped_biome_set(tmp_path, count=_UNCAPPED_COUNT, capped=False, caps=False),
+        layers_root=tmp_path,
+    )
+    assert ok.accepted, ok.issues
+    off = await validator.run(
+        _brief(),
+        _capped_biome_set(tmp_path, count=_UNCAPPED_COUNT + 1, capped=False, caps=False),
+        layers_root=tmp_path,
+    )
+    assert not off.accepted
+
+
 async def test_run_does_not_false_reject_an_unmappable_must_have_token(tmp_path):
     # FM1 (the worst failure — an infinite revision loop): the director names a token
     # with NO MUST_HAVE_ASSET mapping. prop skips it (places nothing), so the gate must
