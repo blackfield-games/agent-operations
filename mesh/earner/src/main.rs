@@ -478,6 +478,19 @@ fn estimate_progress(elapsed_secs: u64, deadline_secs: u32) -> u8 {
     (elapsed_secs.saturating_mul(100) / deadline_secs as u64).min(99) as u8
 }
 
+/// The render time to charge for a completed job, in whole seconds.
+///
+/// Floored to 1: the coordinator's content gate rejects `render_seconds == 0`
+/// (`ZeroRenderSeconds`) — a job that submitted a result did at least a second of
+/// work, and both `/stats total_render_seconds` and the metered `rate * render_seconds`
+/// charge would zero out otherwise. Saturated at `u32::MAX` so a pathologically long
+/// render cannot wrap the `u32` the wire and the charge use; the coordinator's own
+/// `validate_render_seconds` upper bound (`deadline_secs * slack`) rejects any value
+/// that large anyway, so the saturation is belt-and-suspenders, not the real ceiling.
+fn render_seconds_charged(elapsed_secs: u64) -> u32 {
+    (elapsed_secs.min(u32::MAX as u64) as u32).max(1)
+}
+
 /// Drive `render_fut` to completion while emitting a heartbeat every `heartbeat_secs`
 /// seconds (`.max(1)` guards against a zero-second interval panicking
 /// `tokio::time::interval`). The coordinator bumps `started_at` on each heartbeat so the
@@ -486,12 +499,17 @@ fn estimate_progress(elapsed_secs: u64, deadline_secs: u32) -> u8 {
 /// `deadline_secs`) so `/stats in_flight_progress_pct_avg` tracks real progress instead
 /// of the constant it reported before. Returns the rendered bytes.
 ///
+/// `started` is the caller's render clock, passed in rather than captured here so the
+/// SAME instant backs both the progress estimate and the caller's `render_seconds`
+/// charge (one source of truth for "how long has this render run").
+///
 /// The stub `runner::render` returns instantly, so for stub jobs no heartbeat fires
 /// mid-render (the loop breaks on the first poll) — that is correct; this mechanism is
 /// for slow real renders.
 async fn render_with_heartbeats<S, F>(
     ws: &mut S,
     job_id: Uuid,
+    started: tokio::time::Instant,
     deadline_secs: u32,
     heartbeat_secs: u64,
     render_fut: F,
@@ -502,7 +520,6 @@ where
     F: std::future::Future<Output = Result<Vec<u8>>>,
 {
     tokio::pin!(render_fut);
-    let started = tokio::time::Instant::now();
     let mut hb = tokio::time::interval(Duration::from_secs(heartbeat_secs.max(1)));
     hb.tick().await; // consume the immediate first tick so the first beat is one interval in
     loop {
@@ -569,10 +586,13 @@ where
 
     // Run the render concurrently with a progress-carrying heartbeat so a job making
     // progress is never reaped by the deadline reaper; a silent earner still hits the
-    // original window.
+    // original window. `started` clocks the render for both the heartbeat progress
+    // estimate and the `render_seconds` charge below.
+    let started = tokio::time::Instant::now();
     let output = render_with_heartbeats(
         ws,
         job.id,
+        started,
         job.deadline_secs,
         heartbeat_secs,
         runner::render(&job),
@@ -589,7 +609,7 @@ where
         earner_address: session.address.clone(),
         output_hash,
         output_url: format!("memory://{}", job.id),
-        render_seconds: 1,
+        render_seconds: render_seconds_charged(started.elapsed().as_secs()),
         signature_hex,
     };
     ws.send(WsMessage::text(serde_json::to_string(&EarnerMsg::Submit(
@@ -704,6 +724,9 @@ async fn poll_once(
     };
 
     tracing::info!(job_id = %job.id, kind = ?job.kind, region = %job.region.region_id(), "job accepted");
+    // The http poll path has no heartbeat channel, so it clocks the render inline for
+    // the `render_seconds` charge (the ws path shares its clock with the heartbeat).
+    let started = tokio::time::Instant::now();
     let output = runner::render(&job).await.context("render failed")?;
 
     let mut hasher = Sha256::new();
@@ -717,7 +740,7 @@ async fn poll_once(
         earner_address: session.address.clone(),
         output_hash,
         output_url: format!("memory://{}", job.id),
-        render_seconds: 1,
+        render_seconds: render_seconds_charged(started.elapsed().as_secs()),
         signature_hex,
     };
 
@@ -1756,9 +1779,10 @@ mod tests {
         // would emit wrong values. A virtual sleep bounds the drive so the test ends.
         let mut sink = RecordingSink::default();
         let job_id = Uuid::new_v4();
+        let started = tokio::time::Instant::now();
         let render = std::future::pending::<Result<Vec<u8>>>();
         tokio::select! {
-            _ = render_with_heartbeats(&mut sink, job_id, 100, 20, render) => {
+            _ = render_with_heartbeats(&mut sink, job_id, started, 100, 20, render) => {
                 unreachable!("a pending render never completes")
             }
             _ = tokio::time::sleep(Duration::from_secs(65)) => {}
