@@ -490,6 +490,104 @@ async def test_run_accepts_a_resolved_world_with_recorded_lod_reductions(tmp_pat
     assert verdict.accepted, verdict.issues
 
 
+def _lod_directive(*, level, scale, authored, effective, name="Lod_0", drop=()):
+    """One LodDirectives block for the halving-legality unit test. `drop` omits fields
+    (to model a malformed directive)."""
+    lines = [
+        f'        custom int lodLevel = {level}',
+        f'        custom double lodScale = {scale}',
+        f'        custom double authoredTriangles = {authored}',
+        f'        custom double effectiveTriangles = {effective}',
+    ]
+    kept = "\n".join(line for line in lines if not any(f" {d} =" in line for d in drop))
+    return f'    def Scope "{name}"\n    {{\n{kept}\n    }}'
+
+
+def test_lod_directive_legality_passes_legal_sheds_and_flags_each_illegal_kind():
+    # The per-directive re-derivation: a legal shed (effective == authored/(1<<level),
+    # 1<=level<=MAX_LOD) is silent; each illegal kind — below-floor fabricated effective,
+    # a level out of range, a scale that mismatches its level, a malformed directive — is
+    # named for route-back. This is the branch-level twin of the end-to-end run() tests.
+    legal = _lod_directive(level=2, scale=0.25, authored=80000.0, effective=20000.0)
+    assert validator._lod_directive_legality("optimization/r.usda", legal) == []
+
+    below_floor = _lod_directive(level=3, scale=0.125, authored=80000.0, effective=1.0)
+    msgs = validator._lod_directive_legality("optimization/r.usda", below_floor)
+    assert len(msgs) == 1 and "effectiveTriangles" in msgs[0] and "fabricated" in msgs[0]
+
+    over_max = _lod_directive(level=4, scale=0.0625, authored=80000.0, effective=5000.0)
+    msgs = validator._lod_directive_legality("optimization/r.usda", over_max)
+    assert len(msgs) == 1 and "lodLevel 4" in msgs[0] and "1..=3" in msgs[0]
+
+    below_min = _lod_directive(level=0, scale=1.0, authored=80000.0, effective=80000.0)
+    msgs = validator._lod_directive_legality("optimization/r.usda", below_min)
+    assert len(msgs) == 1 and "lodLevel 0" in msgs[0]
+
+    # scale 0.125 matches its OWN effective (80000*0.125=10000) but not level 1's legal 0.5,
+    # so the level<->scale check fires before the effective check — a subtler tamper.
+    bad_scale = _lod_directive(level=1, scale=0.125, authored=80000.0, effective=10000.0)
+    msgs = validator._lod_directive_legality("optimization/r.usda", bad_scale)
+    assert len(msgs) == 1 and "lodScale" in msgs[0] and "0.5" in msgs[0]
+
+    malformed = _lod_directive(level=1, scale=0.5, authored=80000.0, effective=40000.0, drop=("lodLevel",))
+    msgs = validator._lod_directive_legality("optimization/r.usda", malformed)
+    assert len(msgs) == 1 and "malformed" in msgs[0]
+
+
+async def test_run_rejects_a_below_floor_fabricated_lod_reduction(tmp_path):
+    # The exploit the sum re-derivation alone cannot see: a directive claims to shed biome
+    # (202144) to effectiveTriangles 1.0 — far below the 1/8 floor (25268) — fabricating a
+    # 202143 reduction. observed is set to authored - that reduction so observed == authored
+    # - Σreduction still balances, and at budget 410000 the fabricated observed 400001 reads
+    # UNDER budget (overBudget false). Every existing _budget_self_consistency check passes,
+    # so absent the halving check this genuinely-over-budget world (even biome's floor shed
+    # leaves 425268 > 410000) ships ACCEPTED. The per-directive legality rejects it.
+    reductions = 202144.0 - 1.0
+    observed = SUMMED_PRIOR - reductions
+    directives = (
+        '\n\n    def Scope "LodDirectives"\n    {\n'
+        '        def Scope "Lod_0"\n        {\n'
+        '            custom string specialist = "biome"\n'
+        '            custom string layer = "biome/r.usda"\n'
+        "            custom int lodLevel = 3\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 202144.0\n"
+        "            custom double effectiveTriangles = 1.0\n"
+        "        }\n    }"
+    )
+    body = _opt_body(budget=410_000, authored=SUMMED_PRIOR, observed=observed, over_budget=False, directives=directives)
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert "optimization" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "optimization"
+    assert any("fabricated reduction" in issue for issue in verdict.issues), verdict.issues
+
+
+async def test_run_rejects_a_lod_directive_whose_scale_mismatches_its_level(tmp_path):
+    # A different illegal kind through the full run(): lodScale 0.125 on a lodLevel 1
+    # directive (legal scale 0.5). effectiveTriangles 25268 matches the WRONG scale so the
+    # sum reconciles and the world sits under the default budget — accepted absent the
+    # check. The level<->scale re-derivation catches the mismatch and routes back.
+    reductions = 202144.0 - 25268.0
+    observed = SUMMED_PRIOR - reductions
+    directives = (
+        '\n\n    def Scope "LodDirectives"\n    {\n'
+        '        def Scope "Lod_0"\n        {\n'
+        '            custom string specialist = "biome"\n'
+        '            custom string layer = "biome/r.usda"\n'
+        "            custom int lodLevel = 1\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 202144.0\n"
+        "            custom double effectiveTriangles = 25268.0\n"
+        "        }\n    }"
+    )
+    body = _opt_body(authored=SUMMED_PRIOR, observed=observed, over_budget=False, directives=directives)
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert _route_back_target(verdict) == "optimization"
+    assert any("lodScale" in issue for issue in verdict.issues), verdict.issues
+
+
 async def test_run_skips_re_derivation_when_a_geometry_layer_is_missing(tmp_path):
     # The re-derivation runs only when the inputs are trustworthy: a missing geometry
     # specialist makes the summed prior incomplete, so the stale-check would spuriously
