@@ -13955,6 +13955,120 @@ mod tests {
         );
     }
 
+    /// A dead-lettered EAS receipt is the canonical proof of validated work; the
+    /// retention sweep must NEVER delete it. That invariant is enforced only implicitly:
+    /// the prune predicate excludes a job whose attestation is `uid IS NULL`, and a
+    /// dead-lettered receipt keeps `uid` NULL (the quarantine stamps only
+    /// `dead_lettered_at`), so it is retained for the SAME reason a still-pending one is.
+    /// The two existing retention-retains tests only ever walk the pending/relayed path,
+    /// so a refactor scoping the subquery to `AND dead_lettered_at IS NULL` (a plausible
+    /// "only keep still-drainable rows" simplification) would keep the pending twin but
+    /// silently prune the quarantined proof — suite still green. Three aged-past-horizon
+    /// rows pin the sub-case: a fully-relayed row (`uid` set) IS pruned, proving the age
+    /// makes rows eligible; the still-pending control AND the dead-lettered subject both
+    /// survive. Mutation: scope the predicate to `AND dead_lettered_at IS NULL` and only
+    /// the dead-lettered row's survival assertion reddens.
+    #[test]
+    fn retention_keeps_a_dead_lettered_attestation() {
+        let mut store = Store::open_in_memory().unwrap();
+        let horizon = 1000;
+        let now = now_secs();
+        let aged = now - horizon - 1;
+
+        let complete = |s: &mut Store, job: &JobSpec| {
+            s.enqueue(job).unwrap();
+            s.take_next(|_| true).unwrap();
+            assert!(s.record_completed(&signed_result(job.id, "r")).unwrap());
+        };
+
+        let dead = seed_job();
+        complete(&mut store, &dead);
+        assert!(store.mark_attestation_dead_lettered(&dead.id, now).unwrap());
+        store.set_created_at(&dead.id, aged).unwrap();
+
+        let pending = seed_job();
+        complete(&mut store, &pending);
+        store.set_created_at(&pending.id, aged).unwrap();
+
+        let relayed = seed_job();
+        complete(&mut store, &relayed);
+        assert!(store.mark_submitted(&relayed.id, "uid-1", now).unwrap());
+        store.set_created_at(&relayed.id, aged).unwrap();
+
+        assert_eq!(
+            store.prune_terminal_jobs(now, horizon, 256).unwrap(),
+            1,
+            "only the relayed row prunes; the dead-lettered proof and the pending row stay"
+        );
+        assert_eq!(
+            store.job_status(&dead.id).unwrap().as_deref(),
+            Some("done"),
+            "the quarantined receipt is never deleted by retention"
+        );
+        assert_eq!(store.job_status(&pending.id).unwrap().as_deref(), Some("done"));
+        assert_eq!(store.job_status(&relayed.id).unwrap(), None, "relayed row pruned");
+        assert_eq!(
+            store.dead_lettered_attestation_count().unwrap(),
+            1,
+            "the surviving proof stays countable at /stats after the sweep"
+        );
+    }
+
+    /// The metering twin: a dead-lettered ComputeMeter debit is an owed, auditable charge
+    /// and retention must never drop it. The debit predicate (`tx_hash IS NULL`) retains a
+    /// dead-lettered debit implicitly, exactly as `uid IS NULL` does the receipt. Every row
+    /// relays its attestation first, so the debit is the ONLY obligation left — isolating
+    /// the metering-side predicate a receipt-only test would leave unguarded. Same three-row
+    /// shape; mutation: scope the debit subquery to `AND dead_lettered_at IS NULL` and the
+    /// dead-lettered debit is pruned.
+    #[test]
+    fn retention_keeps_a_dead_lettered_debit() {
+        let rate = 1_000_000_000_000u128;
+        let mut store = Store::open_in_memory().unwrap().with_compute_rate_wei(rate);
+        let horizon = 1000;
+        let now = now_secs();
+        let aged = now - horizon - 1;
+
+        let settle_attested = |s: &mut Store, job: &JobSpec, uid: &str| {
+            assert!(s.enqueue_within_cap(job, 100, Some(TEST_BUYER)).unwrap());
+            s.take_next(|_| true).unwrap();
+            assert!(s.record_completed(&signed_result(job.id, "r")).unwrap());
+            assert!(s.mark_submitted(&job.id, uid, now).unwrap());
+        };
+
+        let dead = seed_job();
+        settle_attested(&mut store, &dead, "uid-a");
+        assert!(store.mark_debit_dead_lettered(&dead.id, now).unwrap());
+        store.set_created_at(&dead.id, aged).unwrap();
+
+        let pending = seed_job();
+        settle_attested(&mut store, &pending, "uid-b");
+        store.set_created_at(&pending.id, aged).unwrap();
+
+        let relayed = seed_job();
+        settle_attested(&mut store, &relayed, "uid-c");
+        assert!(store.mark_debit_submitted(&relayed.id, "0xtx", now).unwrap());
+        store.set_created_at(&relayed.id, aged).unwrap();
+
+        assert_eq!(
+            store.prune_terminal_jobs(now, horizon, 256).unwrap(),
+            1,
+            "only the row whose debit landed prunes; the dead-lettered charge and the pending one stay"
+        );
+        assert_eq!(
+            store.job_status(&dead.id).unwrap().as_deref(),
+            Some("done"),
+            "the quarantined debit is never deleted by retention"
+        );
+        assert_eq!(store.job_status(&pending.id).unwrap().as_deref(), Some("done"));
+        assert_eq!(store.job_status(&relayed.id).unwrap(), None, "settled row pruned");
+        assert_eq!(
+            store.dead_lettered_debit_count().unwrap(),
+            1,
+            "the surviving charge stays countable at /stats after the sweep"
+        );
+    }
+
     /// Retention NEVER deletes live work: an aged `queued` or `in_flight` job is
     /// the reapers' domain, not the retention sweep's.
     #[test]
