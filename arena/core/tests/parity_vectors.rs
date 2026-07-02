@@ -266,6 +266,34 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     dropped.replay.pickups.clear();
     assert!(dropped.verify().is_err(), "dropping the committed pickup must break the hash");
 
+    // Countdown digest-invariance (starting-phase v45, now committed cross-impl): a
+    // `starting_ticks` countdown is a pure pre-live delay — a Starting step writes no
+    // TickRecord and `starting_ticks` rides OUTSIDE the `rules_commit` — so this case runs
+    // octant_hitscan's identical scored stream and MUST hash identically. It is the one
+    // committed NON-determinant: `aim_mode`, `weapon_mode`, the seed, and the pickup layout
+    // above each BIND the digest, but lengthening the countdown leaves it byte-identical. A
+    // twin that folds `starting_ticks` into its `rules_commit` diverges here and fails the
+    // shared verify loop, closing the gap the v45 timeline category left Rust-unit-only.
+    let countdown = pick("countdown_hashes_as_octant");
+    assert_eq!(countdown.rules.starting_ticks, 3, "the countdown case carries a real, non-trivial pre-live countdown");
+    assert_eq!(octant.rules.starting_ticks, 0, "its no-countdown twin opens directly in Live");
+    assert_eq!(
+        countdown.replay.ticks, octant.replay.ticks,
+        "a Starting step writes no tick -> the countdown scores octant's identical stream"
+    );
+    assert_eq!(
+        countdown.result.replay_hash, octant.result.replay_hash,
+        "the countdown is digest-invariant — starting_ticks never binds the replay_hash"
+    );
+    // The converse of the seed/weapon_mode tampers: those DETERMINANTS break verify when
+    // bumped; the countdown is a NON-determinant, so lengthening it still re-verifies clean.
+    let mut longer_countdown = countdown.clone();
+    longer_countdown.rules.starting_ticks += 2;
+    assert!(
+        longer_countdown.verify().is_ok(),
+        "bumping the countdown is a non-determinant — the lengthened record still verifies"
+    );
+
     // Config (v5): every committed match carries the arena config, and the digest
     // folds its DETERMINANTS — so the UE5 twin must fold bounds + max_ticks too, or its
     // match hashes diverge. An arena-bound or tick-cap tamper on the stored replay moves
