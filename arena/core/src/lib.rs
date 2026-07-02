@@ -3617,7 +3617,11 @@ pub struct ProjectileCase {
 /// commits the INPUTS, the rules, AND the config determinants (v5), so the octant
 /// and fine matches — identical action streams differing only in `aim_mode` — hash
 /// apart on the rules alone, while the rules also bind the OUTCOMES (the projectile
-/// match diverges and a flipped `weapon_mode` fails re-execution).
+/// match diverges and a flipped `weapon_mode` fails re-execution). The countdown case
+/// pins the converse: a match that opens behind a pre-live `starting_ticks` countdown
+/// runs octant's identical stream (a `Starting` step writes no tick, and `starting_ticks`
+/// stays outside the `rules_commit`) and so hashes IDENTICALLY — the one committed
+/// non-determinant, the guard against a twin that folds the countdown into its digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchCase {
     pub label: String,
@@ -6710,11 +6714,13 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
 /// more for the mirror upset, a draw moves the favourite down, every case zero-sum),
 /// the multi-seat ranked-rating delta (an FFA / 3+ field settled as a sum of pairwise
 /// games — the n=2 reduction agreeing with the 1v1, a placement tie scored a draw, the
-/// ±cap honoured, every field zero-sum), and four full-match records proving the digest
+/// ±cap honoured, every field zero-sum), and five full-match records proving the digest
 /// commits the inputs, the rules, AND
 /// the config determinants — the octant and fine cases run the identical action
 /// stream yet hash differently because their aim_mode differs — while the rules also
-/// bind the outcomes a re-run reproduces.
+/// bind the outcomes a re-run reproduces, and the countdown case runs octant's identical
+/// stream behind a pre-live `starting_ticks` countdown yet hashes IDENTICALLY, pinning the
+/// countdown as the one committed non-determinant (it never binds the replay_hash).
 ///
 /// Set domain is `parity-vectors/v12`: the digest binds the combat `rules` and the
 /// `config` determinants (arena bounds + tick cap); v4 added the z-coupled-combat rule
