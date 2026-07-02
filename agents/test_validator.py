@@ -2023,19 +2023,21 @@ def _biome_metric_set(root: Path, *, count, biome_tris: float) -> list[LayerSpec
 
 
 async def test_run_accepts_a_biome_metric_consistent_with_its_count(tmp_path):
-    # FM1 at run() level: a correct world (biome metric == its count's scatter, optimizer body
-    # re-synced) validates clean — the new gate adds no false rejection.
-    count = 500
+    # FM1 at run() level: a correct world — biome emits the region-true uncapped scatter and a
+    # metric consistent with it, optimizer body re-synced — validates clean: neither the triangle
+    # self-consistency gate nor the brief re-derivation false-rejects it.
+    count = _UNCAPPED_COUNT
     layers = _biome_metric_set(tmp_path, count=count, biome_tris=float(count * biome.TRIS_PER_INSTANCE))
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert verdict.accepted, verdict.issues
 
 
 async def test_run_rejects_a_stale_biome_metric_and_routes_to_biome(tmp_path):
-    # FM2 at run() level: biome's metric is stale/tampered (doesn't match its instanceCount), with
-    # the optimizer body re-synced to that metric so the BUDGET gate stays silent — biome is the
-    # ONLY issue (no double-report) and route-back targets it.
-    count = 500
+    # FM2 at run() level: biome's METRIC is stale/tampered (doesn't match its instanceCount) while
+    # the count itself stays region-true (so the brief re-derivation is silent) and the optimizer
+    # body is re-synced to that metric (so the BUDGET gate stays silent) — the triangle gate makes
+    # biome the ONLY issue (no double-report) and route-back targets it.
+    count = _UNCAPPED_COUNT
     biome_tris = float(count * biome.TRIS_PER_INSTANCE) + 999.0
     layers = _biome_metric_set(tmp_path, count=count, biome_tris=biome_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
