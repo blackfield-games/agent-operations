@@ -2507,6 +2507,66 @@ contract MatchSettlementTest is Test {
         assertFalse(settlement.isFieldSeatFunded(ghost, alice), "unknown match, known agent -> false");
         assertFalse(settlement.isFieldSeatFunded(ghost, carol), "unknown match, unknown agent -> false");
     }
+
+    /// @dev FM3: the aggregate readiness predicate is true only once EVERY seat has funded —
+    ///      exactly settleFieldWager's NotFullyFunded precondition. A partial roster (2 of 3) is
+    ///      not ready. Funding one short then completing it pins the full mask, not just "any".
+    function test_isFieldFullyFunded_trueOnlyWhenEverySeatFunded() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+
+        assertFalse(settlement.isFieldFullyFunded(FIELD), "opened, unfunded -> not ready");
+        _fundField(FIELD, alice);
+        _fundField(FIELD, dave); // bob still unfunded: 2 of 3
+        assertFalse(settlement.isFieldFullyFunded(FIELD), "partial roster -> not ready");
+        _fundField(FIELD, bob);
+        assertTrue(settlement.isFieldFullyFunded(FIELD), "every seat funded -> ready");
+    }
+
+    /// @dev FM1: the empty-roster guard. An unknown matchId has n == 0 and fundedBits == 0, so a
+    ///      naive `fundedBits == (1<<n)-1` computes 0 == 0 == true and would report a match that
+    ///      does not exist as settle-ready. The n == 0 short-circuit returns false.
+    function test_isFieldFullyFunded_falseForUnknownMatch() public view {
+        assertFalse(settlement.isFieldFullyFunded(bytes32("never-opened")), "unknown match -> not funded");
+    }
+
+    /// @dev FM3 post-close: settleFieldWager never clears fundedBits, so the field still reads
+    ///      fully funded after settlement — the funded set is on-chain history.
+    function test_isFieldFullyFunded_persistsAfterSettle() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        assertTrue(settlement.isFieldFullyFunded(FIELD), "fully funded before settle");
+
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether); // sum == 3*STAKE
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Settled, "settled");
+        assertTrue(settlement.isFieldFullyFunded(FIELD), "settle never clears fundedBits");
+    }
+
+    /// @dev FM3 post-close: the attester void refunds every seat and zeroes fundedBits, so the
+    ///      field is no longer fully funded once cancelled (the stakes went back).
+    function test_isFieldFullyFunded_clearedAfterCancel() public {
+        _openFundField3(STAKE);
+        assertTrue(settlement.isFieldFullyFunded(FIELD), "fully funded before cancel");
+
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+        assertFalse(settlement.isFieldFullyFunded(FIELD), "cancel refunds -> not fully funded");
+    }
+
+    /// @dev FM3 post-close: the deadline self-refund likewise zeroes fundedBits.
+    function test_isFieldFullyFunded_clearedAfterExpire() public {
+        _openFundField3(STAKE);
+        assertTrue(settlement.isFieldFullyFunded(FIELD), "fully funded before expire");
+
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+        settlement.refundFieldExpired(FIELD);
+        assertFalse(settlement.isFieldFullyFunded(FIELD), "expire refunds -> not fully funded");
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
