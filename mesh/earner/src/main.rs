@@ -961,6 +961,9 @@ mod tests {
             EarnerMsg::Submit(result) => {
                 assert_eq!(result.job_id, job_id);
                 assert_eq!(result.earner_address, session.address);
+                // The stub render returns instantly (0 elapsed) so the charge floors
+                // to 1 — never 0 (the coordinator rejects ZeroRenderSeconds).
+                assert_eq!(result.render_seconds, 1, "instant stub render charges the 1s floor");
 
                 let raw = hex::decode(&result.signature_hex).unwrap();
                 assert_eq!(raw.len(), 65, "signature is 65 bytes r||s||v");
@@ -1345,6 +1348,7 @@ mod tests {
         let result: JobResult = serde_json::from_slice(&submit.body).unwrap();
         assert_eq!(result.job_id, job_id);
         assert_eq!(result.earner_address, session.address);
+        assert_eq!(result.render_seconds, 1, "instant stub render charges the 1s floor over http too");
         let raw = hex::decode(&result.signature_hex).unwrap();
         assert_eq!(raw.len(), 65, "signature is 65 bytes r||s||v");
         let digest = signing_digest(&result.job_id, &result.output_hash);
@@ -1769,6 +1773,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn render_seconds_charged_floors_at_one() {
+        // A completed job that elapsed under a second still did work — the coordinator
+        // rejects render_seconds == 0 (ZeroRenderSeconds), so the charge floors to 1.
+        assert_eq!(render_seconds_charged(0), 1, "sub-second render still charges 1s");
+        assert_eq!(render_seconds_charged(1), 1);
+    }
+
+    #[test]
+    fn render_seconds_charged_passes_through_real_elapsed() {
+        // Above the floor the charge is the elapsed seconds verbatim — in SECONDS, the
+        // unit total_render_seconds and the per-second rate both denominate in.
+        assert_eq!(render_seconds_charged(50), 50);
+        assert_eq!(render_seconds_charged(3600), 3600);
+    }
+
+    #[test]
+    fn render_seconds_charged_saturates_the_u32_cast() {
+        // A pathologically long elapsed cannot wrap the u32 the wire and the charge use.
+        assert_eq!(render_seconds_charged(u32::MAX as u64), u32::MAX);
+        assert_eq!(render_seconds_charged(u32::MAX as u64 + 1), u32::MAX, "no wrap past u32::MAX");
+        assert_eq!(render_seconds_charged(u64::MAX), u32::MAX);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn render_with_heartbeats_reports_progress_from_elapsed_over_deadline() {
         // The heartbeat beat branch — never exercised before this slice (every
@@ -1804,5 +1832,31 @@ mod tests {
             vec![20, 40, 60],
             "each beat reports elapsed/deadline progress, not the old hardcoded 0",
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn render_with_heartbeats_charges_real_elapsed_render_seconds() {
+        // render_seconds is charged from the SAME `started` clock the heartbeat reads,
+        // so a render that completes after virtual time elapses charges that elapsed —
+        // not the old hardcoded 1 — and a slower render charges more. deadline 1000s /
+        // interval 3600s means no beat fires (the render finishes first), isolating the
+        // render_seconds measurement; both durations stay under the coordinator's
+        // deadline*2 plausibility bound.
+        async fn charge_after(secs: u64) -> u32 {
+            let mut sink = RecordingSink::default();
+            let started = tokio::time::Instant::now();
+            let render = async move {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                Ok(vec![7u8; 8])
+            };
+            let out = render_with_heartbeats(&mut sink, Uuid::new_v4(), started, 1000, 3600, render)
+                .await
+                .unwrap();
+            assert_eq!(out, vec![7u8; 8], "the rendered bytes flow through unchanged");
+            render_seconds_charged(started.elapsed().as_secs())
+        }
+
+        assert_eq!(charge_after(50).await, 50, "a 50s render charges 50 render-seconds, not 1");
+        assert_eq!(charge_after(120).await, 120, "a slower render charges more");
     }
 }
