@@ -7503,6 +7503,13 @@ pub fn parity_vectors() -> ParityVectors {
         ],
         matches: vec![
             match_case("octant_hitscan", Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
+            // Octant_hitscan's inputs plus a 3-tick pre-live countdown, and nothing else.
+            // `starting_ticks` rides OUTSIDE the `rules_commit` and a `Starting` step writes
+            // no `TickRecord`, so the drained countdown runs the identical scored stream and
+            // this record's replay_hash MUST equal octant_hitscan's — the digest-invariance
+            // of the countdown. A UE5 twin that folds `starting_ticks` into its `rules_commit`
+            // computes a different hash here and fails to re-verify this committed record.
+            match_case("countdown_hashes_as_octant", Rules { starting_ticks: 3, damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("fine_hitscan", Rules { damage: 100, aim_mode: AimMode::Fine, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             match_case("projectile", Rules { damage: 100, weapon_mode: WeaponMode::Projectile, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() }),
             // Same script as octant_hitscan, plus an ammo pickup at seat 0's spawn it

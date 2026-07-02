@@ -4354,6 +4354,247 @@
       }
     },
     {
+      "label": "countdown_hashes_as_octant",
+      "record": {
+        "config": {
+          "tick_hz": 30,
+          "max_ticks": 3600,
+          "bounds": {
+            "x": 50000,
+            "y": 50000
+          },
+          "seats": 2
+        },
+        "rules": {
+          "max_speed": 200,
+          "weapon_range": 30000,
+          "hit_radius": 1500,
+          "weapon_mode": "hitscan",
+          "projectile_speed": 2000,
+          "aim_mode": "octant",
+          "damage": 100,
+          "fire_cooldown": 6,
+          "mag_size": 30,
+          "friendly_fire": false,
+          "perception_range": 40000,
+          "fov_octant_spread": 4,
+          "start_health": 100,
+          "spawn_radius": 2000,
+          "spawn_jitter": 0,
+          "action_deadline_micros": 50000,
+          "pickup_radius": 1000,
+          "pickup_respawn_cooldown": 300,
+          "melee_range": 2000,
+          "melee_damage": 50,
+          "melee_cooldown": 15,
+          "max_shield": 0,
+          "gravity": 0,
+          "dash_cooldown": 0,
+          "wall_slide": false,
+          "perception_memory_ticks": 0,
+          "vertical_hit_tolerance": 0,
+          "knockback_velocity": 0,
+          "knockback_horizontal": 0,
+          "pawn_radius": 0,
+          "fall_damage": 0,
+          "fall_damage_threshold": 0,
+          "pawn_height": 0,
+          "starting_ticks": 3
+        },
+        "replay": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "seed": 72623859790382856,
+          "seats": [
+            {
+              "seat": 0,
+              "team": 0,
+              "controller": "0x00"
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "controller": "0x01"
+            }
+          ],
+          "blockers": [],
+          "pickups": [],
+          "rules_commit": [
+            0,
+            0,
+            0,
+            200,
+            0,
+            0,
+            117,
+            48,
+            0,
+            0,
+            5,
+            220,
+            0,
+            0,
+            0,
+            7,
+            208,
+            0,
+            0,
+            100,
+            0,
+            6,
+            0,
+            30,
+            0,
+            0,
+            0,
+            156,
+            64,
+            4,
+            0,
+            100,
+            0,
+            0,
+            7,
+            208,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            195,
+            80,
+            0,
+            0,
+            3,
+            232,
+            1,
+            44,
+            0,
+            0,
+            7,
+            208,
+            0,
+            50,
+            0,
+            15,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "config": {
+            "tick_hz": 30,
+            "max_ticks": 3600,
+            "bounds": {
+              "x": 50000,
+              "y": 50000
+            },
+            "seats": 2
+          },
+          "ticks": [
+            {
+              "tick": 0,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 1000,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": false,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "tick": 1,
+              "actions": [
+                {
+                  "seat": 0,
+                  "intent": {
+                    "move_dir": {
+                      "x": 0,
+                      "y": 0
+                    },
+                    "aim": 0,
+                    "buttons": {
+                      "fire": true,
+                      "jump": false,
+                      "ability": false,
+                      "reload": false
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "result": {
+          "protocol_version": 1,
+          "match_id": "00000000-0000-4000-8000-0000000000a1",
+          "final_tick": 2,
+          "outcomes": [
+            {
+              "seat": 0,
+              "team": 0,
+              "placement": 1,
+              "score": 100,
+              "alive_at_end": true
+            },
+            {
+              "seat": 1,
+              "team": 1,
+              "placement": 2,
+              "score": 0,
+              "alive_at_end": false
+            }
+          ],
+          "replay_hash": "1c0f295e877a544f9d658220c40adc743ae422fad9e75893332be3645643de4f"
+        }
+      }
+    },
+    {
       "label": "fine_hitscan",
       "record": {
         "config": {
