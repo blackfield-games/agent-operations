@@ -26,6 +26,7 @@ from biome import biome
 from lighting import lighting
 from terrain import terrain
 from npc import npc
+from optimization import optimization
 
 STYLE_SIM_THRESHOLD = 0.72
 
@@ -661,6 +662,64 @@ def _opt_reductions(text: str) -> float | None:
     return total
 
 
+def _lod_directive_legality(opt_path: str, text: str) -> list[str]:
+    """Why a recorded LodDirective is not a shed the optimizer could legally have made,
+    or [] when every one is — the per-directive twin of the sum re-derivation above.
+
+    _opt_reductions SUMS (authored − effective) trusting each directive's effective
+    figure, and _budget_self_consistency checks that sum reconciles observedTriangles; but
+    neither verifies the reduction is one the optimizer could produce. A shed-able layer
+    only collapses to 1/(1<<lodLevel) of its authored triangles with 1 <= lodLevel <=
+    MAX_LOD — a 1/8 floor, never emptied to nothing (optimization's own invariant,
+    ``_lod_scale``/``MAX_LOD``). A stale or tampered directive claiming an effectiveTriangles
+    below that floor fabricates a reduction, so observed == authored − Σreduction still
+    balances and overBudget reads false while the world is genuinely over budget — the
+    "number changed in isolation" the recorded directives exist to make checkable. Re-derive
+    each directive's legal scale + effective across the trust boundary with the producer's
+    own ``optimization._lod_scale``/``MAX_LOD`` (the lock-step reuse the terrain/biome/npc/
+    prop/lighting gates use), and reject a mismatch, naming optimization so it re-runs. An
+    absent or non-numeric lodLevel/lodScale is an illegal directive, not a crash."""
+    out: list[str] = []
+    floor = 1 << optimization.MAX_LOD
+    for block in re.finditer(r'def Scope "(Lod_\d+)"\s*\{(.*?)\}', text, re.DOTALL):
+        name, body = block.group(1), block.group(2)
+        level = _opt_number(body, "lodLevel")
+        scale = _opt_number(body, "lodScale")
+        authored = _opt_number(body, "authoredTriangles")
+        effective = _opt_number(body, "effectiveTriangles")
+        if level is None or scale is None or authored is None or effective is None:
+            out.append(
+                f"optimization layer {opt_path} directive {name} is malformed: lodLevel/"
+                f"lodScale/authoredTriangles/effectiveTriangles missing or non-numeric — "
+                f"cannot re-derive the recorded reduction; re-run optimization"
+            )
+            continue
+        if not level.is_integer() or not (1 <= level <= optimization.MAX_LOD):
+            out.append(
+                f"optimization layer {opt_path} directive {name} is an illegal shed: "
+                f"lodLevel {level:g} is outside the legal range 1..={optimization.MAX_LOD} "
+                f"(a shed layer floors at 1/{floor}, never below); re-run optimization"
+            )
+            continue
+        legal_scale = optimization._lod_scale(int(level))
+        if not math.isclose(scale, legal_scale, rel_tol=1e-9, abs_tol=1e-6):
+            out.append(
+                f"optimization layer {opt_path} directive {name} is an illegal shed: "
+                f"lodScale {scale:g} != {legal_scale:g} for lodLevel {int(level)} — the "
+                f"recorded scale does not match the level; re-run optimization"
+            )
+            continue
+        if not math.isclose(effective, authored * legal_scale, rel_tol=1e-9, abs_tol=1e-6):
+            out.append(
+                f"optimization layer {opt_path} directive {name} is an illegal shed: "
+                f"effectiveTriangles {effective:.0f} != {authored * legal_scale:.0f} "
+                f"(authoredTriangles {authored:.0f} * lodScale {legal_scale:g} at lodLevel "
+                f"{int(level)}) — a fabricated reduction the optimizer's 1/{floor} floor "
+                f"could not produce; re-run optimization"
+            )
+    return out
+
+
 def _summed_prior_triangles(layers: list[LayerSpec]) -> float:
     """Σ the current geometry layers' triangle metrics — the figure optimization's
     authoredTriangles must equal if it ran on THIS geometry. Mirrors
@@ -689,7 +748,12 @@ def _budget_self_consistency(opt: LayerSpec, text: str, prior_triangles: float) 
     summed prior geometry and reject the mismatch, naming optimization so it re-runs (the
     desync is a re-emittable flaw — the metric gate keeps ownership of the genuine,
     terminal over-budget verdict when metric and body agree). A missing/non-numeric budget
-    field is reported as MALFORMED, not raised (FM4)."""
+    field is reported as MALFORMED, not raised (FM4). The sum re-derivation is paired with
+    a per-directive halving check (``_lod_directive_legality``): reconciling
+    observedTriangles to authored − Σreduction proves the total balances, but a directive
+    claiming an effectiveTriangles below the 1/8 shed floor fabricates a reduction that
+    balances anyway — so each directive is also re-derived against the optimizer's own
+    legal scale, closing the number-changed-in-isolation the sum alone cannot see."""
     budget = _opt_number(text, "triangleBudget")
     authored = _opt_number(text, "authoredTriangles")
     observed = _opt_number(text, "observedTriangles")
@@ -742,6 +806,7 @@ def _budget_self_consistency(opt: LayerSpec, text: str, prior_triangles: float) 
             f"!= the {prior_triangles:.0f} summed from the current prior layers — geometry "
             f"changed after optimization last ran; re-run optimization"
         )
+    out.extend(_lod_directive_legality(opt.path, text))
     return out
 
 
