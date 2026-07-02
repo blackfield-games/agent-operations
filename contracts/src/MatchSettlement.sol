@@ -747,6 +747,25 @@ contract MatchSettlement is Ownable2Step {
         return fieldMatches[matchId].fundedBits & (uint256(1) << (seatPlus1 - 1)) != 0;
     }
 
+    /// @notice Whether EVERY seat of field match `matchId` has funded — the ready-to-settle
+    ///         predicate `settleFieldWager` enforces internally (`fundedBits == (1 << n) - 1`,
+    ///         the `NotFullyFunded` precondition), surfaced so an off-chain settler polls it in
+    ///         ONE O(1) call instead of fetching the whole roster to count `n`, reading
+    ///         `fundedBits`, and recomputing the mask. The aggregate of `isFieldSeatFunded`.
+    ///
+    ///         An unknown or roster-less `matchId` is NOT fully funded: it has `n == 0`, and
+    ///         `(1 << 0) - 1 == 0 == fundedBits` would otherwise report a match that does not
+    ///         exist as settle-ready, so the empty roster short-circuits to `false` first — the
+    ///         same "0 is not a real state" guard `isFieldSeatFunded`/`fieldSeatOf` apply. Reads
+    ///         the LIVE `fundedBits` like its per-seat twin: `true` once every seat funds, STILL
+    ///         `true` after `settleFieldWager` (settle never clears the word), and back to `false`
+    ///         after `cancelFieldMatch`/`refundFieldExpired` (both zero it on refund). NEVER reverts.
+    function isFieldFullyFunded(bytes32 matchId) external view returns (bool) {
+        uint256 n = fieldMatches[matchId].agents.length;
+        if (n == 0) return false;
+        return fieldMatches[matchId].fundedBits == (uint256(1) << n) - 1;
+    }
+
     /// @notice Settle a fully-funded N-seat field wager in ONE attester-gated, fenced
     ///         resolution: distribute the funded pot by placement AND write the zero-sum
     ///         per-seat reputation — the field analog of the 1v1 decisive `settle`. The
