@@ -2414,6 +2414,99 @@ contract MatchSettlementTest is Test {
         assertEq(settlement.fieldSeatOf(FIELD, bob), 2, "seat survives expire");
         assertEq(settlement.fieldSeatOf(FIELD, dave), 3, "seat survives expire");
     }
+
+    /// @dev FM2: isFieldSeatFunded reads the funded bit per seat, so a funded subset reports
+    ///      true only for the seats that paid. Funding seats 0 and 2 but not 1 also pins the
+    ///      bit index: an off-by-one reading bit `seatPlus1` (not `seatPlus1 - 1`) would read
+    ///      bob's clear bit for alice and fail the first assert.
+    function test_isFieldSeatFunded_reflectsFundedSubset() public {
+        address[] memory ag = _roster3(); // [alice, bob, dave]
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+        _fundField(FIELD, dave); // bob's seat left unfunded
+
+        assertTrue(settlement.isFieldSeatFunded(FIELD, alice), "seat 0 funded");
+        assertFalse(settlement.isFieldSeatFunded(FIELD, bob), "seat 1 unfunded");
+        assertTrue(settlement.isFieldSeatFunded(FIELD, dave), "seat 2 funded");
+        assertFalse(settlement.isFieldSeatFunded(FIELD, carol), "non-member -> false");
+    }
+
+    /// @dev FM3 pre-close: the live bit flips false -> true -> false across a seat's fund then
+    ///      sole-funder reclaim, mirroring the 1v1 aFunded/bFunded flag.
+    function test_isFieldSeatFunded_flipsFalseTrueFalseAcrossFundReclaim() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+
+        assertFalse(settlement.isFieldSeatFunded(FIELD, alice), "unfunded -> false");
+        _fundField(FIELD, alice);
+        assertTrue(settlement.isFieldSeatFunded(FIELD, alice), "funded -> true");
+        vm.prank(alice);
+        settlement.reclaimField(FIELD); // alice is the sole funder, so reclaim is allowed
+        assertFalse(settlement.isFieldSeatFunded(FIELD, alice), "reclaimed -> false");
+    }
+
+    /// @dev FM3 post-close: settleFieldWager never clears fundedBits, so the funded set survives
+    ///      settlement — the funded-status the payout/reputation audit reads back.
+    function test_isFieldSeatFunded_persistsAfterSettle() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether); // sum == 3*STAKE
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Settled, "settled");
+        assertTrue(settlement.isFieldSeatFunded(FIELD, alice), "funded set survives settle");
+        assertTrue(settlement.isFieldSeatFunded(FIELD, bob), "funded set survives settle");
+        assertTrue(settlement.isFieldSeatFunded(FIELD, dave), "funded set survives settle");
+    }
+
+    /// @dev FM3 post-close: the attester void (cancelFieldMatch) refunds every seat and clears
+    ///      fundedBits, so the funded status returns to false — where the seat MAP (fieldSeatOf)
+    ///      persists. The two views intentionally diverge post-void: the seat is historical, the
+    ///      escrow is gone, and isFieldSeatFunded tracks the escrow.
+    function test_isFieldSeatFunded_clearedAfterCancel() public {
+        _openFundField3(STAKE);
+        assertTrue(settlement.isFieldSeatFunded(FIELD, alice), "funded before cancel");
+
+        vm.prank(attester);
+        settlement.cancelFieldMatch(FIELD);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Cancelled, "cancelled");
+        assertFalse(settlement.isFieldSeatFunded(FIELD, alice), "cancel refunds -> not funded");
+        assertFalse(settlement.isFieldSeatFunded(FIELD, dave), "cancel refunds -> not funded");
+        assertEq(settlement.fieldSeatOf(FIELD, alice), 1, "seat persists though funded status cleared");
+    }
+
+    /// @dev FM3 post-close: the deadline self-refund (refundFieldExpired) likewise zeroes
+    ///      fundedBits, so the funded status clears on expiry too.
+    function test_isFieldSeatFunded_clearedAfterExpire() public {
+        _openFundField3(STAKE);
+        assertTrue(settlement.isFieldSeatFunded(FIELD, bob), "funded before expire");
+
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+        settlement.refundFieldExpired(FIELD);
+
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Expired, "expired");
+        assertFalse(settlement.isFieldSeatFunded(FIELD, bob), "expire refunds -> not funded");
+        assertFalse(settlement.isFieldSeatFunded(FIELD, dave), "expire refunds -> not funded");
+    }
+
+    /// @dev FM2: a non-member and an unknown match both read the 0 seat sentinel and return
+    ///      false without reverting — probed against a match that DOES have a funded seat, so a
+    ///      false answer is about membership, not an empty funded set.
+    function test_isFieldSeatFunded_falseForNonMemberAndUnknownMatch() public {
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice);
+
+        assertFalse(settlement.isFieldSeatFunded(FIELD, carol), "non-roster agent -> false");
+        assertFalse(settlement.isFieldSeatFunded(FIELD, address(0)), "zero address -> false");
+        bytes32 ghost = bytes32("never-opened");
+        assertFalse(settlement.isFieldSeatFunded(ghost, alice), "unknown match, known agent -> false");
+        assertFalse(settlement.isFieldSeatFunded(ghost, carol), "unknown match, unknown agent -> false");
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
