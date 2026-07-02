@@ -207,6 +207,24 @@ async def run(
             issues.append(message)
             failing.add("biome")
 
+    # Biome UNCAPPED scatter-COUNT vs the brief — the else-branch twin of the CAPPED magnitude gate
+    # (_intent_attributions). The triangle gate above pins triangles↔instanceCount and the cap gate
+    # pins instanceCount↔brief but ONLY under a vegetationCapped marker; an uncapped region's count
+    # is re-derivable from the brief too, yet a stale/tampered count with a consistent metric passes
+    # both. Re-derive it and reject a mismatch, routing back to biome. Gated on NOT-capped so the cap
+    # gate keeps sole ownership of the capped count (no double-report) and — critically — a correctly-
+    # capped count (below the uncapped scatter) is never false-rejected here. Wellformed-only; a body
+    # with no parseable instanceCount is skipped (field-presence is the well-formedness gate's concern).
+    if (
+        biome_layer is not None
+        and biome_layer in wellformed
+        and not biome._caps_vegetation(_director_intent(layers, layers_root, "must_not"))
+    ):
+        biome_text = (layers_root / biome_layer.path).read_text()
+        for message in _biome_scatter_count_consistency(brief, biome_layer, biome_text):
+            issues.append(message)
+            failing.add("biome")
+
     # NPC character triangle self-consistency — the character-emitter sibling of the terrain/biome
     # gates above. npc meters spawnCount * _character_tris(archetype); the budget gate SUMS that
     # metric trusting it, so a stale/tampered npc metric (a count not updated when the archetype
@@ -869,6 +887,38 @@ def _biome_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
         f"biome layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} "
         f"its body declares ({int(count)} instances * {biome.TRIS_PER_INSTANCE} tris each) "
         f"— a stale or tampered biome metric; re-run biome"
+    ]
+
+
+def _biome_scatter_count_consistency(brief: WorldBrief, layer: LayerSpec, text: str) -> list[str]:
+    """Why biome's emitted UNCAPPED ``instanceCount`` disagrees with the scatter the brief
+    determines, or [] when they agree — the brief-re-derivation twin of the CAPPED magnitude
+    gate (``_intent_attributions``), closing the same body↔brief check for the uncapped case.
+
+    ``_biome_triangle_consistency`` pins triangles↔instanceCount and the cap magnitude gate pins
+    instanceCount↔brief, but ONLY under a ``vegetationCapped`` marker. An uncapped region's count
+    is a deterministic function of the brief too (``biome.run`` emits ``_scatter_count(brief.biome,
+    region, None)``), yet nothing re-derived it — a STALE (pre-route-back, authored for another
+    region/brief) or tampered count carrying a CONSISTENT triangles metric passes both the triangle
+    gate and the budget sum, shipping an under/over-scattered region accepted (the number-changed-
+    in-isolation the sum alone cannot see). Re-derive via biome's OWN ``_scatter_count`` (cap
+    ``None``) off the brief the validator already holds (the same brief ``biome.run`` consumed) and
+    reject a mismatch, naming biome so route-back targets it. The CALLER gates this on NOT-capped,
+    so the cap magnitude gate keeps sole ownership of the capped count (no double-report) and a
+    correctly-capped count — strictly below the uncapped scatter — is never false-rejected here.
+    Same skip discipline as the triangle gate: an absent/negative/non-integer count is unverifiable
+    (field-presence is the well-formedness gate's concern) — SKIP; but a present count that
+    disagrees (including a tampered 0 over a nonzero-scatter region) is a real violation."""
+    count = _opt_number(text, "instanceCount")
+    if count is None or count < 0 or count != int(count):
+        return []
+    expected = biome._scatter_count(brief.biome, brief.region.region_id, None)
+    if int(count) == expected:
+        return []
+    return [
+        f"biome layer {layer.path} uncapped instanceCount {int(count)} != the {expected} the "
+        f"brief's region scatters (biome._scatter_count, cap none) — a stale or tampered scatter "
+        f"count; re-run biome"
     ]
 
 
