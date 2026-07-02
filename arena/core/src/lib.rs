@@ -6659,6 +6659,15 @@ fn match_case_with_pickups(label: &str, rules: Rules, pickups: Vec<PickupSpawn>)
         pickups,
         PARITY_MATCH_SEED,
     );
+    // Burn any pre-live countdown before the scripted Live stream: a `starting_ticks > 0`
+    // match opens in `Starting`, where the loop below never fires (it gates on `Live`), so
+    // without this drain the countdown case would record an empty match. A no-countdown
+    // match opens `Live` at construction, so this drains nothing and its record stays
+    // byte-identical — a `Starting` step writes no `TickRecord`, so the scored stream a
+    // drained countdown then runs is identical to its no-countdown twin's.
+    while m.phase() == MatchPhase::Starting {
+        m.step(&BTreeMap::new());
+    }
     let mut tick = 0u64;
     while m.phase() == MatchPhase::Live && tick < 64 {
         let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
