@@ -726,6 +726,27 @@ contract MatchSettlement is Ownable2Step {
         return fieldSeatPlus1[matchId][agent];
     }
 
+    /// @notice Whether `agent` has funded its seat in field match `matchId` — the funded-status
+    ///         half of `fieldSeatOf`, so a consumer reads it in one call instead of combining
+    ///         `fieldSeatOf` with `fundedBits` bit math. Returns `false` for a non-member
+    ///         (including an unknown `matchId`), the same `0`-seat sentinel `fieldSeatOf` uses,
+    ///         and reads exactly the `1 << (seatPlus1 - 1)` bit `fundField`/`reclaimField` write —
+    ///         no off-by-one against the packed set. NEVER reverts, so a read-only consumer can
+    ///         probe any id/agent. The 1v1 analog is the `matches` getter's `aFunded`/`bFunded`.
+    ///
+    ///         Unlike the write-once seat map behind `fieldSeatOf`, `fundedBits` is LIVE, so this
+    ///         tracks the escrow rather than the roster: it flips `false -> true -> false` across
+    ///         `fundField`/`reclaimField`, STAYS `true` after `settleFieldWager` (a settled pot
+    ///         keeps its funded set as on-chain history — settle never clears the word), and
+    ///         returns to `false` after `cancelFieldMatch`/`refundFieldExpired` (both zero
+    ///         `fundedBits` as they refund the seats). A post-settle audit therefore reads the
+    ///         funded set; a post-void one correctly reads nobody funded (the stakes went back).
+    function isFieldSeatFunded(bytes32 matchId, address agent) external view returns (bool) {
+        uint256 seatPlus1 = fieldSeatPlus1[matchId][agent];
+        if (seatPlus1 == 0) return false;
+        return fieldMatches[matchId].fundedBits & (uint256(1) << (seatPlus1 - 1)) != 0;
+    }
+
     /// @notice Settle a fully-funded N-seat field wager in ONE attester-gated, fenced
     ///         resolution: distribute the funded pot by placement AND write the zero-sum
     ///         per-seat reputation — the field analog of the 1v1 decisive `settle`. The
