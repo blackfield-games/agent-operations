@@ -3236,12 +3236,26 @@ async fn submit(
         tracing::warn!(?id, earner = %result.earner_address, reason = e.reason(), "rejected: result failed content gate");
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    // Authenticated, live earner: refresh its liveness for /stats. Done before
-    // locking the store so we never hold the earners lock under the store lock.
+    // Authorization: the anonymous HTTP poll records no dispatch holder
+    // (`take_next` leaves `dispatched_to` NULL), so — unlike the ws session bind in
+    // `handle_submit` — there is no authenticated session identity to bind this
+    // result to. The guarantee this stateless path CAN enforce is registry
+    // membership: a key that never registered (never proved key-possession via
+    // `/register` or a ws `Hello`) must not mint credit + an on-chain EAS receipt by
+    // signing a result alone. Checked after the canonical fold so the lookup keys on
+    // the same lowercase identity the registry stores. The same lock refreshes the
+    // earner's liveness for /stats; taken and dropped before the store lock so the
+    // two never overlap. Reject mirrors the bad-attestation branch (401, job left
+    // in_flight for the reaper) — a registered earner submitting for another is the
+    // documented residual this weaker-than-ws check does not close.
     {
         let now = now_secs();
-        if let Some(info) = state.earners.lock().await.get_mut(&result.earner_address) {
-            info.last_seen = now;
+        match state.earners.lock().await.get_mut(&result.earner_address) {
+            Some(info) => info.last_seen = now,
+            None => {
+                tracing::warn!(?id, earner = %result.earner_address, "rejected: earner not registered");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         }
     }
     // Gate on lifecycle: a result is only valid for a job the earner actually
@@ -4889,6 +4903,19 @@ mod tests {
         }
     }
 
+    /// Enroll the dev earner (the identity every `signed_result` credits) through the
+    /// real `/register` flow, so its HTTP submits clear the registered-earner gate.
+    /// The HTTP submit path credits only enrolled earners; a test that drives a submit
+    /// to settle must register dev first, exactly as the live earner registers before
+    /// it polls (`main.rs` HTTP poll loop).
+    async fn register_dev_earner(state: &Arc<AppState>) {
+        let hello =
+            signed_hello(&dev_signing_key(), &dev_address(), "RTX 4090", 24, vec![JobKind::Terrain]);
+        let resp =
+            post_json(state.clone(), "/register", &serde_json::to_value(hello).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "dev earner registers");
+    }
+
     /// A `JobResult` validly signed by the dev key over a verbatim (possibly
     /// malformed) `output_hash`. Unlike [`signed_result`], the hash is NOT
     /// expanded — the signature is taken over exactly what is sent — so the
@@ -4910,6 +4937,7 @@ mod tests {
     #[tokio::test]
     async fn submit_matching_id_accepted_mismatch_rejected() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         let job = seed_job();
         let job_id = job.id;
         enqueue(&state, &job).await;
@@ -5145,6 +5173,7 @@ mod tests {
     #[tokio::test]
     async fn submit_with_implausible_render_seconds_rejected_unprocessable() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         let job = seed_job(); // deadline_secs = 60 → plausibility bound 120
         let job_id = job.id;
         enqueue(&state, &job).await;
@@ -5169,6 +5198,7 @@ mod tests {
     #[tokio::test]
     async fn submit_at_the_render_seconds_slack_bound_settles() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         let job = seed_job(); // deadline_secs = 60 → bound 120
         let job_id = job.id;
         enqueue(&state, &job).await;
@@ -11483,6 +11513,7 @@ mod tests {
     #[tokio::test]
     async fn http_submit_is_fenced_on_the_dispatch_seq_header() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         let job = seed_job();
         let job_id = job.id;
         enqueue(&state, &job).await;
@@ -11564,6 +11595,7 @@ mod tests {
         let completed_before;
         {
             let state = AppState::with_store(Store::open(&db_path).unwrap(), test_config()).unwrap();
+            register_dev_earner(&state).await;
 
             // Enqueue a second job and submit a validly-signed result for it.
             let job = seed_job();
@@ -12841,6 +12873,7 @@ mod tests {
     #[tokio::test]
     async fn submit_rejected_for_unknown_job() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         // Validly-signed result for a job the store has never seen.
         let job_id = Uuid::new_v4();
         let good = signed_result(job_id, "deadbeef");
@@ -12858,6 +12891,7 @@ mod tests {
     #[tokio::test]
     async fn submit_rejected_when_not_in_flight() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         let job = seed_job();
         let job_id = job.id;
         enqueue(&state, &job).await; // left queued — never polled
@@ -12880,6 +12914,7 @@ mod tests {
     #[tokio::test]
     async fn double_submit_does_not_double_count() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         let job = seed_job();
         let job_id = job.id;
         enqueue(&state, &job).await;
@@ -13754,6 +13789,7 @@ mod tests {
         assert_eq!(json["jobs_in_flight"], 1);
         assert_eq!(json["jobs_queued"], 0);
 
+        register_dev_earner(&state).await;
         // Submit → job done.
         let good = signed_result(job_id, "deadbeef");
         let uri = format!("/jobs/{}/submit", job_id);
@@ -13900,6 +13936,7 @@ mod tests {
     #[tokio::test]
     async fn job_status_endpoint_reports_lifecycle() {
         let state = test_state_empty().await;
+        register_dev_earner(&state).await;
         let job = seed_job();
         let job_id = job.id;
         enqueue(&state, &job).await;
