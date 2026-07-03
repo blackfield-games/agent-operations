@@ -2102,7 +2102,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena_proto::{address_from_verifying_key, join_digest, SeatOutcome};
+    use arena_proto::{address_from_verifying_key, join_digest, Action, ActionButtons, SeatOutcome};
     use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -5243,6 +5243,111 @@ mod tests {
             off.rules().action_deadline_micros,
             Rules::default().action_deadline_micros,
             "no --action-deadline-micros: the matchmaker forms the Rules default budget"
+        );
+    }
+
+    fn idle_intent() -> ActionIntent {
+        ActionIntent {
+            move_dir: Vec2 { x: 0, y: 0 },
+            aim: 0,
+            buttons: ActionButtons { fire: false, jump: false, ability: false, reload: false },
+        }
+    }
+
+    /// A transport-framed Act line for `seat` answering `tick` of `match_id`, exactly as an
+    /// agent sends it — the envelope [`emit`] writes and [`read_agent`] parses back. The input
+    /// twin of `emit`, so a test can feed the deadline-enforced read the way a real client would.
+    fn act_line(seat: SeatId, match_id: Uuid, tick: u64) -> String {
+        let action =
+            Action { protocol_version: PROTOCOL_VERSION, match_id, seat, tick, intent: idle_intent() };
+        let frame = serde_json::to_value(AgentMsg::Act(action)).expect("serialize act");
+        let envelope = serde_json::json!({ "seat": seat, "frame": frame });
+        serde_json::to_string(&envelope).expect("serialize envelope")
+    }
+
+    #[test]
+    fn read_tick_deadlined_honors_a_present_seat_and_forfeits_a_withheld_one() {
+        // FM1/FM2: a seat whose action is already available is ingested; a seat that never
+        // answers is omitted so the sim forfeits it. The sender stays alive across the read (the
+        // stream is OPEN, just silent), so the withheld seat TIMES OUT — the wall-clock case, not
+        // an EOF — firing deterministically since the line is never sent.
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
+        assert_eq!(
+            (m.phase(), m.tick()),
+            (MatchPhase::Live, 0),
+            "a no-countdown direct match opens Live at tick 0"
+        );
+
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 0 answers; seat 1 is withheld
+
+        let intents = read_tick_deadlined(&m, 2, &rx, Duration::from_millis(50));
+        assert!(intents.contains_key(&0), "the present seat 0 is ingested");
+        assert!(!intents.contains_key(&1), "the withheld seat 1 is forfeited (omitted from intents)");
+        drop(tx); // held open ACROSS the read above (so seat 1 timed out, not disconnected)
+    }
+
+    #[test]
+    fn read_tick_deadlined_ingests_every_present_seat_without_forfeit() {
+        // The no-timeout case the golden path relies on: both seats' actions are already in the
+        // channel, so both ingest and NOTHING forfeits — a present line under the budget never
+        // times out — and the read returns well within the budget.
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        tx.send(act_line(1, m.match_id(), 0)).unwrap();
+
+        let start = Instant::now();
+        let intents = read_tick_deadlined(&m, 2, &rx, Duration::from_millis(50));
+        assert_eq!(intents.len(), 2, "both present seats ingest");
+        assert!(intents.contains_key(&0) && intents.contains_key(&1));
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "immediately-available lines never wait the budget (no spurious timeout)"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn read_tick_deadlined_forfeits_every_silent_seat_in_one_shared_read() {
+        // FM4 (deterministic half): several silent seats in one tick ALL forfeit under a single
+        // shared read — only the present seat acts. The shared per-tick clock + break-on-timeout
+        // bound the wall-clock cost to ~one deadline rather than one sequential deadline per unread
+        // seat, but that bound is inherently load-sensitive (a loaded box overshoots a 50 ms wait
+        // several-fold), so it is asserted in the mutation proof, not as a flaky wall-clock check
+        // here. This pins WHICH seats forfeit; the timing bound is proved by neutralising the
+        // shared deadline and observing the n-fold slowdown.
+        let m = build_direct_match(&direct_args(4, "", 0), 4);
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 0 answers; seats 1..=3 are withheld
+
+        let intents = read_tick_deadlined(&m, 4, &rx, Duration::from_millis(50));
+        assert_eq!(
+            intents.keys().copied().collect::<Vec<_>>(),
+            vec![0],
+            "only the present seat acts; all three silent seats forfeit in the one shared read"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn read_tick_deadlined_omits_the_rest_on_a_closed_stream() {
+        // FM3: a closed stream (EOF) is distinguished from a timeout — the remaining seats are
+        // forfeited AT ONCE, not after waiting the budget, so a dead stream doesn't burn one
+        // deadline per tick. Seat 0's line is buffered before the sender drops, so it is still
+        // drained ahead of Disconnected.
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        drop(tx); // EOF: the stream closes with seat 1 never sent
+
+        let start = Instant::now();
+        let intents = read_tick_deadlined(&m, 2, &rx, Duration::from_millis(50));
+        assert!(intents.contains_key(&0), "the buffered seat 0 line is still drained before EOF");
+        assert!(!intents.contains_key(&1), "seat 1 is forfeited on the closed stream");
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "EOF forfeits the rest immediately, it does not wait the budget"
         );
     }
 
