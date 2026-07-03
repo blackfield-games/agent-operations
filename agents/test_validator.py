@@ -2444,6 +2444,150 @@ async def test_run_rejects_an_npc_spawn_count_that_disagrees_with_the_brief(tmp_
     assert _route_back_target(verdict) == "npc"
 
 
+# ---- npc archetype vs the brief + roster: the emitted archetype must match npc._select_archetype -----
+#
+# The SELECTION twin of the terrain gridResolution / biome scatter-count / npc spawnCount / prop
+# placementCount gates and the npc sibling of the prop propAsset gate — npc's OTHER brief-determined
+# dimension (not how MANY npcs, but WHICH archetype). npc.run emits archetype = _select_archetype(region,
+# roster, forbidden), and _npc_triangle_consistency pins triangles↔(spawnCount × _character_tris(archetype))
+# — but it TRUSTS the emitted archetype to PRICE the crowd. An archetype swapped in isolation to another
+# ALLOWED roster member with the metric re-synced passes the triangle gate, the spawn-count gate, AND the
+# budget sum; these pin that the validator re-derives WHICH archetype off the brief + roster, rejects a
+# disagreeing LEGAL pick (routed to npc), and — deferring to the existing intent gates — SKIPS a non-member
+# (the intent:factions loop's concern) and a forbidden archetype (the intent:must_not loop's) rather than
+# double-reporting. The message names npc, never "director" (pipeline-earlier), so route-back targets npc.
+
+
+def _archetype_issues(root: Path, *, archetype: str, factions: str | None = None, must_not: str | None = None):
+    """Drive _npc_archetype_consistency over a layer set: an npc layer spawning `archetype`, plus a director
+    seeding `factions`/`must_not` when either is given (else the default empty-roster director). Returns the
+    gate's issues — the layers/layers_root it needs to re-derive the roster are built under `root`."""
+    bodies = {"npc": _npc_body(archetype)}
+    if factions is not None or must_not is not None:
+        bodies["director"] = _director_body(factions=factions, must_not=must_not)
+    layers = _set_with(root, bodies)
+    npc_layer = next(layer for layer in layers if layer.specialist == "npc")
+    return validator._npc_archetype_consistency(
+        _brief(), layers, root, npc_layer, (root / npc_layer.path).read_text()
+    )
+
+
+def _npc_roster_metric_set(root: Path, *, roster: list[str], archetype: str, npc_tris: float) -> list[LayerSpec]:
+    """A full well-formed set: the director seeds `roster` (intent:factions), npc spawns `archetype` at the
+    region-true spawnCount metering `npc_tris`, and the optimizer body re-syncs to the summed geometry so
+    the budget gate stays silent — isolating the archetype selection gate (no double-report from the
+    triangle / spawn-count / budget gates)."""
+    summed = 262144.0 + 100000.0 + 96000.0 + npc_tris  # terrain + biome + prop + npc metrics
+    out: list[LayerSpec] = []
+    for s in SPECIALISTS:
+        if s == "npc":
+            out.append(_layer(
+                root, "npc", body=_npc_body(archetype, spawn_count=_REGION_SPAWNS), metrics={"triangles": npc_tris}
+            ))
+        elif s == "director":
+            out.append(_layer(root, "director", body=_director_body(factions=",".join(roster))))
+        elif s == "optimization":
+            body = _opt_body(authored=summed, observed=summed, over_budget=False)
+            out.append(_layer(root, "optimization", body=body, metrics={"over_budget": 0.0}))
+        else:
+            out.append(_layer(root, s))
+    return out
+
+
+def test_npc_archetype_consistency_accepts_the_region_true_pick(tmp_path):
+    # FM1 (no false reject): the archetype npc.run selects for this region + roster — nothing to report.
+    roster = ["raider", "sentinel"]
+    archetype = npc._select_archetype(REGION, roster, frozenset())
+    assert _archetype_issues(tmp_path, archetype=archetype, factions=",".join(roster)) == []
+
+
+def test_npc_archetype_consistency_rejects_a_legal_but_off_selection_member(tmp_path):
+    # FM2 (the exploit): a LEGAL roster member that is NOT the region-true pick (a down-swap to a cheaper
+    # allowed archetype, or any stale/tampered legal pick) — rejected, naming npc, the message carrying BOTH
+    # the emitted and the region-true archetype. The hole the factions/must_not/triangle/budget gates miss.
+    roster = ["raider", "sentinel"]
+    picked = npc._select_archetype(REGION, roster, frozenset())
+    off = next(a for a in roster if a != picked)  # a legal member, not the selection
+    issues = _archetype_issues(tmp_path, archetype=off, factions=",".join(roster))
+    assert len(issues) == 1
+    assert "archetype" in issues[0]
+    assert off in issues[0] and picked in issues[0]
+    assert "npc" in issues[0]
+
+
+def test_npc_archetype_consistency_empty_roster_accepts_the_fallback_rejects_others(tmp_path):
+    # The empty-roster case: with no roster npc falls back to NPC_ARCHETYPE, so the gate re-derives that
+    # fallback and accepts it — but rejects any OTHER non-forbidden archetype (npc would never emit it with
+    # no roster). The selection gate OWNS the no-roster case the factions membership gate is dormant on.
+    assert _archetype_issues(tmp_path, archetype=npc.NPC_ARCHETYPE) == []
+    other = next(a for a in sorted(npc.CHARACTER_TRIS) if a != npc.NPC_ARCHETYPE)  # a different KNOWN archetype
+    assert _archetype_issues(tmp_path, archetype=other) != []
+
+
+def test_npc_archetype_consistency_defers_a_non_member_and_a_forbidden_pick(tmp_path):
+    # FM3 (no double-report): a NON-member archetype is owned by _intent_attributions' intent:factions loop
+    # and a FORBIDDEN one by its intent:must_not loop — this gate SKIPS both so neither is reported twice.
+    # It fires only for the complement: a legal, non-forbidden, off-selection pick.
+    assert _archetype_issues(tmp_path, archetype="drone", factions="raider,sentinel") == []  # non-member
+    assert _archetype_issues(  # forbidden (even though the roster names it)
+        tmp_path, archetype="civilian", factions="civilian,raider", must_not="civilians"
+    ) == []
+
+
+def test_npc_archetype_consistency_skips_an_absent_archetype(tmp_path):
+    # FM (degrade): an npc body with no archetype field is skipped (field-presence is the well-formedness
+    # gate's concern; npc.run always co-emits it) — even under a non-empty roster.
+    no_arch = '#usda 1.0\n(\n    defaultPrim = "NPCs"\n)\n\ndef Xform "NPCs"\n{\n}\n'
+    bodies = {"npc": no_arch, "director": _director_body(factions="raider,sentinel")}
+    layers = _set_with(tmp_path, bodies)
+    npc_layer = next(layer for layer in layers if layer.specialist == "npc")
+    assert validator._npc_archetype_consistency(_brief(), layers, tmp_path, npc_layer, no_arch) == []
+
+
+def test_npc_archetype_consistency_tracks_the_selection_in_lock_step(tmp_path):
+    # FM4 (desync): the expectation IS npc._select_archetype(region, roster, forbidden)'s output — the exact
+    # region-true archetype accepts, any other roster member rejects. A copied sorted(roster) index or a
+    # re-implemented hash/salt would drift and either false-reject the legit pick or miss a tampered one.
+    roster = ["raider", "sentinel"]
+    picked = npc._select_archetype(REGION, roster, frozenset())
+    other = next(a for a in roster if a != picked)
+    assert _archetype_issues(tmp_path, archetype=picked, factions=",".join(roster)) == []
+    assert _archetype_issues(tmp_path, archetype=other, factions=",".join(roster)) != []
+
+
+async def test_run_rejects_an_npc_archetype_that_disagrees_with_the_brief(tmp_path):
+    # The exploit at run() level: the archetype swapped IN ISOLATION to a different ALLOWED roster member
+    # with the triangles metric re-synced to spawnCount × _character_tris(swapped) AND the optimizer body
+    # re-synced (_npc_roster_metric_set does both) — so the triangle gate, the spawn-count gate, AND the
+    # budget gate stay silent — ships the region's crowd as the wrong archetype at the wrong per-character
+    # budget. Only the brief re-derivation sees it: rejected, routed to npc, naming both archetypes.
+    roster = ["raider", "sentinel"]
+    picked = npc._select_archetype(REGION, roster, frozenset())  # the region-true pick
+    off = next(a for a in roster if a != picked)  # a legal member, not the selection
+    assert npc._character_tris(off) != npc._character_tris(picked)  # premise: a real per-character budget swap
+    npc_tris = float(_REGION_SPAWNS * npc._character_tris(off))  # metric re-synced to the swapped archetype
+    layers = _npc_roster_metric_set(tmp_path, roster=roster, archetype=off, npc_tris=npc_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("npc._select_archetype" in i and off in i and picked in i for i in verdict.issues)
+    assert "npc" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "npc"
+    assert _route_back_target(verdict) == "npc"
+
+
+async def test_run_leaves_a_non_member_npc_archetype_to_the_factions_gate_not_the_selection_gate(tmp_path):
+    # No double-report at run() level: a NON-member archetype (not in a non-empty roster) is owned by the
+    # intent:factions loop; the selection gate SKIPS it. The run rejects (factions) but carries NO
+    # _select_archetype selection message — the two gates never both fire on the same off-roster pick.
+    npc_tris = float(_REGION_SPAWNS * npc._character_tris("drone"))
+    layers = _npc_roster_metric_set(tmp_path, roster=["raider", "sentinel"], archetype="drone", npc_tris=npc_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:factions" in i and "drone" in i for i in verdict.issues)  # the factions gate owns it
+    assert not any("_select_archetype" in i for i in verdict.issues)  # the selection gate stayed silent
+    assert "npc" in verdict.failing_specialists
+
+
 # ---- prop placement triangle self-consistency: the metric must match count*fill + Σ required ------
 #
 # The placement-emitter sibling of the terrain/biome/npc gates, but prop's metric is a fill TERM plus
