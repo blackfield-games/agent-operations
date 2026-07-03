@@ -5284,6 +5284,127 @@ mod tests {
         serde_json::to_string(&envelope).expect("serialize envelope")
     }
 
+    /// A transport-framed Leave for `seat` — the envelope [`read_agent`] parses back. The
+    /// seat travels in the envelope (as for every agent frame), not the `Leave` body, so a
+    /// forged body cannot depart a seat it does not own.
+    fn leave_line(seat: SeatId) -> String {
+        let frame = serde_json::to_value(AgentMsg::Leave { reason: "forfeit".into() }).expect("serialize leave");
+        let envelope = serde_json::json!({ "seat": seat, "frame": frame });
+        serde_json::to_string(&envelope).expect("serialize envelope")
+    }
+
+    /// A `pump_to_end` input stream from a per-line script, framed the way the handshake's
+    /// stdin iterator yields lines. The blocking pump reads exactly what an agent would send.
+    fn pump_input(lines: &[String]) -> io::Lines<io::BufReader<io::Cursor<String>>> {
+        io::BufReader::new(io::Cursor::new(format!("{}\n", lines.join("\n")))).lines()
+    }
+
+    /// The seats each recorded tick ingested, in ascending order — the transport-level proof
+    /// of who acted and who forfeited: a departed seat never reappears here after its Leave.
+    fn tick_seats(replay: &ReplayRecord) -> Vec<(u64, Vec<SeatId>)> {
+        replay
+            .ticks
+            .iter()
+            .map(|t| (t.tick, t.actions.iter().map(|a| a.seat).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn pump_to_end_records_every_seat_every_tick_with_no_leave() {
+        // FM4 inert baseline: a match with no Leave ingests both seats on every one of its
+        // max_ticks ticks — the byte-identical behaviour the departure cases diverge from.
+        // direct_args caps max_ticks at 4, so the idle 1v1 (both alive, distinct teams) runs
+        // to the timeout with both seats acting throughout.
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mid = m.match_id();
+        let script: Vec<String> =
+            (0..4).flat_map(|t| [act_line(0, mid, t), act_line(1, mid, t)]).collect();
+        let mut out: Vec<u8> = Vec::new();
+        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+
+        assert_eq!(m.phase(), MatchPhase::Ended);
+        assert_eq!(result.outcomes.len(), 2);
+        assert_eq!(
+            tick_seats(&m.into_replay()),
+            vec![(0, vec![0, 1]), (1, vec![0, 1]), (2, vec![0, 1]), (3, vec![0, 1])],
+            "no Leave: every tick ingests both seats"
+        );
+    }
+
+    #[test]
+    fn pump_to_end_forfeits_a_leaver_from_its_leave_tick_and_still_ends() {
+        // FM1: seat 1 acts at tick 0, then Leaves at tick 1. From tick 1 on it forfeits (never
+        // reappears in the recorded stream) while seat 0's actions keep applying, and the match
+        // reaches its bounded end — no hang, no desync onto a following tick's line.
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mid = m.match_id();
+        let script = [
+            act_line(0, mid, 0),
+            act_line(1, mid, 0),
+            act_line(0, mid, 1),
+            leave_line(1), // seat 1 departs at tick 1
+            act_line(0, mid, 2),
+            act_line(0, mid, 3),
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+
+        assert_eq!(m.phase(), MatchPhase::Ended, "the match ends, it does not hang on the departed seat");
+        assert_eq!(result.outcomes.len(), 2, "both seats stay ranked in the terminal result");
+        assert_eq!(
+            tick_seats(&m.into_replay()),
+            vec![(0, vec![0, 1]), (1, vec![0]), (2, vec![0]), (3, vec![0])],
+            "seat 1 acts only through tick 0; from its tick-1 Leave on it forfeits and seat 0 plays on"
+        );
+    }
+
+    #[test]
+    fn pump_to_end_ignores_a_post_leave_act_from_the_departed_seat() {
+        // FM2: seat 1 Leaves at tick 0 and then (buggily) sends an Act for tick 1. That stray
+        // line is dropped WITHOUT consuming seat 0's slot — the read stays aligned — and is never
+        // ingested (a departed-but-alive seat's Act would otherwise pass `ingest`), so seat 1
+        // takes exactly one forfeit path and never acts again.
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mid = m.match_id();
+        let script = [
+            act_line(0, mid, 0),
+            leave_line(1), // seat 1 departs at tick 0
+            act_line(1, mid, 1), // stray, well-formed Act from the departed seat — must be ignored
+            act_line(0, mid, 1),
+            act_line(0, mid, 2),
+            act_line(0, mid, 3),
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+
+        assert_eq!(m.phase(), MatchPhase::Ended);
+        assert_eq!(
+            tick_seats(&m.into_replay()),
+            vec![(0, vec![0]), (1, vec![0]), (2, vec![0]), (3, vec![0])],
+            "seat 1's post-Leave Act is ignored — it never reappears after departing at tick 0"
+        );
+    }
+
+    #[test]
+    fn pump_to_end_ends_cleanly_when_every_seat_leaves() {
+        // FM3: both seats Leave at tick 0 → the active set empties. The read loop reads zero
+        // lines each later tick and the sim steps every seat to a forfeit, reaching the
+        // max_ticks end with a well-formed result — a lone/empty active set does not deadlock
+        // the read or panic on EOF.
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let script = [leave_line(0), leave_line(1)];
+        let mut out: Vec<u8> = Vec::new();
+        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+
+        assert_eq!(m.phase(), MatchPhase::Ended, "both departed: the match still reaches its bounded end");
+        assert_eq!(result.outcomes.len(), 2, "both seats are ranked");
+        assert_eq!(
+            tick_seats(&m.into_replay()),
+            vec![(0, vec![]), (1, vec![]), (2, vec![]), (3, vec![])],
+            "no seat acts once both have left; every tick is an empty forfeit"
+        );
+    }
+
     #[test]
     fn read_tick_deadlined_honors_a_present_seat_and_forfeits_a_withheld_one() {
         // FM1/FM2: a seat whose action is already available is ingested; a seat that never
