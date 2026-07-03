@@ -1077,12 +1077,20 @@ def _lighting_body(driven_by: list[str] | None = None, density: float | None = N
     )
 
 
+# The region-true FILL asset the brief determines for the test REGION — prop.run emits exactly this
+# (a stable per-region hash over the sorted ASSET_TRIS keys). The run-level fixtures carry it (not an
+# arbitrary asset) so the propAsset↔brief SELECTION gate stays silent on the triangle/count-gate and
+# intent fixtures, reused from prop's OWN helper so an ASSET_TRIS/salt change flips it in lock-step.
+_REGION_ASSET = prop._select_asset(REGION)
+
+
 def _prop_body(required_assets: list[str], placement_count: int | None = None) -> str:
     """A prop layer placing one Required prim per asset (the `requiredAsset` marker the
-    gate keys on), beside the fill PointInstancer (propAsset `barricade_01`) — mirroring
-    prop._required_block. `placementCount` is opt-in (omit ⇒ the triangle self-consistency
-    gate can't re-derive the metric and skips the layer, so the intent fixtures that don't
-    declare a count degrade-skip it); pass `placement_count` for the triangle fixtures."""
+    gate keys on), beside the fill PointInstancer (propAsset `_REGION_ASSET`, the region-
+    true pick so the selection gate stays silent) — mirroring prop._required_block.
+    `placementCount` is opt-in (omit ⇒ the triangle self-consistency gate can't re-derive
+    the metric and skips the layer, so the intent fixtures that don't declare a count
+    degrade-skip it); pass `placement_count` for the triangle fixtures."""
     prims = "".join(
         f'\ndef Xform "Required_{i}"\n{{\n    custom string requiredAsset = "{a}"\n}}\n'
         for i, a in enumerate(required_assets)
@@ -1090,7 +1098,7 @@ def _prop_body(required_assets: list[str], placement_count: int | None = None) -
     count_line = f"\n    custom int placementCount = {placement_count}" if placement_count is not None else ""
     return (
         '#usda 1.0\n(\n    defaultPrim = "Props"\n)\n\n'
-        f'def PointInstancer "Props"\n{{\n    custom string propAsset = "barricade_01"{count_line}\n}}\n'
+        f'def PointInstancer "Props"\n{{\n    custom string propAsset = "{_REGION_ASSET}"{count_line}\n}}\n'
         + prims
     )
 
@@ -2417,8 +2425,9 @@ async def test_run_rejects_an_npc_spawn_count_that_disagrees_with_the_brief(tmp_
 #
 # The placement-emitter sibling of the terrain/biome/npc gates, but prop's metric is a fill TERM plus
 # a variable REQUIRED-ASSET SUM (count*_asset_tris(propAsset) + Σ _asset_tris(requiredAsset)). The
-# gate re-derives both from the body and rejects a mismatch, naming prop. The fixed fill is
-# barricade_01 (1500 tris); an asset absent from ASSET_TRIS is reported once (no _asset_tris raise).
+# gate re-derives both from the body and rejects a mismatch, naming prop. The fill is the region-true
+# _REGION_ASSET (_prop_body's pick); an asset absent from ASSET_TRIS is reported once (no _asset_tris
+# raise).
 
 
 def _prop_spec(triangles: float) -> LayerSpec:
@@ -2429,7 +2438,7 @@ def _prop_spec(triangles: float) -> LayerSpec:
 
 
 def _prop_expected(count: int, required: list[str]) -> float:
-    return float(count * prop._asset_tris("barricade_01") + sum(prop._asset_tris(a) for a in required))
+    return float(count * prop._asset_tris(_REGION_ASSET) + sum(prop._asset_tris(a) for a in required))
 
 
 def test_prop_triangle_consistency_accepts_a_metric_matching_its_placements():
