@@ -1441,37 +1441,50 @@ fn finish(m: &Match, n: u8, out: &mut impl Write) -> MatchResult {
     result
 }
 
-/// Read one Live tick's actions, bounded by a SHARED per-tick wall-clock deadline. Every
-/// seat races the same `Instant` (computed once, here), so the whole tick costs at most
-/// ~`deadline` no matter how many seats are slow — a near-miss on the first seat can't
-/// extend the next seat's budget into `n · deadline` (FM4). A seat whose action does not
-/// arrive within the budget, or a stream that has closed ([`RecvTimeoutError::Disconnected`],
-/// EOF), is simply omitted from the returned intents, so `step` forfeits its tick exactly
-/// as it forfeits an absent seat — the sim already ends a match whose seats keep forfeiting.
-/// `ingest` is the same server-authoritative gate the blocking path applies, so a
-/// late-but-delivered action that is now stale (its tick has passed) still forfeits.
+/// Read one Live tick's actions from the still-`active` seats, bounded by a SHARED per-tick
+/// wall-clock deadline. Every seat races the same `Instant` (computed once, here), so the
+/// whole tick costs at most ~`deadline` no matter how many seats are slow — a near-miss on the
+/// first seat can't extend the next seat's budget into `active.len() · deadline` (FM4). A seat
+/// whose action does not arrive within the budget, or a stream that has closed
+/// ([`RecvTimeoutError::Disconnected`], EOF), is simply omitted from the returned intents, so
+/// `step` forfeits its tick exactly as it forfeits an absent seat — the sim already ends a match
+/// whose seats keep forfeiting. `ingest` is the same server-authoritative gate the blocking path
+/// applies, so a late-but-delivered action that is now stale (its tick has passed) still forfeits.
+///
+/// A `Leave` forfeits AND departs its seat from `active` (the enforced-path twin of
+/// [`pump_to_end`]), so no later tick awaits — or is billed a per-tick timeout for — a departed
+/// agent, and a stray line from an already-departed seat is dropped WITHOUT consuming a slot.
 fn read_tick_deadlined(
     m: &Match,
-    n: u8,
+    active: &mut BTreeSet<SeatId>,
     rx: &Receiver<String>,
     deadline: Duration,
 ) -> BTreeMap<SeatId, ActionIntent> {
     let tick_deadline = Instant::now() + deadline;
     let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
-    for _ in 0..n {
-        let remaining = tick_deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
+    let mut remaining = active.len();
+    while remaining > 0 {
+        let wait = tick_deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
             Ok(line) => {
                 let (seat, msg) = read_agent(&line);
+                // A line from an already-departed seat (a buggy post-Leave send) is dropped
+                // without consuming a slot — the same membership gate the blocking pump applies.
+                if !active.contains(&seat) {
+                    continue;
+                }
                 match msg {
                     AgentMsg::Act(action) => {
                         if let Ok(intent) = m.ingest(seat, &action) {
                             intents.insert(seat, intent);
                         }
                     }
-                    AgentMsg::Leave { .. } => {}
+                    AgentMsg::Leave { .. } => {
+                        active.remove(&seat);
+                    }
                     AgentMsg::Join { .. } => panic!("unexpected join during the match"),
                 }
+                remaining -= 1;
             }
             // The tick's budget is spent: the seats that have not answered forfeit. Stop
             // reading so one slow tick costs ~one deadline, not one per unread seat.
@@ -1508,12 +1521,13 @@ fn pump_to_end_deadlined(
     deadline: Duration,
 ) -> MatchResult {
     pump_starting(m, n, out);
+    let mut active: BTreeSet<SeatId> = (0..n).collect();
     while m.phase() == MatchPhase::Live {
-        for seat in 0..n {
+        for &seat in &active {
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
         }
         out.flush().expect("flush observations");
-        let intents = read_tick_deadlined(m, n, rx, deadline);
+        let intents = read_tick_deadlined(m, &mut active, rx, deadline);
         m.step(&intents);
     }
     finish(m, n, out)
@@ -5293,6 +5307,12 @@ mod tests {
         serde_json::to_string(&envelope).expect("serialize envelope")
     }
 
+    /// The full active roster `0..n` — the starting set both pump loops seed before the first
+    /// Live tick, and what the deadline read expects a line from each tick until a seat leaves.
+    fn active_seats(n: u8) -> BTreeSet<SeatId> {
+        (0..n).collect()
+    }
+
     /// A `pump_to_end` input stream from a per-line script, framed the way the handshake's
     /// stdin iterator yields lines. The blocking pump reads exactly what an agent would send.
     fn pump_input(lines: &[String]) -> io::Lines<io::BufReader<io::Cursor<String>>> {
@@ -5421,7 +5441,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<String>();
         tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 0 answers; seat 1 is withheld
 
-        let intents = read_tick_deadlined(&m, 2, &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50));
         assert!(intents.contains_key(&0), "the present seat 0 is ingested");
         assert!(!intents.contains_key(&1), "the withheld seat 1 is forfeited (omitted from intents)");
         drop(tx); // held open ACROSS the read above (so seat 1 timed out, not disconnected)
@@ -5438,7 +5458,7 @@ mod tests {
         tx.send(act_line(1, m.match_id(), 0)).unwrap();
 
         let start = Instant::now();
-        let intents = read_tick_deadlined(&m, 2, &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50));
         assert_eq!(intents.len(), 2, "both present seats ingest");
         assert!(intents.contains_key(&0) && intents.contains_key(&1));
         assert!(
@@ -5461,7 +5481,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<String>();
         tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 0 answers; seats 1..=3 are withheld
 
-        let intents = read_tick_deadlined(&m, 4, &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(4), &rx, Duration::from_millis(50));
         assert_eq!(
             intents.keys().copied().collect::<Vec<_>>(),
             vec![0],
@@ -5482,7 +5502,7 @@ mod tests {
         drop(tx); // EOF: the stream closes with seat 1 never sent
 
         let start = Instant::now();
-        let intents = read_tick_deadlined(&m, 2, &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50));
         assert!(intents.contains_key(&0), "the buffered seat 0 line is still drained before EOF");
         assert!(!intents.contains_key(&1), "seat 1 is forfeited on the closed stream");
         assert!(
