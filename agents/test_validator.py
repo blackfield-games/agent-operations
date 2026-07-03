@@ -2280,6 +2280,12 @@ def test_npc_triangle_consistency_tracks_the_per_archetype_budget_in_lock_step()
     assert validator._npc_triangle_consistency(light, _npc_body("sentinel", spawn_count=count)) != []
 
 
+# The region-true spawn count the brief determines for the test REGION — npc.run emits exactly this
+# (BASE_SPAWNS scaled by npc's stable per-region hash). The run-level fixtures carry it (not an
+# arbitrary count) so the spawnCount↔brief gate stays silent on the triangle-gate fixtures.
+_REGION_SPAWNS = npc._spawn_count(REGION)
+
+
 def _npc_metric_set(root: Path, *, spawn_count, archetype, npc_tris: float) -> list[LayerSpec]:
     """A full well-formed set with npc declaring `spawn_count` × `archetype` and metering `npc_tris`,
     the optimization body re-synced to the resulting summed geometry so the budget gate stays silent
@@ -2322,6 +2328,69 @@ async def test_run_rejects_a_stale_npc_metric_and_routes_to_npc(tmp_path):
     assert "npc" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "npc"
     assert _route_back_target(verdict) == "npc"
+
+
+# ---- npc spawnCount vs the brief: the re-derived crowd size must match npc._spawn_count(region) ----
+#
+# The brief-re-derivation twin of the terrain gridResolution / biome uncapped scatter-count gates.
+# npc.run emits _spawn_count(region), a region-varying deterministic count, and the triangle gate
+# above pins triangles↔(spawnCount × _character_tris) — but the spawnCount ITSELF is trusted blindly.
+# A stale/tampered count with a re-synced triangles metric passes the triangle gate AND the budget
+# sum; these pin that the validator re-derives it off the brief, rejects a disagreeing count (routed
+# to npc), skips an unverifiable body, and — unlike terrain's >=1 grid — treats a PRESENT 0 that
+# disagrees as a real violation (npc's floor is >=0, like biome's instanceCount). _npc_spec's metric
+# is irrelevant here (this gate reads only the body's spawnCount).
+
+
+def test_npc_spawn_count_consistency_accepts_the_region_true_count():
+    # FM1 (no false reject): the count npc.run emits for this brief's region — nothing to report.
+    spec = _npc_spec(0.0)
+    body = _npc_body("raider", spawn_count=_REGION_SPAWNS)
+    assert validator._npc_spawn_count_consistency(_brief(), spec, body) == []
+
+
+def test_npc_spawn_count_consistency_rejects_a_count_that_disagrees_with_the_brief():
+    # FM2: a stale/tampered count (authored for another region) — rejected, naming npc, the message
+    # carrying both the emitted count and the region-true expectation.
+    spec = _npc_spec(0.0)
+    tampered = _REGION_SPAWNS + 1
+    issues = validator._npc_spawn_count_consistency(_brief(), spec, _npc_body("raider", spawn_count=tampered))
+    assert len(issues) == 1
+    assert "spawnCount" in issues[0]
+    assert str(tampered) in issues[0] and str(_REGION_SPAWNS) in issues[0]
+    assert "npc" in issues[0]
+
+
+def test_npc_spawn_count_consistency_skips_an_unverifiable_body():
+    # FM3 (degrade, no false reject): no spawnCount (the factions-suite placeholder shape), or a
+    # negative / non-integer count, leaves it unverifiable — SKIP, mirroring _npc_triangle_consistency's
+    # own count guard. A spawnCount of 0 is NOT skipped here (unlike terrain's grid < 1) — see below.
+    spec = _npc_spec(0.0)
+    assert validator._npc_spawn_count_consistency(_brief(), spec, _npc_body("raider")) == []  # no spawnCount
+    assert validator._npc_spawn_count_consistency(_brief(), spec, _npc_body("raider", spawn_count=-3)) == []
+    assert validator._npc_spawn_count_consistency(_brief(), spec, _npc_body("raider", spawn_count="8.5")) == []
+
+
+def test_npc_spawn_count_consistency_verifies_a_present_zero_that_disagrees():
+    # The biome-not-terrain boundary: npc's floor is >=0 (a 0-spawn region is a valid empty crowd, like
+    # biome's instanceCount, UNLIKE terrain's gridResolution which skips <1). So a PRESENT 0 that
+    # disagrees with the brief (a tampered 0 over this nonzero-spawn region) is a REAL violation, not a
+    # skip — the exact case a `count <= 0` skip would wrongly swallow.
+    assert _REGION_SPAWNS > 0  # premise: this region spawns a nonzero crowd
+    spec = _npc_spec(0.0)
+    issues = validator._npc_spawn_count_consistency(_brief(), spec, _npc_body("raider", spawn_count=0))
+    assert len(issues) == 1 and "spawnCount" in issues[0] and "npc" in issues[0]
+
+
+def test_npc_spawn_count_consistency_tracks_the_brief_in_lock_step():
+    # FM4 (desync): the expectation IS npc._spawn_count(region)'s output — the exact count accepts,
+    # off-by-one rejects. A copied BASE_SPAWNS or a re-implemented jitter would drift and either
+    # false-reject a legit count or miss a tampered one.
+    spec = _npc_spec(0.0)
+    ok = _npc_body("raider", spawn_count=_REGION_SPAWNS)
+    off = _npc_body("raider", spawn_count=_REGION_SPAWNS + 1)
+    assert validator._npc_spawn_count_consistency(_brief(), spec, ok) == []
+    assert validator._npc_spawn_count_consistency(_brief(), spec, off) != []
 
 
 # ---- prop placement triangle self-consistency: the metric must match count*fill + Σ required ------
