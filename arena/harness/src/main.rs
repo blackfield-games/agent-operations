@@ -21,7 +21,7 @@
 //!   and at the end  server -> End(MatchResult).
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -1381,16 +1381,32 @@ fn pump_to_end(
     // (which opens at tick 0). With no countdown (the default) the match opens Live and this
     // is a no-op — byte-identical to the pre-countdown pump.
     pump_starting(m, n, out);
+    // The seats still in the match. A Leave drops its seat here, so the sim forfeits it
+    // (absent from `intents`) every later tick AND the read loop stops expecting its line —
+    // without this a departed-then-silent agent hangs the blocking read forever (or a stray
+    // post-Leave line desyncs the per-tick count onto a following tick). A full active set
+    // is byte-identical to the pre-Leave `0..n` (a BTreeSet iterates ascending), so a match
+    // with no Leave is unchanged.
+    let mut active: BTreeSet<SeatId> = (0..n).collect();
     while m.phase() == MatchPhase::Live {
-        for seat in 0..n {
+        for &seat in &active {
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
         }
         out.flush().expect("flush observations");
 
         let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
-        for _ in 0..n {
+        // One line per still-active seat. A Leave consumes its sender's slot for this tick
+        // and departs the seat; an Act is gated on membership. A line whose seat has already
+        // departed (a buggy post-Leave send) is dropped WITHOUT consuming a slot — a departed
+        // seat's well-formed Act would otherwise pass `ingest` (it left, it is not dead), so
+        // this membership gate, not `ingest`, is what forfeits it.
+        let mut remaining = active.len();
+        while remaining > 0 {
             let line = next_line(lines);
             let (seat, msg) = read_agent(&line);
+            if !active.contains(&seat) {
+                continue;
+            }
             match msg {
                 // ingest is the server-authoritative gate; a rejected action (wrong
                 // tick/seat, downed, version) simply forfeits the tick.
@@ -1399,9 +1415,12 @@ fn pump_to_end(
                         intents.insert(seat, intent);
                     }
                 }
-                AgentMsg::Leave { .. } => {}
+                AgentMsg::Leave { .. } => {
+                    active.remove(&seat);
+                }
                 AgentMsg::Join { .. } => panic!("unexpected join during the match"),
             }
+            remaining -= 1;
         }
         m.step(&intents);
     }
