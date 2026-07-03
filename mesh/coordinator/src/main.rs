@@ -3569,7 +3569,7 @@ async fn ws_session(mut socket: WebSocket, state: Arc<AppState>, source: IpAddr)
                         }
                     }
                     EarnerMsg::Submit(result) => {
-                        let outcome = handle_submit(&state, &offered, accepted, result).await;
+                        let outcome = handle_submit(&state, &offered, accepted, result, &earner_address).await;
                         let sent = send_msg(&mut socket, outcome.reply()).await;
                         match outcome {
                             // Settled or stale: clear the offer, requeue nothing.
@@ -3939,11 +3939,20 @@ impl SubmitOutcome {
 /// verdict to relay plus the offer disposition (see [`SubmitOutcome`]). A result
 /// is settled only while its job is still in_flight under this connection, so a
 /// stale offer cannot double-credit or resurrect a terminal job.
+///
+/// `session_earner` is the identity this connection authenticated as in its
+/// nonce-bound `Hello` (the dispatch holder, canonical-lowercased by
+/// [`recv_hello`]). A result is credited only if its verified signer matches it —
+/// the signature alone proves the *claimed* `earner_address` signed the result,
+/// not that that identity is the one dispatched the job, so without this bind a
+/// session authenticated as A could settle a validly B-signed result and mint
+/// credit for any key B it also controls.
 async fn handle_submit(
     state: &Arc<AppState>,
     offered: &Option<(JobSpec, i64)>,
     accepted: bool,
     mut result: JobResult,
+    session_earner: &str,
 ) -> SubmitOutcome {
     let job_id = result.job_id;
     let rejected = |reason: &str| CoordinatorMsg::Rejected {
@@ -3985,6 +3994,30 @@ async fn handle_submit(
     // Canonical-lowercase the verified signer so the attestation (record_completed)
     // keys on the same identity the registry and fault ledger do — case-invariant.
     result.earner_address = verify::canonical_earner_address(&result.earner_address);
+
+    // Bind credit to the authenticated dispatch holder. The signature above only
+    // proves the result's *claimed* earner_address signed it — not that that
+    // identity is the session that completed the nonce-bound Hello and was
+    // dispatched this job. Without this a node authenticated as A could settle a
+    // validly B-signed result and mint credit, an on-chain EAS receipt, and /stats
+    // standing for any key B it also controls — the credit twin of the fault
+    // attribution the caller already binds to the session address. A foreign
+    // identity is an earner protocol fault on a still-renderable job: Requeue (free
+    // it for another earner) and let the caller charge THIS session's own address.
+    // `session_earner` is already canonical (recv_hello folds it), so this compares
+    // the two canonical forms directly.
+    if result.earner_address != session_earner {
+        tracing::warn!(
+            %job_id,
+            claimed = %result.earner_address,
+            session = %session_earner,
+            "ws rejected: result earner does not match the session identity"
+        );
+        return SubmitOutcome::Requeue(
+            rejected("result earner does not match the session identity"),
+            RequeueKind::EarnerFault,
+        );
+    }
 
     // Content gate: reject a result that is not well-formed enough to meter or
     // attest before touching the store. Requeue (not Drop) so the job — which may
@@ -10995,7 +11028,7 @@ mod tests {
         // FM2: A (seq 1) submits a valid result, but the lease is B's (seq 2).
         // Must Drop, settle nothing, credit no one.
         let result_a = signed_result(job_id, "aaaa"); // dev key == earner A
-        match handle_submit(&state, &Some((job_a.clone(), seq_a)), true, result_a).await {
+        match handle_submit(&state, &Some((job_a.clone(), seq_a)), true, result_a, &dev_address()).await {
             SubmitOutcome::Drop(CoordinatorMsg::Rejected { job_id: jid, .. }) => {
                 assert_eq!(jid, job_id)
             }
@@ -11033,7 +11066,7 @@ mod tests {
         let result_b = signed_result_by(KEY_B, job_id, "bbbb");
         let b_addr = result_b.earner_address.clone();
         assert_ne!(b_addr, dev_address(), "B must be a different earner than A");
-        match handle_submit(&state, &Some((job_b, seq_b)), true, result_b).await {
+        match handle_submit(&state, &Some((job_b, seq_b)), true, result_b, &b_addr).await {
             SubmitOutcome::Accepted(CoordinatorMsg::Accepted { job_id: jid, .. }) => {
                 assert_eq!(jid, job_id)
             }
@@ -11077,7 +11110,7 @@ mod tests {
         assert_eq!((offered.id, seq), (job_id, 1));
 
         let bad = signed_result_raw_hash(job_id, "deadbeef"); // valid sig, malformed hash
-        match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
+        match handle_submit(&state, &Some((offered.clone(), seq)), true, bad, &dev_address()).await {
             SubmitOutcome::Requeue(
                 CoordinatorMsg::Rejected {
                     job_id: jid,
@@ -11144,7 +11177,7 @@ mod tests {
 
         let mut bad = signed_result(job_id, "deadbeef"); // valid sig + hash
         bad.render_seconds = u32::MAX; // the only defect
-        match handle_submit(&state, &Some((offered.clone(), seq)), true, bad).await {
+        match handle_submit(&state, &Some((offered.clone(), seq)), true, bad, &dev_address()).await {
             SubmitOutcome::Requeue(
                 CoordinatorMsg::Rejected {
                     job_id: jid,
@@ -11215,7 +11248,7 @@ mod tests {
             .signature_hex
             .push(if last == 'f' { '0' } else { 'f' });
         assert_earner_fault(
-            handle_submit(&state, &Some((offered.clone(), seq)), true, bad_sig).await,
+            handle_submit(&state, &Some((offered.clone(), seq)), true, bad_sig, &dev_address()).await,
             "bad signature",
         );
 
@@ -11226,6 +11259,7 @@ mod tests {
                 &Some((offered.clone(), seq)),
                 false,
                 signed_result(job_id, "deadbeef"),
+                &dev_address(),
             )
             .await,
             "submit before accept",
@@ -11238,6 +11272,7 @@ mod tests {
                 &Some((offered.clone(), seq)),
                 true,
                 signed_result(Uuid::new_v4(), "x"),
+                &dev_address(),
             )
             .await,
             "job_id mismatch",
