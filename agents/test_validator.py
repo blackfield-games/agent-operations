@@ -1138,6 +1138,15 @@ def _npc_body(archetype: str, spawn_count: int | None = None) -> str:
     )
 
 
+# The region-true archetype the brief determines for the test REGION under an EMPTY roster — npc.run
+# falls back to NPC_ARCHETYPE ("scavenger") when the director seeds no intent:factions. The empty-roster
+# run-level fixtures (the metric/count sets, whose default director carries no factions) carry exactly
+# this so the archetype↔brief SELECTION gate stays silent on them; fixtures WITH a roster derive the pick
+# from npc._select_archetype(REGION, roster, forbidden) in lock-step so an ARCHETYPE_TRIS/salt change
+# flips them automatically rather than silently drifting into a false-reject.
+_REGION_ARCHETYPE = npc._select_archetype(REGION, [], frozenset())
+
+
 def _set_with_missing(root: Path, bodies: dict[str, str], missing: str) -> list[LayerSpec]:
     """A full set with `bodies` applied and `missing`'s file left unwritten (its spec
     still present) — a specialist that failed/timed out, leaving a dangling layer."""
@@ -1466,16 +1475,19 @@ async def test_run_intent_gate_degrades_on_a_missing_biome_layer(tmp_path):
 
 
 async def test_run_accepts_npc_archetype_in_the_director_roster(tmp_path):
-    # FM1 (no false reject): npc picks ONE archetype from the roster by a region hash, so
-    # the gate must accept ANY roster member — never demand a particular pick. Both members
-    # validate; membership is the only requirement.
-    for archetype in ("raider", "sentinel"):
-        layers = _set_with(tmp_path, {
-            "director": _director_body(factions="raider,sentinel"),
-            "npc": _npc_body(archetype),
-        })
-        verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
-        assert verdict.accepted, (archetype, verdict.issues)
+    # FM1 (no false reject): npc draws ONE archetype from a non-empty roster by a region hash; the layer
+    # emitting exactly that region-true pick validates — the factions gate sees a member and the
+    # selection gate re-derives the SAME pick. Derived from npc._select_archetype so it stays in
+    # lock-step. (A roster member that is NOT the region-true pick is now the selection gate's concern,
+    # pinned in test_run_rejects_a_legal_but_off_selection_npc_archetype — no longer accepted here.)
+    roster = ["raider", "sentinel"]
+    archetype = npc._select_archetype(REGION, roster, frozenset())
+    layers = _set_with(tmp_path, {
+        "director": _director_body(factions=",".join(roster)),
+        "npc": _npc_body(archetype),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
 
 
 async def test_run_rejects_an_off_roster_npc_archetype_and_routes_to_npc(tmp_path):
@@ -1498,12 +1510,13 @@ async def test_run_rejects_an_off_roster_npc_archetype_and_routes_to_npc(tmp_pat
 
 
 async def test_run_npc_intent_gate_silent_when_director_seeds_no_roster(tmp_path):
-    # FM3 (back-compat): with no intent:factions the gate is dormant — even an npc layer
-    # whose archetype would be off any roster validates, because there is no roster to
-    # check against (npc legitimately fell back to its default).
+    # FM3 (back-compat): with no intent:factions the FACTIONS membership gate is dormant — no roster to
+    # check against. npc legitimately falls back to NPC_ARCHETYPE, which the selection gate re-derives
+    # off the empty roster and accepts, so a fallback layer validates end-to-end. (A NON-fallback
+    # archetype under an empty roster IS caught — the selection gate's concern, pinned separately.)
     layers = _set_with(tmp_path, {
         "director": _director_body(),
-        "npc": _npc_body("drone"),
+        "npc": _npc_body(_REGION_ARCHETYPE),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert verdict.accepted, verdict.issues
@@ -1523,11 +1536,14 @@ async def test_run_npc_intent_gate_degrades_on_a_missing_npc_layer(tmp_path):
 
 
 async def test_run_npc_intent_gate_does_not_special_case_the_fallback_archetype(tmp_path):
-    # FM4 (fallback confusion): npc's no-roster fallback is "scavenger", but the gate must
-    # treat it as an ordinary token — a roster that legitimately CONTAINS scavenger and an
-    # npc layer spawning it is honored (accepted), NOT rejected as "the fallback".
+    # FM4 (fallback confusion): npc's no-roster fallback is "scavenger", but the gates must treat it as
+    # an ordinary token — a roster that legitimately CONTAINS scavenger AND selects it is honored, NOT
+    # rejected as "the fallback". The roster "scavenger,sentinel" makes scavenger the region-true pick,
+    # so both the factions gate (it is a member) and the selection gate (it is the pick) accept it.
+    roster = ["scavenger", "sentinel"]
+    assert npc._select_archetype(REGION, roster, frozenset()) == "scavenger"  # premise: scavenger selected
     layers = _set_with(tmp_path, {
-        "director": _director_body(factions="scavenger,raider"),
+        "director": _director_body(factions=",".join(roster)),
         "npc": _npc_body("scavenger"),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -1601,12 +1617,15 @@ async def test_run_must_not_npc_gate_accepts_a_non_forbidden_archetype(tmp_path)
 
 
 async def test_run_must_not_npc_gate_silent_without_the_civilians_token(tmp_path):
-    # FM4 (token scope): a must_not that does NOT name civilians imposes no npc ban, so even an
-    # npc layer spawning a civilian validates against the must_not branch. Only the civilians
-    # token bars the civilian archetype (that other tokens map to no archetype is pinned in
-    # test_npc's _forbidden_archetypes unit test); interior_volumes alone keeps biome silent too.
+    # FM4 (token scope): a must_not that does NOT name civilians imposes no npc ban, so an npc layer
+    # spawning a civilian validates against the must_not branch. Only the civilians token bars the
+    # civilian archetype (interior_volumes maps to no archetype — pinned in test_npc's
+    # _forbidden_archetypes unit test — and keeps biome silent too). The roster "civilian,raider" makes
+    # civilian the region-true pick so the selection gate also stays silent, isolating the must_not branch.
+    roster = ["civilian", "raider"]
+    assert npc._select_archetype(REGION, roster, frozenset()) == "civilian"  # premise: civilian selected
     layers = _set_with(tmp_path, {
-        "director": _director_body(must_not="interior_volumes"),
+        "director": _director_body(factions=",".join(roster), must_not="interior_volumes"),
         "npc": _npc_body("civilian"),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -2320,7 +2339,7 @@ def _npc_metric_set(root: Path, *, spawn_count, archetype, npc_tris: float) -> l
 async def test_run_accepts_an_npc_metric_consistent_with_its_spawn_and_archetype(tmp_path):
     # FM1 at run() level: a correct world (npc metric == spawnCount × _character_tris, optimizer body
     # re-synced) validates clean — the new gate adds no false rejection.
-    count, archetype = _REGION_SPAWNS, "raider"
+    count, archetype = _REGION_SPAWNS, _REGION_ARCHETYPE
     npc_tris = float(count * npc._character_tris(archetype))
     layers = _npc_metric_set(tmp_path, spawn_count=count, archetype=archetype, npc_tris=npc_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -2331,7 +2350,7 @@ async def test_run_rejects_a_stale_npc_metric_and_routes_to_npc(tmp_path):
     # FM2 at run() level: npc's metric is stale/tampered (doesn't match its spawnCount × archetype),
     # the optimizer body re-synced to that metric so the BUDGET gate stays silent — npc is the ONLY
     # issue (no double-report) and route-back targets it.
-    count, archetype = _REGION_SPAWNS, "raider"
+    count, archetype = _REGION_SPAWNS, _REGION_ARCHETYPE
     npc_tris = float(count * npc._character_tris(archetype)) + 7000.0
     layers = _npc_metric_set(tmp_path, spawn_count=count, archetype=archetype, npc_tris=npc_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -2412,8 +2431,8 @@ async def test_run_rejects_an_npc_spawn_count_that_disagrees_with_the_brief(tmp_
     # ships the wrong crowd size for the region. Only the brief re-derivation sees it: rejected, routed
     # back to npc, the message naming spawnCount and both the tampered and the region-true count.
     tampered = _REGION_SPAWNS + 1
-    npc_tris = float(tampered * npc._character_tris("raider"))
-    layers = _npc_metric_set(tmp_path, spawn_count=tampered, archetype="raider", npc_tris=npc_tris)
+    npc_tris = float(tampered * npc._character_tris(_REGION_ARCHETYPE))
+    layers = _npc_metric_set(tmp_path, spawn_count=tampered, archetype=_REGION_ARCHETYPE, npc_tris=npc_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert not verdict.accepted
     assert any(
