@@ -1470,7 +1470,16 @@ fn read_tick_deadlined(
                 let (seat, msg) = read_agent(&line);
                 // A line from an already-departed seat (a buggy post-Leave send) is dropped
                 // without consuming a slot — the same membership gate the blocking pump applies.
+                // A misbehaving departed seat could flood strays, so once the shared budget is
+                // spent a stray BREAKS the read rather than draining the backlog past the
+                // deadline: the tick stays ~deadline-bounded and the unread survivors forfeit
+                // exactly as on a timeout (a wall-clock check, so an honest survivor whose real
+                // line sits behind the flood still gets the full budget — a stray-count cap
+                // would forfeit it early, this does not).
                 if !active.contains(&seat) {
+                    if Instant::now() >= tick_deadline {
+                        break;
+                    }
                     continue;
                 }
                 match msg {
