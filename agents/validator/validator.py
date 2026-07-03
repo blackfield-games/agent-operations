@@ -331,6 +331,23 @@ async def run(
         issues.append(message)
         failing.add(specialist)
 
+    # NPC archetype vs the brief + director roster — the SELECTION twin of the four count/grid brief-re-
+    # derivation gates (terrain grid / biome scatter / npc spawn / prop placement) and the npc sibling of
+    # the prop propAsset gate. The triangle gate pins triangles↔(spawnCount × _character_tris(archetype))
+    # but TRUSTS the emitted archetype to price the crowd, and the spawn-count gate re-derives only the
+    # count; an archetype swapped in isolation to a cheaper allowed one, with the triangles metric re-
+    # synced, passes both while shipping the region's crowd as the wrong archetype at the wrong per-
+    # character budget. Re-derive WHICH archetype via npc._select_archetype off the brief + the director
+    # roster and reject a mismatch, routing back to npc. Placed AFTER the _intent_attributions loop so a
+    # NON-member archetype (its intent:factions loop) and a FORBIDDEN one (its intent:must_not loop) are
+    # already owned there — this gate defers both (no double-report) and fires ONLY for a legal-but-off-
+    # selection pick. Wellformed-only (body↔brief, no metric); an absent archetype is skipped.
+    if npc_layer is not None and npc_layer in wellformed:
+        npc_text = (layers_root / npc_layer.path).read_text()
+        for message in _npc_archetype_consistency(brief, layers, layers_root, npc_layer, npc_text):
+            issues.append(message)
+            failing.add("npc")
+
     # style check: TODO call sidecar with brief.style_anchors + rendered preview
     # for now, accept if no other issues
     accepted = len(issues) == 0
@@ -1194,6 +1211,56 @@ def _prop_asset_consistency(brief: WorldBrief, layer: LayerSpec, text: str) -> l
         f"prop layer {layer.path} fill propAsset {fill.group(1)!r} != the {expected!r} the brief's "
         f"region deterministically selects (prop._select_asset) — a stale or tampered fill asset; "
         f"re-run prop"
+    ]
+
+
+def _npc_archetype_consistency(
+    brief: WorldBrief, layers: list[LayerSpec], layers_root: Path, layer: LayerSpec, text: str
+) -> list[str]:
+    """Why npc's emitted ``archetype`` disagrees with the one the brief's region + the director's roster
+    deterministically select, or [] when they agree — the SELECTION twin of the four count/grid brief-re-
+    derivation gates (terrain gridResolution / biome scatter-count / npc spawnCount / prop placementCount)
+    and the npc sibling of ``_prop_asset_consistency``, over npc's OTHER brief-determined dimension: not
+    how MANY npcs, but WHICH archetype.
+
+    npc spawns one hash-selected archetype ``spawnCount`` times — ``npc.run`` emits
+    ``archetype = _select_archetype(region_id, roster, forbidden)`` (a stable per-region hash over the
+    SORTED faction roster the director seeded, salted distinctly from the spawn count so archetype and
+    count vary independently; members the director's ``intent:must_not`` forbids are excluded first; falls
+    back to ``NPC_ARCHETYPE`` when the roster is empty or wholly forbidden). ``_npc_triangle_consistency``
+    pins triangles↔(spawnCount × ``_character_tris(archetype)``) but TRUSTS the emitted archetype to PRICE
+    the crowd, and the spawn-count gate re-derives only the count — so an archetype swapped in isolation to
+    a cheaper allowed one, with the triangles metric re-synced, passes both gates while shipping the
+    region's crowd as the wrong archetype at the wrong per-character budget. Re-derive WHICH archetype via
+    npc's OWN ``_select_archetype`` off the brief + the director roster the validator already holds (the
+    same inputs ``npc.run`` consumed) and reject a mismatch, naming npc so route-back targets it.
+
+    DEFERS the two cases the existing intent gates own, so it never double-reports: a NON-member archetype
+    (a non-empty roster that does not contain it) is ``_intent_attributions``' ``intent:factions`` loop,
+    and a FORBIDDEN archetype is its ``intent:must_not`` loop. The complement of those two — a LEGAL pick
+    (in the roster, or the empty-roster fallback) that is NOT forbidden yet is still not the region's
+    deterministic selection — is the hole NEITHER intent gate sees and this gate's unique concern. An
+    absent archetype is skipped (field-presence is the well-formedness gate's concern; ``npc.run`` always
+    co-emits it). ``roster``/``forbidden`` are recomputed from prop/biome's own ``_director_intent`` and
+    npc's own ``_forbidden_archetypes`` so a roster or MUST_NOT_ARCHETYPE change flips the expectation in
+    lock-step with the intent gates and the producer."""
+    match = re.search(r'archetype\s*=\s*"([^"]+)"', text)
+    if match is None:
+        return []
+    archetype = match.group(1)
+    roster = _director_intent(layers, layers_root, "factions")
+    forbidden = npc._forbidden_archetypes(_director_intent(layers, layers_root, "must_not"))
+    if not ((not roster or archetype in set(roster)) and archetype not in forbidden):
+        return []
+    expected = npc._select_archetype(brief.region.region_id, roster, forbidden)
+    if archetype == expected:
+        return []
+    return [
+        # No pipeline-earlier specialist name (director/terrain/biome/prop/lighting) in the message: the
+        # roster comes from the director but the word-boundary route-back text scan would misroute a
+        # "director" mention to that pipeline-earlier node — so phrase it "faction roster", naming only npc.
+        f"npc layer {layer.path} archetype {archetype!r} != the {expected!r} the region + faction roster "
+        f"deterministically select (npc._select_archetype) — a stale or tampered archetype; re-run npc"
     ]
 
 
