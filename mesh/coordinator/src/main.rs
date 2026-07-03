@@ -5046,6 +5046,71 @@ mod tests {
         assert!(!by_earner.contains_key(&upper), "not the mixed case");
     }
 
+    /// The registered-earner gate: a VALID self-signed result from a key that never
+    /// registered is refused 401 (mirroring the bad-attestation branch) and settles
+    /// nothing — no credit, no results row, no pending EAS receipt — while the job
+    /// stays in_flight for the reaper. Closes the residual the ws session bind left
+    /// open: over the anonymous HTTP path (no dispatch holder to bind to) a throwaway
+    /// key could otherwise mint credit + an on-chain receipt by signing a result alone.
+    #[tokio::test]
+    async fn http_submit_from_an_unregistered_earner_is_refused() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap(); // in_flight
+
+        // A stranger's key: a real signature (the sig gate passes) for an address the
+        // registry has never seen. Deliberately NOT registered.
+        let stranger = "1122334455667788112233445566778811223344556677881122334455667788";
+        let result = signed_result_by(stranger, job_id, "deadbeef");
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&result).unwrap(), 1).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unregistered earner cannot settle over HTTP"
+        );
+
+        // Nothing settled: no credit, no results row, no pending attestation.
+        {
+            let store = state.store.lock().await;
+            assert_eq!(store.completed_count().unwrap(), 0, "no result recorded");
+            assert_eq!(store.pending_attestation_count().unwrap(), 0, "no EAS receipt enqueued");
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(json["jobs_completed"], 0);
+        let json = body_json(get(state.clone(), &format!("/jobs/{job_id}/status")).await).await;
+        assert_eq!(json["status"], "in_flight", "the job stays renderable for an honest earner");
+    }
+
+    /// FM1: the gate keys on the canonical lowercase identity, so a REGISTERED earner
+    /// whose submit claims an UPPER-case variant of its address is not false-rejected —
+    /// it settles and credits the canonical identity. (Complements the reject case above
+    /// and the credit-fold in `submit_folds_a_mixed_case_address_to_the_canonical_identity`,
+    /// pinning that the membership gate too is case-insensitive.)
+    #[tokio::test]
+    async fn http_submit_from_a_registered_earner_in_mixed_case_settles() {
+        let state = test_state_empty().await;
+        register_dev_earner(&state).await;
+        let canonical = dev_address();
+        let upper = upper_case_variant(&canonical);
+
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap(); // in_flight
+
+        let mut result = signed_result(job_id, "deadbeef");
+        result.earner_address = upper; // the registered identity, claimed in a different case
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp = post_submit(state.clone(), &uri, &serde_json::to_value(&result).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::OK, "a registered earner settles regardless of case");
+
+        let by_earner = state.store.lock().await.completed_count_by_earner().unwrap();
+        assert_eq!(by_earner.get(&canonical).copied(), Some(1), "credited to the canonical identity");
+    }
+
     /// FM3 (dispatch poll): an HTTP `/jobs/next?earner=` poll using a case variant of
     /// the registered address resolves to the canonical identity — it applies that
     /// earner's capability filter (and refreshes its liveness) instead of being
