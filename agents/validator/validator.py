@@ -193,6 +193,19 @@ async def run(
             issues.append(message)
             failing.add("terrain")
 
+    # Terrain gridResolution vs the brief — the brief-re-derivation twin of the biome scatter-count
+    # gate below. The triangle gate above pins triangles↔gridResolution, but the grid ITSELF is a
+    # deterministic terrain._grid_resolution(region); a stale/tampered grid with a re-synced triangles
+    # metric passes both the triangle gate and the budget sum, shipping a wrong-resolution floor.
+    # Re-derive it off the brief and reject a mismatch, routing back to terrain. Gated on the layer
+    # being well-formed only (NOT metrics_ok — this compares body↔brief directly, no metric involved),
+    # mirroring the biome scatter gate; a body with no positive-integer gridResolution is skipped.
+    if terrain_layer is not None and terrain_layer in wellformed:
+        terrain_text = (layers_root / terrain_layer.path).read_text()
+        for message in _terrain_grid_resolution_consistency(brief, terrain_layer, terrain_text):
+            issues.append(message)
+            failing.add("terrain")
+
     # Biome scatter triangle self-consistency — the scatter-emitter sibling of the terrain
     # gate above. biome meters instanceCount * TRIS_PER_INSTANCE; the budget gate SUMS that
     # metric trusting it, so a stale/tampered biome metric corrupts the sum just as a terrain
@@ -857,6 +870,35 @@ def _terrain_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
         f"terrain layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} "
         f"its body declares (a {int(grid)}x{int(grid)} heightfield triangulates to "
         f"2*({int(grid)}-1)^2 triangles) — a stale or tampered terrain metric; re-run terrain"
+    ]
+
+
+def _terrain_grid_resolution_consistency(brief: WorldBrief, layer: LayerSpec, text: str) -> list[str]:
+    """Why terrain's emitted ``gridResolution`` disagrees with the resolution the brief's
+    region determines, or [] when they agree — the brief-re-derivation twin of
+    ``_biome_scatter_count_consistency`` over terrain's un-sheddable geometry floor.
+
+    ``_terrain_triangle_consistency`` pins triangles↔gridResolution (metric↔body), but the
+    gridResolution ITSELF is a deterministic function of the region — ``terrain.run`` emits
+    ``_grid_resolution(brief.region.region_id)`` (``BASE_GRID_RESOLUTION`` scaled by a stable
+    per-region hash) — that nothing re-derived. A STALE (authored for another region, pre-
+    route-back) or tampered grid carrying a triangles metric re-synced to it passes BOTH the
+    triangle gate AND the optimizer's budget sum, shipping a heightfield at the WRONG resolution
+    for its region (the number-changed-in-isolation the sum alone cannot see). Re-derive via
+    terrain's OWN ``_grid_resolution`` off the brief the validator already holds (the same brief
+    ``terrain.run`` consumed) and reject a mismatch, naming terrain so route-back targets it.
+    Same skip discipline as the triangle gate: a gridResolution that is absent, below 1, or non-
+    integer is unverifiable (field-presence is the well-formedness gate's concern) — SKIP; a
+    present positive-integer grid that disagrees is a real violation."""
+    grid = _opt_number(text, "gridResolution")
+    if grid is None or grid < 1 or grid != int(grid):
+        return []
+    expected = terrain._grid_resolution(brief.region.region_id)
+    if int(grid) == expected:
+        return []
+    return [
+        f"terrain layer {layer.path} gridResolution {int(grid)} != the {expected} the brief's "
+        f"region determines (terrain._grid_resolution) — a stale or tampered grid; re-run terrain"
     ]
 
 
