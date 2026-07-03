@@ -2486,6 +2486,12 @@ def test_prop_triangle_consistency_tracks_the_per_asset_budget_in_lock_step():
     assert validator._prop_triangle_consistency(light, _prop_body(["comms_tower_01"], placement_count=count)) != []
 
 
+# The region-true placement count the brief determines for the test REGION — prop.run emits exactly
+# this (BASE_PLACEMENTS scaled by prop's stable per-region hash). The run-level fixtures carry it (not
+# an arbitrary count) so the placementCount↔brief gate stays silent on the triangle-gate fixtures.
+_REGION_PLACEMENTS = prop._placement_count(REGION)
+
+
 def _prop_metric_set(root: Path, *, placement_count, required, prop_tris: float) -> list[LayerSpec]:
     """A full well-formed set with prop declaring `placement_count` × the fill + `required` heroes and
     metering `prop_tris`, the optimization body re-synced to the resulting summed geometry so the
@@ -2508,7 +2514,7 @@ def _prop_metric_set(root: Path, *, placement_count, required, prop_tris: float)
 async def test_run_accepts_a_prop_metric_consistent_with_its_placements(tmp_path):
     # FM1 at run() level: a correct world (prop metric == count*fill + Σ required, optimizer re-synced)
     # validates clean — the new gate adds no false rejection.
-    count, required = 8, ["comms_tower_01", "convoy_wreck_01"]
+    count, required = _REGION_PLACEMENTS, ["comms_tower_01", "convoy_wreck_01"]
     layers = _prop_metric_set(tmp_path, placement_count=count, required=required, prop_tris=_prop_expected(count, required))
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert verdict.accepted, verdict.issues
@@ -2517,7 +2523,7 @@ async def test_run_accepts_a_prop_metric_consistent_with_its_placements(tmp_path
 async def test_run_rejects_a_stale_prop_metric_and_routes_to_prop(tmp_path):
     # FM2 at run() level: prop's metric is stale/tampered, the optimizer body re-synced to it so the
     # BUDGET gate stays silent — prop is the ONLY issue (no double-report) and route-back targets it.
-    count, required = 8, ["comms_tower_01"]
+    count, required = _REGION_PLACEMENTS, ["comms_tower_01"]
     prop_tris = _prop_expected(count, required) + 4000.0
     layers = _prop_metric_set(tmp_path, placement_count=count, required=required, prop_tris=prop_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
