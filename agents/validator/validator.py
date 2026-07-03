@@ -280,6 +280,21 @@ async def run(
             issues.append(message)
             failing.add("prop")
 
+    # Prop placementCount vs the brief — the brief-re-derivation twin of the terrain gridResolution /
+    # biome uncapped scatter-count / npc spawnCount gates (the 4th and last geometry emitter). The
+    # triangle gate above pins triangles↔(placementCount × _asset_tris + Σ required), but the
+    # placementCount ITSELF is a deterministic prop._placement_count(region); a stale/tampered count with
+    # a re-synced triangles metric passes both the triangle gate and the budget sum, shipping the wrong
+    # prop density. Re-derive it off the brief and reject a mismatch, routing back to prop. Gated on the
+    # layer being well-formed only (NOT metrics_ok — body↔brief directly, no metric involved), mirroring
+    # the npc/terrain/biome scatter gates; a placementCount of 0 is a valid empty scatter (like biome's
+    # instanceCount, unlike terrain's >=1 grid), so only an absent/negative/non-integer count is skipped.
+    if prop_layer is not None and prop_layer in wellformed:
+        prop_text = (layers_root / prop_layer.path).read_text()
+        for message in _prop_placement_count_consistency(brief, prop_layer, prop_text):
+            issues.append(message)
+            failing.add("prop")
+
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
     # one defines, and the layers still open individually while the composed stage
@@ -1092,6 +1107,39 @@ def _prop_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
         f"prop layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} its body "
         f"declares ({int(count)} x {fill.group(1)} + must-have {required}) "
         f"— a stale or tampered prop metric; re-run prop"
+    ]
+
+
+def _prop_placement_count_consistency(brief: WorldBrief, layer: LayerSpec, text: str) -> list[str]:
+    """Why prop's emitted ``placementCount`` disagrees with the placement density the brief's region
+    determines, or [] when they agree — the brief-re-derivation twin of
+    ``_terrain_grid_resolution_consistency`` / ``_biome_scatter_count_consistency`` /
+    ``_npc_spawn_count_consistency``, the 4th and last geometry emitter's brief-determined dimension.
+
+    ``_prop_triangle_consistency`` pins triangles↔(placementCount × ``_asset_tris(propAsset)`` + Σ
+    required), but the placementCount ITSELF is a deterministic function of the region — ``prop.run``
+    emits ``_placement_count(brief.region.region_id)`` (``BASE_PLACEMENTS`` scaled by a stable per-
+    region hash), independent of the director-required hero set and the hash-selected fill asset — that
+    nothing re-derived. A STALE (authored for another region, pre-route-back) or tampered count carrying
+    a triangles metric re-synced to it passes BOTH the triangle gate AND the optimizer's budget sum,
+    shipping a region at the WRONG prop density (the number-changed-in-isolation the sum alone cannot
+    see). Re-derive via prop's OWN ``_placement_count`` off the brief the validator already holds (the
+    same brief ``prop.run`` consumed) and reject a mismatch, naming prop so route-back targets it. This
+    gate owns only the FILL count; the required-asset set is director-driven (the intent gate's concern),
+    not brief-region-derived. Unlike terrain's grid (a heightfield needs >=1), a placementCount of 0 is a
+    VALID empty-scatter region metering 0 fill triangles — like biome's instanceCount and npc's
+    spawnCount — so SKIP only a count that is absent, negative, or non-integer (field-presence is the
+    well-formedness gate's concern); a present count that disagrees (including a tampered 0 over a
+    nonzero-placement region) is a real violation."""
+    count = _opt_number(text, "placementCount")
+    if count is None or count < 0 or count != int(count):
+        return []
+    expected = prop._placement_count(brief.region.region_id)
+    if int(count) == expected:
+        return []
+    return [
+        f"prop layer {layer.path} placementCount {int(count)} != the {expected} the brief's region "
+        f"determines (prop._placement_count) — a stale or tampered placement count; re-run prop"
     ]
 
 
