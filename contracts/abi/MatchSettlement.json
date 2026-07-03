@@ -3,6 +3,11 @@
     "inputs": [
       {
         "internalType": "address",
+        "name": "eas_",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
         "name": "registry_",
         "type": "address"
       },
@@ -28,6 +33,19 @@
         "internalType": "uint64",
         "name": "",
         "type": "uint64"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "EAS",
+    "outputs": [
+      {
+        "internalType": "contract IEAS",
+        "name": "",
+        "type": "address"
       }
     ],
     "stateMutability": "view",
@@ -164,6 +182,19 @@
     "type": "function"
   },
   {
+    "inputs": [],
+    "name": "fieldSchemaUid",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
     "inputs": [
       {
         "internalType": "bytes32",
@@ -251,6 +282,25 @@
         "internalType": "bool",
         "name": "",
         "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      }
+    ],
+    "name": "matchAttestationUid",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
       }
     ],
     "stateMutability": "view",
@@ -458,6 +508,30 @@
     "type": "function"
   },
   {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "registry_",
+        "type": "address"
+      }
+    ],
+    "name": "registerSchema",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "matchUid",
+        "type": "bytes32"
+      },
+      {
+        "internalType": "bytes32",
+        "name": "fieldUid",
+        "type": "bytes32"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
     "inputs": [],
     "name": "registry",
     "outputs": [
@@ -504,6 +578,19 @@
         "internalType": "bool",
         "name": "authorized",
         "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "schemaUid",
+    "outputs": [
+      {
+        "internalType": "bytes32",
+        "name": "",
+        "type": "bytes32"
       }
     ],
     "stateMutability": "view",
@@ -926,6 +1013,25 @@
         "type": "bytes32"
       },
       {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "uid",
+        "type": "bytes32"
+      }
+    ],
+    "name": "MatchAttested",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchId",
+        "type": "bytes32"
+      },
+      {
         "indexed": false,
         "internalType": "uint256",
         "name": "refundA",
@@ -1208,6 +1314,25 @@
     "anonymous": false,
     "inputs": [
       {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "matchUid",
+        "type": "bytes32"
+      },
+      {
+        "indexed": true,
+        "internalType": "bytes32",
+        "name": "fieldUid",
+        "type": "bytes32"
+      }
+    ],
+    "name": "SchemaRegistered",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
         "indexed": false,
         "internalType": "uint64",
         "name": "settleWindow",
@@ -1387,6 +1512,11 @@
   {
     "inputs": [],
     "name": "SameAgent",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "SchemaNotSet",
     "type": "error"
   },
   {
