@@ -25,6 +25,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use arena_core::{
     arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, Match, Rules,
@@ -376,15 +379,25 @@ struct Args {
     /// speed a hand-seated one does.
     projectile_speed: i32,
     /// Per-action wall-clock deadline in microseconds (`Rules::action_deadline_micros`): the time budget a seat
-    /// has to return its action each tick, enforced by the transport's bounded-latency invariant — a tighter
-    /// budget stresses an agent's compute, a looser one forgives a slow policy. Set by `--action-deadline-micros`;
-    /// UNLIKE the feature-toggle knobs (which default `0` = off) this is a base-balance value, so its default is
-    /// `Rules::default().action_deadline_micros` (`50_000`, 50 ms) — an absent flag is byte-identical to the
-    /// pre-flag harness (and the replay digest) at the DEFAULT budget, NOT at `0` (a `0` budget gives a seat no
-    /// time to act). A `u32` (the plain `.parse()` rejects a negative and bounds the value at `u32::MAX`), applied
-    /// to BOTH the direct and `--mode` paths through [`rules_from`] via [`MatchParams::rules`], so a
-    /// matchmade/ranked match enforces the same deadline a hand-seated one does.
+    /// has to return its action each tick — a tighter budget stresses an agent's compute, a looser one forgives a
+    /// slow policy. This is the DECLARED budget: it is digest-bound (`canonical_encoding`) and carried on every
+    /// [`GatewayMsg::Observe`]; the transport enforces it as a wall-clock read deadline (forfeiting a seat that
+    /// misses it) only under [`Args::enforce_deadline`] — the default read is unbounded and blocking. Set by
+    /// `--action-deadline-micros`; UNLIKE the feature-toggle knobs (which default `0` = off) this is a base-balance
+    /// value, so its default is `Rules::default().action_deadline_micros` (`50_000`, 50 ms) — an absent flag is
+    /// byte-identical to the pre-flag harness (and the replay digest) at the DEFAULT budget, NOT at `0` (a `0`
+    /// budget gives a seat no time to act). A `u32` (the plain `.parse()` rejects a negative and bounds the value
+    /// at `u32::MAX`), applied to BOTH the direct and `--mode` paths through [`rules_from`] via
+    /// [`MatchParams::rules`], so a matchmade/ranked match declares the same deadline a hand-seated one does.
     action_deadline_micros: u32,
+    /// Enforce [`Args::action_deadline_micros`] as a wall-clock READ deadline: when set, the live loop reads each
+    /// tick's actions off a reader thread with `recv_timeout` against a shared per-tick budget, and a seat that
+    /// misses it (or a closed stream) is omitted so the sim forfeits its tick. OFF by default — and off, the loop
+    /// keeps the unbounded blocking read, so the golden/replay path stays timer-free and byte-identical (wall-clock
+    /// enforcement is inherently non-deterministic and must never fire on the deterministic path). Opt-in via
+    /// `--enforce-deadline`; inert (falls back to the blocking read) when the deadline is `0` — a `0`-µs budget has
+    /// nothing to enforce. Applies to BOTH the direct and `--mode` live loops.
+    enforce_deadline: bool,
     /// Heal/ammo collection radius in position units (`Rules::pickup_radius`): a pawn collects a pickup only when
     /// its centre is within this distance of the pickup, so a wider radius makes a pickup easier to grab and a
     /// tighter one demands closer contact. Set by `--pickup-radius`; UNLIKE the feature-toggle knobs (which
@@ -742,6 +755,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 action_deadline_micros
     // gives a seat no time to act, NOT the pre-flag harness.
     let mut action_deadline_micros: u32 = Rules::default().action_deadline_micros;
+    // Opt-in: enforcement of the action deadline as a wall-clock read budget. Off keeps the blocking read, so the
+    // golden/replay path is timer-free and byte-identical.
+    let mut enforce_deadline = false;
     // Base-balance knob: its absent-default is the Rules default (non-zero), not 0 — a 0 pickup_radius is
     // collectible only by a pawn exactly on the pickup, NOT the pre-flag harness.
     let mut pickup_radius: i32 = Rules::default().pickup_radius;
@@ -907,6 +923,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .parse()
                     .expect("action-deadline-micros is a u32 (microseconds)")
             }
+            "--enforce-deadline" => enforce_deadline = true,
             "--pickup-radius" => {
                 pickup_radius = parse_pickup_radius(&it.next().expect("--pickup-radius needs a value"))
             }
@@ -966,6 +983,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         melee_range,
         projectile_speed,
         action_deadline_micros,
+        enforce_deadline,
         pickup_radius,
         pickup_respawn_cooldown,
         spawn_jitter,
@@ -1388,12 +1406,160 @@ fn pump_to_end(
         m.step(&intents);
     }
 
+    finish(m, n, out)
+}
+
+/// Broadcast the terminal [`MatchResult`] to every seat and return it — the shared
+/// match-end emit both the blocking ([`pump_to_end`]) and deadline-enforced
+/// ([`pump_to_end_deadlined`]) live loops close on, so the two paths end a match
+/// byte-identically.
+fn finish(m: &Match, n: u8, out: &mut impl Write) -> MatchResult {
     let result = m.result().expect("an ended match has a result").clone();
     for seat in 0..n {
         emit(out, seat, &GatewayMsg::End(result.clone()));
     }
     out.flush().expect("flush results");
     result
+}
+
+/// Read one Live tick's actions, bounded by a SHARED per-tick wall-clock deadline. Every
+/// seat races the same `Instant` (computed once, here), so the whole tick costs at most
+/// ~`deadline` no matter how many seats are slow — a near-miss on the first seat can't
+/// extend the next seat's budget into `n · deadline` (FM4). A seat whose action does not
+/// arrive within the budget, or a stream that has closed ([`RecvTimeoutError::Disconnected`],
+/// EOF), is simply omitted from the returned intents, so `step` forfeits its tick exactly
+/// as it forfeits an absent seat — the sim already ends a match whose seats keep forfeiting.
+/// `ingest` is the same server-authoritative gate the blocking path applies, so a
+/// late-but-delivered action that is now stale (its tick has passed) still forfeits.
+fn read_tick_deadlined(
+    m: &Match,
+    n: u8,
+    rx: &Receiver<String>,
+    deadline: Duration,
+) -> BTreeMap<SeatId, ActionIntent> {
+    let tick_deadline = Instant::now() + deadline;
+    let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    for _ in 0..n {
+        let remaining = tick_deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                let (seat, msg) = read_agent(&line);
+                match msg {
+                    AgentMsg::Act(action) => {
+                        if let Ok(intent) = m.ingest(seat, &action) {
+                            intents.insert(seat, intent);
+                        }
+                    }
+                    AgentMsg::Leave { .. } => {}
+                    AgentMsg::Join { .. } => panic!("unexpected join during the match"),
+                }
+            }
+            // The tick's budget is spent: the seats that have not answered forfeit. Stop
+            // reading so one slow tick costs ~one deadline, not one per unread seat.
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!(
+                    "[deadline] tick {} read exceeded {}µs; forfeiting the unread seat(s)",
+                    m.tick(),
+                    deadline.as_micros()
+                );
+                break;
+            }
+            // EOF: the agent stream closed. Forfeit the remaining seats this tick and let the
+            // outer loop keep stepping — every later tick disconnects immediately (no wait, no
+            // spin), so the match forfeits to its bounded end rather than hanging on a dead read.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    intents
+}
+
+/// Pump a live match to its end enforcing the per-tick action deadline: like
+/// [`pump_to_end`] but each Live tick reads its actions through [`read_tick_deadlined`]
+/// (a `recv_timeout` against the shared budget) instead of the unbounded blocking
+/// [`next_line`], so a slow or hung seat forfeits on the wall clock. `rx` is fed by a
+/// reader thread ([`pump_to_end_enforced`] wires the real stdin; a test feeds it
+/// directly). Enforcement is opt-in ([`Args::enforce_deadline`]) precisely because this
+/// path is wall-clock-driven and so non-deterministic — the golden/replay path takes
+/// [`pump_to_end`] and never a timer.
+fn pump_to_end_deadlined(
+    m: &mut Match,
+    n: u8,
+    rx: &Receiver<String>,
+    out: &mut impl Write,
+    deadline: Duration,
+) -> MatchResult {
+    pump_starting(m, n, out);
+    while m.phase() == MatchPhase::Live {
+        for seat in 0..n {
+            emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
+        }
+        out.flush().expect("flush observations");
+        let intents = read_tick_deadlined(m, n, rx, deadline);
+        m.step(&intents);
+    }
+    finish(m, n, out)
+}
+
+/// Feed each stdin line to `tx` until EOF, a read error, or the receiver drops (the match
+/// ended). Runs on its own thread because a blocking line read has no timeout in std — the
+/// pump reads from the channel with a per-tick deadline instead. Re-locks `io::stdin()`
+/// itself (the caller has released the handshake's lock; the process-global buffered reader
+/// keeps any bytes it had already buffered, so no line is lost across the handoff), which is
+/// why the whole [`std::io::StdinLock`] — a `!Send` guard — never has to cross the thread
+/// boundary.
+fn feed_stdin_lines(tx: &mpsc::Sender<String>) {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        match line {
+            Ok(l) => {
+                if tx.send(l).is_err() {
+                    break; // the pump dropped the receiver: the match is over
+                }
+            }
+            Err(_) => break, // a read error ends the feed; the pump then sees Disconnected
+        }
+    }
+}
+
+/// Wire the real stdin into [`pump_to_end_deadlined`]: spawn the reader thread that feeds
+/// the channel, then pump. The reader is DETACHED, never joined — a thread blocked on a
+/// silent-but-open stdin would otherwise hang match teardown; when this returns the
+/// receiver drops, and the reader exits on its next send (or dies with the process).
+fn pump_to_end_enforced(m: &mut Match, n: u8, out: &mut impl Write, deadline: Duration) -> MatchResult {
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || feed_stdin_lines(&tx));
+    pump_to_end_deadlined(m, n, &rx, out, deadline)
+}
+
+/// Drive the live match through whichever read discipline the flags select, returning the
+/// terminal [`MatchResult`] for the shared settle path. `deadline == None` (the default,
+/// and any run without `--enforce-deadline` or with a `0`-µs budget) takes the unbounded
+/// blocking [`pump_to_end`] over the handshake's `lines` iterator — byte-identical to the
+/// pre-flag harness. `Some(d)` drops that iterator (releasing the stdin lock) and takes the
+/// wall-clock-enforced [`pump_to_end_enforced`], whose reader thread re-locks stdin.
+fn drive_pump(
+    m: &mut Match,
+    n: u8,
+    deadline: Option<Duration>,
+    mut lines: impl Iterator<Item = io::Result<String>>,
+    out: &mut impl Write,
+) -> MatchResult {
+    match deadline {
+        None => pump_to_end(m, n, &mut lines, out),
+        Some(d) => {
+            drop(lines);
+            pump_to_end_enforced(m, n, out, d)
+        }
+    }
+}
+
+/// The wall-clock read budget to enforce this run, or `None` to keep the blocking read.
+/// `Some(d)` only when `--enforce-deadline` is set AND the declared budget is non-zero —
+/// a `0`-µs deadline has nothing to enforce (it would forfeit every seat every tick), so
+/// it falls back to the blocking read rather than stranding the match.
+fn enforced_deadline(args: &Args, m: &Match) -> Option<Duration> {
+    let micros = m.rules().action_deadline_micros;
+    (args.enforce_deadline && micros > 0).then(|| Duration::from_micros(micros as u64))
 }
 
 /// Settle a finished match through the optional mock settler. Overlays any
@@ -1822,7 +1988,8 @@ fn main() {
     // so settlement overlays no recovered ids.
     if let Some(mode) = args.mode {
         let (mm, mut m) = handshake_matchmade(&args, mode, n, &settler, &mut lines, &mut out);
-        let result = pump_to_end(&mut m, n, &mut lines, &mut out);
+        let deadline = enforced_deadline(&args, &m);
+        let result = drive_pump(&mut m, n, deadline, lines, &mut out);
         // Settle the ladder while the roster is still alive (it maps seat→controller for
         // the rating readout); `settle_finished` then consumes the match.
         settle_ranked_ladder(&mm, &result, m.seats());
@@ -1927,7 +2094,8 @@ fn main() {
         out.flush().expect("flush welcome+start");
     }
 
-    let result = pump_to_end(&mut m, n, &mut lines, &mut out);
+    let deadline = enforced_deadline(&args, &m);
+    let result = drive_pump(&mut m, n, deadline, lines, &mut out);
     settle_finished(&settler, &result, m, &recovered);
 }
 
@@ -2548,6 +2716,7 @@ mod tests {
             melee_range: Rules::default().melee_range,
             projectile_speed: Rules::default().projectile_speed,
             action_deadline_micros: Rules::default().action_deadline_micros,
+            enforce_deadline: false,
             pickup_radius: Rules::default().pickup_radius,
             pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
             spawn_jitter: Rules::default().spawn_jitter,
@@ -2640,6 +2809,7 @@ mod tests {
             melee_range: Rules::default().melee_range,
             projectile_speed: Rules::default().projectile_speed,
             action_deadline_micros: Rules::default().action_deadline_micros,
+            enforce_deadline: false,
             pickup_radius: Rules::default().pickup_radius,
             pickup_respawn_cooldown: Rules::default().pickup_respawn_cooldown,
             spawn_jitter: Rules::default().spawn_jitter,
@@ -4999,6 +5169,19 @@ mod tests {
             Rules::default().action_deadline_micros,
             "no --action-deadline-micros defaults to the Rules default budget, NOT 0"
         );
+    }
+
+    #[test]
+    fn enforce_deadline_is_a_valueless_opt_in_off_by_default() {
+        // The enforcement toggle is a bare boolean flag (consumes no token), OFF by default — off keeps the
+        // unbounded blocking read so the golden/replay path stays timer-free. A --enforce-deadline before --seats 3
+        // sets the toggle and still parses --seats (it pulled no value).
+        let on = parse_args_from(["--enforce-deadline", "--seats", "3"].into_iter().map(String::from));
+        assert!(on.enforce_deadline, "--enforce-deadline arms the wall-clock read budget");
+        assert_eq!(on.seats, 3, "--enforce-deadline consumed no token, so --seats 3 parsed");
+
+        let off = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert!(!off.enforce_deadline, "no --enforce-deadline leaves the blocking, timer-free read (the default)");
     }
 
     #[test]
