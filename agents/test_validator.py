@@ -1918,6 +1918,11 @@ async def test_run_lighting_density_tracks_the_fog_table_in_lock_step(tmp_path):
 # body's gridResolution and rejects a metric that disagrees (routed back to terrain), skips a
 # body with no positive-integer gridResolution, and tracks terrain's own formula in lock-step.
 
+# The region-true gridResolution the brief determines for the test REGION — terrain.run emits
+# exactly this. The run-level fixtures carry it (not an arbitrary grid) so the gridResolution↔brief
+# gate stays silent on them; the brief-re-derivation tests offset from it to model a stale grid.
+_REGION_GRID = terrain._grid_resolution(REGION)
+
 
 def _terrain_body(grid) -> str:
     """A terrain layer declaring a `grid`x`grid` heightfield — mirroring terrain.run, the
@@ -1999,8 +2004,8 @@ def _terrain_metric_set(root: Path, *, grid, terrain_tris: float) -> list[LayerS
 
 async def test_run_accepts_a_terrain_metric_consistent_with_its_grid(tmp_path):
     # FM1 at run() level: a correct world (terrain metric == its grid's heightfield, optimizer
-    # body re-synced) validates clean — the new gate adds no false rejection.
-    grid = 600
+    # body re-synced) validates clean — the metric AND gridResolution gates both stay silent.
+    grid = _REGION_GRID
     layers = _terrain_metric_set(tmp_path, grid=grid, terrain_tris=float(terrain._heightfield_triangles(grid)))
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert verdict.accepted, verdict.issues
@@ -2009,8 +2014,9 @@ async def test_run_accepts_a_terrain_metric_consistent_with_its_grid(tmp_path):
 async def test_run_rejects_a_stale_terrain_metric_and_routes_to_terrain(tmp_path):
     # FM2 at run() level: terrain's metric is stale/tampered (doesn't match its gridResolution),
     # with the optimizer body re-synced to that metric so the BUDGET gate stays silent — terrain
-    # is the ONLY issue (no double-report) and route-back targets it.
-    grid = 600
+    # is the ONLY issue (no double-report) and route-back targets it. The grid stays region-true
+    # so the gridResolution↔brief gate is silent — only the tampered METRIC trips the triangle gate.
+    grid = _REGION_GRID
     terrain_tris = 262144.0
     assert terrain._heightfield_triangles(grid) != terrain_tris
     layers = _terrain_metric_set(tmp_path, grid=grid, terrain_tris=terrain_tris)
