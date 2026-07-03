@@ -253,6 +253,20 @@ async def run(
             issues.append(message)
             failing.add("npc")
 
+    # NPC spawnCount vs the brief — the brief-re-derivation twin of the terrain gridResolution / biome
+    # uncapped scatter-count gates. The triangle gate above pins triangles↔(spawnCount × _character_tris),
+    # but the spawnCount ITSELF is a deterministic npc._spawn_count(region); a stale/tampered count with a
+    # re-synced triangles metric passes both the triangle gate and the budget sum, shipping the wrong crowd
+    # size. Re-derive it off the brief and reject a mismatch, routing back to npc. Gated on the layer being
+    # well-formed only (NOT metrics_ok — body↔brief directly, no metric involved), mirroring the terrain/
+    # biome scatter gates; a spawnCount of 0 is a valid empty crowd (like biome's instanceCount, unlike
+    # terrain's >=1 grid), so only an absent/negative/non-integer count is skipped.
+    if npc_layer is not None and npc_layer in wellformed:
+        npc_text = (layers_root / npc_layer.path).read_text()
+        for message in _npc_spawn_count_consistency(brief, npc_layer, npc_text):
+            issues.append(message)
+            failing.add("npc")
+
     # Prop placement triangle self-consistency — the placement-emitter sibling of the terrain/biome/
     # npc gates above. prop meters count*_asset_tris(propAsset) + sum(_asset_tris(a) for a in the
     # requiredAsset markers); the budget gate SUMS that metric trusting it, so a stale/tampered prop
@@ -1002,6 +1016,37 @@ def _npc_triangle_consistency(layer: LayerSpec, text: str) -> list[str]:
         f"npc layer {layer.path} triangles metric {reported:.0f} != the {expected:.0f} its body "
         f"declares ({int(count)} x {name} @ {npc._character_tris(name)} tris each) "
         f"— a stale or tampered npc metric; re-run npc"
+    ]
+
+
+def _npc_spawn_count_consistency(brief: WorldBrief, layer: LayerSpec, text: str) -> list[str]:
+    """Why npc's emitted ``spawnCount`` disagrees with the crowd size the brief's region
+    determines, or [] when they agree — the brief-re-derivation twin of
+    ``_terrain_grid_resolution_consistency`` / ``_biome_scatter_count_consistency`` over npc's
+    other geometry half.
+
+    ``_npc_triangle_consistency`` pins triangles↔(spawnCount × ``_character_tris(archetype)``)
+    (metric↔body), but the spawnCount ITSELF is a deterministic function of the region — ``npc.run``
+    emits ``_spawn_count(brief.region.region_id)`` (``BASE_SPAWNS`` scaled by a stable per-region
+    hash), independent of the roster-dependent archetype — that nothing re-derived. A STALE (authored
+    for another region, pre-route-back) or tampered count carrying a triangles metric re-synced to it
+    passes BOTH the triangle gate AND the optimizer's budget sum, shipping a region at the WRONG crowd
+    size (the number-changed-in-isolation the sum alone cannot see). Re-derive via npc's OWN
+    ``_spawn_count`` off the brief the validator already holds (the same brief ``npc.run`` consumed)
+    and reject a mismatch, naming npc so route-back targets it. Unlike terrain's grid (a heightfield
+    needs >=1), a spawnCount of 0 is a VALID empty-crowd region metering 0 npc triangles — like biome's
+    instanceCount — so SKIP only a count that is absent, negative, or non-integer (field-presence is
+    the well-formedness gate's concern); a present count that disagrees (including a tampered 0 over a
+    nonzero-spawn region) is a real violation."""
+    count = _opt_number(text, "spawnCount")
+    if count is None or count < 0 or count != int(count):
+        return []
+    expected = npc._spawn_count(brief.region.region_id)
+    if int(count) == expected:
+        return []
+    return [
+        f"npc layer {layer.path} spawnCount {int(count)} != the {expected} the brief's region "
+        f"determines (npc._spawn_count) — a stale or tampered spawn count; re-run npc"
     ]
 
 
