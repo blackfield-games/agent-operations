@@ -5532,6 +5532,68 @@ mod tests {
     }
 
     #[test]
+    fn read_tick_deadlined_departs_a_leaving_seat_so_it_is_no_longer_awaited() {
+        // The enforced-path twin of the blocking departure: a Leave forfeits its seat AND drops
+        // it from the active set, so the next tick's read expects only the survivors and never
+        // waits the budget for the departed seat. Both lines are buffered, so the departure read
+        // never times out.
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mut active = active_seats(2);
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        tx.send(leave_line(1)).unwrap();
+
+        let intents = read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(50));
+        assert!(intents.contains_key(&0), "seat 0 acted");
+        assert!(!intents.contains_key(&1), "seat 1 left → forfeited, not in intents");
+        assert_eq!(active, active_seats(1), "seat 1 departed the active set");
+
+        // The next tick awaits only seat 0: its buffered line returns at once and the read never
+        // blocks on the departed seat 1 (which, still awaited, would cost the full 50 ms budget).
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        let start = Instant::now();
+        let next = read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(50));
+        assert_eq!(next.keys().copied().collect::<Vec<_>>(), vec![0], "only the surviving seat is read");
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "the departed seat is not awaited — the read does not wait the budget for it"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn pump_to_end_deadlined_forfeits_a_leaver_and_reaches_a_bounded_end() {
+        // The enforced-path twin of pump_to_end_forfeits_a_leaver...: seat 1 Leaves at tick 0 and
+        // goes silent; seat 0 plays on to the max_ticks end and seat 1 forfeits from its Leave tick
+        // — no hang, and (unlike the pre-fix path) no per-tick timeout spent awaiting the leaver.
+        // Every line is pre-buffered and aligned to the advancing tick, so nothing times out.
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mid = m.match_id();
+        let (tx, rx) = mpsc::channel::<String>();
+        tx.send(act_line(0, mid, 0)).unwrap();
+        tx.send(leave_line(1)).unwrap();
+        for t in 1..4 {
+            tx.send(act_line(0, mid, t)).unwrap();
+        }
+
+        let mut out: Vec<u8> = Vec::new();
+        let start = Instant::now();
+        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(50));
+        assert_eq!(m.phase(), MatchPhase::Ended, "the leaver does not stall the enforced pump");
+        assert_eq!(result.outcomes.len(), 2);
+        assert_eq!(
+            tick_seats(&m.into_replay()),
+            vec![(0, vec![0]), (1, vec![0]), (2, vec![0]), (3, vec![0])],
+            "seat 1 forfeits from its tick-0 Leave; seat 0 plays every tick"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "the aligned, pre-buffered stream never waits a per-tick budget for the departed seat"
+        );
+        drop(tx);
+    }
+
+    #[test]
     fn parse_pickup_radius_maps_a_non_negative_radius() {
         assert_eq!(parse_pickup_radius("0"), 0);
         assert_eq!(parse_pickup_radius("4000"), 4000);
