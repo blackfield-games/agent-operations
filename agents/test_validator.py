@@ -1084,13 +1084,17 @@ def _lighting_body(driven_by: list[str] | None = None, density: float | None = N
 _REGION_ASSET = prop._select_asset(REGION)
 
 
-def _prop_body(required_assets: list[str], placement_count: int | None = None) -> str:
+def _prop_body(
+    required_assets: list[str], placement_count: int | None = None, fill_asset: str = _REGION_ASSET
+) -> str:
     """A prop layer placing one Required prim per asset (the `requiredAsset` marker the
-    gate keys on), beside the fill PointInstancer (propAsset `_REGION_ASSET`, the region-
-    true pick so the selection gate stays silent) — mirroring prop._required_block.
-    `placementCount` is opt-in (omit ⇒ the triangle self-consistency gate can't re-derive
-    the metric and skips the layer, so the intent fixtures that don't declare a count
-    degrade-skip it); pass `placement_count` for the triangle fixtures."""
+    gate keys on), beside the fill PointInstancer (propAsset `fill_asset`, defaulting to
+    the region-true `_REGION_ASSET` pick so the selection gate stays silent) — mirroring
+    prop._required_block. `placementCount` is opt-in (omit ⇒ the triangle self-consistency
+    gate can't re-derive the metric and skips the layer, so the intent fixtures that don't
+    declare a count degrade-skip it); pass `placement_count` for the triangle fixtures.
+    Pass `fill_asset` to model a stale/tampered fill (a wrong known asset, or an unknown
+    one) the propAsset↔brief selection gate must catch or defer."""
     prims = "".join(
         f'\ndef Xform "Required_{i}"\n{{\n    custom string requiredAsset = "{a}"\n}}\n'
         for i, a in enumerate(required_assets)
@@ -1098,7 +1102,7 @@ def _prop_body(required_assets: list[str], placement_count: int | None = None) -
     count_line = f"\n    custom int placementCount = {placement_count}" if placement_count is not None else ""
     return (
         '#usda 1.0\n(\n    defaultPrim = "Props"\n)\n\n'
-        f'def PointInstancer "Props"\n{{\n    custom string propAsset = "{_REGION_ASSET}"{count_line}\n}}\n'
+        f'def PointInstancer "Props"\n{{\n    custom string propAsset = "{fill_asset}"{count_line}\n}}\n'
         + prims
     )
 
@@ -2501,16 +2505,19 @@ def test_prop_triangle_consistency_tracks_the_per_asset_budget_in_lock_step():
 _REGION_PLACEMENTS = prop._placement_count(REGION)
 
 
-def _prop_metric_set(root: Path, *, placement_count, required, prop_tris: float) -> list[LayerSpec]:
-    """A full well-formed set with prop declaring `placement_count` × the fill + `required` heroes and
-    metering `prop_tris`, the optimization body re-synced to the resulting summed geometry so the
-    budget gate stays silent — only the prop triangle self-consistency check is exercised."""
+def _prop_metric_set(
+    root: Path, *, placement_count, required, prop_tris: float, fill_asset: str = _REGION_ASSET
+) -> list[LayerSpec]:
+    """A full well-formed set with prop declaring `placement_count` × the `fill_asset` fill + `required`
+    heroes and metering `prop_tris`, the optimization body re-synced to the resulting summed geometry so
+    the budget gate stays silent — only the prop self-consistency checks are exercised. `fill_asset`
+    defaults to the region-true pick (selection gate silent); pass a wrong/unknown asset to drive it."""
     summed = 262144.0 + 100000.0 + 144000.0 + prop_tris  # terrain + biome + npc + prop metrics
     out: list[LayerSpec] = []
     for s in SPECIALISTS:
         if s == "prop":
             out.append(
-                _layer(root, "prop", body=_prop_body(required, placement_count=placement_count), metrics={"triangles": prop_tris})
+                _layer(root, "prop", body=_prop_body(required, placement_count=placement_count, fill_asset=fill_asset), metrics={"triangles": prop_tris})
             )
         elif s == "optimization":
             body = _opt_body(authored=summed, observed=summed, over_budget=False)
@@ -2624,3 +2631,94 @@ async def test_run_rejects_a_prop_placement_count_that_disagrees_with_the_brief(
     assert "prop" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "prop"
     assert _route_back_target(verdict) == "prop"
+
+
+# ---- prop FILL propAsset vs the brief: the emitted fill must match prop._select_asset ----------------
+#
+# The SELECTION twin of the terrain gridResolution / biome scatter-count / npc spawnCount / prop
+# placementCount gates — prop's OTHER brief-determined dimension (not how MANY props, but WHICH one).
+# prop.run emits propAsset = _select_asset(region), and _prop_triangle_consistency pins triangles↔(count
+# × _asset_tris(propAsset) + Σ required) — but it TRUSTS the emitted asset to PRICE the fill. A fill
+# swapped in isolation to a cheaper KNOWN asset with the metric re-synced passes the triangle gate AND
+# the budget sum; these pin that the validator re-derives WHICH asset off the brief, rejects a
+# disagreeing KNOWN pick (routed to prop), and — deferring to the triangle/metrics gates — SKIPS an
+# absent or UNKNOWN (unbudgetable) asset rather than double-reporting it. _prop_spec's metric is
+# irrelevant here (this gate reads only the body's propAsset).
+
+# A KNOWN asset that is NOT the region's deterministic pick — a stale/tampered fill's payload.
+_WRONG_ASSET = next(a for a in sorted(prop.ASSET_TRIS) if a != _REGION_ASSET)
+
+
+def test_prop_asset_consistency_accepts_the_region_true_asset():
+    # FM1 (no false reject): the fill prop.run selects for this brief's region — nothing to report.
+    assert validator._prop_asset_consistency(_brief(), _prop_spec(0.0), _prop_body([])) == []
+
+
+def test_prop_asset_consistency_rejects_a_different_known_asset():
+    # FM2 (the exploit): a fill swapped to a different BUDGETABLE asset (a down-swap to a cheaper prop, or
+    # any stale/tampered pick) — rejected, naming prop, the message carrying BOTH the emitted and the
+    # region-true asset. This is the wrong-but-VALID pick the triangle/budget checks structurally miss.
+    issues = validator._prop_asset_consistency(_brief(), _prop_spec(0.0), _prop_body([], fill_asset=_WRONG_ASSET))
+    assert len(issues) == 1
+    assert "propAsset" in issues[0]
+    assert _WRONG_ASSET in issues[0] and _REGION_ASSET in issues[0]
+    assert "prop" in issues[0]
+
+
+def test_prop_asset_consistency_skips_an_absent_or_unknown_asset():
+    # FM3 (degrade / no double-report): an absent propAsset (field-presence is the well-formedness gate's
+    # concern) OR an UNKNOWN asset (not in ASSET_TRIS — owned by _prop_triangle_consistency's unbudgetable
+    # report / the metrics-schema gate) is SKIPPED here, so a known-but-unbudgetable fill is never double-
+    # reported alongside the triangle gate. This gate fires only for a wrong-but-BUDGETABLE pick.
+    spec = _prop_spec(0.0)
+    no_propasset = (
+        '#usda 1.0\n(\n    defaultPrim = "Props"\n)\n\n'
+        'def PointInstancer "Props"\n{\n    custom int placementCount = 5\n}\n'
+    )
+    assert validator._prop_asset_consistency(_brief(), spec, no_propasset) == []  # absent
+    assert "phantom_01" not in prop.ASSET_TRIS  # premise: unknown
+    assert validator._prop_asset_consistency(_brief(), spec, _prop_body([], fill_asset="phantom_01")) == []
+
+
+def test_prop_asset_consistency_tracks_the_selection_in_lock_step():
+    # FM4 (desync): the expectation IS prop._select_asset(region)'s output — the exact region-true asset
+    # accepts, any other KNOWN asset rejects. A copied sorted(ASSET_TRIS) index or a re-implemented
+    # hash/salt would drift and either false-reject the legit pick or miss a tampered one.
+    spec = _prop_spec(0.0)
+    assert validator._prop_asset_consistency(_brief(), spec, _prop_body([])) == []
+    assert validator._prop_asset_consistency(_brief(), spec, _prop_body([], fill_asset=_WRONG_ASSET)) != []
+
+
+async def test_run_rejects_a_prop_fill_asset_that_disagrees_with_the_brief(tmp_path):
+    # The exploit at run() level: the fill DOWN-SWAPPED to the cheapest known asset with the triangles
+    # metric re-synced to count × _asset_tris(cheaper) AND the optimizer body re-synced (_prop_metric_set
+    # does both) — so the triangle gate and the budget gate stay silent — ships the region's fill as the
+    # wrong prop at the wrong per-asset budget (the 20x under-count). Only the brief re-derivation sees
+    # it: rejected, routed back to prop, the message naming propAsset and BOTH assets.
+    cheaper = min(prop.ASSET_TRIS, key=prop._asset_tris)
+    assert cheaper != _REGION_ASSET and prop._asset_tris(cheaper) < prop._asset_tris(_REGION_ASSET)  # premise
+    count = _REGION_PLACEMENTS
+    prop_tris = float(count * prop._asset_tris(cheaper))  # re-synced to the cheaper fill, no required
+    layers = _prop_metric_set(tmp_path, placement_count=count, required=[], prop_tris=prop_tris, fill_asset=cheaper)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("propAsset" in i and cheaper in i and _REGION_ASSET in i for i in verdict.issues)
+    assert "prop" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "prop"
+    assert _route_back_target(verdict) == "prop"
+
+
+async def test_run_leaves_an_unknown_prop_fill_to_the_triangle_gate_not_the_selection_gate(tmp_path):
+    # No double-report at run() level: an UNKNOWN fill (not in ASSET_TRIS) is owned by
+    # _prop_triangle_consistency's unbudgetable report; the selection gate SKIPS it. The run rejects
+    # (unbudgetable) but carries NO _select_asset selection message — the two gates never both fire on
+    # the same unknown asset.
+    assert "phantom_01" not in prop.ASSET_TRIS  # premise
+    layers = _prop_metric_set(
+        tmp_path, placement_count=_REGION_PLACEMENTS, required=[], prop_tris=50000.0, fill_asset="phantom_01"
+    )
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("ASSET_TRIS" in i for i in verdict.issues)  # the triangle gate owns it
+    assert not any("_select_asset" in i for i in verdict.issues)  # the selection gate stayed silent
+    assert "prop" in verdict.failing_specialists
