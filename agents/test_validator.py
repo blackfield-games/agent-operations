@@ -1985,6 +1985,52 @@ def test_terrain_triangle_consistency_tracks_the_heightfield_formula_in_lock_ste
     assert validator._terrain_triangle_consistency(spec, _terrain_body(g2)) != []
 
 
+# gridResolution↔brief re-derivation — the brief-re-derivation twin of the biome uncapped
+# scatter-count gate. terrain.run emits _grid_resolution(region), a region-varying deterministic
+# value, and the triangle gate above pins triangles↔gridResolution — but the gridResolution itself
+# is trusted blindly. A stale/tampered grid with a re-synced triangles metric passes the triangle
+# gate AND the budget sum; these pin that the validator re-derives it off the brief, rejects a
+# disagreeing grid (routed to terrain), skips an unverifiable body, and tracks the formula in
+# lock-step. _terrain_spec's metric is irrelevant here (this gate reads only the body's grid).
+
+
+def test_terrain_grid_resolution_consistency_accepts_the_region_true_grid():
+    # FM1 (no false reject): the grid terrain.run emits for this brief's region — nothing to report.
+    spec = _terrain_spec(0.0)
+    assert validator._terrain_grid_resolution_consistency(_brief(), spec, _terrain_body(_REGION_GRID)) == []
+
+
+def test_terrain_grid_resolution_consistency_rejects_a_grid_that_disagrees_with_the_brief():
+    # FM2: a stale/tampered grid (authored for another region) — rejected, naming terrain, the
+    # message carrying both the emitted grid and the region-true expectation.
+    spec = _terrain_spec(0.0)
+    tampered = _REGION_GRID + 1
+    issues = validator._terrain_grid_resolution_consistency(_brief(), spec, _terrain_body(tampered))
+    assert len(issues) == 1
+    assert "gridResolution" in issues[0]
+    assert str(tampered) in issues[0] and str(_REGION_GRID) in issues[0]
+    assert "terrain" in issues[0]
+
+
+def test_terrain_grid_resolution_consistency_skips_an_unverifiable_body():
+    # FM3 (degrade, no false reject): no gridResolution (the VALID_BODY placeholder other gates'
+    # fixtures use), or a <1 / non-integer grid, leaves the value unverifiable — SKIP, mirroring
+    # _terrain_triangle_consistency's own guard exactly so no other fixture is newly false-rejected.
+    spec = _terrain_spec(0.0)
+    assert validator._terrain_grid_resolution_consistency(_brief(), spec, VALID_BODY) == []
+    assert validator._terrain_grid_resolution_consistency(_brief(), spec, _terrain_body(0)) == []
+    assert validator._terrain_grid_resolution_consistency(_brief(), spec, _terrain_body("512.5")) == []
+
+
+def test_terrain_grid_resolution_consistency_tracks_the_brief_in_lock_step():
+    # FM4 (desync): the expectation IS terrain._grid_resolution(region)'s output — the exact grid
+    # accepts, off-by-one rejects. A copied BASE_GRID_RESOLUTION or a re-implemented jitter would
+    # drift and either false-reject a legit grid or miss a tampered one.
+    spec = _terrain_spec(0.0)
+    assert validator._terrain_grid_resolution_consistency(_brief(), spec, _terrain_body(_REGION_GRID)) == []
+    assert validator._terrain_grid_resolution_consistency(_brief(), spec, _terrain_body(_REGION_GRID + 1)) != []
+
+
 def _terrain_metric_set(root: Path, *, grid, terrain_tris: float) -> list[LayerSpec]:
     """A full well-formed set with terrain declaring `grid` and metering `terrain_tris`, and the
     optimization body re-synced to the resulting summed geometry so the budget gate stays silent
@@ -2023,6 +2069,28 @@ async def test_run_rejects_a_stale_terrain_metric_and_routes_to_terrain(tmp_path
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert not verdict.accepted
     assert any("terrain" in i and "triangles metric" in i for i in verdict.issues)
+    assert "terrain" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "terrain"
+    assert _route_back_target(verdict) == "terrain"
+
+
+async def test_run_rejects_a_terrain_grid_that_disagrees_with_the_brief(tmp_path):
+    # FM2 at run() level (the exploit the gate exists to catch): a gridResolution changed in
+    # isolation, with the triangles metric re-synced to it (_terrain_metric_set co-emits
+    # _heightfield_triangles(grid)) AND the optimizer body re-synced — so the triangle gate and the
+    # budget gate stay silent — ships a heightfield at the wrong resolution for its region. Only the
+    # brief re-derivation sees it: rejected, routed back to terrain, the message naming gridResolution
+    # and both the tampered and the region-true grid.
+    tampered = _REGION_GRID + 1
+    layers = _terrain_metric_set(
+        tmp_path, grid=tampered, terrain_tris=float(terrain._heightfield_triangles(tampered))
+    )
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any(
+        "gridResolution" in i and str(tampered) in i and str(_REGION_GRID) in i
+        for i in verdict.issues
+    )
     assert "terrain" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "terrain"
     assert _route_back_target(verdict) == "terrain"
