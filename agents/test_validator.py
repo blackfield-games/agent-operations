@@ -2532,3 +2532,86 @@ async def test_run_rejects_a_stale_prop_metric_and_routes_to_prop(tmp_path):
     assert "prop" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "prop"
     assert _route_back_target(verdict) == "prop"
+
+
+# ---- prop placementCount vs the brief: the re-derived density must match prop._placement_count -------
+#
+# The brief-re-derivation twin of the terrain gridResolution / biome uncapped scatter-count / npc
+# spawnCount gates — the 4th and last geometry emitter's brief-determined dimension. prop.run emits
+# _placement_count(region), a region-varying deterministic count, and the triangle gate above pins
+# triangles↔(placementCount × _asset_tris + Σ required) — but the placementCount ITSELF is trusted
+# blindly. A stale/tampered count with a re-synced triangles metric passes the triangle gate AND the
+# budget sum; these pin that the validator re-derives it off the brief, rejects a disagreeing count
+# (routed to prop), skips an unverifiable body, and — unlike terrain's >=1 grid — treats a PRESENT 0
+# that disagrees as a real violation (prop's floor is >=0, like biome/npc). _prop_spec's metric is
+# irrelevant here (this gate reads only the body's placementCount).
+
+
+def test_prop_placement_count_consistency_accepts_the_region_true_count():
+    # FM1 (no false reject): the count prop.run emits for this brief's region — nothing to report.
+    spec = _prop_spec(0.0)
+    body = _prop_body([], placement_count=_REGION_PLACEMENTS)
+    assert validator._prop_placement_count_consistency(_brief(), spec, body) == []
+
+
+def test_prop_placement_count_consistency_rejects_a_count_that_disagrees_with_the_brief():
+    # FM2: a stale/tampered count (authored for another region) — rejected, naming prop, the message
+    # carrying both the emitted count and the region-true expectation.
+    spec = _prop_spec(0.0)
+    tampered = _REGION_PLACEMENTS + 1
+    issues = validator._prop_placement_count_consistency(_brief(), spec, _prop_body([], placement_count=tampered))
+    assert len(issues) == 1
+    assert "placementCount" in issues[0]
+    assert str(tampered) in issues[0] and str(_REGION_PLACEMENTS) in issues[0]
+    assert "prop" in issues[0]
+
+
+def test_prop_placement_count_consistency_skips_an_unverifiable_body():
+    # FM3 (degrade, no false reject): no placementCount (the intent-suite placeholder shape), or a
+    # negative / non-integer count, leaves it unverifiable — SKIP, mirroring _prop_triangle_consistency's
+    # own count guard. A placementCount of 0 is NOT skipped here (unlike terrain's grid < 1) — see below.
+    spec = _prop_spec(0.0)
+    assert validator._prop_placement_count_consistency(_brief(), spec, _prop_body([])) == []  # no count
+    assert validator._prop_placement_count_consistency(_brief(), spec, _prop_body([], placement_count=-4)) == []
+    assert validator._prop_placement_count_consistency(_brief(), spec, _prop_body([], placement_count="27.5")) == []
+
+
+def test_prop_placement_count_consistency_verifies_a_present_zero_that_disagrees():
+    # The biome-not-terrain boundary: prop's floor is >=0 (a 0-placement region is a valid empty scatter
+    # metering 0 fill triangles, like biome's instanceCount / npc's spawnCount, UNLIKE terrain's grid
+    # which skips <1). So a PRESENT 0 that disagrees with the brief (a tampered 0 over this nonzero-
+    # placement region) is a REAL violation, not a skip — the exact case a `count <= 0` skip would swallow.
+    assert _REGION_PLACEMENTS > 0  # premise: this region places a nonzero scatter
+    spec = _prop_spec(0.0)
+    issues = validator._prop_placement_count_consistency(_brief(), spec, _prop_body([], placement_count=0))
+    assert len(issues) == 1 and "placementCount" in issues[0] and "prop" in issues[0]
+
+
+def test_prop_placement_count_consistency_tracks_the_brief_in_lock_step():
+    # FM4 (desync): the expectation IS prop._placement_count(region)'s output — the exact count accepts,
+    # off-by-one rejects. A copied BASE_PLACEMENTS or a re-implemented jitter would drift and either
+    # false-reject a legit count or miss a tampered one.
+    spec = _prop_spec(0.0)
+    ok = _prop_body([], placement_count=_REGION_PLACEMENTS)
+    off = _prop_body([], placement_count=_REGION_PLACEMENTS + 1)
+    assert validator._prop_placement_count_consistency(_brief(), spec, ok) == []
+    assert validator._prop_placement_count_consistency(_brief(), spec, off) != []
+
+
+async def test_run_rejects_a_prop_placement_count_that_disagrees_with_the_brief(tmp_path):
+    # FM4 at run() level (the exploit the gate exists to catch): a placementCount changed in isolation,
+    # with the triangles metric re-synced to it (count × fill + Σ required) AND the optimizer body
+    # re-synced (_prop_metric_set does both) — so the triangle gate and the budget gate stay silent —
+    # ships the wrong prop density for the region. Only the brief re-derivation sees it: rejected, routed
+    # back to prop, the message naming placementCount and both the tampered and the region-true count.
+    tampered = _REGION_PLACEMENTS + 1
+    layers = _prop_metric_set(tmp_path, placement_count=tampered, required=[], prop_tris=_prop_expected(tampered, []))
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any(
+        "placementCount" in i and str(tampered) in i and str(_REGION_PLACEMENTS) in i
+        for i in verdict.issues
+    )
+    assert "prop" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "prop"
+    assert _route_back_target(verdict) == "prop"
