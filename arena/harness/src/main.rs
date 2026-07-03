@@ -5352,6 +5352,26 @@ mod tests {
     }
 
     #[test]
+    fn pump_to_end_deadlined_forfeits_a_dead_stream_to_a_bounded_end() {
+        // FM3 (no hang, no spin): a match whose stream is closed before a single action forfeits
+        // every tick and reaches its bounded end (the max_ticks cap) rather than blocking forever
+        // on a dead read. direct_args caps max_ticks at 4 and Disconnected returns at once (no
+        // per-tick deadline wait), so the whole enforced pump completes promptly and terminates.
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let (tx, rx) = mpsc::channel::<String>();
+        drop(tx); // the agent stream is closed before a single action
+
+        let mut out: Vec<u8> = Vec::new();
+        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(50));
+        assert_eq!(
+            m.phase(),
+            MatchPhase::Ended,
+            "the deadlined pump drives a dead-stream match to its bounded end, it does not hang"
+        );
+        assert_eq!(result.outcomes.len(), 2, "both seats are ranked in the terminal result");
+    }
+
+    #[test]
     fn parse_pickup_radius_maps_a_non_negative_radius() {
         assert_eq!(parse_pickup_radius("0"), 0);
         assert_eq!(parse_pickup_radius("4000"), 4000);
