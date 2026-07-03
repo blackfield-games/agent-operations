@@ -2,7 +2,7 @@
 pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
-import {MatchSettlement} from "../src/MatchSettlement.sol";
+import {MatchSettlement, IEAS, ISchemaRegistry} from "../src/MatchSettlement.sol";
 import {AgentRegistry} from "../src/AgentRegistry.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -13,10 +13,37 @@ contract MockToken is ERC20 {
     }
 }
 
+/// @dev Records the last attest so a test can decode its payload, and derives a
+///      deterministic uid from (schema, recipient, data) — distinct per settled result.
+contract MockEAS is IEAS {
+    uint256 public attestCalls;
+    bytes32 public lastSchema;
+    address public lastRecipient;
+    bool public lastRevocable;
+    bytes public lastData;
+
+    function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
+        attestCalls++;
+        lastSchema = request.schema;
+        lastRecipient = request.data.recipient;
+        lastRevocable = request.data.revocable;
+        lastData = request.data.data;
+        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+}
+
+/// @dev Returns a distinct uid per schema string so the 1v1 and field schemas never collide.
+contract MockSchemaRegistry is ISchemaRegistry {
+    function register(string calldata schema, address, bool) external pure returns (bytes32) {
+        return keccak256(bytes(schema));
+    }
+}
+
 contract MatchSettlementTest is Test {
     MatchSettlement settlement;
     AgentRegistry registry;
     MockToken token;
+    MockEAS eas;
 
     address owner = address(0xA11CE);
     address attester = address(0xA77E57E5);
@@ -58,11 +85,13 @@ contract MatchSettlementTest is Test {
     function setUp() public {
         token = new MockToken();
         registry = new AgentRegistry(address(token), 0, owner);
-        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        eas = new MockEAS();
+        settlement = new MatchSettlement(address(eas), address(registry), owner, REP_DELTA);
 
         vm.startPrank(owner);
         registry.setReputationWriter(address(settlement), true);
         settlement.setAttester(attester, true);
+        settlement.registerSchema(address(new MockSchemaRegistry()));
         vm.stopPrank();
 
         // Two live agent identities; carol stays unregistered.
@@ -116,23 +145,23 @@ contract MatchSettlementTest is Test {
 
     function test_constructor_revertsZeroRegistry() public {
         vm.expectRevert(MatchSettlement.ZeroRegistry.selector);
-        new MatchSettlement(address(0), owner, REP_DELTA);
+        new MatchSettlement(address(eas), address(0), owner, REP_DELTA);
     }
 
     function test_constructor_revertsZeroReputationDelta() public {
         vm.expectRevert(MatchSettlement.ZeroReputationDelta.selector);
-        new MatchSettlement(address(registry), owner, 0);
+        new MatchSettlement(address(eas), address(registry), owner, 0);
     }
 
     function test_constructor_revertsReputationDeltaTooLarge() public {
         vm.expectRevert(MatchSettlement.ReputationDeltaTooLarge.selector);
-        new MatchSettlement(address(registry), owner, uint256(type(int256).max) + 1);
+        new MatchSettlement(address(eas), address(registry), owner, uint256(type(int256).max) + 1);
     }
 
     function test_constructor_revertsZeroToken() public {
         AgentRegistry zeroTokenRegistry = new AgentRegistry(address(0), 0, owner);
         vm.expectRevert(MatchSettlement.ZeroToken.selector);
-        new MatchSettlement(address(zeroTokenRegistry), owner, REP_DELTA);
+        new MatchSettlement(address(eas), address(zeroTokenRegistry), owner, REP_DELTA);
     }
 
     // --- openMatch (FM2: attester gating; idempotency: single-use id) ---
@@ -2642,6 +2671,7 @@ contract MatchSettlementReentrancyTest is Test {
     MatchSettlement settlement;
     AgentRegistry registry;
     HookToken token;
+    MockEAS eas;
     ReentrantWinner attacker;
 
     address owner = address(0xA11CE);
@@ -2656,13 +2686,15 @@ contract MatchSettlementReentrancyTest is Test {
     function setUp() public {
         token = new HookToken();
         registry = new AgentRegistry(address(token), 0, owner);
-        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        eas = new MockEAS();
+        settlement = new MatchSettlement(address(eas), address(registry), owner, REP_DELTA);
         attacker = new ReentrantWinner(settlement, registry, token);
 
         vm.startPrank(owner);
         registry.setReputationWriter(address(settlement), true);
         settlement.setAttester(attester, true);
         settlement.setAttester(address(attacker), true); // grant so reentry tests the fence, not the gate
+        settlement.registerSchema(address(new MockSchemaRegistry()));
         vm.stopPrank();
 
         // bob: a normal registered, funded opponent.
@@ -2755,7 +2787,7 @@ contract MatchSettlementRefundReentrancyTest is Test {
     function setUp() public {
         token = new HookToken();
         registry = new AgentRegistry(address(token), 0, owner);
-        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        settlement = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
         attacker = new ReentrantRefundClaimer(settlement, registry, token);
 
         vm.startPrank(owner);
@@ -2857,7 +2889,7 @@ contract MatchSettlementFieldRefundReentrancyTest is Test {
     function setUp() public {
         token = new HookToken();
         registry = new AgentRegistry(address(token), 0, owner);
-        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        settlement = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
         attacker = new ReentrantFieldClaimer(settlement, registry, token);
 
         vm.startPrank(owner);
@@ -2924,13 +2956,14 @@ contract MatchSettlementFieldSettleReentrancyTest is Test {
     function setUp() public {
         token = new HookToken();
         registry = new AgentRegistry(address(token), 0, owner);
-        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        settlement = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
         attacker = new ReentrantFieldClaimer(settlement, registry, token);
 
         vm.startPrank(owner);
         registry.setReputationWriter(address(settlement), true);
         settlement.setAttester(attester, true);
         settlement.setMaxRatingDelta(RATING_CAP); // wager settle writes per-seat reputation
+        settlement.registerSchema(address(new MockSchemaRegistry()));
         vm.stopPrank();
 
         token.transfer(bob, 10_000 ether);

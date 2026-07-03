@@ -2,13 +2,29 @@
 pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
-import {MatchSettlement} from "../src/MatchSettlement.sol";
+import {MatchSettlement, IEAS, ISchemaRegistry} from "../src/MatchSettlement.sol";
 import {AgentRegistry} from "../src/AgentRegistry.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract MockToken is ERC20 {
     constructor() ERC20("Mock", "MCK") {
         _mint(msg.sender, 100_000_000 ether);
+    }
+}
+
+/// @dev A non-reverting EAS + registry so every settle path in the handler actually
+///      attests and mutates state (an unregistered schema would revert SchemaNotSet and
+///      silently make the settle invariants vacuous). The invariants don't read the
+///      attestation, only that settling succeeds, so the uid derivation is unobserved.
+contract MockEAS is IEAS {
+    function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
+        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+}
+
+contract MockSchemaRegistry is ISchemaRegistry {
+    function register(string calldata schema, address, bool) external pure returns (bytes32) {
+        return keccak256(bytes(schema));
     }
 }
 
@@ -326,7 +342,7 @@ contract MatchSettlementInvariantTest is Test {
     function setUp() public {
         token = new MockToken();
         registry = new AgentRegistry(address(token), 0, owner);
-        settlement = new MatchSettlement(address(registry), owner, REP_DELTA);
+        settlement = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
 
         address[] memory actors = new address[](4);
         actors[0] = address(0xB0B);
@@ -340,6 +356,7 @@ contract MatchSettlementInvariantTest is Test {
         registry.setReputationWriter(address(settlement), true);
         settlement.setAttester(address(handler), true);
         settlement.setMaxRatingDelta(RATING_CAP); // enable the variable settle handlers
+        settlement.registerSchema(address(new MockSchemaRegistry()));
         vm.stopPrank();
 
         for (uint256 i = 0; i < actors.length; i++) {
