@@ -39,6 +39,40 @@ contract MockSchemaRegistry is ISchemaRegistry {
     }
 }
 
+/// @dev On its FIRST attest, re-enters settle() for the same match — proving the Settled
+///      fence (written before the attest) rejects the reentrant settle: no double-settle,
+///      no second attestation. Mirrors RenderReceipts' ReentrantEAS.
+contract ReentrantEAS is IEAS {
+    MatchSettlement public target;
+    bytes32 public reMatchId;
+    address public reWinner;
+    bytes32 public reHash;
+    uint256 public attestCalls;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    function arm(MatchSettlement target_, bytes32 matchId_, address winner_, bytes32 hash_) external {
+        target = target_;
+        reMatchId = matchId_;
+        reWinner = winner_;
+        reHash = hash_;
+    }
+
+    function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
+        attestCalls++;
+        if (!reentered) {
+            reentered = true;
+            try target.settle(reMatchId, reWinner, reHash) {}
+            catch (bytes memory err) {
+                reentryReverted = true;
+                reentryRevertSelector = bytes4(err);
+            }
+        }
+        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+}
+
 contract MatchSettlementTest is Test {
     MatchSettlement settlement;
     AgentRegistry registry;
@@ -2595,6 +2629,208 @@ contract MatchSettlementTest is Test {
         vm.warp(deadline);
         settlement.refundFieldExpired(FIELD);
         assertFalse(settlement.isFieldFullyFunded(FIELD), "expire refunds -> not fully funded");
+    }
+
+    // --- EAS attestation (FM1 reentrancy fence, FM3 encoding round-trip, FM4 persistence) ---
+
+    /// @dev Wire a fresh settlement (a second reputation writer alongside the setUp one) and
+    ///      let alice/bob fund its escrow, optionally registering the schemas.
+    function _wireFresh(MatchSettlement s, bool withSchema) internal {
+        vm.startPrank(owner);
+        registry.setReputationWriter(address(s), true);
+        s.setAttester(attester, true);
+        s.setMaxRatingDelta(RATING_CAP);
+        if (withSchema) s.registerSchema(address(new MockSchemaRegistry()));
+        vm.stopPrank();
+        vm.prank(alice);
+        token.approve(address(s), type(uint256).max);
+        vm.prank(bob);
+        token.approve(address(s), type(uint256).max);
+    }
+
+    /// @dev FM3/FM4: a decisive settle attests the 1v1 shape to the winner and the payload
+    ///      decodes back EXACTLY — with seat B winning, so agentA carries the NEGATED delta
+    ///      (a swapped-seat or dropped-negation encoding is caught). The uid persists.
+    function test_settle_attestsDecisiveResultThatDecodesBack() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        int256 delta = 25 ether;
+
+        vm.prank(attester);
+        settlement.settleRanked(MATCH, bob, HASH, delta); // seat B wins
+
+        assertEq(eas.attestCalls(), 1, "one attestation per settled match");
+        assertEq(eas.lastSchema(), settlement.schemaUid(), "attested under the 1v1 schema");
+        assertEq(eas.lastRecipient(), bob, "recipient is the decisive winner");
+        assertTrue(eas.lastRevocable(), "revocable for the future dispute path");
+
+        (bytes32 mId, address agentA, address agentB, address winner, bytes32 replayHash, int256 deltaA) =
+            abi.decode(eas.lastData(), (bytes32, address, address, address, bytes32, int256));
+        assertEq(mId, MATCH, "matchId");
+        assertEq(agentA, alice, "seat A preserved in order");
+        assertEq(agentB, bob, "seat B preserved in order");
+        assertEq(winner, bob, "winner named");
+        assertEq(replayHash, HASH, "replay digest");
+        assertEq(deltaA, -delta, "agentA carries the negated winner delta");
+
+        bytes32 expected = keccak256(abi.encode(settlement.schemaUid(), bob, eas.lastData()));
+        assertEq(settlement.matchAttestationUid(MATCH), expected, "uid of the exact payload persisted");
+    }
+
+    /// @dev FM4 draw edge: a draw shares the 1v1 schema but names NO winner (winner==0,
+    ///      recipient==0) while still carrying agentA's signed delta. A schema assuming a
+    ///      decisive pair would mis-encode this.
+    function test_settleDraw_attestsDrawWithZeroWinner() public {
+        _enableVariable(RATING_CAP);
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        int256 deltaA = 15 ether;
+
+        vm.prank(attester);
+        settlement.settleDrawRanked(MATCH, HASH, deltaA);
+
+        assertEq(eas.attestCalls(), 1);
+        assertEq(eas.lastSchema(), settlement.schemaUid(), "draw shares the 1v1 schema");
+        assertEq(eas.lastRecipient(), address(0), "a draw names no recipient");
+
+        (bytes32 mId, address agentA, address agentB, address winner, bytes32 replayHash, int256 dA) =
+            abi.decode(eas.lastData(), (bytes32, address, address, address, bytes32, int256));
+        assertEq(mId, MATCH);
+        assertEq(agentA, alice);
+        assertEq(agentB, bob);
+        assertEq(winner, address(0), "winner==0 marks the draw");
+        assertEq(replayHash, HASH);
+        assertEq(dA, deltaA, "agentA's signed draw delta");
+        assertTrue(settlement.matchAttestationUid(MATCH) != bytes32(0), "draw persisted a uid");
+    }
+
+    /// @dev FM4 field edge: the reputation-only settleField attests the full roster + delta
+    ///      vector against the DISTINCT field schema, with a zero pot.
+    function test_settleField_attestsRosterWithZeroPot() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(eas.attestCalls(), 1);
+        assertEq(eas.lastSchema(), settlement.fieldSchemaUid(), "attested under the field schema");
+        assertEq(eas.lastRecipient(), address(0));
+
+        (bytes32 mId, address[] memory agents, int256[] memory deltas, bytes32 replayHash, uint256 pot) =
+            abi.decode(eas.lastData(), (bytes32, address[], int256[], bytes32, uint256));
+        assertEq(mId, MATCH);
+        assertEq(agents.length, 3, "full roster carried");
+        assertEq(agents[0], alice);
+        assertEq(agents[1], bob);
+        assertEq(agents[2], dave);
+        assertEq(deltas[0], 30 ether);
+        assertEq(deltas[1], -10 ether);
+        assertEq(deltas[2], -20 ether);
+        assertEq(replayHash, HASH);
+        assertEq(pot, 0, "reputation-only field carries a zero pot");
+        assertTrue(settlement.matchAttestationUid(MATCH) != bytes32(0));
+    }
+
+    /// @dev FM4 field-wager edge: settleFieldWager attests the roster + delta vector AND the
+    ///      funded pot (stake * seats) against the field schema. The field schema (not the 1v1
+    ///      pair) is what round-trips a 3-seat wager.
+    function test_settleFieldWager_attestsRosterAndPot() public {
+        _enableVariable(RATING_CAP);
+        address[] memory ag = _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertEq(eas.attestCalls(), 1);
+        assertEq(eas.lastSchema(), settlement.fieldSchemaUid());
+        assertEq(eas.lastRecipient(), address(0));
+
+        (bytes32 mId, address[] memory agents, int256[] memory deltas, bytes32 replayHash, uint256 pot) =
+            abi.decode(eas.lastData(), (bytes32, address[], int256[], bytes32, uint256));
+        assertEq(mId, FIELD);
+        assertEq(agents[0], ag[0]);
+        assertEq(agents[1], ag[1]);
+        assertEq(agents[2], ag[2]);
+        assertEq(deltas[0], 20 ether);
+        assertEq(deltas[1], 0);
+        assertEq(deltas[2], -20 ether);
+        assertEq(replayHash, HASH);
+        assertEq(pot, 3 * STAKE, "wager pot = stake * seats");
+        assertTrue(settlement.matchAttestationUid(FIELD) != bytes32(0));
+    }
+
+    /// @dev FM1: the attest is the LAST interaction, after the Settled fence and the payout.
+    ///      A reentrant EAS re-entering settle() is rejected by the fence (MatchNotOpen) — no
+    ///      double-settle, no double-pay, exactly one attestation.
+    function test_settle_reentrantEasCannotDoubleSettle() public {
+        ReentrantEAS reEas = new ReentrantEAS();
+        MatchSettlement s = new MatchSettlement(address(reEas), address(registry), owner, REP_DELTA);
+        _wireFresh(s, true);
+        vm.prank(owner);
+        s.setAttester(address(reEas), true); // grant so the reentry tests the fence, not the attester gate
+
+        vm.prank(attester);
+        s.openMatch(MATCH, alice, bob, STAKE);
+        vm.prank(alice);
+        s.fund(MATCH);
+        vm.prank(bob);
+        s.fund(MATCH);
+
+        reEas.arm(s, MATCH, alice, HASH);
+        uint256 aliceBefore = token.balanceOf(alice);
+
+        vm.prank(attester);
+        s.settle(MATCH, alice, HASH);
+
+        assertTrue(reEas.reentered(), "reentry fired");
+        assertTrue(reEas.reentryReverted(), "reentrant settle blocked by the Settled fence");
+        assertEq(
+            reEas.reentryRevertSelector(),
+            MatchSettlement.MatchNotOpen.selector,
+            "the fence, not another revert"
+        );
+        assertEq(reEas.attestCalls(), 1, "settled and attested exactly once");
+        assertEq(token.balanceOf(alice), aliceBefore + 2 * STAKE, "winner paid the pot exactly once");
+        assertEq(token.balanceOf(address(s)), 0, "no escrow drained beyond the pot");
+        assertTrue(s.matchAttestationUid(MATCH) != bytes32(0), "single attestation persisted");
+    }
+
+    /// @dev FM2: settle-liveness is coupled to schema registration — a 1v1 settle before
+    ///      registerSchema reverts SchemaNotSet (the guard fires before any effect).
+    function test_settle_revertsWhenSchemaUnregistered() public {
+        MatchSettlement s = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
+        _wireFresh(s, false); // schema deliberately NOT registered
+
+        vm.prank(attester);
+        s.openMatch(MATCH, alice, bob, STAKE);
+        vm.prank(alice);
+        s.fund(MATCH);
+        vm.prank(bob);
+        s.fund(MATCH);
+
+        vm.expectRevert(MatchSettlement.SchemaNotSet.selector);
+        vm.prank(attester);
+        s.settle(MATCH, alice, HASH);
+    }
+
+    /// @dev FM2 field variant: settleField reverts SchemaNotSet on the field schema guard.
+    function test_settleField_revertsWhenSchemaUnregistered() public {
+        MatchSettlement s = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
+        _wireFresh(s, false);
+        _registerAgent(dave, "dave-bot");
+
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+
+        vm.expectRevert(MatchSettlement.SchemaNotSet.selector);
+        vm.prank(attester);
+        s.settleField(MATCH, ag, ds, HASH);
     }
 }
 
