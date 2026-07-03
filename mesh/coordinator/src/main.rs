@@ -11287,6 +11287,116 @@ mod tests {
         assert_eq!(store.completed_count().unwrap(), 0);
     }
 
+    /// The credit-binding gate: a session authenticated as A cannot settle a
+    /// result attributed to a different identity B, even one that is validly
+    /// self-signed (so the signature gate passes). The verified signer must match
+    /// the session's dispatch-holder identity — otherwise credit, the on-chain EAS
+    /// receipt, and /stats standing would land on a key that never authenticated or
+    /// was dispatched the job. A foreign identity is an earner fault on a still-
+    /// renderable job → Requeue, nothing settled. Twin of the content-gate requeue.
+    #[tokio::test]
+    async fn ws_submit_with_foreign_earner_address_rejected() {
+        const KEY_B: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        // A holds this dispatch; the session identity is the dev address.
+        let (offered, seq) = state
+            .store
+            .lock()
+            .await
+            .take_next(|_| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((offered.id, seq), (job_id, 1));
+
+        // A valid, self-signed result — but for a DIFFERENT identity than the
+        // session. The signature gate passes (B really signed it); the identity
+        // bind must still refuse it so credit can't be minted for B.
+        let foreign = signed_result_by(KEY_B, job_id, "beef");
+        assert_ne!(
+            foreign.earner_address,
+            dev_address(),
+            "B must differ from the session identity A"
+        );
+        match handle_submit(&state, &Some((offered.clone(), seq)), true, foreign, &dev_address()).await {
+            SubmitOutcome::Requeue(
+                CoordinatorMsg::Rejected {
+                    job_id: jid,
+                    reason,
+                },
+                kind,
+            ) => {
+                assert_eq!(jid, job_id);
+                assert_eq!(reason, "result earner does not match the session identity");
+                assert_eq!(kind, RequeueKind::EarnerFault);
+            }
+            other => panic!("a foreign-identity submit must Requeue(EarnerFault), got {other:?}"),
+        }
+
+        // Nothing settled and no one credited: still in_flight under our dispatch.
+        let store = state.store.lock().await;
+        assert_eq!(
+            store.job_status(&job_id).unwrap().as_deref(),
+            Some("in_flight")
+        );
+        assert_eq!(
+            store.completed_count().unwrap(),
+            0,
+            "no credit for the foreign identity"
+        );
+    }
+
+    /// The identity bind is case-invariant: it runs on the canonical (lowercased)
+    /// signer, so an honest result whose claimed earner_address arrives in a
+    /// different hex case than the session's canonical Hello identity still settles
+    /// — the compare is A == A, not a casing artifact. Guards against binding
+    /// before the canonical fold.
+    #[tokio::test]
+    async fn ws_submit_same_identity_mixed_case_accepts() {
+        let state = test_state_empty().await;
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+
+        let (offered, seq) = state
+            .store
+            .lock()
+            .await
+            .take_next(|_| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((offered.id, seq), (job_id, 1));
+
+        // The session's own identity, but UPPER-cased on the wire. The signature
+        // gate is case-insensitive; the canonical fold lowercases it before the
+        // identity compare, so this is the honest A == A path.
+        let mut mixed = signed_result(job_id, "beef");
+        mixed.earner_address = format!("0x{}", mixed.earner_address[2..].to_ascii_uppercase());
+        assert_ne!(
+            mixed.earner_address,
+            dev_address(),
+            "the wire casing differs from the canonical session identity"
+        );
+        match handle_submit(&state, &Some((offered, seq)), true, mixed, &dev_address()).await {
+            SubmitOutcome::Accepted(CoordinatorMsg::Accepted { job_id: jid, .. }) => {
+                assert_eq!(jid, job_id)
+            }
+            other => panic!("an honest same-identity result (mixed case) must be Accepted, got {other:?}"),
+        }
+
+        let store = state.store.lock().await;
+        assert_eq!(store.job_status(&job_id).unwrap().as_deref(), Some("done"));
+        let credited = store.completed_count_by_earner().unwrap();
+        assert_eq!(
+            credited.get(&dev_address()),
+            Some(&1),
+            "credit lands on the canonical session identity"
+        );
+    }
+
     /// FM4 mechanism: a job in the per-session `skip` set is not handed back to
     /// the same earner, so a faulting earner can't be re-offered the job it just
     /// faulted on (no reject/re-offer hot loop). The job stays queued for others.
