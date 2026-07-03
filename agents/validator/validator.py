@@ -295,6 +295,21 @@ async def run(
             issues.append(message)
             failing.add("prop")
 
+    # Prop FILL propAsset vs the brief — the SELECTION twin of the four count/grid brief-re-derivation
+    # gates (terrain grid / biome scatter / npc spawn / prop placement). The triangle gate pins
+    # triangles↔(placementCount × _asset_tris(propAsset) + Σ required) but TRUSTS the emitted asset to
+    # price the fill, and the count gate re-derives only the count; a fill swapped in isolation to a
+    # cheaper known asset, with the triangles metric re-synced, passes both the triangle gate and the
+    # budget sum while shipping the region's fill as the wrong prop at the wrong per-asset budget. Re-
+    # derive WHICH asset via prop._select_asset off the brief and reject a mismatch, routing back to
+    # prop. Wellformed-only (body↔brief, no metric); an absent propAsset is skipped and an unknown asset
+    # is left to the triangle/metrics gates (no double-report) — this gate owns a wrong-but-valid pick.
+    if prop_layer is not None and prop_layer in wellformed:
+        prop_text = (layers_root / prop_layer.path).read_text()
+        for message in _prop_asset_consistency(brief, prop_layer, prop_text):
+            issues.append(message)
+            failing.add("prop")
+
     # Per-layer well-formedness isn't composability: two specialists can define the
     # same prim path with incompatible types, or dangle an override over a prim no
     # one defines, and the layers still open individually while the composed stage
@@ -1140,6 +1155,45 @@ def _prop_placement_count_consistency(brief: WorldBrief, layer: LayerSpec, text:
     return [
         f"prop layer {layer.path} placementCount {int(count)} != the {expected} the brief's region "
         f"determines (prop._placement_count) — a stale or tampered placement count; re-run prop"
+    ]
+
+
+def _prop_asset_consistency(brief: WorldBrief, layer: LayerSpec, text: str) -> list[str]:
+    """Why prop's emitted fill ``propAsset`` disagrees with the library asset the brief's region
+    deterministically selects, or [] when they agree — the SELECTION twin of the four count/grid
+    brief-re-derivation gates (terrain gridResolution / biome scatter-count / npc spawnCount / prop
+    placementCount) over prop's OTHER brief-determined dimension: not how MANY props, but WHICH one.
+
+    prop places one hash-selected fill asset ``placementCount`` times — ``prop.run`` emits
+    ``propAsset = _select_asset(brief.region.region_id)`` (a stable per-region hash over the SORTED
+    ``ASSET_TRIS`` keys, salted distinctly from the count so asset and count vary independently).
+    ``_prop_triangle_consistency`` pins triangles↔(placementCount × ``_asset_tris(propAsset)`` + Σ
+    required) but TRUSTS the emitted asset to PRICE the fill, and the placement-count gate re-derives
+    only the count — so a fill swapped in isolation to a CHEAPER known asset, with the triangles metric
+    re-synced to that asset, passes the triangle gate AND ``_budget_self_consistency`` while shipping
+    the region's fill as the wrong prop at the wrong per-asset budget (a hero comms_tower_01 at 12k tris
+    silently down-swapped to an ammo_crate_01 at 600 — a 20× geometry under-count the sum cannot see).
+    Re-derive WHICH asset via prop's OWN ``_select_asset`` off the brief the validator already holds (the
+    same brief ``prop.run`` consumed) and reject a mismatch, naming prop so route-back targets it.
+
+    Owns only the deterministic FILL pick: the director-required hero set is intent-driven (the intent
+    gate's concern), not brief-region-derived, so it stays out of this gate. Fires ONLY for a present
+    fill that IS budgetable (a member of ``ASSET_TRIS``): an absent ``propAsset`` is skipped (field-
+    presence is the well-formedness gate's concern; ``prop.run`` always co-emits it), and an UNKNOWN
+    asset is left to ``_prop_triangle_consistency``'s unbudgetable report (under metrics_ok) / the
+    metrics-schema gate (which routes prop back when the metric is unreadable and the triangle gate is
+    skipped) — never double-reported here. This gate's unique concern is a wrong-but-VALID pick, the
+    hole the budget checks structurally cannot see."""
+    fill = re.search(r'propAsset\s*=\s*"([^"]*)"', text)
+    if fill is None or fill.group(1) not in prop.ASSET_TRIS:
+        return []
+    expected = prop._select_asset(brief.region.region_id)
+    if fill.group(1) == expected:
+        return []
+    return [
+        f"prop layer {layer.path} fill propAsset {fill.group(1)!r} != the {expected!r} the brief's "
+        f"region deterministically selects (prop._select_asset) — a stale or tampered fill asset; "
+        f"re-run prop"
     ]
 
 
