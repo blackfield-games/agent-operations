@@ -2308,7 +2308,7 @@ def _npc_metric_set(root: Path, *, spawn_count, archetype, npc_tris: float) -> l
 async def test_run_accepts_an_npc_metric_consistent_with_its_spawn_and_archetype(tmp_path):
     # FM1 at run() level: a correct world (npc metric == spawnCount × _character_tris, optimizer body
     # re-synced) validates clean — the new gate adds no false rejection.
-    count, archetype = 8, "raider"
+    count, archetype = _REGION_SPAWNS, "raider"
     npc_tris = float(count * npc._character_tris(archetype))
     layers = _npc_metric_set(tmp_path, spawn_count=count, archetype=archetype, npc_tris=npc_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -2319,7 +2319,7 @@ async def test_run_rejects_a_stale_npc_metric_and_routes_to_npc(tmp_path):
     # FM2 at run() level: npc's metric is stale/tampered (doesn't match its spawnCount × archetype),
     # the optimizer body re-synced to that metric so the BUDGET gate stays silent — npc is the ONLY
     # issue (no double-report) and route-back targets it.
-    count, archetype = 8, "raider"
+    count, archetype = _REGION_SPAWNS, "raider"
     npc_tris = float(count * npc._character_tris(archetype)) + 7000.0
     layers = _npc_metric_set(tmp_path, spawn_count=count, archetype=archetype, npc_tris=npc_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -2391,6 +2391,26 @@ def test_npc_spawn_count_consistency_tracks_the_brief_in_lock_step():
     off = _npc_body("raider", spawn_count=_REGION_SPAWNS + 1)
     assert validator._npc_spawn_count_consistency(_brief(), spec, ok) == []
     assert validator._npc_spawn_count_consistency(_brief(), spec, off) != []
+
+
+async def test_run_rejects_an_npc_spawn_count_that_disagrees_with_the_brief(tmp_path):
+    # FM4 at run() level (the exploit the gate exists to catch): a spawnCount changed in isolation, with
+    # the triangles metric re-synced to it (spawn_count × _character_tris) AND the optimizer body
+    # re-synced (_npc_metric_set does both) — so the triangle gate and the budget gate stay silent —
+    # ships the wrong crowd size for the region. Only the brief re-derivation sees it: rejected, routed
+    # back to npc, the message naming spawnCount and both the tampered and the region-true count.
+    tampered = _REGION_SPAWNS + 1
+    npc_tris = float(tampered * npc._character_tris("raider"))
+    layers = _npc_metric_set(tmp_path, spawn_count=tampered, archetype="raider", npc_tris=npc_tris)
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any(
+        "spawnCount" in i and str(tampered) in i and str(_REGION_SPAWNS) in i
+        for i in verdict.issues
+    )
+    assert "npc" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "npc"
+    assert _route_back_target(verdict) == "npc"
 
 
 # ---- prop placement triangle self-consistency: the metric must match count*fill + Σ required ------
