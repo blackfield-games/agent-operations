@@ -17,6 +17,31 @@ interface IAgentRegistry {
     function TOKEN() external view returns (address);
 }
 
+/// @notice Minimal EAS interfaces — the same canonical Base EAS deployment RenderReceipts
+///         attests render receipts through. Address resolved at deploy time from .env
+///         (EAS_ADDRESS / EAS_SCHEMA_REGISTRY).
+interface IEAS {
+    struct AttestationRequestData {
+        address recipient;
+        uint64 expirationTime;
+        bool revocable;
+        bytes32 refUid;
+        bytes data;
+        uint256 value;
+    }
+
+    struct AttestationRequest {
+        bytes32 schema;
+        AttestationRequestData data;
+    }
+
+    function attest(AttestationRequest calldata request) external payable returns (bytes32);
+}
+
+interface ISchemaRegistry {
+    function register(string calldata schema, address resolver, bool revocable) external returns (bytes32);
+}
+
 /// @notice On-chain settlement for agent-vs-agent (A2A) ranked matches — the
 ///         agent-economy loop closer. An authorized result attester records a
 ///         finalized match (the winning seat and a commitment to the arena
@@ -142,6 +167,13 @@ contract MatchSettlement is Ownable2Step {
 
     IAgentRegistry public immutable registry;
 
+    /// @notice The EAS instance every settled match is attested through — the same rail
+    ///         RenderReceipts issues render receipts on, so a ranked result becomes a
+    ///         portable, indexable, revocable on-chain attestation rather than only a
+    ///         stored `replayHash` + event. Bound at construction; the schemas are
+    ///         registered once by the owner via `registerSchema` before any match opens.
+    IEAS public immutable EAS;
+
     /// @notice The $BLCKFLD token wagers are escrowed in — real, transferable tokens.
     ///         Bound at construction to exactly `registry.TOKEN()` so the escrow token
     ///         can never desync from the identity/bond token (mirrors RenderReceipts
@@ -216,6 +248,24 @@ contract MatchSettlement is Ownable2Step {
 
     mapping(address attester => bool authorized) public resultAttesters;
 
+    /// @notice The EAS schema the two 1v1 paths (`_applyDecisive`, `_applyDraw`) attest
+    ///         against. `winner == address(0)` in an attestation marks a draw (both seats
+    ///         moved by `±deltaA`); a decisive result names the winner. Zero until the
+    ///         owner registers it — a settle before registration reverts `SchemaNotSet`.
+    bytes32 public schemaUid;
+
+    /// @notice The EAS schema the field paths (`settleField`, `settleFieldWager`) attest
+    ///         against — a full roster + per-seat delta vector, plus the wager pot (zero for
+    ///         the reputation-only `settleField`). Distinct from `schemaUid` so a field
+    ///         attestation can never be decoded against the 1v1 shape.
+    bytes32 public fieldSchemaUid;
+
+    /// @notice The EAS attestation uid minted for each settled match, keyed by the arena
+    ///         `matchId` (single-use across every entrypoint, so no shape can collide).
+    ///         Zero until the match settles; the portable pointer indexers resolve a result
+    ///         through, exactly as RenderReceipts' `receiptUid` points at a render receipt.
+    mapping(bytes32 matchId => bytes32) public matchAttestationUid;
+
     event MatchOpened(bytes32 indexed matchId, address indexed agentA, address indexed agentB, uint256 stake);
     event MatchFunded(bytes32 indexed matchId, address indexed agent, uint256 stake);
     event MatchReclaimed(bytes32 indexed matchId, address indexed agent, uint256 stake);
@@ -249,11 +299,15 @@ contract MatchSettlement is Ownable2Step {
     ///      the tx — kept off the log so the event stays a fixed-size settlement marker.
     event FieldMatchWagerSettled(bytes32 indexed matchId, bytes32 replayHash, uint256 seats, uint256 pot);
     event AttesterSet(address indexed attester, bool authorized);
+    /// @dev One registration wires both schemas, so a single event carries both uids.
+    event SchemaRegistered(bytes32 indexed matchUid, bytes32 indexed fieldUid);
+    event MatchAttested(bytes32 indexed matchId, bytes32 indexed uid);
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
     event SettleWindowSet(uint64 settleWindow);
 
     error NotAttester();
+    error SchemaNotSet();
     error ZeroRegistry();
     error ZeroToken();
     error ZeroReputationDelta();
@@ -282,10 +336,11 @@ contract MatchSettlement is Ownable2Step {
     error NonZeroSum(int256 sum);
     error PayoutMismatch(uint256 paid, uint256 pot);
 
-    constructor(address registry_, address owner_, uint256 reputationDelta_) Ownable(owner_) {
+    constructor(address eas_, address registry_, address owner_, uint256 reputationDelta_) Ownable(owner_) {
         if (registry_ == address(0)) revert ZeroRegistry();
         if (reputationDelta_ == 0) revert ZeroReputationDelta();
         if (reputationDelta_ > uint256(type(int256).max)) revert ReputationDeltaTooLarge();
+        EAS = IEAS(eas_);
         registry = IAgentRegistry(registry_);
         // Bind escrow to exactly the token AgentRegistry bonds in, so a wager can
         // never be funded in a different token than the identity it settles against.
@@ -312,6 +367,33 @@ contract MatchSettlement is Ownable2Step {
     function setAttester(address attester, bool authorized) external onlyOwner {
         resultAttesters[attester] = authorized;
         emit AttesterSet(attester, authorized);
+    }
+
+    /// @notice Owner registers both match-result schemas on the given EAS schema registry —
+    ///         one call wires the 1v1 and field shapes together. Coupled to settle-liveness
+    ///         the same way RenderReceipts couples receipt issuance to its schema: a settle
+    ///         before this reverts `SchemaNotSet`, so the deploy runbook registers here
+    ///         BEFORE authorizing any attester or opening a match. Escrow is never stranded
+    ///         by an unregistered schema — an unresolvable match is `refundExpired`-able.
+    function registerSchema(address registry_)
+        external
+        onlyOwner
+        returns (bytes32 matchUid, bytes32 fieldUid)
+    {
+        ISchemaRegistry reg = ISchemaRegistry(registry_);
+        matchUid = reg.register(
+            "bytes32 matchId, address agentA, address agentB, address winner, bytes32 replayHash, int256 deltaA",
+            address(0),
+            true
+        );
+        fieldUid = reg.register(
+            "bytes32 matchId, address[] agents, int256[] deltas, bytes32 replayHash, uint256 pot",
+            address(0),
+            true
+        );
+        schemaUid = matchUid;
+        fieldSchemaUid = fieldUid;
+        emit SchemaRegistered(matchUid, fieldUid);
     }
 
     /// @notice Owner sets the per-match reputation magnitude. Zero is rejected so a
@@ -530,6 +612,7 @@ contract MatchSettlement is Ownable2Step {
         if (n > MAX_FIELD) revert FieldTooLarge();
         if (deltas.length != n) revert LengthMismatch();
         if (replayHash == bytes32(0)) revert ZeroReplayHash();
+        if (fieldSchemaUid == bytes32(0)) revert SchemaNotSet();
 
         _requireFreshId(matchId);
         Match storage m = matches[matchId];
@@ -562,6 +645,10 @@ contract MatchSettlement is Ownable2Step {
             registry.recordMatchResult(agents[i], deltas[i]);
         }
         emit MatchFieldSettled(matchId, replayHash, n);
+
+        _attestSettled(
+            matchId, fieldSchemaUid, address(0), abi.encode(matchId, agents, deltas, replayHash, uint256(0))
+        );
     }
 
     /// @notice Void an open match and refund every funded seat — the recovery path for
@@ -812,6 +899,7 @@ contract MatchSettlement is Ownable2Step {
     ) external onlyAttester {
         if (maxRatingDelta == 0) revert VariableSettleDisabled();
         if (replayHash == bytes32(0)) revert ZeroReplayHash();
+        if (fieldSchemaUid == bytes32(0)) revert SchemaNotSet();
 
         FieldMatch storage fm = fieldMatches[matchId];
         if (fm.status != Status.Open) revert MatchNotOpen();
@@ -834,18 +922,21 @@ contract MatchSettlement is Ownable2Step {
         // Validate BOTH vectors before any effect (CEI). `cap` is a safe cast —
         // `setMaxRatingDelta` bounds `maxRatingDelta <= int256.max`. `sum`/`paid` accumulate
         // in checked arithmetic, so a pathological vector reverts rather than wrapping past
-        // the equality checks below.
-        int256 cap = int256(maxRatingDelta);
-        int256 sum = 0;
-        uint256 paid = 0;
-        for (uint256 i = 0; i < n; i++) {
-            int256 d = deltas[i];
-            if (d > cap || d < -cap) revert RatingDeltaTooLarge();
-            sum += d;
-            paid += payouts[i];
+        // the equality checks below. Scoped in a block so the validation locals are freed
+        // before the settle effects + attest (keeps the frame off the legacy stack ceiling).
+        {
+            int256 cap = int256(maxRatingDelta);
+            int256 sum = 0;
+            uint256 paid = 0;
+            for (uint256 i = 0; i < n; i++) {
+                int256 d = deltas[i];
+                if (d > cap || d < -cap) revert RatingDeltaTooLarge();
+                sum += d;
+                paid += payouts[i];
+            }
+            if (sum != 0) revert NonZeroSum(sum);
+            if (paid != pot) revert PayoutMismatch(paid, pot);
         }
-        if (sum != 0) revert NonZeroSum(sum);
-        if (paid != pot) revert PayoutMismatch(paid, pot);
 
         fm.status = Status.Settled;
         fm.replayHash = replayHash;
@@ -861,6 +952,11 @@ contract MatchSettlement is Ownable2Step {
             if (p != 0) token.safeTransfer(roster[i], p);
         }
         emit FieldMatchWagerSettled(matchId, replayHash, n, pot);
+
+        address[] memory rosterMem = roster;
+        _attestSettled(
+            matchId, fieldSchemaUid, address(0), abi.encode(matchId, rosterMem, deltas, replayHash, pot)
+        );
     }
 
     /// @dev Shared void-and-refund mechanics for `cancelMatch` and `refundExpired`: flip
@@ -933,6 +1029,7 @@ contract MatchSettlement is Ownable2Step {
         Match storage m = matches[matchId];
         if (m.status != Status.Open) revert MatchNotOpen();
         if (replayHash == bytes32(0)) revert ZeroReplayHash();
+        if (schemaUid == bytes32(0)) revert SchemaNotSet();
         bool winnerIsA = winner == m.agentA;
         if (!winnerIsA && winner != m.agentB) revert InvalidWinner();
         uint256 stake = m.stake;
@@ -949,6 +1046,15 @@ contract MatchSettlement is Ownable2Step {
         uint256 payout = stake * 2;
         if (payout != 0) token.safeTransfer(winner, payout);
         emit MatchSettled(matchId, winner, loser, replayHash, payout);
+
+        _attestSettled(
+            matchId,
+            schemaUid,
+            winner,
+            abi.encode(
+                matchId, m.agentA, m.agentB, winner, replayHash, winnerIsA ? deltaWinner : -deltaWinner
+            )
+        );
     }
 
     /// @dev Shared draw-settlement mechanics for the fixed `settleDraw` (delta 0) and the
@@ -961,6 +1067,7 @@ contract MatchSettlement is Ownable2Step {
         Match storage m = matches[matchId];
         if (m.status != Status.Open) revert MatchNotOpen();
         if (replayHash == bytes32(0)) revert ZeroReplayHash();
+        if (schemaUid == bytes32(0)) revert SchemaNotSet();
         uint256 stake = m.stake;
         if (stake != 0 && !(m.aFunded && m.bFunded)) revert NotFullyFunded();
 
@@ -977,5 +1084,38 @@ contract MatchSettlement is Ownable2Step {
             token.safeTransfer(agentB, stake);
         }
         emit MatchDrawn(matchId, agentA, agentB, replayHash);
+
+        _attestSettled(
+            matchId,
+            schemaUid,
+            address(0),
+            abi.encode(matchId, agentA, agentB, address(0), replayHash, deltaA)
+        );
+    }
+
+    /// @dev Attest a settled result on EAS and record its uid. Called LAST in every settle
+    ///      path — after the terminal `Settled` fence, all escrow effects, and the
+    ///      settlement event — so a reentrant EAS re-enters a non-`Open` match and is
+    ///      rejected by the fence, the same CEI ordering RenderReceipts places its attest
+    ///      under. `revocable: true` leaves room for the follow-up revoke/dispute path
+    ///      (pairing with RenderReceipts.revokeReceipt). The schema is checked non-zero at
+    ///      each call site's `checks` phase, so a settle without a registered schema reverts
+    ///      before any effect.
+    function _attestSettled(bytes32 matchId, bytes32 schema, address recipient, bytes memory data) private {
+        bytes32 uid = EAS.attest(
+            IEAS.AttestationRequest({
+                schema: schema,
+                data: IEAS.AttestationRequestData({
+                    recipient: recipient,
+                    expirationTime: 0,
+                    revocable: true,
+                    refUid: bytes32(0),
+                    data: data,
+                    value: 0
+                })
+            })
+        );
+        matchAttestationUid[matchId] = uid;
+        emit MatchAttested(matchId, uid);
     }
 }

@@ -100,16 +100,20 @@ contract Deploy is Script {
         //    owner-authorized writer (the settlement contract below).
         AgentRegistry agentRegistry = new AgentRegistry(cfg.token, cfg.agentMinBond, deployer);
 
-        // 6. Match settlement — A2A wager escrow + reputation write-back. Binds its
-        //    escrow token to AgentRegistry.TOKEN() internally (can't desync), so it
+        // 6. Match settlement — A2A wager escrow + reputation write-back, and each settled
+        //    match attested on the same EAS rail as render receipts. Binds its escrow token
+        //    to AgentRegistry.TOKEN() internally (can't desync), so beyond the EAS address it
         //    takes the registry address + the owner-set reputation magnitude only.
         MatchSettlement matchSettlement =
-            new MatchSettlement(address(agentRegistry), deployer, cfg.matchReputationDelta);
+            new MatchSettlement(cfg.eas, address(agentRegistry), deployer, cfg.matchReputationDelta);
 
         // --- post-deploy wiring (deployer is owner) ---
 
-        // Register the canonical EAS schema and authorize the coordinator to issue receipts.
+        // Register the canonical EAS schemas and authorize the coordinator to issue receipts.
+        // MatchSettlement's schemas MUST land before its attester is authorized below — a
+        // settle before registration reverts SchemaNotSet.
         renderReceipts.registerSchema(cfg.schemaRegistry);
+        matchSettlement.registerSchema(cfg.schemaRegistry);
         renderReceipts.setCoordinator(cfg.coordinator, true);
 
         // Coordinator is the authorized compute spender + artifact minter.
