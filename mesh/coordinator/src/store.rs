@@ -2193,6 +2193,34 @@ impl Store {
         Ok(updated)
     }
 
+    /// The on-chain attestation obligation for a job, for the `GET /jobs/{id}` read
+    /// path. `Ok(Some((uid, submitted_at)))` iff a `pending_attestations` row exists —
+    /// i.e. the job is a validated render that OWES an EAS receipt; the inner `uid`
+    /// and `submitted_at` are populated only once the (operator-gated) relayer lands
+    /// the receipt on-chain ([`mark_submitted`](Self::mark_submitted)), and are NULL
+    /// while the receipt is still pending or dead-lettered. `Ok(None)` when no row
+    /// exists at all (a compute-only job, or EAS disabled) — the clean absent the read
+    /// path renders as `null`. The outer `Option` (row presence) and the inner `uid`
+    /// (landed-on-chain) together let a client tell relayed / owed-but-unrelayed /
+    /// none apart — the three states the `/jobs/{id}` attestation field must NOT
+    /// collapse. The non-test read twin of the test-only
+    /// [`attestation_uid`](Self::attestation_uid).
+    pub fn attestation_readback(
+        &self,
+        job_id: &uuid::Uuid,
+    ) -> Result<Option<(Option<String>, Option<i64>)>> {
+        let row = self.conn.query_row(
+            "SELECT uid, submitted_at FROM pending_attestations WHERE job_id = ?1",
+            [&job_id.to_string()],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Test-only: read back the pending attestation recorded for a job, rebuilt
     /// as an `eas::PendingAttestation` so a test can assert the settle-time
     /// mapping round-trips. `None` when no pending row exists for the job.

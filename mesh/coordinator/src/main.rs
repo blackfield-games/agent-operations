@@ -499,12 +499,28 @@ struct JobSummary {
     status: String,
 }
 
-/// Full detail for `GET /jobs/{id}`: the job's `JobSpec` plus its recorded
-/// `JobResult` once the job has completed (`null` until then).
+/// The EAS attestation state for a job on `GET /jobs/{id}`. The `JobDetail.attestation`
+/// field is non-`null` iff the job has a `pending_attestations` row — i.e. it is a
+/// validated render that OWES an on-chain receipt. `uid` and `submitted_at` stay `null`
+/// until the (operator-gated) relayer lands the receipt on Base, then carry the real EAS
+/// attestation uid + unix submit time. A client thus tells three states apart:
+/// `attestation: null` (no attestation — a compute-only job, or EAS disabled),
+/// `attestation: { uid: null, submitted_at: null }` (owed but not yet relayed), and
+/// `attestation: { uid, submitted_at }` (on-chain proof retrievable).
+#[derive(Debug, Serialize)]
+struct Attestation {
+    uid: Option<String>,
+    submitted_at: Option<i64>,
+}
+
+/// Full detail for `GET /jobs/{id}`: the job's `JobSpec`, its recorded `JobResult` once
+/// the job has completed (`null` until then), and its EAS [`Attestation`] state (`null`
+/// when the job owes no on-chain receipt; see [`Attestation`] for the three states).
 #[derive(Debug, Serialize)]
 struct JobDetail {
     spec: JobSpec,
     result: Option<JobResult>,
+    attestation: Option<Attestation>,
 }
 
 /// Query string for `GET /jobs`. `status`, when present, filters the listing to
@@ -3120,10 +3136,12 @@ async fn job_status(
     }
 }
 
-/// `GET /jobs/{id}` — full detail for a single job: its `JobSpec` plus the
-/// recorded `JobResult` once the job has completed (`result` is `null` until
-/// then). 404 for an unknown id, 500 on a store error. Read-only; takes a
-/// single store lock. Distinct from the status-only `GET /jobs/{id}/status`.
+/// `GET /jobs/{id}` — full detail for a single job: its `JobSpec`, the recorded
+/// `JobResult` once the job has completed (`result` is `null` until then), and its
+/// EAS [`Attestation`] state (`null` when the job owes no on-chain receipt; see
+/// [`Attestation`] for the three states a client must tell apart). 404 for an unknown
+/// id, 500 on a store error. Read-only; takes a single store lock. Distinct from the
+/// status-only `GET /jobs/{id}/status`.
 async fn job_detail(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -3144,7 +3162,15 @@ async fn job_detail(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
-    Ok(Json(JobDetail { spec, result }))
+    let attestation = match store.attestation_readback(&id) {
+        Ok(Some((uid, submitted_at))) => Some(Attestation { uid, submitted_at }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(?id, ?e, "job_detail: attestation_readback failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    Ok(Json(JobDetail { spec, result, attestation }))
 }
 
 /// Upper bound on rows returned by `GET /jobs`, to keep the payload bounded.
