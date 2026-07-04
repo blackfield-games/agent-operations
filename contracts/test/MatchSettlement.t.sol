@@ -2989,6 +2989,68 @@ contract MatchSettlementTest is Test {
         assertTrue(s.matchAttestationRevoked(MATCH), "still revoked, exactly once");
     }
 
+    // --- live/revoked attestation counters (the RenderReceipts.receiptCount twin) ---
+
+    /// @dev The live counter rises by exactly one on a decisive settle AND on a
+    ///      structurally-distinct draw (both funnel the SHARED counter through
+    ///      _attestSettled — no missed path, no double-count), then a revoke moves ONE from
+    ///      live to revoked, and a guarded re-revoke can't drive the live count below the
+    ///      attests that raised it.
+    function test_attestationCounters_riseOnSettleFallOnRevoke() public {
+        assertEq(settlement.liveAttestationCount(), 0, "starts at zero");
+        assertEq(settlement.revokedAttestationCount(), 0);
+
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+        assertEq(settlement.liveAttestationCount(), 1, "a decisive settle adds one live attestation");
+        assertEq(settlement.revokedAttestationCount(), 0, "nothing revoked yet");
+
+        bytes32 m2 = bytes32("match-2");
+        _open(m2, STAKE);
+        _fundBoth(m2);
+        vm.prank(attester);
+        settlement.settleDraw(m2, HASH);
+        assertEq(settlement.liveAttestationCount(), 2, "a second, distinct settle shape shares the counter");
+
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+        assertEq(settlement.liveAttestationCount(), 1, "revoke decrements the live count");
+        assertEq(settlement.revokedAttestationCount(), 1, "revoke increments the revoked count");
+
+        // Re-revoking the first is guarded (AlreadyRevoked), so the live count can never be
+        // driven below the attests that raised it.
+        vm.prank(attester);
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.AttestationAlreadyRevoked.selector, MATCH));
+        settlement.revokeAttestation(MATCH);
+        assertEq(settlement.liveAttestationCount(), 1, "a guarded re-revoke does not double-decrement");
+        assertEq(settlement.revokedAttestationCount(), 1, "nor double-count the revoke");
+    }
+
+    /// @dev FM2 the field call sites count too: settleField (reputation-only) and
+    ///      settleFieldWager (escrowed) are the other two _attestSettled call sites, so each
+    ///      must also add exactly one to the shared live counter.
+    function test_attestationCount_risesOnBothFieldSettlePaths() public {
+        _enableVariable(RATING_CAP);
+
+        // Field-wager first — _openFundField3 registers + funds the [alice, bob, dave] roster.
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds2 = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds2, HASH);
+        assertEq(settlement.liveAttestationCount(), 1, "settleFieldWager adds one via the shared counter");
+
+        // Reputation-only settleField (the other field call site) — dave already registered.
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+        assertEq(settlement.liveAttestationCount(), 2, "settleField adds the fourth call site's one");
+        assertEq(settlement.revokedAttestationCount(), 0, "no revokes on the field paths");
+    }
+
     /// @dev FM1: the attest is the LAST interaction, after the Settled fence and the payout.
     ///      A reentrant EAS re-entering settle() is rejected by the fence (MatchNotOpen) — no
     ///      double-settle, no double-pay, exactly one attestation.
