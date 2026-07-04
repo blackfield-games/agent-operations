@@ -1417,6 +1417,13 @@ fn pump_to_end(
                 }
                 AgentMsg::Leave { .. } => {
                     active.remove(&seat);
+                    // A Leave is a durable FORFEIT, not just a transport departure: down
+                    // the seat in the sim so a 1v1 ends when the opponent is left alone
+                    // (not at the max_ticks cap) and a leaver can't win on the score
+                    // tiebreak. `active.remove` above stops the transport polling it; this
+                    // eliminates it. Recorded into the tick's forfeits, so the golden/replay
+                    // reproduces it.
+                    m.forfeit(seat);
                 }
                 AgentMsg::Join { .. } => panic!("unexpected join during the match"),
             }
@@ -1536,7 +1543,15 @@ fn pump_to_end_deadlined(
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
         }
         out.flush().expect("flush observations");
+        let active_before: BTreeSet<SeatId> = active.clone();
         let intents = read_tick_deadlined(m, &mut active, rx, deadline);
+        // A Leave dropped its seat from `active` inside the read; forfeit each departed
+        // seat so the sim ELIMINATES it — the enforced-path twin of pump_to_end's inline
+        // forfeit. A timeout or EOF still tick-forfeits only (the leaver keeps its seat),
+        // so a slow-but-connected agent is not eliminated here (see read_tick_deadlined).
+        for &seat in active_before.difference(&active) {
+            m.forfeit(seat);
+        }
         m.step(&intents);
     }
     finish(m, n, out)
@@ -5338,6 +5353,17 @@ mod tests {
             .collect()
     }
 
+    /// The seats that FORFEITED at each tick that had any — the leave stream, so a test
+    /// can pin exactly when a Leave eliminated its seat (and that a no-Leave match has none).
+    fn tick_forfeits(replay: &ReplayRecord) -> Vec<(u64, Vec<SeatId>)> {
+        replay
+            .ticks
+            .iter()
+            .filter(|t| !t.forfeits.is_empty())
+            .map(|t| (t.tick, t.forfeits.clone()))
+            .collect()
+    }
+
     #[test]
     fn pump_to_end_records_every_seat_every_tick_with_no_leave() {
         // FM4 inert baseline: a match with no Leave ingests both seats on every one of its
@@ -5362,76 +5388,93 @@ mod tests {
 
     #[test]
     fn pump_to_end_forfeits_a_leaver_from_its_leave_tick_and_still_ends() {
-        // FM1: seat 1 acts at tick 0, then Leaves at tick 1. From tick 1 on it forfeits (never
-        // reappears in the recorded stream) while seat 0's actions keep applying, and the match
-        // reaches its bounded end — no hang, no desync onto a following tick's line.
+        // FM1: seat 1 acts at tick 0, then Leaves at tick 1. The Leave is a durable FORFEIT
+        // — seat 1 is ELIMINATED at tick 1, so this 1v1 ENDS there (seat 0 is left alone),
+        // not idling to the max_ticks cap. seat 0's queued tick-2/3 lines are never read.
         let mut m = build_direct_match(&direct_args(2, "", 0), 2);
         let mid = m.match_id();
         let script = [
             act_line(0, mid, 0),
             act_line(1, mid, 0),
             act_line(0, mid, 1),
-            leave_line(1), // seat 1 departs at tick 1
-            act_line(0, mid, 2),
+            leave_line(1),       // seat 1 forfeits at tick 1
+            act_line(0, mid, 2), // never read — the match has already ended
             act_line(0, mid, 3),
         ];
         let mut out: Vec<u8> = Vec::new();
         let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
 
-        assert_eq!(m.phase(), MatchPhase::Ended, "the match ends, it does not hang on the departed seat");
-        assert_eq!(result.outcomes.len(), 2, "both seats stay ranked in the terminal result");
+        assert_eq!(m.phase(), MatchPhase::Ended, "the leaver's elimination ends the 1v1");
+        assert_eq!(result.final_tick, 2, "it ends at the leave tick, not the max_ticks cap");
+        let replay = m.into_replay();
         assert_eq!(
-            tick_seats(&m.into_replay()),
-            vec![(0, vec![0, 1]), (1, vec![0]), (2, vec![0]), (3, vec![0])],
-            "seat 1 acts only through tick 0; from its tick-1 Leave on it forfeits and seat 0 plays on"
+            tick_seats(&replay),
+            vec![(0, vec![0, 1]), (1, vec![0])],
+            "seat 1 acts only at tick 0; at its tick-1 Leave it forfeits and the match ends"
         );
+        assert_eq!(tick_forfeits(&replay), vec![(1, vec![1])], "seat 1 is recorded as forfeiting at tick 1");
+        let s0 = result.outcomes.iter().find(|o| o.seat == 0).unwrap();
+        let s1 = result.outcomes.iter().find(|o| o.seat == 1).unwrap();
+        assert_eq!((s0.placement, s0.alive_at_end), (1, true), "the seat that stayed wins");
+        assert_eq!((s1.placement, s1.alive_at_end), (2, false), "the leaver is eliminated, placed last");
     }
 
     #[test]
     fn pump_to_end_ignores_a_post_leave_act_from_the_departed_seat() {
-        // FM2: seat 1 Leaves at tick 0 and then (buggily) sends an Act for tick 1. That stray
-        // line is dropped WITHOUT consuming seat 0's slot — the read stays aligned — and is never
-        // ingested (a departed-but-alive seat's Act would otherwise pass `ingest`), so seat 1
-        // takes exactly one forfeit path and never acts again.
-        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        // FM2 (read-loop alignment): seat 1 Leaves at tick 0 and then (buggily) sends an Act
+        // for tick 1. A 3-seat FFA keeps the match alive after the one departure (seats 0 and 2
+        // fight on), so the stray line is actually reached: it is dropped WITHOUT consuming a
+        // slot — the read stays aligned, so seats 0 AND 2 are still both recorded at tick 1 —
+        // and is never ingested. Seat 1 forfeits exactly once (tick 0) and never reappears.
+        let mut m = build_direct_match(&direct_args(3, "", 0), 3);
         let mid = m.match_id();
         let script = [
             act_line(0, mid, 0),
-            leave_line(1), // seat 1 departs at tick 0
-            act_line(1, mid, 1), // stray, well-formed Act from the departed seat — must be ignored
+            leave_line(1), // seat 1 forfeits at tick 0
+            act_line(2, mid, 0),
+            act_line(1, mid, 1), // stray, well-formed Act from the departed seat — must be dropped
             act_line(0, mid, 1),
+            act_line(2, mid, 1),
             act_line(0, mid, 2),
+            act_line(2, mid, 2),
             act_line(0, mid, 3),
+            act_line(2, mid, 3),
         ];
         let mut out: Vec<u8> = Vec::new();
-        pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+        pump_to_end(&mut m, 3, &mut pump_input(&script), &mut out);
 
         assert_eq!(m.phase(), MatchPhase::Ended);
+        let replay = m.into_replay();
         assert_eq!(
-            tick_seats(&m.into_replay()),
-            vec![(0, vec![0]), (1, vec![0]), (2, vec![0]), (3, vec![0])],
-            "seat 1's post-Leave Act is ignored — it never reappears after departing at tick 0"
+            tick_seats(&replay),
+            vec![(0, vec![0, 2]), (1, vec![0, 2]), (2, vec![0, 2]), (3, vec![0, 2])],
+            "the stray tick-1 line from departed seat 1 is dropped without desyncing seats 0/2"
+        );
+        assert_eq!(
+            tick_forfeits(&replay),
+            vec![(0, vec![1])],
+            "seat 1 forfeits once at tick 0 and never reappears in either stream"
         );
     }
 
     #[test]
     fn pump_to_end_ends_cleanly_when_every_seat_leaves() {
-        // FM3: both seats Leave at tick 0 → the active set empties. The read loop reads zero
-        // lines each later tick and the sim steps every seat to a forfeit, reaching the
-        // max_ticks end with a well-formed result — a lone/empty active set does not deadlock
-        // the read or panic on EOF.
+        // FM3: both seats Leave at tick 0 → both are forfeited (eliminated) that tick, leaving
+        // ZERO teams alive, so the match ends immediately at tick 0 with a well-formed result —
+        // an empty active set does not deadlock the read or panic on EOF, and a mutual forfeit
+        // does not stall to the max_ticks cap.
         let mut m = build_direct_match(&direct_args(2, "", 0), 2);
         let script = [leave_line(0), leave_line(1)];
         let mut out: Vec<u8> = Vec::new();
         let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
 
-        assert_eq!(m.phase(), MatchPhase::Ended, "both departed: the match still reaches its bounded end");
+        assert_eq!(m.phase(), MatchPhase::Ended, "both departed: the match ends at once, not at the cap");
+        assert_eq!(result.final_tick, 1, "both forfeit at tick 0, so the match ends there");
         assert_eq!(result.outcomes.len(), 2, "both seats are ranked");
-        assert_eq!(
-            tick_seats(&m.into_replay()),
-            vec![(0, vec![]), (1, vec![]), (2, vec![]), (3, vec![])],
-            "no seat acts once both have left; every tick is an empty forfeit"
-        );
+        assert!(result.outcomes.iter().all(|o| !o.alive_at_end), "no one survives a mutual forfeit");
+        let replay = m.into_replay();
+        assert_eq!(tick_seats(&replay), vec![(0, vec![])], "no seat acts — the only tick is an empty forfeit");
+        assert_eq!(tick_forfeits(&replay), vec![(0, vec![0, 1])], "both seats forfeit at tick 0");
     }
 
     #[test]
@@ -5572,29 +5615,27 @@ mod tests {
 
     #[test]
     fn pump_to_end_deadlined_forfeits_a_leaver_and_reaches_a_bounded_end() {
-        // The enforced-path twin of pump_to_end_forfeits_a_leaver...: seat 1 Leaves at tick 0 and
-        // goes silent; seat 0 plays on to the max_ticks end and seat 1 forfeits from its Leave tick
-        // — no hang, and (unlike the pre-fix path) no per-tick timeout spent awaiting the leaver.
-        // Every line is pre-buffered and aligned to the advancing tick, so nothing times out.
+        // The enforced-path twin of pump_to_end_forfeits_a_leaver...: seat 1 Leaves at tick 0.
+        // The Leave is a durable FORFEIT here too — the caller eliminates each seat that departed
+        // `active` — so seat 1 is downed and this 1v1 ENDS at tick 0. No hang, and no per-tick
+        // timeout spent awaiting the leaver (every line is pre-buffered, so nothing times out).
         let mut m = build_direct_match(&direct_args(2, "", 0), 2);
         let mid = m.match_id();
         let (tx, rx) = mpsc::channel::<String>();
         tx.send(act_line(0, mid, 0)).unwrap();
         tx.send(leave_line(1)).unwrap();
         for t in 1..4 {
-            tx.send(act_line(0, mid, t)).unwrap();
+            tx.send(act_line(0, mid, t)).unwrap(); // never read — the match ends at tick 0
         }
 
         let mut out: Vec<u8> = Vec::new();
         let start = Instant::now();
         let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(50));
-        assert_eq!(m.phase(), MatchPhase::Ended, "the leaver does not stall the enforced pump");
-        assert_eq!(result.outcomes.len(), 2);
-        assert_eq!(
-            tick_seats(&m.into_replay()),
-            vec![(0, vec![0]), (1, vec![0]), (2, vec![0]), (3, vec![0])],
-            "seat 1 forfeits from its tick-0 Leave; seat 0 plays every tick"
-        );
+        assert_eq!(m.phase(), MatchPhase::Ended, "the leaver's elimination ends the enforced pump");
+        assert_eq!(result.final_tick, 1, "the 1v1 ends at the tick-0 forfeit, not the max_ticks cap");
+        let replay = m.into_replay();
+        assert_eq!(tick_seats(&replay), vec![(0, vec![0])], "seat 0 acts at tick 0; seat 1 forfeited");
+        assert_eq!(tick_forfeits(&replay), vec![(0, vec![1])], "seat 1 forfeits at its tick-0 Leave");
         assert!(
             start.elapsed() < Duration::from_millis(50),
             "the aligned, pre-buffered stream never waits a per-tick budget for the departed seat"
