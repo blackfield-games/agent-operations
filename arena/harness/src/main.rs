@@ -1448,6 +1448,14 @@ fn finish(m: &Match, n: u8, out: &mut impl Write) -> MatchResult {
     result
 }
 
+/// Consecutive per-tick deadline misses that escalate a persistently-silent seat from a TICK
+/// forfeit (it holds still but stays alive) to a durable MATCH forfeit (elimination). Small so a
+/// 1v1 against a hung or dead agent ends in a few ticks instead of idling to the `max_ticks` cap,
+/// but `> 1` so a single near-miss by a laggy-but-alive agent never eliminates it — only a
+/// sustained silence does, and a seat that answers resets its streak. Enforced-path only; the
+/// blocking golden/replay pump has no wall-clock deadline to miss.
+const MISS_FORFEIT_THRESHOLD: u32 = 3;
+
 /// Read one Live tick's actions from the still-`active` seats, bounded by a SHARED per-tick
 /// wall-clock deadline. Every seat races the same `Instant` (computed once, here), so the
 /// whole tick costs at most ~`deadline` no matter how many seats are slow — a near-miss on the
@@ -1461,14 +1469,30 @@ fn finish(m: &Match, n: u8, out: &mut impl Write) -> MatchResult {
 /// A `Leave` forfeits AND departs its seat from `active` (the enforced-path twin of
 /// [`pump_to_end`]), so no later tick awaits — or is billed a per-tick timeout for — a departed
 /// agent, and a stray line from an already-departed seat is dropped WITHOUT consuming a slot.
+///
+/// A tick forfeit alone is not durable: a hung seat misses every tick yet stays alive to the
+/// `max_ticks` cap, so a 1v1 against a dead agent drags out to the cap (~an hour at 30 Hz·3600).
+/// This read ESCALATES a persistent silence to elimination. `misses` (owned by the caller so it
+/// survives across ticks) counts each seat's CONSECUTIVE deadline misses and is reset the moment
+/// the seat answers; once a seat crosses [`MISS_FORFEIT_THRESHOLD`] it departs `active` and the
+/// caller forfeits it — the same active-set-difference elimination a `Leave` takes. A closed
+/// stream is an immediate departure (a dead stream never answers, so there is no streak to count):
+/// every still-silent seat is dropped at once, so a mid-match EOF eliminates the dark seats and the
+/// match ends the moment one team remains instead of disconnecting every later tick to the cap.
 fn read_tick_deadlined(
     m: &Match,
     active: &mut BTreeSet<SeatId>,
     rx: &Receiver<String>,
     deadline: Duration,
+    misses: &mut BTreeMap<SeatId, u32>,
 ) -> BTreeMap<SeatId, ActionIntent> {
     let tick_deadline = Instant::now() + deadline;
     let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+    // The seats that delivered a line this tick — an accepted Act, a rejected one, or a Leave.
+    // A seat here is alive and talking, so it resets its consecutive-miss streak and is exempt
+    // from this tick's timeout/EOF escalation; an active seat absent from this set when the
+    // budget runs out is the silent one whose streak advances.
+    let mut answered: BTreeSet<SeatId> = BTreeSet::new();
     let mut remaining = active.len();
     while remaining > 0 {
         let wait = tick_deadline.saturating_duration_since(Instant::now());
@@ -1489,6 +1513,10 @@ fn read_tick_deadlined(
                     }
                     continue;
                 }
+                // The seat answered this tick: it is alive and talking, so its consecutive-miss
+                // streak resets (a single near-miss never accumulates toward elimination).
+                answered.insert(seat);
+                misses.remove(&seat);
                 match msg {
                     AgentMsg::Act(action) => {
                         if let Ok(intent) = m.ingest(seat, &action) {
@@ -1502,20 +1530,38 @@ fn read_tick_deadlined(
                 }
                 remaining -= 1;
             }
-            // The tick's budget is spent: the seats that have not answered forfeit. Stop
-            // reading so one slow tick costs ~one deadline, not one per unread seat.
+            // The tick's budget is spent: the seats that have not answered forfeit the tick. Stop
+            // reading so one slow tick costs ~one deadline, not one per unread seat. Each silent
+            // seat's consecutive-miss streak advances; one that crosses the threshold has gone
+            // persistently dark, so it departs `active` and the caller ELIMINATES it (a hung 1v1
+            // ends in a few ticks, not at the cap). A seat under the threshold only tick-forfeits.
             Err(RecvTimeoutError::Timeout) => {
                 eprintln!(
                     "[deadline] tick {} read exceeded {}µs; forfeiting the unread seat(s)",
                     m.tick(),
                     deadline.as_micros()
                 );
+                for seat in active.difference(&answered).copied().collect::<Vec<_>>() {
+                    let streak = misses.entry(seat).or_insert(0);
+                    *streak += 1;
+                    if *streak >= MISS_FORFEIT_THRESHOLD {
+                        active.remove(&seat);
+                        misses.remove(&seat);
+                    }
+                }
                 break;
             }
-            // EOF: the agent stream closed. Forfeit the remaining seats this tick and let the
-            // outer loop keep stepping — every later tick disconnects immediately (no wait, no
-            // spin), so the match forfeits to its bounded end rather than hanging on a dead read.
-            Err(RecvTimeoutError::Disconnected) => break,
+            // EOF: the agent stream closed. Every still-silent seat departs `active` at once (an
+            // immediate forfeit — no streak to count on a dead stream), and the caller eliminates
+            // it, so the match ends the moment one team remains rather than disconnecting on every
+            // later tick to the cap. An already-answered seat keeps its seat (its line landed).
+            Err(RecvTimeoutError::Disconnected) => {
+                for seat in active.difference(&answered).copied().collect::<Vec<_>>() {
+                    active.remove(&seat);
+                    misses.remove(&seat);
+                }
+                break;
+            }
         }
     }
     intents
@@ -1538,17 +1584,21 @@ fn pump_to_end_deadlined(
 ) -> MatchResult {
     pump_starting(m, n, out);
     let mut active: BTreeSet<SeatId> = (0..n).collect();
+    // Per-seat consecutive deadline misses, kept across ticks so a persistent silence escalates
+    // to elimination (see read_tick_deadlined). A seat that answers clears its entry; a match
+    // where every seat answers on time keeps this empty and byte-identical to the pre-escalation pump.
+    let mut misses: BTreeMap<SeatId, u32> = BTreeMap::new();
     while m.phase() == MatchPhase::Live {
         for &seat in &active {
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
         }
         out.flush().expect("flush observations");
         let active_before: BTreeSet<SeatId> = active.clone();
-        let intents = read_tick_deadlined(m, &mut active, rx, deadline);
-        // A Leave dropped its seat from `active` inside the read; forfeit each departed
-        // seat so the sim ELIMINATES it — the enforced-path twin of pump_to_end's inline
-        // forfeit. A timeout or EOF still tick-forfeits only (the leaver keeps its seat),
-        // so a slow-but-connected agent is not eliminated here (see read_tick_deadlined).
+        let intents = read_tick_deadlined(m, &mut active, rx, deadline, &mut misses);
+        // Each seat that departed `active` inside the read — a Leave, a threshold-crossing silent
+        // seat, or an EOF-dropped one — is forfeited so the sim ELIMINATES it (the enforced-path
+        // twin of pump_to_end's inline forfeit). A single sub-threshold miss keeps its seat, so a
+        // slow-but-connected agent is not eliminated here (see read_tick_deadlined).
         for &seat in active_before.difference(&active) {
             m.forfeit(seat);
         }
@@ -5493,7 +5543,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<String>();
         tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 0 answers; seat 1 is withheld
 
-        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50), &mut BTreeMap::new());
         assert!(intents.contains_key(&0), "the present seat 0 is ingested");
         assert!(!intents.contains_key(&1), "the withheld seat 1 is forfeited (omitted from intents)");
         drop(tx); // held open ACROSS the read above (so seat 1 timed out, not disconnected)
@@ -5510,7 +5560,7 @@ mod tests {
         tx.send(act_line(1, m.match_id(), 0)).unwrap();
 
         let start = Instant::now();
-        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50), &mut BTreeMap::new());
         assert_eq!(intents.len(), 2, "both present seats ingest");
         assert!(intents.contains_key(&0) && intents.contains_key(&1));
         assert!(
@@ -5533,7 +5583,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<String>();
         tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 0 answers; seats 1..=3 are withheld
 
-        let intents = read_tick_deadlined(&m, &mut active_seats(4), &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(4), &rx, Duration::from_millis(50), &mut BTreeMap::new());
         assert_eq!(
             intents.keys().copied().collect::<Vec<_>>(),
             vec![0],
@@ -5554,7 +5604,7 @@ mod tests {
         drop(tx); // EOF: the stream closes with seat 1 never sent
 
         let start = Instant::now();
-        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active_seats(2), &rx, Duration::from_millis(50), &mut BTreeMap::new());
         assert!(intents.contains_key(&0), "the buffered seat 0 line is still drained before EOF");
         assert!(!intents.contains_key(&1), "seat 1 is forfeited on the closed stream");
         assert!(
@@ -5591,11 +5641,12 @@ mod tests {
         // never times out.
         let m = build_direct_match(&direct_args(2, "", 0), 2);
         let mut active = active_seats(2);
+        let mut misses = BTreeMap::new();
         let (tx, rx) = mpsc::channel::<String>();
         tx.send(act_line(0, m.match_id(), 0)).unwrap();
         tx.send(leave_line(1)).unwrap();
 
-        let intents = read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(50));
+        let intents = read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(50), &mut misses);
         assert!(intents.contains_key(&0), "seat 0 acted");
         assert!(!intents.contains_key(&1), "seat 1 left → forfeited, not in intents");
         assert_eq!(active, active_seats(1), "seat 1 departed the active set");
@@ -5604,7 +5655,7 @@ mod tests {
         // blocks on the departed seat 1 (which, still awaited, would cost the full 50 ms budget).
         tx.send(act_line(0, m.match_id(), 0)).unwrap();
         let start = Instant::now();
-        let next = read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(50));
+        let next = read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(50), &mut misses);
         assert_eq!(next.keys().copied().collect::<Vec<_>>(), vec![0], "only the surviving seat is read");
         assert!(
             start.elapsed() < Duration::from_millis(50),
