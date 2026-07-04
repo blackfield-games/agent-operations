@@ -2725,7 +2725,7 @@ mod tests {
         let real_ticks = padded.replay.ticks.len();
         let next = real_ticks as u64;
         for k in 0..20_000u64 {
-            padded.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new() });
+            padded.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new(), forfeits: Vec::new() });
         }
         let frames = replay_frames(&padded).expect("a post-terminal-padded record still verifies + replays");
         assert_eq!(frames.len(), real_ticks + 1, "frames track the SIMULATED ticks, not the padded length");
@@ -2746,7 +2746,7 @@ mod tests {
         let mut over = finished_record();
         let next = over.replay.ticks.len() as u64;
         for k in 0..=arena_core::MAX_REPLAY_TICKS as u64 {
-            over.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new() });
+            over.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new(), forfeits: Vec::new() });
         }
         assert!(over.replay.ticks.len() > arena_core::MAX_REPLAY_TICKS);
         assert!(matches!(replay_frames(&over), Err(ReplayError::TooManyTicks { .. })));
@@ -2917,7 +2917,7 @@ mod tests {
         let real_frames = replay_frames(&padded).unwrap().len();
         let next = padded.replay.ticks.len() as u64;
         for k in 0..20_000u64 {
-            padded.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new() });
+            padded.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new(), forfeits: Vec::new() });
         }
 
         // Ring sized for the REAL frames + End: an extra padding publish would overflow it.
