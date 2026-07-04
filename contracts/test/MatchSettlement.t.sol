@@ -2811,6 +2811,184 @@ contract MatchSettlementTest is Test {
         assertTrue(settlement.matchAttestationUid(FIELD) != bytes32(0));
     }
 
+    // --- attestation revoke (dispute/correction path) ---
+
+    /// @dev The happy path: an attester revokes a settled 1v1 result's attestation. EAS.revoke
+    ///      is called ONCE with the persisted uid and the 1v1 schema; the match is flagged
+    ///      revoked. Crucially the settled ESCROW payout and REPUTATION are NOT reversed — a
+    ///      revoke retracts only the portable claim, mirroring RenderReceipts.revokeReceipt.
+    function test_revokeAttestation_retractsA1v1ResultWithoutReversingSettlement() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH); // alice wins the 2*STAKE pot
+
+        bytes32 uid = settlement.matchAttestationUid(MATCH);
+        uint256 aliceAfterSettle = token.balanceOf(alice);
+        int256 aliceRepAfterSettle = registry.reputationOf(alice);
+        int256 bobRepAfterSettle = registry.reputationOf(bob);
+
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+
+        assertEq(eas.revokeCalls(), 1, "exactly one EAS.revoke");
+        assertEq(eas.lastRevokedUid(), uid, "revoked the persisted attestation uid");
+        assertEq(eas.lastRevokedSchema(), settlement.schemaUid(), "revoked under the 1v1 schema");
+        assertTrue(settlement.matchAttestationRevoked(MATCH), "match flagged revoked");
+        assertEq(
+            settlement.matchAttestationUid(MATCH),
+            uid,
+            "uid pointer retained (points at the revoked attestation)"
+        );
+
+        // The settlement itself is FINAL: revoke moves no funds and no reputation.
+        assertEq(token.balanceOf(alice), aliceAfterSettle, "winner keeps the pot; revoke is not a clawback");
+        assertEq(token.balanceOf(address(settlement)), 0, "no escrow resurrected");
+        assertEq(registry.reputationOf(alice), aliceRepAfterSettle, "winner reputation unchanged");
+        assertEq(registry.reputationOf(bob), bobRepAfterSettle, "loser reputation unchanged");
+    }
+
+    function test_revokeAttestation_emitsMatchAttestationRevoked() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+        bytes32 uid = settlement.matchAttestationUid(MATCH);
+
+        vm.expectEmit(true, true, false, false);
+        emit MatchAttestationRevoked(MATCH, uid);
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+    }
+
+    /// @dev A draw is a 1v1 result, so its attestation revokes under the 1v1 schema.
+    function test_revokeAttestation_drawUsesTheOneVOneSchema() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settleDraw(MATCH, HASH);
+
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+        assertEq(eas.lastRevokedSchema(), settlement.schemaUid(), "draw revokes under the 1v1 schema");
+    }
+
+    /// @dev The reputation-only settleField records into the `matches` slot (never setting
+    ///      agentA) yet attests under the FIELD schema — this pins that the revoke hands EAS
+    ///      the field schema for it, not the 1v1 schema its `matches` residence might suggest.
+    function test_revokeAttestation_settleFieldUsesTheFieldSchema() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(30 ether, -10 ether, -20 ether);
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+        assertEq(eas.revokeCalls(), 1);
+        assertEq(
+            eas.lastRevokedSchema(),
+            settlement.fieldSchemaUid(),
+            "field-reputation revokes under the field schema"
+        );
+        assertEq(eas.lastRevokedUid(), settlement.matchAttestationUid(MATCH), "revoked the persisted uid");
+    }
+
+    function test_revokeAttestation_fieldWagerUsesTheFieldSchema() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        vm.prank(attester);
+        settlement.revokeAttestation(FIELD);
+        assertEq(
+            eas.lastRevokedSchema(), settlement.fieldSchemaUid(), "field-wager revokes under the field schema"
+        );
+        assertTrue(settlement.matchAttestationRevoked(FIELD));
+    }
+
+    function test_revokeAttestation_revertsForNeverSettledMatch() public {
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.NotAttested.selector, MATCH));
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+    }
+
+    /// @dev An opened-and-funded but UNSETTLED match has no uid yet, so it cannot be revoked
+    ///      (NotAttested) — the uid is the settled-and-attested marker.
+    function test_revokeAttestation_revertsForOpenButUnsettledMatch() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.NotAttested.selector, MATCH));
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+        assertEq(eas.revokeCalls(), 0, "no EAS.revoke for an unattested match");
+    }
+
+    function test_revokeAttestation_revertsWhenAlreadyRevoked() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.AttestationAlreadyRevoked.selector, MATCH));
+        vm.prank(attester);
+        settlement.revokeAttestation(MATCH);
+        assertEq(eas.revokeCalls(), 1, "a second revoke does not reach EAS");
+    }
+
+    function test_revokeAttestation_revertsForNonAttester() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        vm.prank(bob); // a registered agent, but not an attester
+        settlement.revokeAttestation(MATCH);
+        assertFalse(settlement.matchAttestationRevoked(MATCH), "non-attester cannot revoke");
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    /// @dev CEI: a malicious EAS re-entering revokeAttestation during EAS.revoke hits the
+    ///      matchAttestationRevoked fence (written before the external call) and reverts
+    ///      AttestationAlreadyRevoked — exactly one revoke, one EAS.revoke.
+    function test_revokeAttestation_reentrantEasCannotDoubleRevoke() public {
+        ReentrantRevokeEAS reEas = new ReentrantRevokeEAS();
+        MatchSettlement s = new MatchSettlement(address(reEas), address(registry), owner, REP_DELTA);
+        _wireFresh(s, true);
+        vm.prank(owner);
+        s.setAttester(address(reEas), true); // grant so the reentry tests the fence, not the attester gate
+
+        vm.prank(attester);
+        s.openMatch(MATCH, alice, bob, STAKE);
+        vm.prank(alice);
+        s.fund(MATCH);
+        vm.prank(bob);
+        s.fund(MATCH);
+        vm.prank(attester);
+        s.settle(MATCH, alice, HASH);
+
+        reEas.arm(s, MATCH);
+        vm.prank(attester);
+        s.revokeAttestation(MATCH);
+
+        assertEq(reEas.revokeCalls(), 1, "one outer EAS.revoke, no reentrant second");
+        assertTrue(reEas.reentered(), "the mock did attempt the reentry");
+        assertTrue(reEas.reentryReverted(), "the reentrant revokeAttestation reverted");
+        assertEq(
+            reEas.reentryRevertSelector(),
+            MatchSettlement.AttestationAlreadyRevoked.selector,
+            "reentry blocked by the AlreadyRevoked fence"
+        );
+        assertTrue(s.matchAttestationRevoked(MATCH), "still revoked, exactly once");
+    }
+
     /// @dev FM1: the attest is the LAST interaction, after the Settled fence and the payout.
     ///      A reentrant EAS re-entering settle() is rejected by the fence (MatchNotOpen) — no
     ///      double-settle, no double-pay, exactly one attestation.
