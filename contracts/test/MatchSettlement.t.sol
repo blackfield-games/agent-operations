@@ -21,6 +21,9 @@ contract MockEAS is IEAS {
     address public lastRecipient;
     bool public lastRevocable;
     bytes public lastData;
+    uint256 public revokeCalls;
+    bytes32 public lastRevokedUid;
+    bytes32 public lastRevokedSchema;
 
     function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
         attestCalls++;
@@ -29,6 +32,12 @@ contract MockEAS is IEAS {
         lastRevocable = request.data.revocable;
         lastData = request.data.data;
         return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+
+    function revoke(IEAS.RevocationRequest calldata request) external payable {
+        revokeCalls++;
+        lastRevokedUid = request.data.uid;
+        lastRevokedSchema = request.schema;
     }
 }
 
@@ -70,6 +79,42 @@ contract ReentrantEAS is IEAS {
             }
         }
         return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {}
+}
+
+/// @dev On its FIRST revoke, re-enters revokeAttestation for the same match — proving the
+///      matchAttestationRevoked fence (set before the external EAS.revoke, CEI) rejects the
+///      reentrant revoke: exactly one revoke, one EAS.revoke call. `attest` is benign so the
+///      settle that mints the attestation runs normally.
+contract ReentrantRevokeEAS is IEAS {
+    MatchSettlement public target;
+    bytes32 public reMatchId;
+    uint256 public revokeCalls;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    function arm(MatchSettlement target_, bytes32 matchId_) external {
+        target = target_;
+        reMatchId = matchId_;
+    }
+
+    function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
+        return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
+    }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {
+        revokeCalls++;
+        if (!reentered) {
+            reentered = true;
+            try target.revokeAttestation(reMatchId) {}
+            catch (bytes memory err) {
+                reentryReverted = true;
+                reentryRevertSelector = bytes4(err);
+            }
+        }
     }
 }
 
@@ -115,6 +160,7 @@ contract MatchSettlementTest is Test {
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
     event SettleWindowSet(uint64 settleWindow);
+    event MatchAttestationRevoked(bytes32 indexed matchId, bytes32 indexed uid);
 
     function setUp() public {
         token = new MockToken();

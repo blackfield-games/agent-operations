@@ -20,6 +20,8 @@ contract MockEAS is IEAS {
     function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
         return keccak256(abi.encode(request.schema, request.data.recipient, request.data.data));
     }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {}
 }
 
 contract MockSchemaRegistry is ISchemaRegistry {

@@ -35,7 +35,19 @@ interface IEAS {
         AttestationRequestData data;
     }
 
+    struct RevocationRequestData {
+        bytes32 uid;
+        uint256 value;
+    }
+
+    struct RevocationRequest {
+        bytes32 schema;
+        RevocationRequestData data;
+    }
+
     function attest(AttestationRequest calldata request) external payable returns (bytes32);
+
+    function revoke(RevocationRequest calldata request) external payable;
 }
 
 interface ISchemaRegistry {
@@ -265,6 +277,23 @@ contract MatchSettlement is Ownable2Step {
     ///         Zero until the match settles; the portable pointer indexers resolve a result
     ///         through, exactly as RenderReceipts' `receiptUid` points at a render receipt.
     mapping(bytes32 matchId => bytes32) public matchAttestationUid;
+    /// @notice The EAS schema each settled match was attested under — `schemaUid` for a 1v1
+    ///         (`settle`/`settleDraw`) result, `fieldSchemaUid` for a field
+    ///         (`settleField`/`settleFieldWager`) result. Recorded at attest so
+    ///         `revokeAttestation` hands EAS the exact schema the attestation was minted
+    ///         under (EAS reverts a revoke whose schema does not match the attestation)
+    ///         without re-deriving the match shape, and so an indexer can route its decode
+    ///         by the same discriminator the two `MatchAttested` shapes carry. Zero until
+    ///         the match settles.
+    mapping(bytes32 matchId => bytes32) public matchAttestationSchema;
+    /// @notice Whether a settled match's on-chain attestation has since been revoked by the
+    ///         attester. A revoked attestation is retracted at EAS (indexers following
+    ///         `matchAttestationUid` see it as no longer live) and cannot be revoked again.
+    ///         This retracts ONLY the portable CLAIM — the settled escrow payout and the
+    ///         reputation write are FINAL and are NOT reversed (mirrors
+    ///         RenderReceipts.revokeReceipt, which retracts a receipt without clawing back
+    ///         the earner's credit). Zero until revoked.
+    mapping(bytes32 matchId => bool) public matchAttestationRevoked;
 
     event MatchOpened(bytes32 indexed matchId, address indexed agentA, address indexed agentB, uint256 stake);
     event MatchFunded(bytes32 indexed matchId, address indexed agent, uint256 stake);
@@ -302,12 +331,15 @@ contract MatchSettlement is Ownable2Step {
     /// @dev One registration wires both schemas, so a single event carries both uids.
     event SchemaRegistered(bytes32 indexed matchUid, bytes32 indexed fieldUid);
     event MatchAttested(bytes32 indexed matchId, bytes32 indexed uid);
+    event MatchAttestationRevoked(bytes32 indexed matchId, bytes32 indexed uid);
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
     event SettleWindowSet(uint64 settleWindow);
 
     error NotAttester();
     error SchemaNotSet();
+    error NotAttested(bytes32 matchId);
+    error AttestationAlreadyRevoked(bytes32 matchId);
     error ZeroRegistry();
     error ZeroToken();
     error ZeroReputationDelta();
@@ -959,6 +991,43 @@ contract MatchSettlement is Ownable2Step {
         );
     }
 
+    /// @notice Retract a settled match's on-chain EAS attestation — the dispute/correction
+    ///         path for a result later found wrong (e.g. the arena replay-verifier
+    ///         contradicts the attested winner, or a mis-attribution is caught). Attester-
+    ///         gated, mirroring `RenderReceipts.revokeReceipt` (the issuer of a claim is the
+    ///         party that retracts it). EAS marks the attestation revoked, so an indexer
+    ///         following `matchAttestationUid[matchId]` reads it as no longer live.
+    ///
+    ///         Scope — this retracts ONLY the portable attestation. The settled escrow
+    ///         payout and the reputation write are FINAL and are NOT reversed here: a
+    ///         correction that must also move funds or standing is a separate governance
+    ///         action, deliberately out of this path (reversing a paid-out, already-spent
+    ///         result on-chain is neither safe nor generally possible). The same posture as
+    ///         `revokeReceipt`, which retracts a render receipt without clawing back credit.
+    function revokeAttestation(bytes32 matchId) external onlyAttester {
+        bytes32 uid = matchAttestationUid[matchId];
+        // uid != 0 is the settled-and-attested marker (only `_attestSettled` writes it, and
+        // only the four settle paths call it). A never-settled match — or a revoke that
+        // races `_attestSettled` before its `matchAttestationUid` write, e.g. a reentrant
+        // EAS during the settle-time `attest` — reads zero here and reverts, so no separate
+        // status check is needed.
+        if (uid == bytes32(0)) revert NotAttested(matchId);
+        if (matchAttestationRevoked[matchId]) revert AttestationAlreadyRevoked(matchId);
+
+        // CEI: mark revoked before the external EAS.revoke, so a reentrant EAS that
+        // re-enters revokeAttestation for the same match hits the AlreadyRevoked guard —
+        // exactly one revoke, exactly one EAS.revoke call.
+        matchAttestationRevoked[matchId] = true;
+        emit MatchAttestationRevoked(matchId, uid);
+
+        EAS.revoke(
+            IEAS.RevocationRequest({
+                schema: matchAttestationSchema[matchId],
+                data: IEAS.RevocationRequestData({uid: uid, value: 0})
+            })
+        );
+    }
+
     /// @dev Shared void-and-refund mechanics for `cancelMatch` and `refundExpired`: flip
     ///      to the given terminal `status` and clear the funded flags BEFORE refunding
     ///      (checks-effects-interactions), so neither path can double-refund a stake nor
@@ -1116,6 +1185,7 @@ contract MatchSettlement is Ownable2Step {
             })
         );
         matchAttestationUid[matchId] = uid;
+        matchAttestationSchema[matchId] = schema;
         emit MatchAttested(matchId, uid);
     }
 }
