@@ -2199,8 +2199,9 @@ impl Store {
     /// and `submitted_at` are populated only once the (operator-gated) relayer lands
     /// the receipt on-chain ([`mark_submitted`](Self::mark_submitted)), and are NULL
     /// while the receipt is still pending or dead-lettered. `Ok(None)` when no row
-    /// exists at all (a compute-only job, or EAS disabled) — the clean absent the read
-    /// path renders as `null`. The outer `Option` (row presence) and the inner `uid`
+    /// exists at all — a job that has not settled into a receipt (still queued/in-flight,
+    /// or a settle whose result did not map to one) — the clean absent the read path
+    /// renders as `null`. The outer `Option` (row presence) and the inner `uid`
     /// (landed-on-chain) together let a client tell relayed / owed-but-unrelayed /
     /// none apart — the three states the `/jobs/{id}` attestation field must NOT
     /// collapse. The non-test read twin of the test-only

@@ -504,7 +504,8 @@ struct JobSummary {
 /// validated render that OWES an on-chain receipt. `uid` and `submitted_at` stay `null`
 /// until the (operator-gated) relayer lands the receipt on Base, then carry the real EAS
 /// attestation uid + unix submit time. A client thus tells three states apart:
-/// `attestation: null` (no attestation — a compute-only job, or EAS disabled),
+/// `attestation: null` (no receipt — the job has not settled into one, still
+/// queued/in-flight or a settle whose result did not map),
 /// `attestation: { uid: null, submitted_at: null }` (owed but not yet relayed), and
 /// `attestation: { uid, submitted_at }` (on-chain proof retrievable).
 #[derive(Debug, Serialize)]
