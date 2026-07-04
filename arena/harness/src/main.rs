@@ -5615,10 +5615,10 @@ mod tests {
 
     #[test]
     fn pump_to_end_deadlined_forfeits_a_dead_stream_to_a_bounded_end() {
-        // FM3 (no hang, no spin): a match whose stream is closed before a single action forfeits
-        // every tick and reaches its bounded end (the max_ticks cap) rather than blocking forever
-        // on a dead read. direct_args caps max_ticks at 4 and Disconnected returns at once (no
-        // per-tick deadline wait), so the whole enforced pump completes promptly and terminates.
+        // FM4 (no hang, no spin): a match whose stream is closed before a single action
+        // ELIMINATES every silent seat at once (a closed stream is an immediate forfeit, not a
+        // per-tick timeout), so it ends the moment no team survives — promptly at tick 1, NOT
+        // idling to the max_ticks cap and NOT blocking forever on a dead read.
         let mut m = build_direct_match(&direct_args(2, "", 0), 2);
         let (tx, rx) = mpsc::channel::<String>();
         drop(tx); // the agent stream is closed before a single action
@@ -5628,9 +5628,14 @@ mod tests {
         assert_eq!(
             m.phase(),
             MatchPhase::Ended,
-            "the deadlined pump drives a dead-stream match to its bounded end, it does not hang"
+            "the deadlined pump drives a dead-stream match to its end, it does not hang"
         );
+        assert_eq!(result.final_tick, 1, "both seats forfeit the EOF tick, so it ends at tick 1, not the cap");
         assert_eq!(result.outcomes.len(), 2, "both seats are ranked in the terminal result");
+        assert!(result.outcomes.iter().all(|o| !o.alive_at_end), "a dead stream downs both seats");
+        let replay = m.into_replay();
+        assert_eq!(tick_seats(&replay), vec![(0, vec![])], "no seat acts on a dead stream");
+        assert_eq!(tick_forfeits(&replay), vec![(0, vec![0, 1])], "both seats forfeit at the tick-0 EOF");
     }
 
     #[test]
