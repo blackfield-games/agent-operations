@@ -5700,6 +5700,96 @@ mod tests {
     }
 
     #[test]
+    fn read_tick_deadlined_escalates_a_persistently_silent_seat_after_the_threshold() {
+        // The escalation core, driven deterministically by a never-sent line (no sleep race — the
+        // assertion is on the miss COUNT, not a duration). Seat 0 answers each read; seat 1 is
+        // withheld, so every read times out on it and advances its consecutive-miss streak. Seat 1
+        // keeps its seat through the sub-threshold misses and is ELIMINATED (departs `active`, which
+        // is what the pump turns into m.forfeit) on exactly the MISS_FORFEIT_THRESHOLD-th miss.
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mut active = active_seats(2);
+        let mut misses = BTreeMap::new();
+        let (tx, rx) = mpsc::channel::<String>();
+
+        for streak in 1..MISS_FORFEIT_THRESHOLD {
+            tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 0 answers; seat 1 withheld
+            read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(5), &mut misses);
+            assert!(active.contains(&1), "a sub-threshold silence keeps seat 1 in the match");
+            assert_eq!(misses.get(&1), Some(&streak), "seat 1's consecutive-miss streak tracks each miss");
+        }
+
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(5), &mut misses);
+        assert_eq!(active, active_seats(1), "the threshold-th consecutive miss eliminates seat 1, leaving only seat 0");
+        assert_eq!(misses.get(&1), None, "an eliminated seat's streak entry is cleared");
+        assert!(!misses.contains_key(&0), "the seat that answered every read never accrued a miss");
+        drop(tx);
+    }
+
+    #[test]
+    fn read_tick_deadlined_resets_the_miss_streak_when_a_seat_answers() {
+        // FM3: only a CONSECUTIVE silence eliminates. Seat 1 misses to one shy of the threshold,
+        // then ANSWERS — clearing its streak — so a later miss restarts at 1 and it is never
+        // eliminated, even though its TOTAL misses now exceed the threshold.
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mut active = active_seats(2);
+        let mut misses = BTreeMap::new();
+        let (tx, rx) = mpsc::channel::<String>();
+
+        for _ in 1..MISS_FORFEIT_THRESHOLD {
+            tx.send(act_line(0, m.match_id(), 0)).unwrap(); // seat 1 withheld
+            read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(5), &mut misses);
+        }
+        assert_eq!(misses.get(&1), Some(&(MISS_FORFEIT_THRESHOLD - 1)), "seat 1 is one miss from the threshold");
+
+        // Seat 1 answers this read: both seats deliver a line, so the read returns with no timeout.
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        tx.send(act_line(1, m.match_id(), 0)).unwrap();
+        read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(5), &mut misses);
+        assert_eq!(misses.get(&1), None, "answering clears seat 1's consecutive-miss streak");
+        assert!(active.contains(&1), "seat 1 is still in the match after answering");
+
+        // A fresh miss restarts the streak at 1: despite MORE total misses than the threshold,
+        // seat 1 survives, because the run was broken.
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(5), &mut misses);
+        assert_eq!(misses.get(&1), Some(&1), "the post-answer streak restarts at 1, not at the pre-answer count");
+        assert!(active.contains(&1), "a non-consecutive silence never eliminates seat 1");
+        drop(tx);
+    }
+
+    #[test]
+    fn pump_to_end_deadlined_escalates_persistent_silence_to_a_prompt_end() {
+        // The whole point, end to end: a match whose seats go persistently silent — the stream
+        // stays OPEN (a timeout each tick, NOT an EOF) — must not idle to the max_ticks cap.
+        // Nothing is ever sent, so every tick times out and both seats accrue misses; on the
+        // MISS_FORFEIT_THRESHOLD-th consecutive miss both are eliminated and the match ends at
+        // tick == threshold (3), well before the cap (max_ticks 4). Deterministic: the never-sent
+        // lines drive the escalation; the outcome is count-, not duration-, based.
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let (_tx, rx) = mpsc::channel::<String>(); // held open (no EOF) but never fed
+        let mut out: Vec<u8> = Vec::new();
+        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(5));
+
+        assert_eq!(m.phase(), MatchPhase::Ended, "persistent silence ends the match, it does not idle to the cap");
+        assert_eq!(
+            result.final_tick as u32, MISS_FORFEIT_THRESHOLD,
+            "the match ends on the threshold-th consecutive miss, not at the max_ticks cap"
+        );
+        assert!(result.outcomes.iter().all(|o| !o.alive_at_end), "both persistently-silent seats are eliminated");
+        let replay = m.into_replay();
+        assert_eq!(
+            tick_forfeits(&replay),
+            vec![((MISS_FORFEIT_THRESHOLD - 1) as u64, vec![0, 1])],
+            "both seats are durably forfeited together on the escalation tick, and only then"
+        );
+        assert!(
+            tick_seats(&replay).iter().all(|(_, seats)| seats.is_empty()),
+            "no seat ever acts — every tick is a silent forfeit"
+        );
+    }
+
+    #[test]
     fn parse_pickup_radius_maps_a_non_negative_radius() {
         assert_eq!(parse_pickup_radius("0"), 0);
         assert_eq!(parse_pickup_radius("4000"), 4000);
