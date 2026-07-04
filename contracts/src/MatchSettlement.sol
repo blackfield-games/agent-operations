@@ -295,6 +295,21 @@ contract MatchSettlement is Ownable2Step {
     ///         the earner's credit). Zero until revoked.
     mapping(bytes32 matchId => bool) public matchAttestationRevoked;
 
+    /// @notice Protocol-wide count of LIVE (settled, attested, not-yet-revoked) match
+    ///         attestations: `_attestSettled` increments it, `revokeAttestation`
+    ///         decrements it. The MatchSettlement twin of `RenderReceipts.receiptCount`,
+    ///         so an indexer/HUD reads the aggregate directly instead of scanning
+    ///         `MatchAttested`/`MatchAttestationRevoked` events — `AgentRegistry`'s
+    ///         `matchesSettled` is per-agent, not a protocol-wide live count. Cumulative
+    ///         attested is `liveAttestationCount + revokedAttestationCount`.
+    uint256 public liveAttestationCount;
+    /// @notice Running count of revoked match attestations. With the live
+    ///         `liveAttestationCount` this reconstructs cumulative attested
+    ///         (`liveAttestationCount + revokedAttestationCount`), mirroring
+    ///         `RenderReceipts.revokedCount`. Only ever increases (a revoke is one-shot,
+    ///         guarded by `matchAttestationRevoked`).
+    uint256 public revokedAttestationCount;
+
     event MatchOpened(bytes32 indexed matchId, address indexed agentA, address indexed agentB, uint256 stake);
     event MatchFunded(bytes32 indexed matchId, address indexed agent, uint256 stake);
     event MatchReclaimed(bytes32 indexed matchId, address indexed agent, uint256 stake);
@@ -1016,8 +1031,12 @@ contract MatchSettlement is Ownable2Step {
 
         // CEI: mark revoked before the external EAS.revoke, so a reentrant EAS that
         // re-enters revokeAttestation for the same match hits the AlreadyRevoked guard —
-        // exactly one revoke, exactly one EAS.revoke call.
+        // exactly one revoke, exactly one EAS.revoke call. The guards above (uid != 0 AND
+        // not-already-revoked) make this decrement one-shot per match, so the live count
+        // moves down exactly once and can never underflow below its matching attest.
         matchAttestationRevoked[matchId] = true;
+        --liveAttestationCount;
+        ++revokedAttestationCount;
         emit MatchAttestationRevoked(matchId, uid);
 
         EAS.revoke(
@@ -1186,6 +1205,10 @@ contract MatchSettlement is Ownable2Step {
         );
         matchAttestationUid[matchId] = uid;
         matchAttestationSchema[matchId] = schema;
+        // One live attestation added. Called exactly once per match (each settle path is
+        // fenced to a single terminal transition), so no path double-counts and none is
+        // missed — the count tracks live attestations across every settle shape.
+        ++liveAttestationCount;
         emit MatchAttested(matchId, uid);
     }
 }
