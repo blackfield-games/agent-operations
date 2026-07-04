@@ -913,6 +913,22 @@ pub struct SeatAction {
 pub struct TickRecord {
     pub tick: u64,
     pub actions: Vec<SeatAction>,
+    /// The seats that FORFEITED (durably left the match) AT this tick, ascending by
+    /// seat. A forfeit is applied at the top of the tick's step — the seat is downed
+    /// (`alive == false`) before its intent is read, so a forfeited seat never also
+    /// appears in [`actions`](TickRecord::actions) the same tick. Unlike an absent
+    /// action (which forfeits only the TICK — the pawn holds still but stays alive),
+    /// a forfeit is a DURABLE elimination: it removes the seat from the live set so
+    /// the match can end when one team remains, and an eliminated seat can never
+    /// outrank a survivor. This is an external event (the agent left / was
+    /// disconnected), NOT derivable from the action stream, so it is recorded here
+    /// and re-applied by replay; it is folded into
+    /// [`digest`](ReplayRecord::digest) (v7), so a tampered forfeit set — one added,
+    /// removed, or reordered — yields a different hash and fails re-verification.
+    /// `#[serde(default)]` so a record written before forfeits existed deserializes
+    /// to the empty (no-forfeit) behavior it ran under.
+    #[serde(default)]
+    pub forfeits: Vec<SeatId>,
 }
 
 /// A static axis-aligned vision-blocking volume on the ground plane — the
@@ -1066,7 +1082,8 @@ impl ReplayRecord {
         // v2 folded in the static `blockers` set; v3 folds in the static `pickups`
         // set; v4 folds in the `rules_commit` (the combat tuning); v5 folds in the
         // `config` DETERMINANTS (arena bounds + tick cap); v6 folds each blocker's
-        // `height` (the z-extent that bounds vision occlusion). The bump is honest
+        // `height` (the z-extent that bounds vision occlusion); v7 folds each tick's
+        // `forfeits` (the seats that durably left AT that tick). The bump is honest
         // about each encoding change. Blockers are physical cover now (they stop movement
         // and fire, which a re-run DOES reproduce), but their VISION effect still
         // cannot be bound by re-execution alone — outcomes never reveal what a seat
@@ -1079,7 +1096,7 @@ impl ReplayRecord {
         // outcome yet, like the rules, rode only on the parent `MatchRecord.config`.
         // Folding them all keeps the digest a complete, self-identifying commitment to
         // the match world, the rules, AND the arena it ran under.
-        h.update(b"blackfield/arena/replay/v6");
+        h.update(b"blackfield/arena/replay/v7");
         h.update(self.protocol_version.to_be_bytes());
         h.update(self.match_id.as_bytes());
         h.update(self.seed.to_be_bytes());
@@ -1128,6 +1145,18 @@ impl ReplayRecord {
                 h.update(a.intent.move_dir.y.to_be_bytes());
                 h.update(a.intent.aim.to_be_bytes());
                 h.update([a.intent.buttons.bits()]);
+            }
+            // v7: the seats that forfeited (durably left) AT this tick. A forfeit
+            // downs a pawn and ends the match a tick sooner, so it drives the outcome
+            // yet is NOT derivable from the action stream — folding it here is what
+            // pins the leave/disconnect stream to the hash, so a record with its
+            // forfeits stripped (the leaver survives) can no longer share a commitment
+            // with the honest match. Length-prefixed like `actions`, so the fold is
+            // collision-free and byte-stable; an empty set (the common case) adds only
+            // the `0u32` prefix.
+            h.update((t.forfeits.len() as u32).to_be_bytes());
+            for &s in &t.forfeits {
+                h.update([s]);
             }
         }
         h.finalize().into()
@@ -1980,11 +2009,12 @@ mod tests {
     fn replay_digest_golden() {
         // A fixed record must hash to a fixed value. Any change to the canonical
         // encoding (field order, prefixing, domain tag, the v2 blockers / v3 pickups /
-        // v4 rules_commit / v5 config-determinant / v6 blocker-height sections) flips
-        // this — the hard byte-stability pin for on-chain attestation.
+        // v4 rules_commit / v5 config-determinant / v6 blocker-height / v7 per-tick
+        // forfeit sections) flips this — the hard byte-stability pin for on-chain
+        // attestation.
         assert_eq!(
             hex::encode(sample_replay().digest()),
-            "b5af35731ce5cfd34bc3e8774e575f5929bc5bc6a59555255dc881722e4f46c0"
+            "4b0b2632cfa219080144bc988c0a0f27df0799d44e67b970058d4333cf54cb10"
         );
     }
 
@@ -2080,6 +2110,22 @@ mod tests {
         let mut r = sample_replay();
         r.config.seats += 1;
         assert_eq!(base, r.digest(), "config.seats is redundant with the bound roster, not folded again");
+        // A forfeit binds (v7): the seats that durably left AT a tick drive the outcome
+        // (a downed pawn ends the match sooner) yet are not derivable from the action
+        // stream, so a record with its leave stream stripped must NOT share a hash with
+        // the honest match — the settlement-forgery guard.
+        let mut r = sample_replay();
+        r.ticks[1].forfeits.push(0);
+        let with_forfeit = r.digest();
+        assert_ne!(base, with_forfeit, "a forfeit must bind (a stripped leave stream can't share a hash)");
+        // The forfeiting SEAT binds — leaving seat 1 hashes apart from leaving seat 0.
+        let mut r = sample_replay();
+        r.ticks[1].forfeits.push(1);
+        assert_ne!(with_forfeit, r.digest(), "a forfeit's seat must bind");
+        // The forfeit's TICK binds — the same leave one tick earlier is a different match.
+        let mut r = sample_replay();
+        r.ticks[0].forfeits.push(0);
+        assert_ne!(with_forfeit, r.digest(), "a forfeit's tick must bind");
     }
 
     #[test]
@@ -2101,6 +2147,22 @@ mod tests {
         json.as_object_mut().unwrap().remove("config");
         let parsed: ReplayRecord = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.config, MatchConfig::default(), "a config-less record fills the default config");
+    }
+
+    #[test]
+    fn tick_record_forfeits_default_and_round_trip() {
+        // Back-compat: a TickRecord written before `forfeits` existed (no key) parses
+        // to the empty, no-forfeit behavior it ran under — serde(default), the same
+        // structural back-compat the blockers/pickups/config defaults give.
+        let mut json = serde_json::to_value(sample_replay()).unwrap();
+        json.pointer_mut("/ticks/0").unwrap().as_object_mut().unwrap().remove("forfeits");
+        let parsed: ReplayRecord = serde_json::from_value(json).unwrap();
+        assert!(parsed.ticks[0].forfeits.is_empty(), "a forfeit-less tick fills the empty default");
+        // A non-empty forfeit stream round-trips intact (ascending seats preserved).
+        let mut rec = sample_replay();
+        rec.ticks[1].forfeits = vec![0, 1];
+        let round: ReplayRecord = serde_json::from_value(serde_json::to_value(&rec).unwrap()).unwrap();
+        assert_eq!(round, rec, "a forfeit-bearing TickRecord did not round-trip");
     }
 
     #[test]
@@ -2287,6 +2349,7 @@ mod tests {
                         seat: 0,
                         intent: ActionIntent { move_dir: Vec2 { x: 600, y: 800 }, aim: 0x4000, buttons },
                     }],
+                    forfeits: Vec::new(),
                 },
                 TickRecord {
                     tick: 1,
@@ -2294,6 +2357,7 @@ mod tests {
                         seat: 1,
                         intent: ActionIntent { move_dir: Vec2 { x: -100, y: 0 }, aim: 0, buttons },
                     }],
+                    forfeits: Vec::new(),
                 },
             ],
         }
