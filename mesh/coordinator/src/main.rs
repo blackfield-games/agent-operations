@@ -47,6 +47,13 @@ const PLACEHOLDER_ATTESTATION_UID: &str =
 /// authoritative fence; HTTP poll is the legacy/dev transport.
 const DISPATCH_SEQ_HEADER: &str = "x-dispatch-seq";
 
+/// Response header on `POST /register` carrying the earner's freshly-issued poll
+/// token, and the request header (`Authorization: Bearer <token>` is preferred; this
+/// is the issue side) the earner echoes on `GET /jobs/next` to authenticate its
+/// liveness refresh. Out-of-band like [`DISPATCH_SEQ_HEADER`] so the `/register` body
+/// contract is unchanged.
+const POLL_TOKEN_HEADER: &str = "x-poll-token";
+
 mod eas;
 mod meter;
 mod relay;
@@ -266,6 +273,13 @@ struct EarnerInfo {
     supported: Vec<JobKind>,
     /// Unix epoch seconds of the last sign of life from this earner.
     last_seen: i64,
+    /// Per-registration secret ([`new_poll_token`]), issued when the earner proves
+    /// key-possession at its signed registration and rotated on every re-register.
+    /// A `GET /jobs/next` liveness refresh for this address is honored only when the
+    /// poll presents this token (see [`next_job`]) — so an unauthenticated caller
+    /// can't keep another earner's address counted live. NEVER serialized (`/earners`
+    /// and `/stats` build separate DTOs), so it stays server-side.
+    poll_token: String,
 }
 
 impl EarnerInfo {
@@ -274,6 +288,20 @@ impl EarnerInfo {
     fn is_live(&self, now: i64, ttl_secs: i64) -> bool {
         now.saturating_sub(self.last_seen) <= ttl_secs
     }
+}
+
+/// Bytes of entropy in a poll token — 32 (256-bit), hex-encoded to a 64-char bearer.
+const POLL_TOKEN_BYTES: usize = 32;
+
+/// A fresh random poll token (hex of [`POLL_TOKEN_BYTES`] CSPRNG bytes), or `None` if
+/// the OS RNG is unavailable — the caller fails the registration CLOSED rather than
+/// issue a guessable or empty credential (an empty stored token would let an empty
+/// presented `Bearer ` authenticate every caller). Mirrors the WS challenge nonce's
+/// `getrandom` + `hex::encode` idiom.
+fn new_poll_token() -> Option<String> {
+    let mut buf = [0u8; POLL_TOKEN_BYTES];
+    getrandom::getrandom(&mut buf).ok()?;
+    Some(hex::encode(buf))
 }
 
 struct AppState {
@@ -2231,11 +2259,21 @@ fn is_evm_address(s: &str) -> bool {
 /// wrong token of the SAME length (the byte-recovery attack) is the constant-time
 /// path (pinned by a test).
 fn ingest_authorized(headers: &HeaderMap, expected: &str) -> bool {
+    bearer_token(headers)
+        .is_some_and(|presented| presented.as_bytes().ct_eq(expected.as_bytes()).into())
+}
+
+/// The `<token>` from an `Authorization: Bearer <token>` header, or `None` if the
+/// header is absent, not valid visible-ASCII (`to_str` errs, never panics), or not a
+/// `Bearer` scheme. The raw credential — a caller MUST compare it in CONSTANT TIME
+/// (`ct_eq`) against the expected secret, never `==` (which leaks the secret one byte
+/// at a time over timed requests). Shared by the ingest-token gate and the
+/// `/jobs/next` poll-token liveness gate.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|presented| presented.as_bytes().ct_eq(expected.as_bytes()).into())
 }
 
 /// Upper bounds on self-reported `Hello` fields, enforced by `validate_hello` so a
@@ -2328,13 +2366,17 @@ fn validate_hello(
 
 /// Earner → coordinator registration. Accepts an `EarnerMsg::Hello` and
 /// upserts the earner keyed by address. Other `EarnerMsg` variants are
-/// rejected here (job dispatch lives on its own routes for now).
+/// rejected here (job dispatch lives on its own routes for now). On success the
+/// response carries an [`POLL_TOKEN_HEADER`] the earner echoes as
+/// `Authorization: Bearer <token>` on `GET /jobs/next` to authenticate its
+/// liveness refresh — the body stays `"registered"` (out-of-band, so the body
+/// contract is unchanged for a legacy client that only checks the status).
 async fn register(
     State(state): State<Arc<AppState>>,
     Extension(PeerAddr(peer)): Extension<PeerAddr>,
     headers: HeaderMap,
     Json(msg): Json<EarnerMsg>,
-) -> Result<&'static str, StatusCode> {
+) -> Result<([(&'static str, String); 1], &'static str), StatusCode> {
     // Per-source registration rate limit FIRST — ahead of the secp256k1 verify in
     // `validate_hello` (cheap-reject-first, FM2) — so an over-limit source is shed
     // with 429 before any curve recovery or registry lock. The source is the
@@ -2380,6 +2422,14 @@ async fn register(
     // varying case across boundaries must not split into two identities.
     let earner_address = verify::canonical_earner_address(&earner_address);
 
+    // Mint the poll token BEFORE admit so the exact secret stored in the registry is
+    // the one returned to the earner. Fail CLOSED on an RNG error rather than admit an
+    // earner with no (or an empty) token — an empty stored token would authenticate an
+    // empty `Bearer ` from anyone.
+    let Some(poll_token) = new_poll_token() else {
+        tracing::error!(address = %earner_address, "register: poll token RNG failed; refusing");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
     let now = now_secs();
     let admission = admit_earner(
         &mut *state.earners.lock().await,
@@ -2389,6 +2439,7 @@ async fn register(
             vram_gb,
             supported,
             last_seen: now,
+            poll_token: poll_token.clone(),
         },
         state.max_earners,
         now,
@@ -2411,7 +2462,7 @@ async fn register(
         state.earners_evicted.fetch_add(1, Ordering::Relaxed);
     }
     tracing::info!(address = %earner_address, vram_gb, "earner registered");
-    Ok("registered")
+    Ok(([(POLL_TOKEN_HEADER, poll_token)], "registered"))
 }
 
 /// `POST /jobs` — enqueue a new render job. Validates the request, mints a fresh
@@ -3071,7 +3122,11 @@ struct NextJobQuery {
     earner: Option<String>,
 }
 
-async fn next_job(State(state): State<Arc<AppState>>, Query(q): Query<NextJobQuery>) -> Response {
+async fn next_job(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<NextJobQuery>,
+) -> Response {
     // Capability match for the HTTP transport. The stateless `/jobs/next` used to
     // hand out any kind; an earner that advertised a SUBSET then self-dropped the
     // unsupported job (see the earner's poll_once guard) had already had an
@@ -3079,22 +3134,31 @@ async fn next_job(State(state): State<Arc<AppState>>, Query(q): Query<NextJobQue
     // toward dead-letter. If the poll names a registered earner, hand out only
     // kinds it supports. The earners lock is taken and the supported set cloned
     // out HERE, before the store lock, so the two locks never overlap.
+    let presented = bearer_token(&headers);
     let supported = match q.earner.as_deref() {
         Some(addr) => {
             // Resolve the poll to the canonical identity it registered under, so a
             // case-variant `earner=` param hits the same registry entry rather than
-            // being treated as an unknown earner (which would skip the liveness
-            // refresh and lapse to unfiltered dispatch).
+            // being treated as an unknown earner (which would lapse to unfiltered
+            // dispatch).
             let addr = verify::canonical_earner_address(addr);
-            // An identified poll is a sign of life: refresh last_seen (mirroring
-            // the submit path) so an actively-polling HTTP earner stays live in
-            // the registry — counted in /stats, and keeping THIS filter applicable
-            // instead of lapsing to unfiltered once the reaper prunes it. Clones
-            // the advertised kinds out; the earners lock drops at the block end,
-            // before the store lock.
             let mut earners = state.earners.lock().await;
             earners.get_mut(&addr).map(|e| {
-                e.last_seen = now_secs();
+                // Liveness refresh is AUTHENTICATED: only a poll presenting the poll
+                // token this address was issued at its signed registration
+                // (`Authorization: Bearer <token>`, constant-time compared) is a sign
+                // of life. Otherwise an unauthenticated caller could poll with a
+                // victim's `earner=` address and keep it counted live in /stats and
+                // dispatch-eligible while the real earner is offline. Dispatch itself
+                // stays open — the advertised kinds are still cloned out for the
+                // capability filter, so a legacy/unauthenticated poll still gets work;
+                // only the last_seen WRITE is gated. Clones the kinds out; the earners
+                // lock drops at the block end, before the store lock.
+                if presented
+                    .is_some_and(|t| t.as_bytes().ct_eq(e.poll_token.as_bytes()).into())
+                {
+                    e.last_seen = now_secs();
+                }
                 e.supported.clone()
             })
         }
@@ -3806,6 +3870,14 @@ async fn recv_hello_inner(
         // address keys the registry, every fault attribution, and job offers for this
         // session, so they all derive from one case-invariant form.
         let earner_address = verify::canonical_earner_address(&earner_address);
+        // A WS earner receives pushed offers and never polls `/jobs/next`, so this
+        // token is unused for it — but EarnerInfo carries it uniformly and it must
+        // never be empty (an empty token would authenticate an empty `Bearer ` if this
+        // earner were ever polled for). Fail closed (close the socket) on an RNG error.
+        let Some(poll_token) = new_poll_token() else {
+            tracing::error!(address = %earner_address, "ws: poll token RNG failed; closing");
+            return None;
+        };
         let now = now_secs();
         let admission = admit_earner(
             &mut *state.earners.lock().await,
@@ -3815,6 +3887,7 @@ async fn recv_hello_inner(
                 vram_gb,
                 supported,
                 last_seen: now,
+                poll_token,
             },
             state.max_earners,
             now,
@@ -4380,6 +4453,16 @@ mod tests {
             .unwrap()
     }
 
+    /// The poll token the coordinator issued in the `X-Poll-Token` header of a
+    /// `/register` response — the credential a `/jobs/next` liveness refresh needs.
+    fn poll_token_of(resp: &axum::response::Response) -> String {
+        resp.headers()
+            .get(POLL_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("register issues a poll token")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn register_then_stats_reflects_earner() {
         let state = test_state_empty().await;
@@ -4790,26 +4873,111 @@ mod tests {
 
     #[tokio::test]
     async fn next_job_poll_refreshes_earner_liveness() {
-        // An identified poll is a sign of life: it refreshes last_seen (mirroring
-        // submit) so an actively-polling HTTP earner isn't pruned and its filter
-        // keeps applying. Stale the earner to last_seen=0, poll, assert it advanced.
+        // An AUTHENTICATED poll (carrying the poll token issued at registration) is a
+        // sign of life: it refreshes last_seen (mirroring submit) so an actively-polling
+        // HTTP earner isn't pruned and its filter keeps applying. Stale the earner to
+        // last_seen=0, poll WITH its token, assert it advanced.
         let state = test_state_empty().await;
         enqueue(&state, &job_of(JobKind::Terrain)).await;
         let addr = test_address("cap");
-        post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        let token = poll_token_of(
+            &post_json(
+                state.clone(),
+                "/register",
+                &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
+            )
+            .await,
+        );
         state.earners.lock().await.get_mut(&addr).unwrap().last_seen = 0;
 
-        let _ = get(state.clone(), &format!("/jobs/next?earner={addr}")).await;
+        let auth = format!("Bearer {token}");
+        let _ = get_auth(state.clone(), &format!("/jobs/next?earner={addr}"), Some(&auth)).await;
 
         let last_seen = state.earners.lock().await.get(&addr).unwrap().last_seen;
         assert!(
             last_seen > 0,
-            "an identified poll refreshes the earner's last_seen"
+            "an authenticated poll refreshes the earner's last_seen"
+        );
+    }
+
+    /// The liveness-spoof guard: a poll for a victim's `earner=` address that does NOT
+    /// present the victim's poll token must NOT refresh its last_seen, so an
+    /// unauthenticated attacker can't keep an offline earner counted live in /stats and
+    /// dispatch-eligible. Dispatch itself stays open (the job is still handed out) — only
+    /// the liveness WRITE is gated. Covers no-token AND wrong-token.
+    #[tokio::test]
+    async fn next_job_unauthenticated_poll_does_not_refresh_liveness() {
+        let state = test_state_empty().await;
+        enqueue(&state, &job_of(JobKind::Terrain)).await;
+        let victim = test_address("victim");
+        post_json(
+            state.clone(),
+            "/register",
+            &serde_json::to_value(hello("victim", 24, vec![JobKind::Terrain])).unwrap(),
+        )
+        .await;
+        state.earners.lock().await.get_mut(&victim).unwrap().last_seen = 0;
+
+        // (a) No token at all → no refresh, but a job is still dispatched (attacker
+        // gains nothing on liveness).
+        let resp = get(state.clone(), &format!("/jobs/next?earner={victim}")).await;
+        assert!(
+            body_json(resp).await["id"].is_string(),
+            "dispatch stays open for an unauthenticated poll"
+        );
+        assert_eq!(
+            state.earners.lock().await.get(&victim).unwrap().last_seen,
+            0,
+            "an unauthenticated poll must NOT refresh the victim's last_seen"
+        );
+
+        // (b) A wrong token (right shape, not the victim's) also does not refresh.
+        enqueue(&state, &job_of(JobKind::Terrain)).await;
+        let forged = format!("Bearer {}", "0".repeat(64));
+        let _ = get_auth(state.clone(), &format!("/jobs/next?earner={victim}"), Some(&forged)).await;
+        assert_eq!(
+            state.earners.lock().await.get(&victim).unwrap().last_seen,
+            0,
+            "a wrong poll token must NOT refresh the victim's last_seen"
+        );
+    }
+
+    /// FM3 — re-registration rotates the poll token, and that must NOT stall honest
+    /// dispatch. A re-registered earner (same address, new session) gets a FRESH token;
+    /// an in-flight poll still carrying the OLD token isn't refreshed (a stale credential
+    /// can't prove liveness), but dispatch stays open so the earner keeps getting work,
+    /// and its next poll with the new token refreshes normally.
+    #[tokio::test]
+    async fn next_job_reregistration_rotates_the_poll_token_without_stalling_dispatch() {
+        let state = test_state_empty().await;
+        let addr = test_address("cap");
+        let hello_msg = serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap();
+        let token1 = poll_token_of(&post_json(state.clone(), "/register", &hello_msg).await);
+        let token2 = poll_token_of(&post_json(state.clone(), "/register", &hello_msg).await);
+        assert_ne!(token1, token2, "re-registration rotates the poll token");
+
+        // A poll with the STALE token1: dispatch still works, liveness NOT refreshed.
+        enqueue(&state, &job_of(JobKind::Terrain)).await;
+        state.earners.lock().await.get_mut(&addr).unwrap().last_seen = 0;
+        let stale_auth = format!("Bearer {token1}");
+        let resp = get_auth(state.clone(), &format!("/jobs/next?earner={addr}"), Some(&stale_auth)).await;
+        assert!(
+            body_json(resp).await["id"].is_string(),
+            "a stale token does not stall dispatch"
+        );
+        assert_eq!(
+            state.earners.lock().await.get(&addr).unwrap().last_seen,
+            0,
+            "a stale token does not refresh liveness"
+        );
+
+        // The current token2 refreshes normally.
+        enqueue(&state, &job_of(JobKind::Terrain)).await;
+        let fresh_auth = format!("Bearer {token2}");
+        let _ = get_auth(state.clone(), &format!("/jobs/next?earner={addr}"), Some(&fresh_auth)).await;
+        assert!(
+            state.earners.lock().await.get(&addr).unwrap().last_seen > 0,
+            "the current poll token refreshes liveness"
         );
     }
 
@@ -5155,16 +5323,21 @@ mod tests {
         let sk = test_signing_key("poll-earner");
         let canonical = address_from_signing_key(&sk);
         let upper = upper_case_variant(&canonical);
-        post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(signed_hello(&sk, &canonical, "RTX 4090", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        let token = poll_token_of(
+            &post_json(
+                state.clone(),
+                "/register",
+                &serde_json::to_value(signed_hello(&sk, &canonical, "RTX 4090", 24, vec![JobKind::Terrain])).unwrap(),
+            )
+            .await,
+        );
         state.earners.lock().await.get_mut(&canonical).unwrap().last_seen = 0;
 
-        // Poll with the UPPER-case variant: it must resolve to the registered earner.
-        let resp = get(state.clone(), &format!("/jobs/next?earner={upper}")).await;
+        // Poll with the UPPER-case variant AND the token: the address must resolve to
+        // the registered earner for both the capability filter and — since the token
+        // matches that canonical identity — the liveness refresh.
+        let auth = format!("Bearer {token}");
+        let resp = get_auth(state.clone(), &format!("/jobs/next?earner={upper}"), Some(&auth)).await;
         let json = body_json(resp).await;
         assert_eq!(
             json["id"].as_str().unwrap(),
@@ -8090,6 +8263,7 @@ mod tests {
                 vram_gb: 24,
                 supported: vec![JobKind::Terrain],
                 last_seen: now_secs(),
+                poll_token: "tok".into(),
             },
         );
         assert_eq!(
@@ -9281,6 +9455,7 @@ mod tests {
             vram_gb: 24,
             supported: vec![JobKind::Terrain],
             last_seen,
+            poll_token: "tok".into(),
         }
     }
 
@@ -14000,6 +14175,7 @@ mod tests {
             vram_gb: 24,
             supported: vec![JobKind::Terrain],
             last_seen: 1000,
+            poll_token: "tok".into(),
         };
         assert!(info.is_live(1000, 60), "0s elapsed is live");
         assert!(info.is_live(1060, 60), "exactly ttl elapsed is still live");
@@ -14016,6 +14192,7 @@ mod tests {
                 vram_gb: 24,
                 supported: vec![JobKind::Terrain],
                 last_seen: 1000,
+                poll_token: "tok".into(),
             },
         );
         map.insert(
@@ -14025,6 +14202,7 @@ mod tests {
                 vram_gb: 16,
                 supported: vec![JobKind::NpcTick],
                 last_seen: 900,
+                poll_token: "tok".into(),
             },
         );
         // now=1000, ttl=60: fresh elapsed 0 (live); stale elapsed 100 (>60, dead).
