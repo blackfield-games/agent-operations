@@ -1456,6 +1456,34 @@ fn finish(m: &Match, n: u8, out: &mut impl Write) -> MatchResult {
 /// blocking golden/replay pump has no wall-clock deadline to miss.
 const MISS_FORFEIT_THRESHOLD: u32 = 3;
 
+/// Escalate the still-silent active seats when a tick's read ends without them answering (a
+/// timeout, a stray-past-deadline break, or a closed stream). On a timeout (`eof == false`) each
+/// silent seat's consecutive-miss streak advances and one that crosses [`MISS_FORFEIT_THRESHOLD`]
+/// departs `active` — the caller then turns that departure into `m.forfeit`. On a closed stream
+/// (`eof == true`) every silent seat departs at once (an immediate forfeit — a dead stream never
+/// answers, so there is no streak to count). An eliminated seat's streak entry is cleared. The
+/// silent set is materialised before the loop mutates `active`, so a departure never skips a peer.
+fn forfeit_silent_seats(
+    active: &mut BTreeSet<SeatId>,
+    answered: &BTreeSet<SeatId>,
+    misses: &mut BTreeMap<SeatId, u32>,
+    eof: bool,
+) {
+    for seat in active.difference(answered).copied().collect::<Vec<_>>() {
+        if eof {
+            active.remove(&seat);
+            misses.remove(&seat);
+            continue;
+        }
+        let streak = misses.entry(seat).or_insert(0);
+        *streak += 1;
+        if *streak >= MISS_FORFEIT_THRESHOLD {
+            active.remove(&seat);
+            misses.remove(&seat);
+        }
+    }
+}
+
 /// Read one Live tick's actions from the still-`active` seats, bounded by a SHARED per-tick
 /// wall-clock deadline. Every seat races the same `Instant` (computed once, here), so the
 /// whole tick costs at most ~`deadline` no matter how many seats are slow — a near-miss on the
@@ -1509,6 +1537,11 @@ fn read_tick_deadlined(
                 // would forfeit it early, this does not).
                 if !active.contains(&seat) {
                     if Instant::now() >= tick_deadline {
+                        // Budget spent on a stray from a departed seat: the silent survivors
+                        // missed this tick exactly as on a timeout, so escalate them before
+                        // breaking — else a one-stray-per-tick flood would reset the read past
+                        // the deadline forever without ever advancing a co-silent seat's streak.
+                        forfeit_silent_seats(active, &answered, misses, false);
                         break;
                     }
                     continue;
@@ -1541,14 +1574,7 @@ fn read_tick_deadlined(
                     m.tick(),
                     deadline.as_micros()
                 );
-                for seat in active.difference(&answered).copied().collect::<Vec<_>>() {
-                    let streak = misses.entry(seat).or_insert(0);
-                    *streak += 1;
-                    if *streak >= MISS_FORFEIT_THRESHOLD {
-                        active.remove(&seat);
-                        misses.remove(&seat);
-                    }
-                }
+                forfeit_silent_seats(active, &answered, misses, false);
                 break;
             }
             // EOF: the agent stream closed. Every still-silent seat departs `active` at once (an
@@ -1556,10 +1582,7 @@ fn read_tick_deadlined(
             // it, so the match ends the moment one team remains rather than disconnecting on every
             // later tick to the cap. An already-answered seat keeps its seat (its line landed).
             Err(RecvTimeoutError::Disconnected) => {
-                for seat in active.difference(&answered).copied().collect::<Vec<_>>() {
-                    active.remove(&seat);
-                    misses.remove(&seat);
-                }
+                forfeit_silent_seats(active, &answered, misses, true);
                 break;
             }
         }
