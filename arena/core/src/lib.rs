@@ -1156,6 +1156,13 @@ pub struct Match {
     /// `Rules` on replay — never itself recorded.
     starting_remaining: u32,
     seed: u64,
+    /// Seats queued to FORFEIT (durably leave) at the next [`step`](Match::step):
+    /// filled by [`forfeit`](Match::forfeit), drained at the top of the Live step
+    /// (each pawn downed, the set recorded into that tick's [`TickRecord::forfeits`]).
+    /// Transient live-only state — never recorded, and reconstructed on replay because
+    /// [`replay_match`] re-calls `forfeit` from the recorded stream. A `BTreeSet` so
+    /// the drain is ascending (canonical) and a repeated leave is idempotent.
+    pending_forfeits: BTreeSet<SeatId>,
     /// The accepted (post-clamp) action stream, one record per simulated tick —
     /// the deterministic replay.
     ticks: Vec<TickRecord>,
@@ -1277,6 +1284,7 @@ impl Match {
             },
             starting_remaining: rules.starting_ticks,
             seed,
+            pending_forfeits: BTreeSet::new(),
             ticks: Vec::new(),
             result: None,
         }
@@ -1723,6 +1731,34 @@ impl Match {
         from
     }
 
+    /// Durably forfeit a seat — the leave/disconnect path the transport calls when an
+    /// agent quits ([`AgentMsg::Leave`]) or its stream drops. Unlike an absent action,
+    /// which forfeits only the TICK (the pawn holds still but stays alive), this is an
+    /// ELIMINATION: the seat is downed at the next [`step`](Match::step), BEFORE its
+    /// intent is read, so it never acts the tick it leaves and vanishes from the live
+    /// set — the match can then end when one team remains, and an eliminated seat can
+    /// never outrank a survivor (closing the leave-while-ahead-on-score exploit a
+    /// merely-idle leaver allowed). A forfeit is not a kill: it credits no one and
+    /// imparts no damage or knockback.
+    ///
+    /// Returns `true` if the seat was a live participant now queued to forfeit;
+    /// `false` (a no-op) for an unknown seat, an already-down seat (killed in combat,
+    /// or a repeat leave), or a match that has already [`Ended`]. Idempotent — a second
+    /// call while the seat is still pending, or after it is down, changes nothing. The
+    /// forfeit is applied and recorded into the next tick's [`TickRecord::forfeits`],
+    /// so [`replay_match`] reproduces it and [`digest`](arena_proto::ReplayRecord::digest)
+    /// commits it.
+    ///
+    /// [`Ended`]: MatchPhase::Ended
+    /// [`AgentMsg::Leave`]: arena_proto::AgentMsg::Leave
+    /// [`TickRecord::forfeits`]: arena_proto::TickRecord::forfeits
+    pub fn forfeit(&mut self, seat: SeatId) -> bool {
+        if self.phase == MatchPhase::Ended || !self.pawn_alive(seat) {
+            return false;
+        }
+        self.pending_forfeits.insert(seat)
+    }
+
     /// Advance the match exactly one tick from the given intents. A seat absent
     /// from `intents` (or already down) forfeits the tick — it holds position and
     /// does not fire — so a slow or hung seat never stalls the match (the
@@ -1760,10 +1796,32 @@ impl Match {
             self.refresh_perception_memory(current);
         }
 
+        // Apply any queued forfeits (leaves/disconnects) at the TOP of the tick —
+        // after the perception refresh above, so a perceiver's remembered set still
+        // matches the observe(current) it was already sent, but BEFORE intents are
+        // accepted, so a leaver never acts the tick it departs and drops out of the
+        // live set. Draining the BTreeSet yields ascending (canonical) seats; each
+        // still-alive one is downed (an elimination, crediting no one), and the set of
+        // seats actually downed is recorded into this tick's `forfeits` so replay
+        // re-applies it and the digest commits it. Empty (the common case) is inert.
+        let forfeited: Vec<SeatId> = if self.pending_forfeits.is_empty() {
+            Vec::new()
+        } else {
+            let mut downed = Vec::new();
+            for seat in std::mem::take(&mut self.pending_forfeits) {
+                if let Some(p) = self.pawns.iter_mut().find(|p| p.seat == seat && p.alive) {
+                    p.alive = false;
+                    downed.push(seat);
+                }
+            }
+            downed
+        };
+
         // Accept only intents from seats alive at the start of the tick, each
         // defensively clamped — this is what gets applied AND recorded, so no
         // caller (driver, replay, or direct) can move a pawn faster than the
-        // rules or pad the replay with a corpse's action.
+        // rules or pad the replay with a corpse's action. A seat forfeited just
+        // above is now down, so its intent (if any) is dropped here too.
         let accepted: BTreeMap<SeatId, ActionIntent> = intents
             .iter()
             .filter(|(&seat, _)| self.pawn_alive(seat))
@@ -1943,7 +2001,7 @@ impl Match {
         self.advance_projectiles();
 
         let actions = accepted.iter().map(|(&seat, &intent)| SeatAction { seat, intent }).collect();
-        self.ticks.push(TickRecord { tick: current, actions });
+        self.ticks.push(TickRecord { tick: current, actions, forfeits: forfeited });
 
         self.tick += 1;
         self.maybe_finish();
@@ -2606,6 +2664,12 @@ pub enum ReplayError {
     UnknownSeat { tick: u64, seat: SeatId },
     /// A tick's actions are not in canonical ascending-unique seat order.
     SeatOrder { tick: u64 },
+    /// A recorded forfeit names a seat that is not in the roster.
+    ForfeitUnknownSeat { tick: u64, seat: SeatId },
+    /// A tick's forfeits are not in canonical ascending-unique seat order. Enforcing
+    /// this both rejects a non-canonical leave stream cleanly and bounds `forfeits` to
+    /// the roster size, so a crafted tick cannot pad it to DoS the re-run.
+    ForfeitOrder { tick: u64 },
     /// The `ticks` are not the canonical contiguous `0,1,2,…` sequence (reordered,
     /// duplicated, or gapped) — the live sim records one record per tick in order.
     TickOrder { index: usize, tick: u64 },
@@ -2667,6 +2731,12 @@ impl std::fmt::Display for ReplayError {
             }
             ReplayError::SeatOrder { tick } => {
                 write!(f, "invalid replay: tick {tick} actions are not in canonical seat order")
+            }
+            ReplayError::ForfeitUnknownSeat { tick, seat } => {
+                write!(f, "invalid replay: tick {tick} forfeits seat {seat} not in the roster")
+            }
+            ReplayError::ForfeitOrder { tick } => {
+                write!(f, "invalid replay: tick {tick} forfeits are not in canonical seat order")
             }
             ReplayError::TickOrder { index, tick } => {
                 write!(f, "invalid replay: tick {tick} at position {index} breaks canonical order")
@@ -2833,8 +2903,8 @@ impl MatchRecord {
         }
 
         // The live sim records exactly one tick per simulated tick, in order, each
-        // tick's actions ascending-unique by a seat in the roster. Enforce that
-        // canonical shape up front: a reordered, gapped, or corpse-padded stream
+        // tick's actions AND forfeits ascending-unique by a seat in the roster. Enforce
+        // that canonical shape up front: a reordered, gapped, or corpse-padded stream
         // is rejected here rather than silently re-clamped into a divergent hash.
         for (index, tr) in self.replay.ticks.iter().enumerate() {
             if tr.tick != index as u64 {
@@ -2849,6 +2919,19 @@ impl MatchRecord {
                     return Err(ReplayError::SeatOrder { tick: tr.tick });
                 }
                 prev = Some(a.seat);
+            }
+            // Same canonical shape for the forfeit stream. This also bounds `forfeits`
+            // to the roster size, so a crafted tick cannot pad it with a huge or
+            // out-of-roster list to DoS the re-run's per-seat `forfeit` scan.
+            let mut prev_forfeit: Option<SeatId> = None;
+            for &seat in &tr.forfeits {
+                if !roster.contains(&seat) {
+                    return Err(ReplayError::ForfeitUnknownSeat { tick: tr.tick, seat });
+                }
+                if prev_forfeit.is_some_and(|p| p >= seat) {
+                    return Err(ReplayError::ForfeitOrder { tick: tr.tick });
+                }
+                prev_forfeit = Some(seat);
             }
         }
 
@@ -2959,6 +3042,16 @@ pub fn replay_match(mut m: Match, replay: &ReplayRecord) -> Match {
     for tr in &replay.ticks {
         if m.phase() != MatchPhase::Live {
             break;
+        }
+        // Re-queue this tick's forfeits BEFORE the step so the re-run downs exactly the
+        // seats the record says left here — a forfeit is an external event, not derivable
+        // from the action stream, so replay must feed it back in. step then drains and
+        // re-records them, reproducing `TickRecord::forfeits` (and the digest) bit-for-bit.
+        // A forfeit for a seat already down in the re-run (a tampered or mis-tick'd record)
+        // is a no-op that will NOT re-record, diverging the recomputed hash — the intended
+        // rejection in `MatchRecord::verify`.
+        for &seat in &tr.forfeits {
+            m.forfeit(seat);
         }
         let intents: BTreeMap<SeatId, ActionIntent> =
             tr.actions.iter().map(|a| (a.seat, a.intent)).collect();
@@ -11282,6 +11375,143 @@ mod tests {
     }
 
     #[test]
+    fn forfeit_downs_the_leaver_and_ends_a_1v1_immediately() {
+        // The lifecycle fix. A hung seat (above) idles every tick, stays ALIVE, and only
+        // ends the match at the max_ticks cap (or when combat downs it). A durable
+        // forfeit ELIMINATES the leaver, so a 1v1 ends the very tick the opponent is left
+        // alone — no stall to the 3600-tick cap.
+        let mut m = close_match(1);
+        for _ in 0..3 {
+            step_with(&mut m, &[]); // both idle, no combat -> nowhere near the cap
+        }
+        assert_eq!(m.phase(), MatchPhase::Live, "an idle 1v1 is still live after a few ticks");
+        let leave_tick = m.tick();
+        assert!(m.forfeit(1), "seat 1 is a live participant, so its leave is queued");
+        step_with(&mut m, &[]);
+        assert_eq!(m.phase(), MatchPhase::Ended, "one team left alive -> the match ends at the forfeit tick");
+        let r = m.result().unwrap();
+        assert_eq!(r.final_tick, leave_tick + 1, "it ends immediately, not at max_ticks (3600)");
+        let s0 = r.outcomes.iter().find(|o| o.seat == 0).unwrap();
+        let s1 = r.outcomes.iter().find(|o| o.seat == 1).unwrap();
+        assert_eq!(s0.placement, 1, "the seat that stayed wins");
+        assert!(s0.alive_at_end, "the winner survives");
+        assert_eq!(s1.placement, 2, "the leaver places behind the survivor");
+        assert!(!s1.alive_at_end, "the leaver is eliminated, not idle-but-alive");
+    }
+
+    #[test]
+    fn a_leaver_cannot_win_on_the_score_tiebreak() {
+        // The exploit a merely-idle leaver allowed: seat 1 is AHEAD on score (both still
+        // alive). If a leave were only a tick-idle, seat 1 would end the match still a
+        // 'survivor' and take placement 1 on the (survivors, score, seat) tiebreak. A
+        // durable forfeit eliminates it, so it can never outrank the seat that stayed.
+        let mut m = close_match(1);
+        m.pawns.iter_mut().find(|p| p.seat == 0).unwrap().score = 5;
+        m.pawns.iter_mut().find(|p| p.seat == 1).unwrap().score = 50;
+        assert!(m.forfeit(1), "seat 1 leaves while ahead on score");
+        step_with(&mut m, &[]);
+        let r = m.result().unwrap();
+        let s0 = r.outcomes.iter().find(|o| o.seat == 0).unwrap();
+        let s1 = r.outcomes.iter().find(|o| o.seat == 1).unwrap();
+        assert_eq!(s0.placement, 1, "the seat that stayed wins despite the LOWER score");
+        assert_eq!(s1.placement, 2, "the leaver cannot win by leaving while ahead");
+        assert!(!s1.alive_at_end, "the leaver is eliminated");
+        assert_eq!(s1.score, 50, "it keeps its earned score — it just cannot place first");
+    }
+
+    #[test]
+    fn a_forfeit_is_recorded_replayed_and_verified() {
+        let mut m = close_match(1);
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+        assert!(m.forfeit(1), "seat 1 leaves after tick 0");
+        while m.phase() == MatchPhase::Live {
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+        }
+        // The forfeit sits in the canonical stream at exactly its tick, recorded once.
+        let rec = m.to_record().expect("an ended match records");
+        let forfeit_ticks: Vec<(u64, Vec<SeatId>)> = rec
+            .replay
+            .ticks
+            .iter()
+            .filter(|t| !t.forfeits.is_empty())
+            .map(|t| (t.tick, t.forfeits.clone()))
+            .collect();
+        assert_eq!(forfeit_ticks, vec![(1, vec![1])], "seat 1 forfeits at tick 1, recorded once");
+        // Replay reconstructs the forfeit and reproduces the outcome + hash bit-for-bit,
+        // and the honest record self-verifies.
+        let replayed = replay_match(close_match(1), &rec.replay);
+        assert_eq!(replayed.result(), Some(&rec.result), "replay reproduces the forfeit outcome + hash");
+        assert_eq!(rec.verify(), Ok(rec.result.clone()), "the honest forfeit record verifies");
+    }
+
+    #[test]
+    fn forfeit_is_a_no_op_for_invalid_repeat_or_downed_seats() {
+        let mut m = close_match(1);
+        assert!(!m.forfeit(9), "an unknown seat forfeit is a no-op");
+        assert!(m.forfeit(1), "the first leave queues");
+        assert!(!m.forfeit(1), "a repeat leave while still pending is idempotent");
+        step_with(&mut m, &[]); // drains: seat 1 is downed, the 1v1 ends
+        assert!(!m.forfeit(1), "forfeiting an already-down seat is a no-op");
+        assert!(!m.forfeit(0), "forfeiting once the match has ended is a no-op");
+        let rec = m.to_record().unwrap();
+        let total: usize = rec.replay.ticks.iter().map(|t| t.forfeits.len()).sum();
+        assert_eq!(total, 1, "seat 1 is recorded exactly once despite the repeat/invalid calls");
+    }
+
+    #[test]
+    fn verify_rejects_a_tampered_forfeit_stream() {
+        let mut m = close_match(1);
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+        assert!(m.forfeit(1));
+        while m.phase() == MatchPhase::Live {
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+        }
+        let rec = m.to_record().unwrap();
+        assert!(rec.verify().is_ok(), "the honest record verifies");
+
+        // Strip the forfeit: without it the leaver stays alive, so the same 2-tick action
+        // stream no longer ends the match — the re-run is non-terminal. Proof the forfeit
+        // is a load-bearing determinant, not cosmetic padding.
+        let mut stripped = rec.clone();
+        for t in &mut stripped.replay.ticks {
+            t.forfeits.clear();
+        }
+        assert_eq!(
+            stripped.verify(),
+            Err(ReplayError::NotTerminal),
+            "without the forfeit the action stream never ends the match"
+        );
+
+        // Re-time the forfeit one tick earlier: the match would end sooner, so the re-run
+        // no longer reproduces the recorded result — the forfeit's TICK is bound.
+        let mut moved = rec.clone();
+        moved.replay.ticks[0].forfeits = vec![1];
+        moved.replay.ticks[1].forfeits.clear();
+        assert_eq!(
+            moved.verify(),
+            Err(ReplayError::ResultMismatch),
+            "a forfeit re-timed to an earlier tick fails to reproduce the result"
+        );
+
+        // A forfeit naming a seat outside the roster is rejected structurally, before the
+        // re-run (it also bounds the list to the roster size).
+        let mut unknown = rec.clone();
+        unknown.replay.ticks[0].forfeits = vec![9];
+        assert!(
+            matches!(unknown.verify(), Err(ReplayError::ForfeitUnknownSeat { tick: 0, seat: 9 })),
+            "an out-of-roster forfeit is rejected"
+        );
+
+        // A non-ascending / duplicated forfeit list is rejected structurally.
+        let mut disordered = rec.clone();
+        disordered.replay.ticks[0].forfeits = vec![1, 1];
+        assert!(
+            matches!(disordered.verify(), Err(ReplayError::ForfeitOrder { tick: 0 })),
+            "a non-canonical forfeit list is rejected"
+        );
+    }
+
+    #[test]
     fn step_clamps_a_forged_overspeed_intent() {
         // step trusts no caller: an unclamped intent that never passed ingest is
         // still clamped before it moves a pawn — no direct caller buys speed.
@@ -11309,6 +11539,7 @@ mod tests {
             ticks: vec![TickRecord {
                 tick: 0,
                 actions: vec![SeatAction { seat: 0, intent: intent(Vec2 { x: 1_000_000, y: 0 }, EAST, false) }],
+                forfeits: Vec::new(),
             }],
         };
         let start = close_match(seed).observe(0).own.position.x;

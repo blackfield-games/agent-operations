@@ -4304,7 +4304,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             },
             {
               "tick": 1,
@@ -4325,7 +4326,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             }
           ]
         },
@@ -4349,7 +4351,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "1c0f295e877a544f9d658220c40adc743ae422fad9e75893332be3645643de4f"
+          "replay_hash": "718e3f003089c57eea6bd22bd2d7cf12e360eedf75dd5616dea5f7ed35e47845"
         }
       }
     },
@@ -4545,7 +4547,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             },
             {
               "tick": 1,
@@ -4566,7 +4569,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             }
           ]
         },
@@ -4590,7 +4594,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "1c0f295e877a544f9d658220c40adc743ae422fad9e75893332be3645643de4f"
+          "replay_hash": "718e3f003089c57eea6bd22bd2d7cf12e360eedf75dd5616dea5f7ed35e47845"
         }
       }
     },
@@ -4785,7 +4789,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             },
             {
               "tick": 1,
@@ -4806,7 +4811,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             }
           ]
         },
@@ -4830,7 +4836,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "d2a415ff0bbd6fba31acd55acaad4e61a5c959590a7663484a2b13ebb5cc6e2e"
+          "replay_hash": "32fa362c6d15c70ee74b0882be245baeba5ed2f543f6182ee100629115295a71"
         }
       }
     },
@@ -5025,7 +5031,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             },
             {
               "tick": 1,
@@ -5046,11 +5053,13 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             },
             {
               "tick": 2,
-              "actions": []
+              "actions": [],
+              "forfeits": []
             }
           ]
         },
@@ -5074,7 +5083,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "73de50a02c1e24e8d663578ebd2ff1b4b9a9a78f5e315814fa530d10f9f596ea"
+          "replay_hash": "3760c7bbb95683cad5e857ef6c04e830c7e2e57682150a23e6196b28bb95bd46"
         }
       }
     },
@@ -5278,7 +5287,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             },
             {
               "tick": 1,
@@ -5299,7 +5309,8 @@
                     }
                   }
                 }
-              ]
+              ],
+              "forfeits": []
             }
           ]
         },
@@ -5323,7 +5334,7 @@
               "alive_at_end": false
             }
           ],
-          "replay_hash": "3165d03fa53398ba41ec92cfbd102e47bdbbb4c83f480a789bf11ac762dc4323"
+          "replay_hash": "7e8cc994a091acceebbac3199328905e84f0500dde6202e623b83b08d7c747ec"
         }
       }
     }
