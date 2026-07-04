@@ -104,9 +104,9 @@ async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
 (
     defaultPrim = "Director"
     customLayerData = {{
-        string aesthetic = "{brief.aesthetic}"
-        string biome = "{brief.biome}"
-        string region_id = "{brief.region.region_id}"
+        string aesthetic = {usd_str(brief.aesthetic)}
+        string biome = {usd_str(brief.biome)}
+        string region_id = {usd_str(brief.region.region_id)}
     }}
 )
 
