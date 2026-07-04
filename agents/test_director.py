@@ -193,3 +193,40 @@ async def test_emitted_layer_carries_the_region_beats(tmp_path, monkeypatch):
     layer = await director.run(brief, [])
     line = _beats_from_usd((tmp_path / "layers" / layer.path).read_text())
     assert line == ". ".join(director._region_beats(brief.region.region_id)) + "."
+
+
+@pytest.mark.asyncio
+async def test_customlayerdata_is_byte_identical_for_a_safe_brief(tmp_path, monkeypatch):
+    # aesthetic/biome/region_id now route through usd_str like intent:beats/factions, but an
+    # injection-free brief must serialize to exactly the bytes it did before — usd_str is
+    # transparent for a value with no USD-significant char, so the default brief is unchanged.
+    # This is the regression floor the escaping fix must not churn (compose/pipeline goldens).
+    monkeypatch.chdir(tmp_path)
+    brief = WorldBrief(biome="forest", region=RegionCoord(x=3, y=7))
+    layer = await director.run(brief, [])
+    text = (tmp_path / "layers" / layer.path).read_text()
+    assert '        string aesthetic = "scorched-modern, post-conflict, cinematic"' in text
+    assert '        string biome = "forest"' in text
+    assert '        string region_id = "r+0003_+0007_l0"' in text
+
+
+@pytest.mark.asyncio
+async def test_free_form_brief_fields_cannot_forge_a_prim(tmp_path, monkeypatch):
+    # aesthetic and biome are FREE-FORM brief text — unlike the fixed factions/beats
+    # vocabularies that test_*_are_parse_safe pin at the source — so they must be escaped at
+    # emission or a quote+newline closes the customLayerData literal and the trailing text
+    # parses as prims, forging a `def` the validator attributes to the director's intent
+    # (the exact prim-forgery usd_str's docstring names). Pin that the injectable fields route
+    # through usd_str: the attack survives only as one escaped literal, never a real prim.
+    monkeypatch.chdir(tmp_path)
+    attack = 'forest"\n    }\n)\ndef Scope "Injected"\n{\n    custom string owned = "'
+    brief = WorldBrief(aesthetic=attack, biome=attack, region=RegionCoord(x=3, y=7))
+    layer = await director.run(brief, [])
+    text = (tmp_path / "layers" / layer.path).read_text()
+    # Only the director's own prim survives at column 0 — nothing broke out of the header.
+    prims = [ln for ln in text.splitlines() if re.match(r"(def|over|class)\s", ln)]
+    assert prims == ['def Scope "Director"']
+    # The attack text is present, but only as an escaped literal (" -> \", newline -> \n).
+    assert 'def Scope "Injected"' not in text
+    assert '\\"Injected\\"' in text
+    assert "\\n" in text
