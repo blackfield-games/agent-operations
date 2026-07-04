@@ -2484,33 +2484,39 @@ impl Match {
 
     /// Per-seat outcomes, ascending by seat. Placement is by TEAM: every seat on a
     /// team shares one placement, so teammates never contend as rivals. Teams rank
-    /// by survivors, then total score, then lowest seat (a stable, deterministic
-    /// tiebreak); teams with an equal (survivors, total score) share a placement.
-    /// With each seat its own team — the free-for-all default — this reduces
-    /// exactly to the per-seat alive>score>seat ranking (survivors is the seat's
-    /// 0/1 alive flag, total score is its own), so FFA outcomes stay byte-identical.
-    /// Each outcome also carries whether its seat `forfeited` (a leave/disconnect vs a
-    /// killed-in-play corpse), surfaced from the pawn state for settlement to read.
+    /// by NON-FORFEIT first (a forfeiter team is disqualified — it places below every
+    /// non-forfeiter regardless of survivors or score), then survivors, then total
+    /// score, then lowest seat (a stable, deterministic tiebreak); teams with an equal
+    /// (forfeited, survivors, total score) share a placement. A team is a forfeiter iff
+    /// ANY of its seats forfeited, so one teammate leaving DQs the whole team as a unit.
+    /// With each seat its own team — the free-for-all default — this reduces to the
+    /// per-seat (not-forfeited)>alive>score>seat ranking, so a seat that forfeited ranks
+    /// dead last even with the highest score, while a NO-forfeit match is byte-identical
+    /// to the pre-DQ ranking (the forfeited term is constant `false` and falls through).
     fn outcomes(&self) -> Vec<SeatOutcome> {
-        // (survivors, total score, lowest seat) per team.
-        let mut teams: BTreeMap<TeamId, (u32, i64, SeatId)> = BTreeMap::new();
+        // (forfeited, survivors, total score, lowest seat) per team. `forfeited` is the
+        // OR of the team's pawns — one seat's leave disqualifies the team.
+        let mut teams: BTreeMap<TeamId, (bool, u32, i64, SeatId)> = BTreeMap::new();
         for p in &self.pawns {
-            let (survivors, total, low_seat) = teams.entry(p.team).or_insert((0, 0, p.seat));
+            let (forfeited, survivors, total, low_seat) =
+                teams.entry(p.team).or_insert((false, 0, 0, p.seat));
+            *forfeited |= p.forfeited;
             *survivors += p.alive as u32;
             *total += p.score as i64;
             *low_seat = (*low_seat).min(p.seat);
         }
-        let mut ranked: Vec<(TeamId, u32, i64, SeatId)> =
-            teams.into_iter().map(|(t, (surv, total, seat))| (t, surv, total, seat)).collect();
-        // Best first: more survivors, then higher total score, then lowest seat.
-        ranked.sort_by(|&(_, a_surv, a_sc, a_seat), &(_, b_surv, b_sc, b_seat)| {
-            b_surv.cmp(&a_surv).then(b_sc.cmp(&a_sc)).then(a_seat.cmp(&b_seat))
+        let mut ranked: Vec<(TeamId, bool, u32, i64, SeatId)> =
+            teams.into_iter().map(|(t, (dq, surv, total, seat))| (t, dq, surv, total, seat)).collect();
+        // Best first: a non-forfeiter (`false`) outranks a forfeiter (`true`) — the DQ
+        // demotion — then more survivors, then higher total score, then lowest seat.
+        ranked.sort_by(|&(_, a_dq, a_surv, a_sc, a_seat), &(_, b_dq, b_surv, b_sc, b_seat)| {
+            a_dq.cmp(&b_dq).then(b_surv.cmp(&a_surv)).then(b_sc.cmp(&a_sc)).then(a_seat.cmp(&b_seat))
         });
         let mut placement_of_team: BTreeMap<TeamId, u16> = BTreeMap::new();
         let mut place = 0u16;
-        let mut prev: Option<(u32, i64)> = None;
-        for (i, &(team, surv, sc, _)) in ranked.iter().enumerate() {
-            let key = (surv, sc);
+        let mut prev: Option<(bool, u32, i64)> = None;
+        for (i, &(team, dq, surv, sc, _)) in ranked.iter().enumerate() {
+            let key = (dq, surv, sc);
             if prev != Some(key) {
                 place = (i + 1) as u16;
                 prev = Some(key);
@@ -11432,6 +11438,137 @@ mod tests {
         assert_eq!(s1.placement, 2, "the leaver cannot win by leaving while ahead");
         assert!(!s1.alive_at_end, "the leaver is eliminated");
         assert_eq!(s1.score, 50, "it keeps its earned score — it just cannot place first");
+    }
+
+    /// Overwrite a pawn's terminal state for a placement unit test. `outcomes` reads only
+    /// each pawn's team/seat/alive/score/forfeited, so a settlement scenario can be pinned
+    /// exactly without driving combat to produce it.
+    fn set_pawn(m: &mut Match, seat: SeatId, alive: bool, forfeited: bool, score: i32) {
+        let p = m.pawns.iter_mut().find(|p| p.seat == seat).unwrap();
+        p.alive = alive;
+        p.forfeited = forfeited;
+        p.score = score;
+    }
+
+    #[test]
+    fn outcomes_dq_a_forfeiter_below_a_fought_to_death_corpse() {
+        // The exploit a score-ranked forfeit left open among all-DOWN seats: `a_leaver_cannot_win`
+        // proves a forfeiter can't outrank a SURVIVOR, but with everyone down a forfeiter still
+        // placed by its pre-departure score — so seat 0 could leave EARLY with a big lead and
+        // outrank seat 1, which fought to the end and died with a small score. A forfeit is a
+        // DISQUALIFICATION: seat 0 places dead LAST regardless of its 50x-higher score, and the
+        // seat that fought to death takes placement 1.
+        let mut m = close_match(1);
+        set_pawn(&mut m, 0, false, true, 50); // left early, way ahead on score
+        set_pawn(&mut m, 1, false, false, 1); // fought to death, tiny score
+        let o = m.outcomes();
+        let s0 = o.iter().find(|o| o.seat == 0).unwrap();
+        let s1 = o.iter().find(|o| o.seat == 1).unwrap();
+        assert!(s0.forfeited, "seat 0 is flagged as a forfeiter");
+        assert!(!s1.forfeited, "seat 1 was killed in play, not a forfeit");
+        assert_eq!(s1.placement, 1, "the seat that fought to death outranks the forfeiter");
+        assert_eq!(s0.placement, 2, "the forfeiter is DQ'd to last DESPITE the 50x-higher score");
+    }
+
+    #[test]
+    fn outcomes_rank_purely_by_score_when_no_seat_forfeits() {
+        // FM2: the DQ demotion is INERT when nobody forfeited — the common case. Two all-down
+        // seats rank purely by score, exactly as before the DQ rule, and both report
+        // forfeited=false. (The whole outcome/settlement golden suite staying green is the
+        // byte-identical proof; this pins the property directly.)
+        let mut m = close_match(1);
+        set_pawn(&mut m, 0, false, false, 1);
+        set_pawn(&mut m, 1, false, false, 9);
+        let o = m.outcomes();
+        let s0 = o.iter().find(|o| o.seat == 0).unwrap();
+        let s1 = o.iter().find(|o| o.seat == 1).unwrap();
+        assert!(!s0.forfeited && !s1.forfeited, "no seat forfeited");
+        assert_eq!(s1.placement, 1, "the higher score wins when neither forfeited (unchanged ranking)");
+        assert_eq!(s0.placement, 2, "the lower score places second, exactly as before");
+    }
+
+    #[test]
+    fn outcomes_dq_a_whole_team_when_one_teammate_forfeits() {
+        // FM3: placement is per-TEAM, and a team is a forfeiter iff ANY seat on it forfeited, so
+        // one teammate leaving DQs the WHOLE team as a unit. Team 0 = {seat 0 forfeits, seat 1
+        // SURVIVES with a huge score}; team 1 = {seats 2, 3 both fought and died}. Team 0 is DQ'd
+        // below the non-forfeiter team 1 despite having a live seat and far more score, and the
+        // surviving teammate shares its team's demoted placement — not silently promoted, not
+        // double-ranked.
+        let roster = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
+            SeatInfo { seat: 1, team: 0, controller: "0xbbbb".into() },
+            SeatInfo { seat: 2, team: 1, controller: "0xcccc".into() },
+            SeatInfo { seat: 3, team: 1, controller: "0xdddd".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(4), Rules::default(), roster, Vec::new(), 1);
+        set_pawn(&mut m, 0, false, true, 0); // team 0 forfeiter
+        set_pawn(&mut m, 1, true, false, 100); // team 0 survivor, big score
+        set_pawn(&mut m, 2, false, false, 5); // team 1, fought and died
+        set_pawn(&mut m, 3, false, false, 5); // team 1, fought and died
+        let o = m.outcomes();
+        let p = |seat: SeatId| o.iter().find(|x| x.seat == seat).unwrap().placement;
+        assert_eq!(p(2), 1, "the non-forfeiter team wins");
+        assert_eq!(p(3), 1, "its teammate shares the winning placement");
+        assert_eq!(p(0), 2, "the forfeiter's team is DQ'd below the non-forfeiter team");
+        assert_eq!(
+            p(1),
+            2,
+            "the SURVIVING teammate shares its team's DQ placement — one leave sinks the team as a unit"
+        );
+    }
+
+    #[test]
+    fn outcomes_dq_orders_forfeiters_below_a_corpse_then_by_score() {
+        // FM4: with everyone down, a non-forfeiter corpse outranks EVERY forfeiter regardless of
+        // score, and the forfeiters then order among themselves — non-forfeiters first, then by
+        // score, then by lowest seat, a total deterministic order. Seat 2 fought and died with the
+        // LOWEST score (1) yet places FIRST over seats 0 (8) and 1 (3), which both forfeited; the
+        // two forfeiters keep their score order (seat 0 ahead of seat 1) inside the demoted tier.
+        let roster = vec![
+            SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
+            SeatInfo { seat: 1, team: 1, controller: "0xbbbb".into() },
+            SeatInfo { seat: 2, team: 2, controller: "0xcccc".into() },
+        ];
+        let mut m = Match::new(MID.parse().unwrap(), config(3), Rules::default(), roster, Vec::new(), 1);
+        set_pawn(&mut m, 0, false, true, 8); // forfeiter, top score
+        set_pawn(&mut m, 1, false, true, 3); // forfeiter, lower score
+        set_pawn(&mut m, 2, false, false, 1); // fought to death, lowest score
+        let o = m.outcomes();
+        let p = |seat: SeatId| o.iter().find(|x| x.seat == seat).unwrap().placement;
+        assert_eq!(p(2), 1, "the fought-to-death corpse wins over both forfeiters DESPITE the lowest score");
+        assert_eq!(p(0), 2, "the higher-score forfeiter leads the demoted DQ tier");
+        assert_eq!(p(1), 3, "the lower-score forfeiter trails within the DQ tier");
+    }
+
+    #[test]
+    fn two_forfeiters_are_dq_below_the_survivor_and_replay_reproduces_it() {
+        // FM4, end to end: a match with TWO forfeiters ranks both below the lone survivor and the
+        // whole DQ outcome re-runs bit-for-bit from the recorded per-tick forfeit stream (the flag
+        // is derived, never separately recorded). Seats 1 and 2 leave at tick 0; seat 0 is left
+        // alone and wins. Both leavers, equal on score, share the DQ placement.
+        let build = || {
+            let roster = vec![
+                SeatInfo { seat: 0, team: 0, controller: "0xaaaa".into() },
+                SeatInfo { seat: 1, team: 1, controller: "0xbbbb".into() },
+                SeatInfo { seat: 2, team: 2, controller: "0xcccc".into() },
+            ];
+            Match::new(MID.parse().unwrap(), config(3), Rules::default(), roster, Vec::new(), 1)
+        };
+        let mut m = build();
+        assert!(m.forfeit(1) && m.forfeit(2), "both seats leave while live");
+        step_with(&mut m, &[]); // drain: seats 1 and 2 down together, only seat 0 remains -> ends
+        assert_eq!(m.phase(), MatchPhase::Ended, "one team left alive ends the match");
+        let rec = m.to_record().expect("an ended match records");
+        let out = |seat: SeatId| *rec.result.outcomes.iter().find(|x| x.seat == seat).unwrap();
+        assert!(!out(0).forfeited && out(0).placement == 1, "the lone survivor wins, un-DQ'd");
+        assert!(out(1).forfeited && out(2).forfeited, "both leavers are flagged forfeited");
+        assert!(out(1).placement > 1 && out(2).placement > 1, "both forfeiters rank below the survivor");
+        assert_eq!(out(1).placement, out(2).placement, "two equal-score forfeiters share the DQ placement");
+        // The DQ outcome + hash re-run bit-for-bit from the forfeit stream, and it self-verifies.
+        let replayed = replay_match(build(), &rec.replay);
+        assert_eq!(replayed.result(), Some(&rec.result), "replay reproduces the two-forfeiter DQ outcome + hash");
+        assert_eq!(rec.verify(), Ok(rec.result.clone()), "the honest two-forfeiter DQ record verifies");
     }
 
     #[test]
