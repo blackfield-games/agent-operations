@@ -188,6 +188,11 @@ class SeatOutcome(_Wire):
     placement: U16
     score: I32
     alive_at_end: bool
+    # True if this seat forfeited (leave/disconnect/persistent-silence) rather than
+    # being killed in play; a forfeit is a DQ, so `placement` already reflects the
+    # demotion below every non-forfeiter. Defaults to False for a result encoded before
+    # the field existed (the Rust side is serde(default) — the same back-compat).
+    forfeited: bool = False
 
 
 class MatchResult(_Wire):
