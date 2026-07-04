@@ -8398,6 +8398,53 @@ mod tests {
         assert_eq!(status["status"], "queued");
     }
 
+    /// The `attestation` field on `GET /jobs/{id}` must keep the three EAS states
+    /// distinct — the delivery half of "every validated render earns a receipt".
+    /// FM1: a relayed job's read must carry the REAL landed uid, not null/placeholder.
+    /// FM2: a settled-but-undrained job must be present-with-null-uid, distinguishable
+    /// from "no attestation". FM3: a job that owes no receipt must read a clean `null`,
+    /// not a malformed field or an error.
+    #[tokio::test]
+    async fn job_detail_surfaces_the_three_attestation_states() {
+        let state = test_state_empty().await;
+
+        // FM3 — no attestation: a queued, unsettled job owes no on-chain receipt.
+        let unsettled = seed_job();
+        enqueue(&state, &unsettled).await;
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", unsettled.id)).await).await;
+        assert!(detail["attestation"].is_null(), "an unsettled job owes no receipt");
+
+        // FM2 — owed but not yet relayed: settle records the pending row, uid still NULL.
+        // The field is PRESENT (object) so a client tells 'owed' from 'none'.
+        let owed = seed_job();
+        settle_one(&state, &owed).await;
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", owed.id)).await).await;
+        assert!(detail["attestation"].is_object(), "an owed attestation is present, not absent");
+        assert!(detail["attestation"]["uid"].is_null(), "uid stays null until the relay lands it");
+        assert!(
+            detail["attestation"]["submitted_at"].is_null(),
+            "submitted_at stays null until relayed"
+        );
+
+        // FM1 — relayed: one drain pass lands the real uid + submit time on-chain, and
+        // the read surfaces exactly the uid the relay minted for THIS job.
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", owed.id)).await).await;
+        assert_eq!(
+            detail["attestation"]["uid"].as_str(),
+            Some(format!("0xmockbatch-{}", eas::job_id_hex(&owed.id)).as_str()),
+            "the read surfaces the real landed uid, not a placeholder"
+        );
+        assert!(
+            detail["attestation"]["submitted_at"].is_i64(),
+            "submitted_at carries the unix submit time once relayed"
+        );
+
+        // The unrelated unsettled job is untouched by the drain — still a clean null.
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", unsettled.id)).await).await;
+        assert!(detail["attestation"].is_null(), "drain leaves a no-receipt job absent");
+    }
+
     /// Boundary region coords (i32 extremes, layer u8::MAX) are accepted and
     /// round-trip intact. `RegionCoord::region_id` — which the dispatch and
     /// attestation paths later feed — is pure formatting with no arithmetic, so
