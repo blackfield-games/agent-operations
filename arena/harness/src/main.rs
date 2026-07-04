@@ -5782,6 +5782,31 @@ mod tests {
     }
 
     #[test]
+    fn read_tick_deadlined_escalates_past_a_departed_seat_stray_flood() {
+        // A departed seat flooding strays PAST the deadline must not stall a co-silent seat's
+        // escalation. Seat 0 has already left (active = {1}); seat 1 is silent. A zero budget makes
+        // the deadline already spent when the buffered stray is read, so each read takes the
+        // stray-past-deadline branch deterministically (no flood race) — which must still advance
+        // seat 1's streak. Without that, a one-stray-per-tick flooder would peg seat 1 at zero
+        // misses forever and strand the match at the cap.
+        let m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mut active: BTreeSet<SeatId> = BTreeSet::from([1]); // seat 0 already departed
+        let mut misses = BTreeMap::new();
+        let (tx, rx) = mpsc::channel::<String>();
+
+        for streak in 1..MISS_FORFEIT_THRESHOLD {
+            tx.send(act_line(0, m.match_id(), 0)).unwrap(); // a stray from the DEPARTED seat 0
+            read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(0), &mut misses);
+            assert!(active.contains(&1), "the departed-seat stray does not stall seat 1's escalation");
+            assert_eq!(misses.get(&1), Some(&streak), "seat 1's streak advances through the stray-past-deadline break");
+        }
+        tx.send(act_line(0, m.match_id(), 0)).unwrap();
+        read_tick_deadlined(&m, &mut active, &rx, Duration::from_millis(0), &mut misses);
+        assert!(!active.contains(&1), "seat 1 is eliminated on the threshold-th miss, stray flood notwithstanding");
+        drop(tx);
+    }
+
+    #[test]
     fn pump_to_end_deadlined_escalates_persistent_silence_to_a_prompt_end() {
         // The whole point, end to end: a match whose seats go persistently silent — the stream
         // stays OPEN (a timeout each tick, NOT an EOF) — must not idle to the max_ticks cap.
