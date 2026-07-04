@@ -219,14 +219,18 @@ async fn run_http(args: &Args, session: &Session) -> Result<()> {
     let client = http_client(HTTP_REQUEST_TIMEOUT, HTTP_CONNECT_TIMEOUT)?;
     let supported = all_supported();
 
-    if let Err(e) = register(&client, args, session).await {
-        // Non-fatal: the coordinator may not yet support /register, or be down.
-        // We still fall through to polling for jobs.
-        tracing::warn!(error = %e, "registration failed");
-    }
+    let poll_token = match register(&client, args, session).await {
+        Ok(token) => token,
+        Err(e) => {
+            // Non-fatal: the coordinator may not yet support /register, or be down.
+            // We still fall through to polling for jobs (with no poll token).
+            tracing::warn!(error = %e, "registration failed");
+            None
+        }
+    };
 
     loop {
-        match poll_once(&client, args, session, &supported).await {
+        match poll_once(&client, args, session, &supported, poll_token.as_deref()).await {
             Ok(true) => {}
             Ok(false) => tokio::time::sleep(Duration::from_secs(args.poll_secs)).await,
             Err(e) => {
@@ -621,7 +625,14 @@ where
     Ok(())
 }
 
-async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> Result<()> {
+/// Register with the coordinator and return the poll token it issued in the
+/// `x-poll-token` response header — the credential [`poll_once`] echoes as
+/// `Authorization: Bearer <token>` so the coordinator refreshes THIS earner's
+/// liveness (an unauthenticated poll for our address can't). `None` if the header is
+/// absent (an older coordinator that predates the poll-token gate), in which case the
+/// earner still polls and is dispatched work — it just won't have its liveness
+/// refreshed by polling, so it relies on the submit-path refresh.
+async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> Result<Option<String>> {
     let supported = all_supported();
     let hello = EarnerMsg::Hello {
         earner_address: session.address.clone(),
@@ -632,8 +643,13 @@ async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> R
     };
     let url = format!("{}/register", args.coordinator);
     let resp = client.post(&url).json(&hello).send().await?.error_for_status()?;
-    tracing::info!(status = %resp.status(), "registered with coordinator");
-    Ok(())
+    let poll_token = resp
+        .headers()
+        .get("x-poll-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    tracing::info!(status = %resp.status(), have_poll_token = poll_token.is_some(), "registered with coordinator");
+    Ok(poll_token)
 }
 
 /// Whether a finished poll cycle should poll again immediately. A successful
@@ -664,16 +680,23 @@ async fn poll_once(
     args: &Args,
     session: &Session,
     supported: &[JobKind],
+    poll_token: Option<&str>,
 ) -> Result<bool> {
     let url = format!("{}/jobs/next", args.coordinator);
     // Name ourselves so the coordinator filters the hand-out to the kinds we
     // advertised at registration (capability match on the HTTP transport). The
     // self-guard below stays as defense-in-depth for a coordinator that doesn't.
-    let mut resp = client
+    // Present the poll token issued at registration as `Authorization: Bearer` so the
+    // coordinator refreshes OUR liveness — without it the refresh is declined (an
+    // unauthenticated poll can't keep an address live), so an idle-but-polling earner
+    // would otherwise age out of the registry between jobs.
+    let mut req = client
         .get(&url)
-        .query(&[("earner", session.address.as_str())])
-        .send()
-        .await?;
+        .query(&[("earner", session.address.as_str())]);
+    if let Some(token) = poll_token {
+        req = req.bearer_auth(token);
+    }
+    let mut resp = req.send().await?;
     // The coordinator stamps the dispatch_seq for this hand-out in a header; we
     // must echo it on submit so a job reaped+reassigned to another earner can't
     // be settled by us (the fence). Read it before consuming the body.
@@ -1325,7 +1348,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         // A submit accepted with 2xx means more work may be queued → keep polling.
-        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported(), None).await.unwrap();
         assert!(keep, "a successful submit (2xx) should keep polling");
 
         // The earner POSTed a JobResult to /jobs/{id}/submit whose signature
@@ -1358,6 +1381,43 @@ mod tests {
         assert_eq!(address_from_verifying_key(&vk), session.address);
     }
 
+    /// The HTTP poll authenticates its liveness refresh: a poll token, when present, is
+    /// sent as `Authorization: Bearer <token>` on `/jobs/next` (the credential the
+    /// coordinator requires to refresh this earner's last_seen); with no token, no
+    /// Authorization header is sent at all.
+    #[tokio::test]
+    async fn poll_once_sends_the_poll_token_as_bearer() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+
+        // No job either way — the assertion is on the OUTBOUND request headers.
+        Mock::given(method("GET"))
+            .and(path("/jobs/next"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::Value::Null))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        poll_once(&client, &args, &session, &all_supported(), Some("poll-tok-xyz")).await.unwrap();
+        poll_once(&client, &args, &session, &all_supported(), None).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let polls: Vec<_> = requests.iter().filter(|r| r.url.path() == "/jobs/next").collect();
+        assert_eq!(polls.len(), 2, "both polls hit /jobs/next");
+        assert_eq!(
+            polls[0].headers.get("authorization").map(|v| v.to_str().unwrap()),
+            Some("Bearer poll-tok-xyz"),
+            "an authenticated poll sends the token as a Bearer credential"
+        );
+        assert_eq!(
+            polls[1].headers.get("authorization"),
+            None,
+            "a poll with no token sends no Authorization header"
+        );
+    }
+
     #[tokio::test]
     async fn poll_once_returns_false_when_no_job_is_available() {
         let server = MockServer::start().await;
@@ -1374,7 +1434,7 @@ mod tests {
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported(), None).await.unwrap();
         assert!(!keep, "no job available → back off rather than re-poll immediately");
 
         let requests = server.received_requests().await.unwrap();
@@ -1406,7 +1466,7 @@ mod tests {
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported(), None).await.unwrap();
         assert!(!keep, "a 409-rejected submit must back off, not keep polling");
     }
 
@@ -1438,7 +1498,7 @@ mod tests {
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        let keep = poll_once(&client, &args, &session, &[JobKind::Terrain]).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &[JobKind::Terrain], None).await.unwrap();
         assert!(!keep, "an unsupported job must back off, not keep polling");
 
         let requests = server.received_requests().await.unwrap();
@@ -1482,7 +1542,7 @@ mod tests {
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported(), None).await.unwrap();
         assert!(keep, "a max-sized legitimate body must dispatch and keep polling");
 
         let requests = server.received_requests().await.unwrap();
@@ -1528,7 +1588,7 @@ mod tests {
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        let result = poll_once(&client, &args, &session, &all_supported()).await;
+        let result = poll_once(&client, &args, &session, &all_supported(), None).await;
         assert!(
             result.is_err(),
             "an oversized response body must be rejected (Err), not deserialized: {result:?}"
@@ -1574,7 +1634,7 @@ mod tests {
         // local connect is instant); the TOTAL timeout is what trips on the stall.
         let client = http_client(Duration::from_millis(200), Duration::from_secs(10)).unwrap();
 
-        let result = poll_once(&client, &args, &session, &all_supported()).await;
+        let result = poll_once(&client, &args, &session, &all_supported(), None).await;
         assert!(
             result.is_err(),
             "a stalled coordinator response must time out as Err, not hang: {result:?}"
@@ -1611,7 +1671,7 @@ mod tests {
         let args = args_for(&server);
         let client = http_client(HTTP_REQUEST_TIMEOUT, HTTP_CONNECT_TIMEOUT).unwrap();
 
-        let keep = poll_once(&client, &args, &session, &all_supported()).await.unwrap();
+        let keep = poll_once(&client, &args, &session, &all_supported(), None).await.unwrap();
         assert!(keep, "a fast response under the production timeout must dispatch + keep polling");
 
         let requests = server.received_requests().await.unwrap();
@@ -1630,14 +1690,19 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/register"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(ResponseTemplate::new(200).insert_header("x-poll-token", "issued-tok-123"))
             .mount(&server)
             .await;
 
         let args = args_for(&server);
         let client = reqwest::Client::new();
 
-        register(&client, &args, &session).await.unwrap();
+        let poll_token = register(&client, &args, &session).await.unwrap();
+        assert_eq!(
+            poll_token.as_deref(),
+            Some("issued-tok-123"),
+            "register captures the issued poll token from the x-poll-token response header"
+        );
 
         // The earner POSTed its Hello announcing address, GPU, and supported kinds.
         let requests = server.received_requests().await.unwrap();
