@@ -1500,6 +1500,7 @@ mod tests {
             placement: if seat == winner_seat { 1 } else { 2 },
             score: 0,
             alive_at_end: seat == winner_seat,
+            forfeited: false,
         };
         MatchResult {
             protocol_version: PROTOCOL_VERSION,
@@ -1564,6 +1565,7 @@ mod tests {
                     placement,
                     score: 0,
                     alive_at_end: placement == 1,
+                    forfeited: false,
                 })
                 .collect(),
             replay_hash: String::new(),

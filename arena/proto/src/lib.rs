@@ -731,8 +731,8 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
         match_id: mid,
         final_tick: 2,
         outcomes: vec![
-            SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true },
-            SeatOutcome { seat: 1, team: 2, placement: 2, score: 1, alive_at_end: false },
+            SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 1, team: 2, placement: 2, score: 1, alive_at_end: false, forfeited: true },
         ],
         replay_hash: PARITY_REPLAY_HASH.to_string(),
     };
@@ -1172,6 +1172,16 @@ pub struct SeatOutcome {
     pub placement: u16,
     pub score: i32,
     pub alive_at_end: bool,
+    /// `true` if this seat forfeited (a leave, disconnect, or persistent-silence
+    /// elimination) rather than being killed in play. A forfeit is a
+    /// DISQUALIFICATION: its whole team places strictly below every non-forfeiter
+    /// team regardless of score, so `placement` already reflects the demotion — this
+    /// flag is the human-readable reason. `#[serde(default)]` so a result encoded
+    /// before the field existed decodes to `false` (a killed-in-play corpse), and it
+    /// is NOT a digest input: the forfeit is already committed by the replay's
+    /// per-tick forfeit stream (v7), from which this is re-derived on verify.
+    #[serde(default)]
+    pub forfeited: bool,
 }
 
 /// The terminal result of a match — the canonical, attestable summary settlement
@@ -1897,7 +1907,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             match_id: FIXED_MATCH.parse().unwrap(),
             final_tick: 2,
-            outcomes: vec![SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true }],
+            outcomes: vec![SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true, forfeited: false }],
             replay_hash: hex::encode(sample_replay().digest()),
         };
         let mut end = serde_json::to_value(&result).unwrap();
@@ -2173,14 +2183,30 @@ mod tests {
             "match_id": FIXED_MATCH,
             "final_tick": 2,
             "outcomes": [
-                { "seat": 0, "team": 1, "placement": 1, "score": 3, "alive_at_end": true },
-                { "seat": 1, "team": 2, "placement": 2, "score": 1, "alive_at_end": false }
+                { "seat": 0, "team": 1, "placement": 1, "score": 3, "alive_at_end": true, "forfeited": false },
+                { "seat": 1, "team": 2, "placement": 2, "score": 1, "alive_at_end": false, "forfeited": true }
             ],
             "replay_hash": hex::encode(rec.digest())
         });
         let parsed: MatchResult = serde_json::from_value(canonical.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "MatchResult wire shape drifted");
         assert_eq!(parsed.replay_hash, hex::encode(rec.digest()), "result must commit to the replay digest");
+    }
+
+    #[test]
+    fn seat_outcome_forfeited_defaults_and_round_trips() {
+        // Back-compat: a SeatOutcome written before `forfeited` existed (no key) decodes
+        // to `false` — a killed-in-play corpse, the pre-DQ meaning — the same serde(default)
+        // structural back-compat blockers/pickups/forfeits give. The field is NOT a digest
+        // input (the per-tick forfeit stream already commits who left), so an old MatchResult
+        // re-verifies under the SAME v7 tag; only the settlement READ gains the flag.
+        let legacy = serde_json::json!({ "seat": 3, "team": 1, "placement": 2, "score": 5, "alive_at_end": false });
+        let parsed: SeatOutcome = serde_json::from_value(legacy).unwrap();
+        assert!(!parsed.forfeited, "an omitted forfeited field defaults to false (killed in play, not DQ'd)");
+        // A forfeiter round-trips intact.
+        let dq = SeatOutcome { seat: 3, team: 1, placement: 2, score: 5, alive_at_end: false, forfeited: true };
+        let round: SeatOutcome = serde_json::from_value(serde_json::to_value(dq).unwrap()).unwrap();
+        assert_eq!(round, dq, "a forfeited SeatOutcome did not round-trip");
     }
 
     #[test]
@@ -2228,7 +2254,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             match_id: FIXED_MATCH.parse().unwrap(),
             final_tick: 2,
-            outcomes: vec![SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true }],
+            outcomes: vec![SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true, forfeited: false }],
             replay_hash: hex::encode(sample_replay().digest()),
         };
         let mut end = serde_json::to_value(&result).unwrap();

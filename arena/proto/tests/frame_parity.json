@@ -187,6 +187,7 @@
         "outcomes": [
           {
             "alive_at_end": true,
+            "forfeited": false,
             "placement": 1,
             "score": 3,
             "seat": 0,
@@ -194,6 +195,7 @@
           },
           {
             "alive_at_end": false,
+            "forfeited": true,
             "placement": 2,
             "score": 1,
             "seat": 1,

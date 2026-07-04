@@ -2260,7 +2260,7 @@ mod tests {
     }
 
     fn outcome(seat: SeatId, placement: u16, score: i32, alive: bool) -> SeatOutcome {
-        SeatOutcome { seat, team: u16::from(seat), placement, score, alive_at_end: alive }
+        SeatOutcome { seat, team: u16::from(seat), placement, score, alive_at_end: alive, forfeited: false }
     }
 
     fn result_for(outcomes: Vec<SeatOutcome>) -> MatchResult {

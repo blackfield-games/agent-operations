@@ -865,6 +865,15 @@ struct Pawn {
     /// Cumulative damage this pawn has dealt to enemies — the match score.
     score: i32,
     alive: bool,
+    /// `true` once this pawn was DOWNED by a forfeit (a leave/disconnect drained
+    /// through [`step`](Match::step)), as opposed to killed in play — the two are
+    /// otherwise indistinguishable (`alive == false` for both). Read by
+    /// [`outcomes`](Match::outcomes) to rank a forfeiter as a DISQUALIFICATION,
+    /// strictly below every non-forfeiter. Never recorded (derived from the tick
+    /// stream's `forfeits` like `z_vel`/`dash_cooldown`): `replay_match` re-queues
+    /// the same forfeits, so the drain reproduces this bit-for-bit and it adds NO
+    /// `canonical_encoding`/digest surface — the v7 forfeit fold already commits it.
+    forfeited: bool,
 }
 
 /// One in-flight projectile — match state derived entirely from a recorded fire
@@ -1261,6 +1270,7 @@ impl Match {
                     launched_by: None,
                     score: 0,
                     alive: true,
+                    forfeited: false,
                 }
             })
             .collect();
@@ -1811,6 +1821,7 @@ impl Match {
             for seat in std::mem::take(&mut self.pending_forfeits) {
                 if let Some(p) = self.pawns.iter_mut().find(|p| p.seat == seat && p.alive) {
                     p.alive = false;
+                    p.forfeited = true;
                     downed.push(seat);
                 }
             }
@@ -2478,6 +2489,8 @@ impl Match {
     /// With each seat its own team — the free-for-all default — this reduces
     /// exactly to the per-seat alive>score>seat ranking (survivors is the seat's
     /// 0/1 alive flag, total score is its own), so FFA outcomes stay byte-identical.
+    /// Each outcome also carries whether its seat `forfeited` (a leave/disconnect vs a
+    /// killed-in-play corpse), surfaced from the pawn state for settlement to read.
     fn outcomes(&self) -> Vec<SeatOutcome> {
         // (survivors, total score, lowest seat) per team.
         let mut teams: BTreeMap<TeamId, (u32, i64, SeatId)> = BTreeMap::new();
@@ -2513,6 +2526,7 @@ impl Match {
                 placement: placement_of_team[&p.team],
                 score: p.score,
                 alive_at_end: p.alive,
+                forfeited: p.forfeited,
             })
             .collect();
         outcomes.sort_by_key(|o| o.seat);
@@ -6715,6 +6729,7 @@ fn field_delta_case(label: &str, field: &[(SeatId, u16, i32)], k: i32) -> FieldD
             placement,
             score: 0,
             alive_at_end: placement == 1,
+            forfeited: false,
         })
         .collect();
     let ratings: Vec<i32> = field.iter().map(|&(_, _, rating)| rating).collect();
@@ -7773,8 +7788,8 @@ mod tests {
             match_id: MID.parse().unwrap(),
             final_tick: 10,
             outcomes: vec![
-                SeatOutcome { seat: 0, team: 0, placement: p0, score: 0, alive_at_end: p0 == 1 },
-                SeatOutcome { seat: 1, team: 1, placement: p1, score: 0, alive_at_end: p1 == 1 },
+                SeatOutcome { seat: 0, team: 0, placement: p0, score: 0, alive_at_end: p0 == 1, forfeited: false },
+                SeatOutcome { seat: 1, team: 1, placement: p1, score: 0, alive_at_end: p1 == 1, forfeited: false },
             ],
             replay_hash: "00".into(),
         };
@@ -7803,7 +7818,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             match_id: MID.parse().unwrap(),
             final_tick: 1,
-            outcomes: vec![SeatOutcome { seat: 0, team: 0, placement: 1, score: 0, alive_at_end: true }],
+            outcomes: vec![SeatOutcome { seat: 0, team: 0, placement: 1, score: 0, alive_at_end: true, forfeited: false }],
             replay_hash: "00".into(),
         };
         assert_eq!(ranked_delta(&solo, 1500, 1500, 32), None);
@@ -7819,7 +7834,7 @@ mod tests {
             final_tick: 10,
             outcomes: seats
                 .iter()
-                .map(|&(seat, placement)| SeatOutcome { seat, team: seat as TeamId, placement, score: 0, alive_at_end: placement == 1 })
+                .map(|&(seat, placement)| SeatOutcome { seat, team: seat as TeamId, placement, score: 0, alive_at_end: placement == 1, forfeited: false })
                 .collect(),
             replay_hash: "00".into(),
         }
@@ -12043,8 +12058,8 @@ mod tests {
     #[test]
     fn settlement_picks_the_unique_first_place_seat() {
         let r = result_with(vec![
-            SeatOutcome { seat: 0, team: 0, placement: 1, score: 7, alive_at_end: true },
-            SeatOutcome { seat: 1, team: 1, placement: 2, score: 3, alive_at_end: false },
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 7, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 3, alive_at_end: false, forfeited: false },
         ]);
         assert_eq!(settlement(&r), Settlement::Win { seat: 0 });
     }
@@ -12055,8 +12070,8 @@ mod tests {
         // an arbitrary win for the lower seat. A classifier that took the FIRST
         // placement-1 seat would wrongly settle seat 0.
         let r = result_with(vec![
-            SeatOutcome { seat: 0, team: 0, placement: 1, score: 5, alive_at_end: true },
-            SeatOutcome { seat: 1, team: 1, placement: 1, score: 5, alive_at_end: true },
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 5, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 1, team: 1, placement: 1, score: 5, alive_at_end: true, forfeited: false },
         ]);
         assert_eq!(settlement(&r), Settlement::Draw);
     }
@@ -12068,8 +12083,8 @@ mod tests {
         // call this a draw (nobody alive). Note the winner is the HIGHER seat id,
         // so this also rejects any "first seat wins" shortcut.
         let r = result_with(vec![
-            SeatOutcome { seat: 0, team: 0, placement: 2, score: 1, alive_at_end: false },
-            SeatOutcome { seat: 1, team: 1, placement: 1, score: 4, alive_at_end: false },
+            SeatOutcome { seat: 0, team: 0, placement: 2, score: 1, alive_at_end: false, forfeited: false },
+            SeatOutcome { seat: 1, team: 1, placement: 1, score: 4, alive_at_end: false, forfeited: false },
         ]);
         assert_eq!(settlement(&r), Settlement::Win { seat: 1 });
     }
@@ -12077,8 +12092,8 @@ mod tests {
     #[test]
     fn settlement_is_a_draw_when_all_down_with_equal_score() {
         let r = result_with(vec![
-            SeatOutcome { seat: 0, team: 0, placement: 1, score: 2, alive_at_end: false },
-            SeatOutcome { seat: 1, team: 1, placement: 1, score: 2, alive_at_end: false },
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 2, alive_at_end: false, forfeited: false },
+            SeatOutcome { seat: 1, team: 1, placement: 1, score: 2, alive_at_end: false, forfeited: false },
         ]);
         assert_eq!(settlement(&r), Settlement::Draw);
     }
