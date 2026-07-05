@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v45",
+  "domain": "blackfield/arena/parity-vectors/v46",
   "protocol_version": 1,
   "spawns": [
     {
@@ -1020,6 +1020,18 @@
         "a": 0,
         "b": 0
       }
+    },
+    {
+      "label": "all_forfeit_1v1_draws",
+      "rating_a": 1600,
+      "rating_b": 1400,
+      "outcome": "draw",
+      "k": 32,
+      "expected_a_bp": 7597,
+      "delta": {
+        "a": -8,
+        "b": 8
+      }
     }
   ],
   "field_deltas": [
@@ -1209,6 +1221,109 @@
         {
           "seat": 1,
           "delta": 31
+        },
+        {
+          "seat": 2,
+          "delta": 0
+        }
+      ]
+    },
+    {
+      "label": "two_seat_all_forfeit_matches_ranked_delta",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 1,
+          "rating": 1600,
+          "forfeited": true
+        },
+        {
+          "seat": 1,
+          "placement": 2,
+          "rating": 1400,
+          "forfeited": true
+        }
+      ],
+      "k": 32,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": -8
+        },
+        {
+          "seat": 1,
+          "delta": 8
+        }
+      ]
+    },
+    {
+      "label": "partial_forfeit_two_leavers_draw",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 1,
+          "rating": 1500
+        },
+        {
+          "seat": 1,
+          "placement": 2,
+          "rating": 1500,
+          "forfeited": true
+        },
+        {
+          "seat": 2,
+          "placement": 3,
+          "rating": 1500,
+          "forfeited": true
+        }
+      ],
+      "k": 32,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": 32
+        },
+        {
+          "seat": 1,
+          "delta": -16
+        },
+        {
+          "seat": 2,
+          "delta": -16
+        }
+      ]
+    },
+    {
+      "label": "all_forfeit_field_moves_nobody",
+      "seats": [
+        {
+          "seat": 0,
+          "placement": 1,
+          "rating": 1500,
+          "forfeited": true
+        },
+        {
+          "seat": 1,
+          "placement": 2,
+          "rating": 1500,
+          "forfeited": true
+        },
+        {
+          "seat": 2,
+          "placement": 3,
+          "rating": 1500,
+          "forfeited": true
+        }
+      ],
+      "k": 32,
+      "deltas": [
+        {
+          "seat": 0,
+          "delta": 0
+        },
+        {
+          "seat": 1,
+          "delta": 0
         },
         {
           "seat": 2,

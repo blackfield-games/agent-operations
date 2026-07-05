@@ -672,6 +672,14 @@ fn u32_is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// `serde` `skip_serializing_if` predicate for an opt-in `bool` flag (e.g.
+/// [`FieldSeat::forfeited`]): a non-forfeiter is the near-universal case, omitted so
+/// pre-forfeit parity goldens serialize byte-identically (`serde(default)` fills the
+/// `false` on read).
+fn bool_is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl Default for Rules {
     fn default() -> Self {
         Rules {
@@ -4670,12 +4678,18 @@ pub struct RatingDeltaCase {
 }
 
 /// One seat's input to a [`FieldDeltaCase`]: its canonical `seat`, final `placement`
-/// (1-based, tied seats share a rank), and pre-match `rating`.
+/// (1-based, tied seats share a rank), pre-match `rating`, and whether it `forfeited`
+/// (a DQ'd leaver — two of them draw their pairwise game, see [`ranked_field_delta`]).
+/// `forfeited` is the input a twin needs to reproduce the all-forfeit no-contest deltas;
+/// it is omitted from serialization when `false` (the near-universal case) so every
+/// pre-forfeit field vector stays byte-identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldSeat {
     pub seat: SeatId,
     pub placement: u16,
     pub rating: i32,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub forfeited: bool,
 }
 
 /// A pinned multi-seat ranked-rating case: a placement field with each seat's pre-match
@@ -5207,8 +5221,19 @@ pub struct ParityVectors {
 /// records a different timeline and reddens ONLY this category. `starting_ticks` is DELIBERATELY outside
 /// `canonical_encoding` (the sole documented exception — a pre-live delay leaves the scored tick stream, and thus every
 /// `replay_hash`, byte-identical), so this is a new phase-lifecycle category that moves NO committed match hash — a
-/// deliberate convention every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v45";
+/// deliberate convention every twin must follow. Bumped to v46 for the ALL-FORFEIT NO-CONTEST rule — a settlement-layer
+/// convention APPENDED to the existing `rating_deltas`/`field_deltas` categories (not a new one), exactly as v10/v41
+/// appended a new rule to `knockback`. `settlement` demotes a placement-1 forfeiter to a no-contest `Draw` (a
+/// non-forfeiter always outranks a forfeiter, so first place is a forfeiter only when EVERY team forfeited), which
+/// `ranked_delta` inherits; `ranked_field_delta` draws two forfeiters in the pairwise FFA fold. Before v46 EVERY
+/// rating/field vector was built `forfeited: false`, so a twin working from the set never saw the rule and would credit
+/// the higher-placed leaver a win. Four appended cases pin it: a 1v1 all-forfeit Draw swing, a two-seat all-forfeit
+/// field equal to it bit-for-bit (n=2 reduces to the 1v1), a partial-forfeit field where two leavers DRAW though one
+/// placed above the other (a placement-only twin would split them), and an all-forfeit equal-rating field that moves
+/// nobody. This is a settlement READ, NOT a replay-digest input — the `forfeited` flag is DERIVED from the already-
+/// committed v7 forfeit stream, so the parity domain bump is ORTHOGONAL to the replay digest, which stays put; no
+/// committed match hash moves. A deliberate convention every twin must follow.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v46";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6752,20 +6777,32 @@ fn rating_delta_case(label: &str, rating_a: i32, rating_b: i32, outcome: MatchOu
 /// synthesize the canonical placement result, run [`ranked_field_delta`], and record
 /// the field and the exact zero-sum per-seat deltas a twin must reproduce. The
 /// synthesized [`SeatOutcome`] carries only what the delta reads (seat + placement);
-/// the per-seat `score`/`alive_at_end`/`team` do not enter the computation.
+/// the per-seat `score`/`alive_at_end`/`team` do not enter the computation. No seat
+/// forfeited — the [`field_delta_case_ff`] sibling pins the all-forfeit no-contest rule.
 fn field_delta_case(label: &str, field: &[(SeatId, u16, i32)], k: i32) -> FieldDeltaCase {
+    let field: Vec<(SeatId, u16, i32, bool)> = field.iter().map(|&(s, p, r)| (s, p, r, false)).collect();
+    field_delta_case_ff(label, &field, k)
+}
+
+/// [`field_delta_case`] with a per-seat `forfeited` flag (the 4th tuple field) — the
+/// forfeit-capable sibling that pins the all-forfeit no-contest rule [`ranked_field_delta`]
+/// applies (two forfeiters draw their pairwise game). A sibling rather than a widened
+/// signature so every existing (all non-forfeit) `field_delta_case` call site stays
+/// untouched. A forfeiter never ends `alive_at_end` (it left), though only its `placement`
+/// and `forfeited` reach the delta fold.
+fn field_delta_case_ff(label: &str, field: &[(SeatId, u16, i32, bool)], k: i32) -> FieldDeltaCase {
     let outcomes = field
         .iter()
-        .map(|&(seat, placement, _)| SeatOutcome {
+        .map(|&(seat, placement, _, forfeited)| SeatOutcome {
             seat,
             team: seat as TeamId,
             placement,
             score: 0,
-            alive_at_end: placement == 1,
-            forfeited: false,
+            alive_at_end: placement == 1 && !forfeited,
+            forfeited,
         })
         .collect();
-    let ratings: Vec<i32> = field.iter().map(|&(_, _, rating)| rating).collect();
+    let ratings: Vec<i32> = field.iter().map(|&(_, _, rating, _)| rating).collect();
     let result = MatchResult {
         protocol_version: PROTOCOL_VERSION,
         match_id: parity_match_id(),
@@ -6776,7 +6813,7 @@ fn field_delta_case(label: &str, field: &[(SeatId, u16, i32)], k: i32) -> FieldD
     let deltas = ranked_field_delta(&result, &ratings, k).expect("a >=2-seat field aligned with its ratings");
     FieldDeltaCase {
         label: label.to_string(),
-        seats: field.iter().map(|&(seat, placement, rating)| FieldSeat { seat, placement, rating }).collect(),
+        seats: field.iter().map(|&(seat, placement, rating, forfeited)| FieldSeat { seat, placement, rating, forfeited }).collect(),
         k,
         deltas,
     }
@@ -7037,6 +7074,12 @@ pub fn parity_vectors() -> ParityVectors {
             // A gap past the cap saturates the expected score, so a heavy favourite's
             // win rounds to nothing (anti-farming) — the clamp made load-bearing.
             rating_delta_case("beyond_cap_favoured_win", 3000, 1000, MatchOutcome::WinA, 32),
+            // All-forfeit 1v1 (v46): both seats forfeited, so `settlement` is a no-contest
+            // Draw — NOT a win for the higher-placed leaver — and `ranked_delta` inherits it.
+            // At UNEQUAL ratings the draw swing still moves the favourite DOWN toward the
+            // underdog. This is the rating swing the two-seat all-forfeit field below
+            // reproduces bit-for-bit (n=2 IS the 1v1), tying the two categories together.
+            rating_delta_case("all_forfeit_1v1_draws", 1600, 1400, MatchOutcome::Draw, 32),
         ],
         field_deltas: vec![
             // A two-seat field routed through the multi-seat path: one pairwise game IS
@@ -7062,6 +7105,24 @@ pub fn parity_vectors() -> ParityVectors {
             // upset costs it ~a full K while both expected wins over the 200 seat 2 round to
             // nothing. Pins the cap in the multi-seat path.
             field_delta_case("saturated_gap_upset", &[(0, 2, 3000), (1, 1, 1500), (2, 3, 200)], 32),
+            // Two-seat all-forfeit (v46): both seats forfeited at UNEQUAL ratings and
+            // DIFFERENT placements — seat 0 placed first — yet the forfeit-draw rule settles
+            // their pairwise game a Draw, so the favoured seat 0 LOSES rating (a draw from
+            // the favourite) where a placement-only twin would credit it the WIN its first
+            // place implies (a sign flip). n=2 reduces to the 1v1: this equals the
+            // all_forfeit_1v1_draws rating vector bit-for-bit.
+            field_delta_case_ff("two_seat_all_forfeit_matches_ranked_delta", &[(0, 1, 1600, true), (1, 2, 1400, true)], 32),
+            // Partial forfeit (v46): a survivor (seat 0) outplaces two leavers, but the two
+            // leavers DRAW their own pairwise game though seat 1 placed ABOVE seat 2 — so at
+            // equal ratings they take the IDENTICAL loss to the survivor. A placement-only
+            // twin would split them (crediting seat 1 a win over seat 2). The DQ penalty holds
+            // (both lose to the survivor); the leave-with-a-lead edge between leavers does not.
+            field_delta_case_ff("partial_forfeit_two_leavers_draw", &[(0, 1, 1500, false), (1, 2, 1500, true), (2, 3, 1500, true)], 32),
+            // All-forfeit field (v46): every seat forfeited at equal ratings, so every pair is
+            // a draw and NO reputation moves — a true no-contest. A placement-only twin would
+            // still pay out the symmetric equal-rating spread (+X / 0 / -X); the forfeit rule
+            // zeroes it. The FFA generalization of the 1v1 all-forfeit above.
+            field_delta_case_ff("all_forfeit_field_moves_nobody", &[(0, 1, 1500, true), (1, 2, 1500, true), (2, 3, 1500, true)], 32),
         ],
         knockback: vec![
             // The vertical impulse: a damaging hitscan hit pops the grounded survivor upward
