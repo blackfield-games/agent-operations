@@ -1170,10 +1170,21 @@ impl Store {
     ///
     /// A job is reaped only when ALL hold:
     /// * `dispatched_to IS NOT NULL` — it was dispatched over the WS path, which
-    ///   records the holder. An anonymous HTTP poll leaves `dispatched_to` NULL and
-    ///   is intentionally skipped here (it stays on the deadline reaper) — treating
-    ///   NULL as "no live holder" would requeue every HTTP-dispatched job every
-    ///   tick, an infinite churn.
+    ///   records the holder. An HTTP poll leaves `dispatched_to` NULL and is
+    ///   intentionally skipped here (it stays on the deadline reaper). This is a
+    ///   deliberate transport asymmetry, NOT an oversight to "fix" by stamping the
+    ///   HTTP poller as the holder: the WS earner heartbeats DURING the render
+    ///   (`render_with_heartbeats`, bumping both `last_seen` and the job's
+    ///   `started_at` via `touch`), so a WS holder gone silent past `earner_ttl_secs`
+    ///   has genuinely crashed. The HTTP earner renders INLINE with no heartbeat
+    ///   channel (`mesh/earner` `poll_once`) — it refreshes liveness only at the poll
+    ///   and the submit, so a HEALTHY earner mid-render (any job longer than
+    ///   `earner_ttl_secs`) is indistinguishable from a crashed one. Holder-stamping
+    ///   HTTP would therefore false-reclaim those healthy long renders at the
+    ///   earner-TTL (duplicate GPU work, the original submit fenced out); the per-job
+    ///   deadline is the ONLY safe reclaim point for a transport with no mid-render
+    ///   liveness signal. (Independently: treating NULL as "no live holder" would also
+    ///   requeue every HTTP job every tick, an infinite churn.)
     /// * `dispatched_to NOT IN live` — the holder has dropped out of the in-memory
     ///   registry's live set (silent past `earner_ttl_secs`). A still-heartbeating
     ///   earner stays in `live` and is left alone.

@@ -3165,6 +3165,13 @@ async fn next_job(
         None => None,
     };
     let store = state.store.lock().await;
+    // Always `take_next` (NULL `dispatched_to`) — never `take_next_for`, even for an
+    // AUTHENTICATED poll whose identity we now have. The liveness reaper is WS-only by
+    // design: an HTTP earner renders inline with no mid-render heartbeat (see `mesh/earner`
+    // `poll_once`), refreshing liveness only at the poll and the submit, so a healthy earner
+    // mid-render is indistinguishable from a crash. Stamping the holder here would let the
+    // liveness reaper false-reclaim healthy renders longer than `earner_ttl_secs`; the per-job
+    // deadline is the only safe reclaim for HTTP. See `Store::reap_stale_holders`.
     let taken = match &supported {
         Some(kinds) => store.take_next(|job| kinds.contains(&job.kind)),
         None => store.take_next(|_| true),
