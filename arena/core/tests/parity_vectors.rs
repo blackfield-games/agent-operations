@@ -398,6 +398,40 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert!(sat.deltas[0].delta.abs() >= sat.k - 2, "the capped upset sheds nearly a full K");
     assert_eq!(sat.deltas[2].delta, 0, "the expected wins over the weakest, past the cap, move nothing");
 
+    // All-forfeit no-contest (v46): the settlement-layer forfeit rule a twin must follow.
+    // A forfeiter neither wins nor takes rating off another forfeiter, so first place is a
+    // no-contest when EVERY seat forfeited. Each FieldSeat serializes its `forfeited` input
+    // (omitted when false), so the twin has what it needs to reproduce these — without it
+    // the equal-rating forfeit fields would contradict the placement-only `all_equal_field`.
+    // 1v1: an all-forfeit match settles Draw, so at unequal ratings the favourite still moves
+    // DOWN — never the win its placement lead would imply.
+    let ff_1v1 = rd("all_forfeit_1v1_draws");
+    assert_eq!(ff_1v1.outcome, MatchOutcome::Draw, "an all-forfeit 1v1 settles a no-contest draw");
+    assert!(ff_1v1.delta.a < 0, "the favoured seat still moves DOWN on the forfeit draw");
+    // n=2 cross-check: a two-seat all-forfeit FIELD equals the 1v1 rating vector bit-for-bit
+    // (one spec for one input across the two categories). Discriminating: seat 0 placed FIRST
+    // yet LOSES rating — a placement-only twin would credit it the win (a sign flip).
+    let ff_two = fd("two_seat_all_forfeit_matches_ranked_delta");
+    assert!(ff_two.seats[0].forfeited && ff_two.seats[1].forfeited, "both seats forfeited");
+    assert!(ff_two.seats[0].placement < ff_two.seats[1].placement, "seat 0 placed first");
+    assert!(ff_two.deltas[0].delta < 0, "yet the first-placed forfeiter loses rating (the draw, not the win)");
+    assert_eq!(ff_two.deltas[0].delta, ff_1v1.delta.a, "the two-seat all-forfeit field equals the 1v1 rating delta.a");
+    assert_eq!(ff_two.deltas[1].delta, ff_1v1.delta.b, "... and delta.b — one spec, one input across the categories");
+    // Partial forfeit: a survivor outplaces two leavers, but the two leavers DRAW their own
+    // game though seat 1 placed above seat 2, so their deltas are EQUAL — a placement-only
+    // twin would split them. The DQ penalty still holds: both lose to the survivor.
+    let ff_part = fd("partial_forfeit_two_leavers_draw");
+    assert!(!ff_part.seats[0].forfeited, "seat 0 is the survivor");
+    assert!(ff_part.seats[1].forfeited && ff_part.seats[2].forfeited, "seats 1 and 2 forfeited");
+    assert!(ff_part.seats[1].placement < ff_part.seats[2].placement, "seat 1 placed above seat 2");
+    assert_eq!(ff_part.deltas[1].delta, ff_part.deltas[2].delta, "the two leavers draw -> equal deltas (a placement-only twin splits them)");
+    assert!(ff_part.deltas[0].delta > ff_part.deltas[1].delta, "the survivor still beats both leavers (the DQ penalty holds)");
+    // All-forfeit field: every pair a draw, so NO reputation moves — even though a placement-
+    // only twin would pay out the symmetric equal-rating spread `all_equal_field` pins.
+    let ff_all = fd("all_forfeit_field_moves_nobody");
+    assert!(ff_all.seats.iter().all(|s| s.forfeited), "every seat forfeited");
+    assert!(ff_all.deltas.iter().all(|d| d.delta == 0), "an all-forfeit field moves nobody");
+
     // Knockback (v9): a damaging hit pops a grounded survivor UPWARD by exactly
     // knockback_velocity — the variable-fall source — through the one shared damage sink
     // (so every weapon mode launches), and never recoils the shooter. Gated on gravity>0
