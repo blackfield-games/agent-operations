@@ -3333,24 +3333,38 @@ fn segment_hits_disc(a: Vec2, b: Vec2, c: Vec2, radius: i32) -> bool {
 pub enum Settlement {
     /// Exactly one seat finished at placement 1 — a decisive winner.
     Win { seat: SeatId },
-    /// Two or more seats tied for placement 1 (equal alive-flag and score, or an
-    /// all-down match with a shared top score) — no decisive winner.
+    /// No decisive winner: two or more seats tied for placement 1 (equal alive-flag
+    /// and score, or an all-down match with a shared top score), OR an all-forfeit
+    /// match nobody played to the end (every team forfeited, so first place is a
+    /// forfeiter — a no-contest, not a win to crown).
     Draw,
 }
 
 /// Classify a finished match for settlement from its outcomes alone.
 ///
 /// `placement` is 1-based with tied seats sharing a rank (see [`SeatOutcome`]):
-/// the ordering already folds alive-over-dead then higher-score, so a *single*
-/// seat at placement 1 is the decisive winner and two-or-more sharing it is a
-/// draw. Keying on placement (not `alive_at_end`) is deliberate — an all-down
+/// the ordering already folds forfeit-DQ, then alive-over-dead, then higher-score,
+/// so a *single* seat at placement 1 is the decisive winner and two-or-more sharing
+/// it is a draw. Keying on placement (not `alive_at_end`) is deliberate — an all-down
 /// match still has a higher-score winner that placement ranks first, and that is
-/// the result the on-chain record commits.
+/// the result the on-chain record commits. The one exception: an all-forfeit match
+/// (every team DQ'd, so first place is itself a forfeiter) is a no-contest `Draw`, not
+/// a win — nobody who abandoned the match should be paid or rated as its winner.
 pub fn settlement(result: &MatchResult) -> Settlement {
     let mut winner: Option<SeatId> = None;
     for o in &result.outcomes {
         if o.placement != 1 {
             continue;
+        }
+        // A placement-1 seat is a forfeiter ONLY when every team forfeited — a
+        // non-forfeiter always outranks a forfeiter in `outcomes()`, so a lone survivor
+        // would take first. So this is an all-forfeit match nobody played to the end: it
+        // has no legitimate winner. Settle it as a no-decisive-winner `Draw` rather than
+        // crowning the least-bad forfeiter, which would pay + rate a seat for a match it
+        // abandoned — and would reopen the "leave with a lead" exploit for the
+        // mutual-forfeit case (two seats leave; the one ahead when they quit is crowned).
+        if o.forfeited {
+            return Settlement::Draw;
         }
         if winner.is_some() {
             return Settlement::Draw;
@@ -12254,6 +12268,54 @@ mod tests {
             Settlement::Win { seat } => assert_eq!(firsts, vec![seat]),
             Settlement::Draw => assert!(firsts.len() != 1),
         }
+    }
+
+    #[test]
+    fn settlement_all_forfeit_is_a_no_contest_not_a_crowned_forfeiter() {
+        // Every team forfeited (nobody played to the end), so first place is itself a
+        // forfeiter. Keying on placement alone crowned the higher-score forfeiter as a
+        // decisive Win — paying + rating a seat for a match it abandoned, and reopening
+        // the "leave with a lead" exploit for the mutual-forfeit case (both leave; the
+        // one ahead when they quit wins). It must be a no-contest Draw. Discriminating:
+        // seat 0 is placement 1 with the HIGHER score, so a placement-only classifier
+        // crowns it; the forfeit guard demotes it to Draw (mutation-proving branch).
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 7, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 3, alive_at_end: false, forfeited: true },
+        ]);
+        assert_eq!(settlement(&r), Settlement::Draw);
+    }
+
+    #[test]
+    fn settlement_a_survivor_still_beats_a_forfeiter() {
+        // A forfeit by ONE seat is a DQ, not a no-contest: the non-forfeiter takes first
+        // and is still the decisive winner. The all-forfeit guard must fire only when
+        // placement 1 ITSELF forfeited, never demote a legitimate win over a forfeiter —
+        // even one that left while AHEAD on score (seat 1 leads 9-2 but leaves; seat 0
+        // survives and wins). Inertness pin for the normal single-forfeit DQ path.
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 2, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 9, alive_at_end: false, forfeited: true },
+        ]);
+        assert_eq!(settlement(&r), Settlement::Win { seat: 0 });
+    }
+
+    #[test]
+    fn ranked_delta_of_an_all_forfeit_match_is_a_draw_not_a_rating_win() {
+        // The rating consumer must not credit a forfeiter either: an all-forfeit result
+        // yields the symmetric Draw delta, not a WinA rating gain for the higher-score
+        // leaver. Pre-fix, settlement() returned Win{seat 0}, so this paid seat 0 a full
+        // WinA rating swing for a match it abandoned.
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 7, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 3, alive_at_end: false, forfeited: true },
+        ]);
+        let (ra, rb, k) = (1600, 1400, 32);
+        assert_eq!(
+            ranked_delta(&r, ra, rb, k),
+            Some(rating_delta(ra, rb, MatchOutcome::Draw, k)),
+            "an all-forfeit match applies the draw delta, never a win for a forfeiter"
+        );
     }
 
     fn health_pickup(x: i32, y: i32, amount: u16) -> PickupSpawn {
