@@ -3548,7 +3548,9 @@ pub struct SeatDelta {
 ///
 /// Each seat plays one virtual head-to-head against every other seat: the pairwise
 /// outcome is read from the two seats' `placement` (a lower placement places better —
-/// a win; equal placements — a draw), scored through the identical [`rating_delta`]
+/// a win; equal placements — a draw), except that two forfeiters always draw (a DQ'd
+/// seat neither gains nor loses rating against another DQ'd seat), scored through the
+/// identical [`rating_delta`]
 /// curve, and the pairwise results summed per seat. This is the standard
 /// multiplayer-Elo "score against the field vs expected" rule, written as a sum of
 /// pairwise games so zero-sum is STRUCTURAL: every pair contributes `(x, -x)` (a
@@ -3583,7 +3585,18 @@ pub fn ranked_field_delta(result: &MatchResult, ratings: &[i32], k: i32) -> Opti
     let mut sums = vec![0i64; n];
     for i in 0..n {
         for j in (i + 1)..n {
-            let outcome = if outcomes[i].placement < outcomes[j].placement {
+            // Two forfeiters draw their pairwise game: neither abandoned "better", so
+            // neither takes rating from the other. This is the FFA generalization of the
+            // 1v1 all-forfeit no-contest (see [`settlement`]) — a non-forfeiter still
+            // outplaces and beats a forfeiter (the DQ penalty holds, since `forfeited`
+            // never both-true against a survivor), but a higher-score leaver no longer
+            // gains over a lower-score one (closing the leave-with-a-lead exploit for the
+            // field). An all-forfeit field is then every-pair-a-draw ⇒ every delta zero, a
+            // true no-contest, and a two-seat all-forfeit result matches `ranked_delta`'s
+            // now-`Draw` settlement bit-for-bit.
+            let outcome = if outcomes[i].forfeited && outcomes[j].forfeited {
+                MatchOutcome::Draw
+            } else if outcomes[i].placement < outcomes[j].placement {
                 MatchOutcome::WinA
             } else if outcomes[i].placement > outcomes[j].placement {
                 MatchOutcome::WinB
@@ -7954,6 +7967,57 @@ mod tests {
         assert_eq!(d[0].delta, 0, "a prohibitive favourite winning as expected gains nothing past the cap");
         let extreme = ranked_field_delta(&capped, &[i32::MAX, 0, i32::MIN], 32).unwrap();
         assert_eq!(extreme.iter().map(|x| x.delta as i64).sum::<i64>(), 0, "extreme ratings stay zero-sum");
+    }
+
+    #[test]
+    fn field_delta_two_forfeiters_draw_yet_a_survivor_still_beats_them() {
+        // A DQ'd seat neither gains nor loses rating against another DQ'd seat, so the
+        // leave-with-a-lead exploit is closed for the field too: seat 1 forfeited while
+        // AHEAD of seat 2 (placement 2 vs 3) but must not gain rating over it. A
+        // non-forfeiter (seat 0) still outplaces and beats BOTH forfeiters — the DQ
+        // penalty is intact. Pre-fix the pairwise game read placement blindly, so seat 1
+        // "won" its game against seat 2 (deltas +32/0/-32); the both-forfeit draw makes
+        // the two leavers move together (+32/-16/-16). Discriminating on d[1] == d[2].
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 2, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 9, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 2, team: 2, placement: 3, score: 1, alive_at_end: false, forfeited: true },
+        ]);
+        let d = ranked_field_delta(&r, &[1500, 1500, 1500], 32).unwrap();
+        assert_eq!(d.iter().map(|x| x.delta as i64).sum::<i64>(), 0, "still exactly zero-sum");
+        assert!(d[0].delta > 0, "the survivor beats both forfeiters — the DQ penalty holds");
+        assert!(d[1].delta < 0 && d[2].delta < 0, "both forfeiters still lose to the survivor");
+        assert_eq!(d[1].delta, d[2].delta, "two forfeiters draw: the higher-score leaver gains nothing over the lower");
+    }
+
+    #[test]
+    fn field_delta_all_forfeit_field_is_a_no_contest_matching_ranked_delta() {
+        // Every seat forfeited, so every pairwise game is forfeiter-vs-forfeiter — a draw —
+        // and equal-rated seats then move nobody: a true no-contest. Pre-fix the placement-1
+        // leaver was credited a decisive field win (+32/0/-32 at equal ratings). This is the
+        // field generalization of settlement()'s all-forfeit Draw.
+        let all_dq = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 7, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 4, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 2, team: 2, placement: 3, score: 1, alive_at_end: false, forfeited: true },
+        ]);
+        let d = ranked_field_delta(&all_dq, &[1500, 1500, 1500], 32).unwrap();
+        assert!(d.iter().all(|x| x.delta == 0), "an all-forfeit field moves nobody: {d:?}");
+
+        // The two-seat all-forfeit result still agrees bit-for-bit with ranked_delta (both
+        // Draw) — the invariant the 1v1 settlement fix would otherwise have broken. Unequal
+        // ratings so the draw is non-trivial (the favourite moves down, mirrored).
+        let pair = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 7, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 1, team: 1, placement: 2, score: 3, alive_at_end: false, forfeited: true },
+        ]);
+        let field = ranked_field_delta(&pair, &[1600, 1400], 32).unwrap();
+        let one = ranked_delta(&pair, 1600, 1400, 32).unwrap();
+        assert_eq!(
+            (field[0].delta, field[1].delta),
+            (one.a, one.b),
+            "a 2-seat all-forfeit field settles exactly as ranked_delta's Draw"
+        );
     }
 
     #[test]
