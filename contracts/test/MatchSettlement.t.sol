@@ -1497,6 +1497,37 @@ contract MatchSettlementTest is Test {
         settlement.settleField(MATCH, ag, ds, HASH);
     }
 
+    /// @dev The complement of the never-registered case: a seat that WAS registered but
+    ///      deregistered AFTER the match is still scored. A match settles once it is played
+    ///      and reputation persists across deregistration (recordMatchResult gates on
+    ///      registeredAt != 0), so a losing agent cannot dodge its negative delta by leaving —
+    ///      and because the field's deltas must sum to zero the attester cannot drop the leaver
+    ///      either, so tolerating it is what keeps the whole field settleable. Mirrors the 1v1
+    ///      and settleFieldWager paths, which check registration at open, not at settle.
+    function test_settleField_scoresDeregisteredSeat() public {
+        _enableVariable(RATING_CAP);
+        _registerAgent(dave, "dave-bot");
+        address[] memory ag = _field(alice, bob, dave);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether); // dave (seat 2) is the loser
+
+        vm.prank(dave);
+        registry.deregister(); // dave bails after playing
+        assertFalse(registry.isRegistered(dave), "dave is no longer active");
+
+        vm.prank(attester);
+        settlement.settleField(MATCH, ag, ds, HASH);
+
+        assertEq(
+            registry.reputationOf(dave), -20 ether, "the deregistered loser is still scored (loss not dodged)"
+        );
+        assertEq(registry.reputationOf(alice), 20 ether, "the winner still gains");
+        (,, uint64 daveMatches,,,) = registry.agents(dave);
+        assertEq(daveMatches, 1, "the settled match is counted against the deregistered identity");
+        assertTrue(
+            _status(MATCH) == MatchSettlement.Status.Settled, "the field settles despite a deregistered seat"
+        );
+    }
+
     /// @dev FM3 cap: a per-seat delta over the owner-set ceiling reverts RatingDeltaTooLarge,
     ///      either sign — the attester scales standing only within the cap, same as the 1v1
     ///      variable path. The over-cap seat is balanced so ONLY the cap (not the sum) trips.
