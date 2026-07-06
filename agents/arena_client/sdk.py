@@ -1045,6 +1045,11 @@ def run_local_match(
         # into a cap the caller never asked for (e.g. 65536 -> 0, which ALSO reads as "shield off", so the
         # wrap is doubly wrong) — reject both loudly here, mirroring the harness's u16 parse.
         raise ValueError(f"max_shield is a shield-pool cap in 0..=65535 (0 = off); got {max_shield}")
+    if not 0 <= perception_memory <= 65535:
+        # Core takes perception_memory as a u16 tick window (0 = off), so a negative is meaningless and a
+        # value past 65535 would wrap into a window the caller never asked for (65536 -> 0, which ALSO reads
+        # as "memory off", so the wrap is doubly wrong) — reject both loudly here, mirroring the harness u16.
+        raise ValueError(f"perception_memory is a memory window in ticks 0..=65535 (0 = off); got {perception_memory}")
     if start_health is not None and not 0 <= start_health <= 65535:
         # Core takes start_health as a u16. None means "let the harness apply its default" (no token); a
         # given value must be in range, else an out-of-range forward would wrap into a pool the caller
