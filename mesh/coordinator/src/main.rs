@@ -819,16 +819,38 @@ struct EarnerEntry {
     faults: usize,
 }
 
+/// Reject the zero-valued config knobs that would silently brick the coordinator
+/// before any work begins. The dev-mock relay/spender intervals are deliberately NOT
+/// here — they clamp to a 1s floor at their spawn site (`.max(1)`, mirroring
+/// `idle_probe`) since they only run under a dev flag. The reaper is always-on, so a
+/// zero interval there is a hard config error (a dead background task strands every
+/// in-flight job), not a run-fast request.
+fn validate_args(args: &Args) -> Result<()> {
+    // tokio::time::interval panics on a zero period; the reaper is always spawned.
+    anyhow::ensure!(
+        args.reap_interval_secs > 0,
+        "reap_interval_secs must be > 0 (a 0 period panics the always-on reaper at startup and strands every in-flight job past its deadline)"
+    );
+    anyhow::ensure!(
+        args.relay_batch_size > 0,
+        "relay_batch_size must be >= 1 (0 would claim an empty batch every tick and never drain the receipt backlog)"
+    );
+    // A zero body timeout makes `TimeoutLayer` respond 408 to every POST before its
+    // body can arrive — registration + submit over HTTP become a total outage.
+    anyhow::ensure!(
+        args.http_body_timeout_secs > 0,
+        "http_body_timeout_secs must be > 0 (0 would 408 every POST before its body arrives)"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("coordinator=info,tower_http=info")
         .init();
     let args = Args::parse();
-    anyhow::ensure!(
-        args.relay_batch_size > 0,
-        "relay_batch_size must be >= 1 (0 would claim an empty batch every tick and never drain the receipt backlog)"
-    );
+    validate_args(&args)?;
     let store = Store::open(&args.db)?.with_compute_rate_wei(args.compute_rate_wei);
     // Seeds a fresh DB only; a restart reloads existing jobs from the file.
     // `with_store` also reclaims jobs left in_flight by a previous crash.
@@ -923,13 +945,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // A zero body timeout makes `TimeoutLayer` respond 408 to every POST before
-    // its body can arrive — registration + submit over HTTP become a total
-    // outage. Reject it at startup, mirroring the header-timeout zero guard.
-    anyhow::ensure!(
-        args.http_body_timeout_secs > 0,
-        "http_body_timeout_secs must be > 0 (0 would 408 every POST before its body arrives)"
-    );
     let app = router_with_body_timeout(state, Duration::from_secs(args.http_body_timeout_secs));
 
     let listener = tokio::net::TcpListener::bind(&args.bind).await?;
@@ -1848,7 +1863,10 @@ fn spawn_relayer<R: Relay + 'static>(
     batch_size: usize,
 ) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        // Clamp to a 1s floor: tokio::time::interval panics on a zero period. This
+        // dev-mock-only loop clamps rather than hard-fails (the always-on reaper's
+        // interval is validated in `validate_args`), mirroring `idle_probe`.
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
             tick.tick().await;
             drain_attestations(&state, &relay, batch_size).await;
@@ -2038,7 +2056,9 @@ const ALREADY_SPENT_TX: &str = "already-spent";
 /// through `spender`. Mirrors `spawn_relayer`; only the real binary spawns it.
 fn spawn_debit_relayer<S: Spender + 'static>(state: Arc<AppState>, spender: S, interval_secs: u64) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
+        // Clamp to a 1s floor (see `spawn_relayer`): a zero period panics tokio's
+        // interval, and this dev-mock-only loop clamps rather than hard-fails.
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
             tick.tick().await;
             drain_debits(&state, &spender).await;
