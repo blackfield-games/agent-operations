@@ -355,6 +355,29 @@ def test_compose_accepts_legitimate_relative_paths(tmp_path):
     assert text.index("@./biome/a.b.usda@") < text.index("@./terrain/sub/r+0042_-0017_l0.usda@")
 
 
+@pytest.mark.parametrize(
+    "ok_path",
+    [
+        "npc/..usda",  # STARTS with .. but is not the .. segment
+        "prop/...usda",  # three leading dots
+        "biome/.hidden.usda",  # a dotfile segment
+        "terrain/...",  # all dots, but neither . nor ..
+    ],
+)
+def test_compose_accepts_dotted_filenames_that_are_not_traversal(tmp_path, ok_path):
+    """The traversal guard rejects ONLY the exact `.`/`..` segments (`seg in (".", "..")`),
+    so a segment that merely contains or starts with dots — `..usda`, `.hidden.usda`,
+    `...` — is a legitimate filename and must compose unchanged. Pins the exact-equality
+    semantics so a future over-aggressive `startswith('..')` rewrite that false-rejected
+    these is caught here."""
+    specialist = ok_path.split("/")[0]
+    layers = [
+        LayerSpec(specialist=specialist, region_id="r+0000_+0000_l0", path=ok_path, summary="x", metrics={}),
+    ]
+    root = compose_world(layers, tmp_path)
+    assert f"@./{ok_path}@" in root.read_text()
+
+
 def test_compose_empty_set_warns_and_writes_parseable_empty_world(tmp_path, caplog):
     """An all-None / empty specialist set must DEGRADE (warn), not raise (FM3),
     and write a still-parseable, explicitly-empty world.usda."""
