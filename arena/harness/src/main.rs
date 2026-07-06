@@ -1943,6 +1943,15 @@ fn ranked_reputation_floor_from(args: &Args) -> i128 {
     args.min_reputation.unwrap_or(i128::MIN)
 }
 
+/// True when a reputation floor (`--min-reputation`) is configured but no `--registered`
+/// set is: the floor then has no registry to source reputation from, so the matchmaker —
+/// which consults it only inside a configured registry — never gates on it. A silent
+/// no-op worth warning the operator about, distinct from the loud empty-`--registered`
+/// guard (that rejects a set that would match nobody; this flags a floor that gates nobody).
+fn floor_without_registry_is_inert(args: &Args) -> bool {
+    args.min_reputation.is_some() && args.registered.is_empty()
+}
+
 /// Map a seat's Join (its claimed `agent_id` + `signature_hex`) to a matchmaker
 /// [`JoinRequest`] for `mode`. The arena-01 Join carries no controller kind, so it is
 /// inferred from the mode and whether a signature is present:
@@ -2168,6 +2177,14 @@ fn build_direct_match(args: &Args, n: u8) -> Match {
 
 fn main() {
     let args = parse_args();
+    // Warn (never refuse) if a reputation floor can't gate anything — an operator config
+    // slip the empty---registered guard doesn't cover. stderr only, so stdout stays the
+    // byte-identical protocol stream.
+    if floor_without_registry_is_inert(&args) {
+        eprintln!(
+            "[matchmaker] --min-reputation is set without any --registered address; the reputation floor is inert (no registry to source reputation from)"
+        );
+    }
     let n = args.seats;
 
     // The off-chain settlement seam: a finished match (or a pre-play abort) maps to
@@ -3093,6 +3110,21 @@ mod tests {
         assert_eq!(neg.min_reputation, Some(-1000), "the floor is signed");
         let pos = parse_args_from(["--min-reputation", " 250 ", "--seats", "2"].into_iter().map(String::from));
         assert_eq!(pos.min_reputation, Some(250), "trimmed and parsed");
+    }
+
+    #[test]
+    fn floor_without_registry_is_inert_only_when_a_floor_has_no_registry() {
+        // The four arms of the warn predicate: it flags ONLY a floor with no registry.
+        let floor_and_registry =
+            Args { min_reputation: Some(100), registered: vec![("0xabc".to_string(), 0)], ..direct_args(2, "", 0) };
+        assert!(!floor_without_registry_is_inert(&floor_and_registry), "a floor with a registry gates — not inert");
+        let floor_only = Args { min_reputation: Some(100), registered: vec![], ..direct_args(2, "", 0) };
+        assert!(floor_without_registry_is_inert(&floor_only), "a floor with no registry is inert");
+        let registry_only =
+            Args { min_reputation: None, registered: vec![("0xabc".to_string(), 0)], ..direct_args(2, "", 0) };
+        assert!(!floor_without_registry_is_inert(&registry_only), "a registry with no floor is not the inert case");
+        let neither = Args { min_reputation: None, registered: vec![], ..direct_args(2, "", 0) };
+        assert!(!floor_without_registry_is_inert(&neither), "neither set is not the inert case");
     }
 
     #[test]
