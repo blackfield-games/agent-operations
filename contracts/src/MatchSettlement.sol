@@ -734,8 +734,8 @@ contract MatchSettlement is Ownable2Step {
     }
 
     /// @notice Open a fresh N-seat field-wager escrow over a roster of 2..=`MAX_FIELD`
-    ///         registered, DISTINCT agents with a uniform per-seat `stake` (0 for a
-    ///         no-escrow field). Attester-gated: the match service declares the roster and
+    ///         registered, DISTINCT agents with a uniform POSITIVE per-seat `stake`.
+    ///         Attester-gated: the match service declares the roster and
     ///         the agreed stake; each agent then consents by funding its own seat
     ///         (`fundField`). The N-seat analog of `openMatch` — the fixed `agentA/agentB`
     ///         become an arbitrary roster, the two `aFunded/bFunded` flags a `fundedBits`
@@ -744,14 +744,20 @@ contract MatchSettlement is Ownable2Step {
     ///         Roster integrity is enforced before the match is recorded (a revert unwinds
     ///         every partial write): the field must be 2..=`MAX_FIELD` seats
     ///         (`FieldTooSmall` rejects empty/singleton, `FieldTooLarge` the gas bound),
-    ///         and every agent must be registered (`AgentNotRegistered`) and DISTINCT
-    ///         (`DuplicateAgent`) — a duplicate seat would double-fund/double-refund one
-    ///         identity and corrupt the per-seat accounting. Distinctness is O(n) via
-    ///         `fieldSeatPlus1` (guaranteed empty for a fresh id), not an O(n^2) scan.
+    ///         the `stake` must be POSITIVE (`NoWager` — a zero-stake wager can never fund
+    ///         a seat (`fundField` reverts `NoWager` at stake 0), so `settleFieldWager`'s
+    ///         full-funding precondition is unreachable and it could only be cancelled or
+    ///         expired, never settled; the no-escrow reputation-only field is `settleField`,
+    ///         settled directly without an open), and every agent must be registered
+    ///         (`AgentNotRegistered`) and DISTINCT (`DuplicateAgent`) — a duplicate seat
+    ///         would double-fund/double-refund one identity and corrupt the per-seat
+    ///         accounting. Distinctness is O(n) via `fieldSeatPlus1` (guaranteed empty for
+    ///         a fresh id), not an O(n^2) scan.
     function openFieldMatch(bytes32 matchId, address[] calldata agents, uint256 stake) external onlyAttester {
         uint256 n = agents.length;
         if (n < 2) revert FieldTooSmall();
         if (n > MAX_FIELD) revert FieldTooLarge();
+        if (stake == 0) revert NoWager();
         _requireFreshId(matchId);
 
         // The seat map doubles as the distinctness check: a fresh id has an empty map (the
