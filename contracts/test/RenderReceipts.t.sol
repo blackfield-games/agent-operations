@@ -1412,6 +1412,49 @@ contract RenderReceiptsTest is Test {
         assertEq(receipts.receiptCount(), 0);
     }
 
+    /// @dev Gas-envelope seam (the batch twin of MatchSettlement's MAX_FIELD bound): a batch
+    ///      of EXACTLY MAX_BATCH issues — the cap is inclusive, so it never rejects a
+    ///      legitimate max-size settle wave. Zero-region requests skip the fee route, so this
+    ///      drives the full O(n) fence/attest/persist loop at the boundary. Reads the cap off
+    ///      the contract so it tracks the constant in lock-step (FM4: a hardcoded 64 would
+    ///      drift if the bound moved).
+    function test_issueReceipts_atMaxBatchIssues() public {
+        _arm();
+        uint256 max = receipts.MAX_BATCH();
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](max);
+        for (uint256 i = 0; i < max; i++) {
+            items[i] = _req(earner, keccak256(abi.encode("maxbatch", i)), 10, 0, bytes32(0), bytes32(0));
+        }
+
+        vm.prank(coordinator);
+        bytes32[] memory uids = receipts.issueReceipts(items);
+
+        assertEq(uids.length, max);
+        assertEq(receipts.receiptCount(), max);
+        assertEq(eas.multiAttestCalls(), 1);
+        assertEq(eas.lastBatchSize(), max);
+    }
+
+    /// @dev FM1/FM4: a batch of MAX_BATCH + 1 reverts BatchTooLarge BEFORE any attestation —
+    ///      the gas envelope is a contract guarantee, not a trust assumption, even from an
+    ///      authorized-but-buggy coordinator. Rejected AT the boundary (not one under), and
+    ///      nothing is attested or counted (the whole call reverts in the pre-loop guard).
+    function test_issueReceipts_aboveMaxBatchReverts() public {
+        _arm();
+        uint256 over = receipts.MAX_BATCH() + 1;
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](over);
+        for (uint256 i = 0; i < over; i++) {
+            items[i] = _req(earner, keccak256(abi.encode("overbatch", i)), 10, 0, bytes32(0), bytes32(0));
+        }
+
+        vm.prank(coordinator);
+        vm.expectRevert(RenderReceipts.BatchTooLarge.selector);
+        receipts.issueReceipts(items);
+
+        assertEq(eas.multiAttestCalls(), 0);
+        assertEq(receipts.receiptCount(), 0);
+    }
+
     function test_issueReceipts_revertsNotAuthorized() public {
         _arm();
         RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](1);
