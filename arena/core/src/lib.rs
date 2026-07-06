@@ -8089,6 +8089,53 @@ mod tests {
     }
 
     #[test]
+    fn field_delta_both_dq_teams_draw_including_the_surviving_teammate() {
+        // A forfeit DQ's the WHOLE team, so two DQ'd teams draw every cross-team pair —
+        // the team generalization of the all-forfeit no-contest. 2v2, both teams DQ'd
+        // (each has one leaver), team A (seats 0,1, placement 1) out-scores team B (seats
+        // 2,3, placement 2). The honest survivor on the trailing team (seat 3, forfeited
+        // false) must not be punished, and the leading team's leaver (seat 0) must gain
+        // nothing. Pre-fix the draw keyed on the PERSONAL flag, so seat 0 (leaver,
+        // placement 1) "beat" seat 3 (survivor, placement 2) — the leaver gained +16 over
+        // an honest opponent, re-opening leave-with-a-lead at the team level. Every team
+        // here is DQ'd, so at equal ratings the whole field is a true no-contest.
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 9, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 1, team: 0, placement: 1, score: 2, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 2, team: 1, placement: 2, score: 5, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 3, team: 1, placement: 2, score: 1, alive_at_end: true, forfeited: false },
+        ]);
+        let d = ranked_field_delta(&r, &[1500, 1500, 1500, 1500], 32).unwrap();
+        assert_eq!(d.iter().map(|x| x.delta as i64).sum::<i64>(), 0, "still exactly zero-sum");
+        assert_eq!(d[3].delta, 0, "the honest survivor on the trailing DQ'd team is not punished by the leader's leaver");
+        assert_eq!(d[0].delta, 0, "the leading DQ'd team's leaver gains nothing — leave-with-a-lead stays closed at the team level");
+        assert!(d.iter().all(|x| x.delta == 0), "an all-DQ field is a true no-contest: every seat moves zero, {d:?}");
+    }
+
+    #[test]
+    fn field_delta_a_dq_team_survivor_still_loses_to_a_clean_team() {
+        // The team-DQ draw must stay NARROW — it fires only when BOTH teams are DQ'd. A
+        // clean team (no forfeiter) still beats every seat of a DQ'd team by placement,
+        // including the DQ'd team's non-forfeiting survivor (demoted with its team). 2v2:
+        // team A (seats 0,1) clean at placement 1, team B (seats 2,3) DQ'd at placement 2
+        // with seat 2 the leaver and seat 3 the survivor. No cross-team pair is both-DQ'd,
+        // so this is byte-identical pre/post-fix — a guard against the fix over-reaching
+        // into a DQ-vs-clean draw.
+        let r = result_with(vec![
+            SeatOutcome { seat: 0, team: 0, placement: 1, score: 8, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 1, team: 0, placement: 1, score: 6, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 2, team: 1, placement: 2, score: 3, alive_at_end: false, forfeited: true },
+            SeatOutcome { seat: 3, team: 1, placement: 2, score: 1, alive_at_end: true, forfeited: false },
+        ]);
+        let d = ranked_field_delta(&r, &[1500, 1500, 1500, 1500], 32).unwrap();
+        assert_eq!(d.iter().map(|x| x.delta as i64).sum::<i64>(), 0, "still exactly zero-sum");
+        assert!(d[0].delta > 0 && d[1].delta > 0, "the clean team gains — the DQ penalty holds");
+        assert!(d[2].delta < 0 && d[3].delta < 0, "both DQ'd-team seats lose, incl. the non-forfeiting survivor");
+        assert_eq!(d[0].delta, d[1].delta, "the two clean-team seats move together");
+        assert_eq!(d[2].delta, d[3].delta, "the DQ'd team's leaver and survivor move together (same team, same placement)");
+    }
+
+    #[test]
     fn field_delta_rejects_a_degenerate_or_misaligned_field() {
         // A field needs >= 2 seats and ratings aligned 1:1 with the outcomes; anything
         // else has no well-defined settlement, so it yields None rather than a wrong delta.
