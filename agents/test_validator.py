@@ -1861,6 +1861,28 @@ async def test_run_interiors_gate_degrades_on_a_missing_director(tmp_path):
 # vocabulary via _recognized_beats rather than a hardcoded keyword set.
 
 
+# The recognition/density VARIETY these run gates once exercised is pinned at unit level (here and in
+# test_lighting.py), not through validator.run: the director intent:beats re-derivation gate below now
+# demands a region-true beats line on every well-formed director, and a region's beats are a FIXED
+# 3-phrase composition that reproduces neither an unmodeled-only line nor an arbitrary 2-beat density.
+# So the recognizer/density facts those fixtures relied on move here, and the remaining run fixtures
+# adopt _REGION_BEATS_LINE.
+def test_lighting_beats_recognition_and_density_variety_are_unit_pinned():
+    # An unmodeled-only line: the recognizer models nothing, so the validator's lighting loop stays
+    # silent (its `if recognized:` guard is false). Unreachable at run level now — such a line is not
+    # region-true, so the director-beats gate rejects it — but still the reason the loop is silent.
+    assert lighting._recognized_beats("quiet meadow. gentle breeze.") == []
+    assert lighting._fog_density([]) == 0.0
+    # A modeled+unmodeled MIX recognizes ONLY the modeled token — the filter the drivenBy check trusts.
+    assert lighting._recognized_beats("scorched earth. quiet meadow.") == ["scorched"]
+    # Why the density gate compares with abs_tol: _fog_density emits `{d:.2f}`, a 2-decimal string, and
+    # a sum of 2-decimal table values is float-imprecise (0.10 + 0.20 is 0.30000000000000004, emitted
+    # "0.30"), so an exact compare would false-reject a correct layer.
+    d = lighting._fog_density(["abandoned", "ash"])
+    assert d != float(f"{d:.2f}")
+    assert f"{d:.2f}" == "0.30"
+
+
 async def test_run_accepts_lighting_atmosphere_driven_by_recognized_beats(tmp_path):
     # FM1 (no false reject): the director names beats lighting models and lighting emits the
     # Atmosphere driven by exactly those recognized tokens — nothing unmet, byte-clean.
@@ -1889,20 +1911,6 @@ async def test_run_rejects_a_dropped_atmosphere_and_routes_to_lighting(tmp_path)
     assert "lighting" in verdict.failing_specialists
     assert _failing_specialist(verdict.issues) == "lighting"
     assert _route_back_target(verdict) == "lighting"
-
-
-async def test_run_lighting_intent_gate_silent_for_unmodeled_only_beats(tmp_path):
-    # FM1/FM3 (no false reject): a beats line naming NO beat lighting models imposes no
-    # atmosphere — lighting correctly emits its pre-beats palette (no Atmosphere) and the
-    # gate must stay silent (no recognized beat ⇒ nothing to verify).
-    beats = "quiet meadow. gentle breeze."
-    assert not lighting._recognized_beats(beats)  # premise: this line models nothing
-    layers = _set_with(tmp_path, {
-        "director": _director_body(beats=beats),
-        "lighting": _lighting_body(driven_by=None),
-    })
-    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
-    assert verdict.accepted, verdict.issues
 
 
 async def test_run_lighting_intent_gate_degrades_on_a_missing_lighting_layer(tmp_path):
@@ -1951,22 +1959,6 @@ async def test_run_lighting_intent_gate_tracks_recognized_beats_vocabulary(tmp_p
 # SET check confirms the right beats but not the MAGNITUDE they accumulate to, so a stale/tampered
 # density desynced from that sum (while drivenBy still looks right) shipped accepted. Density is
 # verified ONLY on the drivenBy-correct branch (a wrong drivenBy is the single violation).
-
-
-async def test_run_accepts_lighting_density_consistent_with_recognized_beats(tmp_path):
-    # FM1 (no false reject): drivenBy == recognized AND inputs:density == _fog_density(recognized).
-    # _fog_density([scorched, ash]) is a float-imprecise 0.35 (0.15 + 0.20 == 0.35000000000000003),
-    # emitted "0.35", so the abs_tol=5e-3 must absorb the rounded-string-vs-float-sum gap — an exact
-    # compare would false-reject this correct layer and loop the revision.
-    beats = "scorched earth. drifting ash."
-    recognized = lighting._recognized_beats(beats)
-    layers = _set_with(tmp_path, {
-        "director": _director_body(beats=beats),
-        "lighting": _lighting_body(driven_by=recognized),  # density defaults to _fog_density
-    })
-    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
-    assert verdict.accepted, verdict.issues
-    assert verdict.issues == []
 
 
 async def test_run_rejects_a_stale_lighting_density_and_routes_to_lighting(tmp_path):
