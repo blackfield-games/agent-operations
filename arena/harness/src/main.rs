@@ -3065,6 +3065,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_registered_carries_an_optional_reputation_suffix() {
+        // A bare address defaults to reputation 0; a ':<int>' suffix (signed, whitespace
+        // trimmed) carries the on-chain reputation for the --min-reputation floor.
+        let parsed = parse_args_from(
+            ["--registered", "0xabc:1500", "--registered", " 0xdef:-500\n", "--registered", "0xghi", "--seats", "2"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(
+            parsed.registered,
+            vec![("0xabc".to_string(), 1500), ("0xdef".to_string(), -500), ("0xghi".to_string(), 0)],
+            "the suffix carries a signed reputation; a bare address defaults to 0"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "reputation must be a signed integer")]
+    fn parse_registered_rejects_a_non_integer_reputation() {
+        parse_args_from(["--registered", "0xabc:notanint", "--seats", "2"].into_iter().map(String::from));
+    }
+
+    #[test]
+    fn parse_min_reputation_reads_a_signed_floor() {
+        assert_eq!(parse_args_from(["--seats", "2"].into_iter().map(String::from)).min_reputation, None);
+        let neg = parse_args_from(["--min-reputation", "-1000", "--seats", "2"].into_iter().map(String::from));
+        assert_eq!(neg.min_reputation, Some(-1000), "the floor is signed");
+        let pos = parse_args_from(["--min-reputation", " 250 ", "--seats", "2"].into_iter().map(String::from));
+        assert_eq!(pos.min_reputation, Some(250), "trimmed and parsed");
+    }
+
+    #[test]
     fn parse_fov_accepts_the_whole_domain() {
         // 0 (facing octant alone) through 4 (full circle) are the sim's valid spreads.
         assert_eq!((0..=4).map(|s| parse_fov(&s.to_string())).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
@@ -6619,6 +6650,60 @@ mod tests {
         assert!(
             matches!(mm.join(MatchMode::Agent, nonce0.as_bytes(), req), Ok(JoinOutcome::Queued)),
             "with no --registered set, a signed seat is admitted (possession-only, unchanged)",
+        );
+    }
+
+    #[test]
+    fn matchmade_ranked_admission_enforces_the_reputation_floor() {
+        // End to end through build_matchmaker: --min-reputation is the floor a registered
+        // seat's reputation (from --registered <addr>:<rep>) must clear. A seat at/above the
+        // floor is admitted; a registered seat below it is refused ReputationBelowFloor even
+        // with a valid signature — its standing, not its key, bars it from ranked queues.
+        let good_sk = join_key();
+        let bad_sk = other_join_key();
+        let good_addr = address_from_verifying_key(good_sk.verifying_key());
+        let bad_addr = address_from_verifying_key(bad_sk.verifying_key());
+
+        // good_addr sits exactly at the floor (inclusive), bad_addr one below it.
+        let args = Args {
+            registered: vec![(good_addr.clone(), 100), (bad_addr.clone(), 99)],
+            min_reputation: Some(100),
+            ..direct_args(2, "", 0)
+        };
+        let mm = build_matchmaker(&args, 2);
+
+        let nonce0 = nonce_for(id(), 0);
+        let good_req = join_request_for(
+            MatchMode::Agent,
+            0,
+            &[],
+            &good_addr,
+            &sign_join_proof(&good_sk, &good_addr, nonce0.as_bytes()),
+        );
+        assert!(
+            matches!(mm.join(MatchMode::Agent, nonce0.as_bytes(), good_req), Ok(JoinOutcome::Queued)),
+            "a registered seat exactly at the floor is admitted",
+        );
+
+        let nonce1 = nonce_for(id(), 1);
+        let bad_req = join_request_for(
+            MatchMode::Agent,
+            1,
+            &[],
+            &bad_addr,
+            &sign_join_proof(&bad_sk, &bad_addr, nonce1.as_bytes()),
+        );
+        assert!(
+            matches!(
+                mm.join(MatchMode::Agent, nonce1.as_bytes(), bad_req),
+                Err(JoinError::ReputationBelowFloor { .. })
+            ),
+            "a registered seat below the floor is refused even with a valid signature over its challenge",
+        );
+        assert_eq!(
+            mm.waiting(MatchMode::Agent),
+            1,
+            "only the at-floor seat queued; the below-floor seat never entered",
         );
     }
 
