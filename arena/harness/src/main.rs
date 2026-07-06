@@ -6477,6 +6477,73 @@ mod tests {
         assert!(formed.into_formed().is_some(), "a human + a casual agent forms a Mixed cross-play match");
     }
 
+    #[test]
+    fn matchmade_ranked_admission_enforces_the_registered_set() {
+        // End to end through build_matchmaker: --registered is the eligibility set the
+        // matchmaker gates ranked admission on. A registered key holder is admitted; a key
+        // holder that signs correctly but is NOT registered is refused — the match it would
+        // form could never settle on-chain (MatchSettlement AgentNotRegistered).
+        let registered_sk = join_key();
+        let outsider_sk = other_join_key();
+        let registered_addr = address_from_verifying_key(registered_sk.verifying_key());
+        let outsider_addr = address_from_verifying_key(outsider_sk.verifying_key());
+
+        // Only the registered agent is listed as eligible.
+        let args = Args { registered: vec![registered_addr.clone()], ..direct_args(2, "", 0) };
+        let mm = build_matchmaker(&args, 2);
+
+        let nonce0 = nonce_for(id(), 0);
+        let reg_req = join_request_for(
+            MatchMode::Agent,
+            0,
+            &[],
+            &registered_addr,
+            &sign_join_proof(&registered_sk, &registered_addr, nonce0.as_bytes()),
+        );
+        assert!(
+            matches!(mm.join(MatchMode::Agent, nonce0.as_bytes(), reg_req), Ok(JoinOutcome::Queued)),
+            "a registered key holder is admitted to a ranked seat",
+        );
+
+        let nonce1 = nonce_for(id(), 1);
+        let out_req = join_request_for(
+            MatchMode::Agent,
+            1,
+            &[],
+            &outsider_addr,
+            &sign_join_proof(&outsider_sk, &outsider_addr, nonce1.as_bytes()),
+        );
+        assert!(
+            matches!(
+                mm.join(MatchMode::Agent, nonce1.as_bytes(), out_req),
+                Err(JoinError::Unauthenticated { .. })
+            ),
+            "an unregistered key holder is refused even with a valid signature over its challenge",
+        );
+        assert_eq!(mm.waiting(MatchMode::Agent), 1, "only the registered seat queued; the outsider never entered");
+    }
+
+    #[test]
+    fn no_registered_flag_leaves_ranked_admission_possession_only() {
+        // The default (no --registered) must not gate on registration — byte-identical to the
+        // possession-only ranked path: a signed key holder is admitted with no eligibility set.
+        let sk = join_key();
+        let addr = address_from_verifying_key(sk.verifying_key());
+        let mm = build_matchmaker(&direct_args(2, "", 0), 2);
+        let nonce0 = nonce_for(id(), 0);
+        let req = join_request_for(
+            MatchMode::Agent,
+            0,
+            &[],
+            &addr,
+            &sign_join_proof(&sk, &addr, nonce0.as_bytes()),
+        );
+        assert!(
+            matches!(mm.join(MatchMode::Agent, nonce0.as_bytes(), req), Ok(JoinOutcome::Queued)),
+            "with no --registered set, a signed seat is admitted (possession-only, unchanged)",
+        );
+    }
+
     /// Form a ranked Agent match of `keys.len()` seats through a fresh matchmaker — each
     /// seat signs its challenge so the verifier admits it. Returns the matchmaker (its
     /// ladder + the pending_ranked registration live) and the formed match, so a test can
