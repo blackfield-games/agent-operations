@@ -18,13 +18,13 @@
 //!   signer from the arena-01 `join_digest` over *this connection's* challenge
 //!   nonce and admits a ranked seat only when the recovered address equals the
 //!   claimed `agent_id` — key possession, not assertion. Whether that address is a
-//!   *registered* on-chain agent is a separate eligibility check that composes on
-//!   top: [`RegistryVerifier`] wraps a possession verifier with a
+//!   *registered* on-chain agent is a separate eligibility check scoped to ranked
+//!   (`Agent`-mode) seats: [`Matchmaker::with_ranked_registry`] gates them on a
 //!   [`RegistrySnapshot`] (the arena view of `AgentRegistry.isRegistered`) so a
 //!   ranked seat needs both a proven key and a registered identity — the arena
 //!   mirror of the `isRegistered` gate `MatchSettlement` enforces at match-open.
-//!   ([`StubIdentityVerifier`] still stands in for the possession check in the
-//!   crypto-free policy tests.)
+//!   Registration is a ranked concern only; `Mixed` casual cross-play never settles,
+//!   so it is not gated on registration.
 //! - **Formation is atomic.** Per-mode queues live behind one lock, so a join that
 //!   completes a match pulls its whole roster under that lock — no concurrent join
 //!   can double-seat a participant or start a match a seat short.
@@ -120,139 +120,46 @@ impl IdentityVerifier for StubIdentityVerifier {
 }
 
 /// A point-in-time view of which agent identities are registered on-chain in the
-/// `AgentRegistry`, so the matchmaker can gate a ranked seat on registration
-/// *eligibility* — the arena mirror of the `AgentRegistry.isRegistered` check
-/// `MatchSettlement` enforces at match-open (`AgentNotRegistered`). Admitting a key
-/// holder whose address is *not* registered would form a ranked match that plays
-/// but can never settle on-chain; this snapshot lets that be caught at the door.
+/// `AgentRegistry`, so the matchmaker can gate a *ranked* seat on registration
+/// eligibility — the arena mirror of the `AgentRegistry.isRegistered` check
+/// `MatchSettlement` enforces at match-open (`AgentNotRegistered`). A ranked seat
+/// whose address is not registered would form a match that plays but can never
+/// settle on-chain, so [`Matchmaker::with_ranked_registry`] catches it at the door.
 ///
 /// The matchmaker never calls the chain on its hot path: an operator loads the
 /// registered set out of band — replaying the registry's `Registered` /
-/// `Deregistered` events, or an `isRegistered` sweep — and refreshes it. Addresses
-/// are held lowercased and compared case-insensitively, matching
-/// [`verify_join_signature`]'s identity comparison (the recovered address is
-/// lowercase, compared `eq_ignore_ascii_case`), so `0xABC` and `0xabc` are the same
-/// registrant here as they are to the signature gate.
+/// `Deregistered` events, or an `isRegistered` sweep — and supplies it. Addresses are
+/// held lowercased and compared case-insensitively, matching [`verify_join_signature`]'s
+/// identity comparison (the recovered address is lowercase, compared
+/// `eq_ignore_ascii_case`), so `0xABC` and `0xabc` are the same registrant here as
+/// they are to the signature gate.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RegistrySnapshot {
     registered: BTreeSet<String>,
 }
 
 impl RegistrySnapshot {
-    /// An empty snapshot — no identity registered. Distinct from *unenforced*: a
-    /// [`RegistryVerifier`] built over an empty snapshot rejects every ranked seat
-    /// (nobody is registered), whereas [`RegistryVerifier::unenforced`] does not gate
-    /// on registration at all. Keeping the two apart is deliberate — conflating
-    /// "no registrants" with "gate off" would silently admit everyone.
+    /// An empty snapshot. As a matchmaker's ranked registry it rejects every ranked
+    /// seat (nobody is registered) — distinct from leaving the registry unset, where
+    /// registration is not enforced at all (see [`Matchmaker::with_ranked_registry`]).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Mark `agent_id` as a registered on-chain identity. Lowercased on insert so
-    /// lookups are case-insensitive. Chainable, so a roster reads as one expression.
-    pub fn register(&mut self, agent_id: impl AsRef<str>) -> &mut Self {
-        self.registered.insert(agent_id.as_ref().to_ascii_lowercase());
-        self
-    }
-
-    /// Drop `agent_id` from the registered set — the mirror of the registry's
-    /// `Deregistered` event, so an event-driven updater can apply a deregistration
-    /// incrementally without rebuilding the whole snapshot. A no-op if it was not
-    /// registered.
-    pub fn deregister(&mut self, agent_id: impl AsRef<str>) -> &mut Self {
-        self.registered.remove(&agent_id.as_ref().to_ascii_lowercase());
-        self
-    }
-
-    /// Build a snapshot from an iterator of registered addresses — e.g. the
+    /// Build a snapshot from an iterator of registered addresses — the
     /// `Registered`-minus-`Deregistered` set replayed from the registry's event log,
-    /// or an `isRegistered` sweep of known agents.
+    /// or an `isRegistered` sweep. Lowercased so lookups are case-insensitive.
     pub fn from_addresses<I, S>(addrs: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut snapshot = Self::new();
-        for addr in addrs {
-            snapshot.register(addr);
-        }
-        snapshot
+        Self { registered: addrs.into_iter().map(|a| a.as_ref().to_ascii_lowercase()).collect() }
     }
 
     /// `true` iff `agent_id` is in the registered set (case-insensitive).
     pub fn is_registered(&self, agent_id: &str) -> bool {
         self.registered.contains(&agent_id.to_ascii_lowercase())
-    }
-
-    /// How many identities are registered.
-    pub fn len(&self) -> usize {
-        self.registered.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.registered.is_empty()
-    }
-}
-
-/// Composes on-chain registration eligibility over an inner identity check: a
-/// ranked seat is admitted only when the inner verifier accepts (key *possession* —
-/// typically [`SignatureVerifier`]) **and** the claimed identity is registered in
-/// the [`RegistrySnapshot`]. This is the production ranked gate the arena design
-/// calls for (arena-04 stubbed it and deferred registration to "a later task"):
-/// possession proves the connection controls the address; registration proves that
-/// address is an eligible on-chain agent — the arena counterpart of the
-/// `AgentRegistry.isRegistered` check `MatchSettlement` enforces at match-open. So a
-/// ranked match this gate forms is one that can actually settle; rejecting an
-/// unregistered key holder here avoids forming a match that would only revert with
-/// `AgentNotRegistered` at settle.
-///
-/// The two checks are independent, and both must hold: a registered address whose
-/// key the connection does *not* hold fails the inner check (a forged claim), and a
-/// key holder that is not registered fails the snapshot (ineligible). Only both
-/// together admit a ranked seat.
-///
-/// Registration enforcement is operator config, so [`unenforced`](Self::unenforced)
-/// delegates entirely to the inner verifier — an unconfigured matchmaker is
-/// byte-identical to using the inner verifier alone (the historical possession-only
-/// ranked path), matching the crate's "unconfigured = prior behaviour" convention.
-#[derive(Debug, Clone)]
-pub struct RegistryVerifier<V> {
-    inner: V,
-    /// The registered set to gate on, or `None` to not enforce registration at all.
-    /// `None` is distinct from `Some(empty)`: the former delegates to `inner`, the
-    /// latter rejects every ranked seat (nobody is registered).
-    registered: Option<RegistrySnapshot>,
-}
-
-impl<V> RegistryVerifier<V> {
-    /// Gate ranked admission on membership in `registered` *and* the inner check.
-    pub fn enforcing(inner: V, registered: RegistrySnapshot) -> Self {
-        Self { inner, registered: Some(registered) }
-    }
-
-    /// Do not enforce registration — delegate entirely to `inner`. The inner
-    /// possession check still runs; only the registration gate is off. Lets the same
-    /// composed type carry the "no on-chain gate configured" case without a second
-    /// matchmaker type.
-    pub fn unenforced(inner: V) -> Self {
-        Self { inner, registered: None }
-    }
-}
-
-impl<V: IdentityVerifier> IdentityVerifier for RegistryVerifier<V> {
-    fn verify(&self, agent_id: &str, nonce: &[u8], signature_hex: &str) -> bool {
-        // Both checks must hold; the result is order-independent. Check the cheap
-        // registration set first so an unregistered claim short-circuits *before* the
-        // expensive ECDSA recovery the inner SignatureVerifier runs — a registered
-        // address still pays recovery to prove possession, an unregistered one never
-        // does (a flood of unregistered ranked joins can't force recovery work). When
-        // registration is unenforced, this is exactly the inner check.
-        if let Some(registered) = &self.registered {
-            if !registered.is_registered(agent_id) {
-                return false;
-            }
-        }
-        self.inner.verify(agent_id, nonce, signature_hex)
     }
 }
 
@@ -309,6 +216,13 @@ pub enum JoinError {
     /// seat is ranked in `Agent` mode; in `Mixed`, a token — once presented — must
     /// still verify, so a forged ranked claim is caught even in casual cross-play.
     Unauthenticated { agent_id: String },
+    /// A ranked (`Agent`-mode) seat proved possession of its key but its address is
+    /// not in the matchmaker's ranked registry — a distinct state from
+    /// [`Unauthenticated`](Self::Unauthenticated) (a bad/absent signature): the key
+    /// is genuine, the identity just isn't an eligible on-chain agent, so the match
+    /// it would form could never settle. Only raised when a ranked registry is
+    /// configured (see [`Matchmaker::with_ranked_registry`]).
+    NotRegistered { agent_id: String },
 }
 
 impl std::fmt::Display for JoinError {
@@ -319,6 +233,9 @@ impl std::fmt::Display for JoinError {
             }
             JoinError::Unauthenticated { agent_id } => {
                 write!(f, "join rejected: ranked seat for agent {agent_id} is unauthenticated")
+            }
+            JoinError::NotRegistered { agent_id } => {
+                write!(f, "join rejected: ranked agent {agent_id} is not a registered on-chain identity")
             }
         }
     }
@@ -624,6 +541,12 @@ pub struct Matchmaker<V> {
     state: Mutex<State>,
     verifier: V,
     params: MatchParams,
+    /// The on-chain registration eligibility gate for ranked (`Agent`-mode) seats, or
+    /// `None` to not enforce registration (possession-only — the historical path).
+    /// Only `Agent` mode is ranked/settle-able, so this is consulted for `Agent` seats
+    /// alone; `Mixed` casual cross-play and `Human` never touch it. Set via
+    /// [`with_ranked_registry`](Self::with_ranked_registry); `None` by default.
+    ranked_registry: Option<RegistrySnapshot>,
 }
 
 impl<V: IdentityVerifier> Matchmaker<V> {
@@ -652,7 +575,22 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             params.seats_per_match,
             params.team_size
         );
-        Self { state: Mutex::new(State::default()), verifier, params }
+        Self { state: Mutex::new(State::default()), verifier, params, ranked_registry: None }
+    }
+
+    /// Gate ranked (`Agent`-mode) admission on on-chain registration eligibility: a
+    /// ranked seat is then admitted only when it proves possession (the verifier) AND
+    /// its address is in `registry` — the arena mirror of the `AgentRegistry.isRegistered`
+    /// check `MatchSettlement` enforces at match-open, so a ranked match this matchmaker
+    /// forms is one that can actually settle. `None` leaves registration unenforced
+    /// (possession-only), byte-identical to the pre-registry path. Registration is a
+    /// *ranked* concern — only `Agent` matches settle — so it is scoped to `Agent` seats;
+    /// `Mixed` casual cross-play and `Human` are unaffected whether or not a registry is
+    /// set. Builder-style so it composes onto [`new`](Self::new) /
+    /// [`from_snapshot`](Self::from_snapshot).
+    pub fn with_ranked_registry(mut self, registry: Option<RegistrySnapshot>) -> Self {
+        self.ranked_registry = registry;
+        self
     }
 
     /// Restore a matchmaker whose ranked rating ladder is seeded from a prior
@@ -746,6 +684,20 @@ impl<V: IdentityVerifier> Matchmaker<V> {
                     return Err(JoinError::Unauthenticated { agent_id: req.agent_id.clone() });
                 }
                 None => {}
+            }
+            // A ranked (Agent-mode) seat must also be a registered on-chain identity when
+            // a registry is configured: only Agent matches settle (see `build`), so a
+            // ranked seat that isn't registered would form a match that reverts
+            // `AgentNotRegistered` at settle. Registration is scoped to Agent seats —
+            // Mixed casual cross-play never settles, so an honest possession-verified
+            // Mixed agent is not gated on registration. Runs after possession above, so a
+            // NotRegistered result always carries a genuine key.
+            if mode == MatchMode::Agent {
+                if let Some(registry) = &self.ranked_registry {
+                    if !registry.is_registered(&req.agent_id) {
+                        return Err(JoinError::NotRegistered { agent_id: req.agent_id.clone() });
+                    }
+                }
             }
         }
         Ok(())
@@ -1361,8 +1313,7 @@ mod tests {
         // The registered set must agree with verify_join_signature's identity
         // comparison (recovered address is lowercase, compared eq_ignore_ascii_case),
         // so a registrant stored under one casing matches a join claiming another.
-        let mut snap = RegistrySnapshot::new();
-        snap.register("0xABC");
+        let snap = RegistrySnapshot::from_addresses(["0xABC"]);
         assert!(snap.is_registered("0xABC"), "same casing");
         assert!(snap.is_registered("0xabc"), "lowercased claim matches");
         assert!(snap.is_registered("0xAbC"), "mixed casing matches");
@@ -1370,33 +1321,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_snapshot_from_addresses_dedups_by_casing() {
-        // Two casings of one address are one registrant, not two — otherwise a
-        // deregistration under one casing would leave the other live.
-        let snap = RegistrySnapshot::from_addresses(["0xA", "0xa", "0xB"]);
-        assert_eq!(snap.len(), 2, "0xA and 0xa collapse to one member");
-        assert!(snap.is_registered("0xa"));
-        assert!(snap.is_registered("0xb"));
-    }
-
-    #[test]
-    fn registry_snapshot_deregister_removes_and_is_a_noop_when_absent() {
-        // Mirrors the registry's Deregistered event: an event-driven updater drops a
-        // member incrementally (case-insensitively), and dropping an absent one is
-        // harmless.
-        let mut snap = RegistrySnapshot::from_addresses(["0xA", "0xB"]);
-        snap.deregister("0xa");
-        assert!(!snap.is_registered("0xA"), "deregistered case-insensitively");
-        assert_eq!(snap.len(), 1);
-        snap.deregister("0xnever");
-        assert_eq!(snap.len(), 1, "deregistering a non-member is a no-op");
-    }
-
-    #[test]
-    fn registry_snapshot_new_is_empty_and_registers_no_one() {
+    fn registry_snapshot_empty_registers_no_one() {
         let snap = RegistrySnapshot::new();
-        assert!(snap.is_empty());
-        assert_eq!(snap.len(), 0);
         assert!(!snap.is_registered("0xanything"), "an empty snapshot registers no identity");
     }
 
@@ -2792,46 +2718,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn registry_verifier_requires_both_registration_and_inner() {
-        // Compose over the stub inner (no crypto) to exercise the four arms: only a
-        // registered identity whose inner check also passes is admitted.
-        let mut inner = StubIdentityVerifier::new();
-        inner.authorize("0xa", "tok");
-        inner.authorize("0xb", "tok");
-        let v = RegistryVerifier::enforcing(inner, RegistrySnapshot::from_addresses(["0xa"]));
-
-        assert!(v.verify("0xa", b"n", "tok"), "registered AND possessed is admitted");
-        assert!(!v.verify("0xa", b"n", "wrong"), "registered but wrong token — no possession — rejected");
-        assert!(!v.verify("0xb", b"n", "tok"), "possessed but UNREGISTERED rejected (the new gate)");
-        assert!(!v.verify("0xc", b"n", "tok"), "neither registered nor possessed rejected");
-    }
-
-    #[test]
-    fn registry_verifier_unenforced_delegates_to_inner() {
-        let mut inner = StubIdentityVerifier::new();
-        inner.authorize("0xa", "tok");
-        let open = RegistryVerifier::unenforced(inner.clone());
-        assert!(open.verify("0xa", b"n", "tok"), "unenforced admits whatever inner admits");
-        assert!(!open.verify("0xa", b"n", "wrong"), "the inner possession check still gates");
-        assert!(!open.verify("0xb", b"n", "tok"), "an unauthorized identity is still rejected");
-
-        // An EMPTY *enforcing* snapshot is not the same as unenforced: it registers no
-        // one, so it rejects even the authorized identity — conflating the two would
-        // silently admit everyone.
-        let closed = RegistryVerifier::enforcing(inner, RegistrySnapshot::new());
-        assert!(!closed.verify("0xa", b"n", "tok"), "an empty registered set rejects the authorized");
-    }
-
-    fn registered_mm(registered: &[String]) -> Matchmaker<RegistryVerifier<SignatureVerifier>> {
-        let snap = RegistrySnapshot::from_addresses(registered.iter());
-        Matchmaker::new(RegistryVerifier::enforcing(SignatureVerifier, snap), MatchParams::default())
+    /// A matchmaker whose ranked (Agent-mode) admission is gated on `registered`.
+    fn registered_mm(registered: &[String]) -> Matchmaker<SignatureVerifier> {
+        Matchmaker::new(SignatureVerifier, MatchParams::default())
+            .with_ranked_registry(Some(RegistrySnapshot::from_addresses(registered.iter())))
     }
 
     #[test]
     fn agent_mode_admits_a_registered_key_holder() {
         // End to end on the real verifier: two registered key holders form a ranked
-        // match. addr_a is registered under UPPERCASE to prove the snapshot's
+        // match. addr_a is registered under UPPERCASE to prove the registry's
         // case-insensitivity agrees with the recovered (lowercase) address.
         let (a, b) = (agent_key(), other_key());
         let (addr_a, addr_b) = (agent_addr(&a), agent_addr(&b));
@@ -2856,6 +2752,7 @@ mod tests {
         // The heart of this task: an agent that HOLDS its key and signs correctly is
         // still rejected at ranked admission when its address is not registered — the
         // match it would form could never settle (MatchSettlement AgentNotRegistered).
+        // The error is NotRegistered, not Unauthenticated: the key is genuine.
         let a = agent_key();
         let addr_a = agent_addr(&a);
         let mm = registered_mm(&[agent_addr(&other_key())]); // some OTHER agent is registered
@@ -2864,7 +2761,7 @@ mod tests {
         assert!(
             matches!(
                 mm.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(addr_a.as_str(), sig_a)),
-                Err(JoinError::Unauthenticated { .. })
+                Err(JoinError::NotRegistered { .. })
             ),
             "a key-holder that is not registered is rejected at ranked admission"
         );
@@ -2875,7 +2772,8 @@ mod tests {
     fn agent_mode_registration_does_not_replace_possession() {
         // The victim address IS registered, but the attacker holds a different key and
         // signs claiming the victim. Recovery yields the attacker's address, so the
-        // inner possession check fails — registration alone never admits a forger.
+        // possession check fails FIRST — a forged claim is Unauthenticated, never
+        // NotRegistered, since registration is only consulted after possession proves out.
         let victim = agent_addr(&agent_key());
         let mm = registered_mm(std::slice::from_ref(&victim));
         let nonce: &[u8] = b"chal";
@@ -2891,10 +2789,29 @@ mod tests {
     }
 
     #[test]
-    fn unenforced_registry_verifier_matches_the_bare_signature_gate() {
-        // A matchmaker over an unenforced RegistryVerifier forms the same ranked match
-        // a bare SignatureVerifier does — no registration configured = prior behaviour.
-        let mm = Matchmaker::new(RegistryVerifier::unenforced(SignatureVerifier), MatchParams::default());
+    fn mixed_mode_ignores_the_ranked_registry() {
+        // Regression guard: registration gates RANKED (Agent) seats only. A Mixed match
+        // is casual cross-play and never settles, so an honest signed agent that is NOT
+        // registered must still be admitted (on possession) — before scoping the gate to
+        // Agent mode, this join was wrongly rejected and cancelled the whole Mixed match.
+        let a = agent_key();
+        let addr_a = agent_addr(&a);
+        let mm = registered_mm(&[agent_addr(&other_key())]); // addr_a is NOT registered
+        let nonce: &[u8] = b"chal-a";
+        let sig_a = sign_join(&a, PROTOCOL_VERSION, &addr_a, nonce);
+        assert!(
+            mm.join(MatchMode::Mixed, nonce, JoinRequest::ranked_agent(addr_a.as_str(), sig_a))
+                .expect("a signed Mixed agent is admitted on possession, unregistered or not")
+                .is_queued(),
+            "the ranked registry does not gate Mixed casual cross-play"
+        );
+    }
+
+    #[test]
+    fn no_ranked_registry_is_possession_only() {
+        // No registry configured (the default, or an explicit None) = the historical
+        // possession-only ranked path: signed seats form a match, byte-identical to before.
+        let mm = Matchmaker::new(SignatureVerifier, MatchParams::default()).with_ranked_registry(None);
         let (a, b) = (agent_key(), other_key());
         let (addr_a, addr_b) = (agent_addr(&a), agent_addr(&b));
         let (nonce_a, nonce_b): (&[u8], &[u8]) = (b"chal-a", b"chal-b");
@@ -2909,7 +2826,7 @@ mod tests {
                 .unwrap()
                 .into_formed()
                 .is_some(),
-            "unenforced admits signed seats exactly like the bare gate"
+            "an unconfigured ranked registry admits signed seats exactly like the bare gate"
         );
     }
 
