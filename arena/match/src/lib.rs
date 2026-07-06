@@ -22,9 +22,12 @@
 //!   (`Agent`-mode) seats: [`Matchmaker::with_ranked_registry`] gates them on a
 //!   [`RegistrySnapshot`] (the arena view of `AgentRegistry.isRegistered`) so a
 //!   ranked seat needs both a proven key and a registered identity — the arena
-//!   mirror of the `isRegistered` gate `MatchSettlement` enforces at match-open.
-//!   Registration is a ranked concern only; `Mixed` casual cross-play never settles,
-//!   so it is not gated on registration.
+//!   mirror of the `isRegistered` gate `MatchSettlement` enforces at match-open. The
+//!   same snapshot carries each registrant's reputation, so
+//!   [`Matchmaker::with_ranked_reputation_floor`] can further hold a
+//!   registered-but-deeply-negative agent out of ranked queues (default: no floor).
+//!   Registration and the floor are a ranked concern only; `Mixed` casual cross-play
+//!   never settles, so it is not gated on either.
 //! - **Formation is atomic.** Per-mode queues live behind one lock, so a join that
 //!   completes a match pulls its whole roster under that lock — no concurrent join
 //!   can double-seat a participant or start a match a seat short.
