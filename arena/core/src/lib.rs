@@ -3556,8 +3556,9 @@ pub struct SeatDelta {
 ///
 /// Each seat plays one virtual head-to-head against every other seat: the pairwise
 /// outcome is read from the two seats' `placement` (a lower placement places better —
-/// a win; equal placements — a draw), except that two forfeiters always draw (a DQ'd
-/// seat neither gains nor loses rating against another DQ'd seat), scored through the
+/// a win; equal placements — a draw), except that two seats on DQ'd teams always draw
+/// (a forfeit disqualifies the whole team, and a DQ'd seat — even a non-forfeiting
+/// survivor — neither gains nor loses rating against another DQ'd seat), scored through the
 /// identical [`rating_delta`]
 /// curve, and the pairwise results summed per seat. This is the standard
 /// multiplayer-Elo "score against the field vs expected" rule, written as a sum of
