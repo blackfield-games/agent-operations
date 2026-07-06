@@ -17,10 +17,14 @@
 //!   [`SignatureVerifier`] is the real gate: it recovers the secp256k1
 //!   signer from the arena-01 `join_digest` over *this connection's* challenge
 //!   nonce and admits a ranked seat only when the recovered address equals the
-//!   claimed `agent_id` — key possession, not assertion. (Whether that address is
-//!   a *registered* on-chain agent is a separate eligibility check that composes on
-//!   top, a later contracts task; [`StubIdentityVerifier`] stands in for that
-//!   allowlist in tests.)
+//!   claimed `agent_id` — key possession, not assertion. Whether that address is a
+//!   *registered* on-chain agent is a separate eligibility check that composes on
+//!   top: [`RegistryVerifier`] wraps a possession verifier with a
+//!   [`RegistrySnapshot`] (the arena view of `AgentRegistry.isRegistered`) so a
+//!   ranked seat needs both a proven key and a registered identity — the arena
+//!   mirror of the `isRegistered` gate `MatchSettlement` enforces at match-open.
+//!   ([`StubIdentityVerifier`] still stands in for the possession check in the
+//!   crypto-free policy tests.)
 //! - **Formation is atomic.** Per-mode queues live behind one lock, so a join that
 //!   completes a match pulls its whole roster under that lock — no concurrent join
 //!   can double-seat a participant or start a match a seat short.
