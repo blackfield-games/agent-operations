@@ -904,7 +904,13 @@ def _lod_directive_legality(
     holds) with a ratio-legal effective fabricates a reduction the sum reconciles to, and an
     over-budget world ships accepted. Match each directive's ``specialist`` to a current prior
     layer and reject an authoredTriangles that is not that layer's metric (or a ``specialist``
-    naming no prior layer — a phantom shed crediting geometry that isn't there). Runs only for
+    naming no prior layer — a phantom shed crediting geometry that isn't there). It also rejects
+    a shed naming a FLOOR-set specialist (``optimization._resolve_floor()``, the do-not-shed set
+    — terrain by default, env-widenable): floor layers route into optimization's ``floor_total``
+    and never into the sheddable candidates, so a recorded floor shed is a fabricated reduction
+    of always-present geometry that grounds cleanly (terrain's authored legally equals its
+    metric, so the check above stays silent). Checked first, before phantom/authored, so a
+    floored name resolves to that one specific reason. Runs only for
     a shed already legal by scale + effective (an illegal one is rejected regardless) and only
     when the map is given, so the direct-call unit path (no map) keeps its legality-only
     contract — the per-layer twin of the sum's ``authored == prior_triangles`` grounding."""
@@ -950,7 +956,13 @@ def _lod_directive_legality(
         if prior_by_specialist is None:
             continue
         specialist = _opt_string(body, "specialist")
-        if specialist not in prior_by_specialist:
+        if specialist in optimization._resolve_floor():
+            out.append(
+                f"optimization layer {opt_path} directive {name} names {specialist!r}, a "
+                f"floor layer the optimizer never sheds — a fabricated reduction of "
+                f"always-present geometry; re-run optimization"
+            )
+        elif specialist not in prior_by_specialist:
             out.append(
                 f"optimization layer {opt_path} directive {name} names {specialist!r}, not a "
                 f"current prior layer — a phantom shed crediting a reduction to geometry that "
