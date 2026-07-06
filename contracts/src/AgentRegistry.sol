@@ -146,6 +146,15 @@ contract AgentRegistry is Ownable2Step {
         return agents[agent].registered;
     }
 
+    /// @notice Whether `agent` was EVER registered — the predicate for scoring an
+    ///         identity that may have since deregistered. Mirrors the `registeredAt != 0`
+    ///         gate `recordMatchResult` applies (a loss cannot be dodged by deregistering
+    ///         before settlement), so a settle path that must tolerate a deregistered
+    ///         participant checks this rather than the current `isRegistered` flag.
+    function wasRegistered(address agent) external view returns (bool) {
+        return agents[agent].registeredAt != 0;
+    }
+
     /// @notice The agent's reputation, for seat weighting. Defined for any address
     ///         (0 for an unknown one), so a reader needs no separate existence check.
     function reputationOf(address agent) external view returns (int256) {
