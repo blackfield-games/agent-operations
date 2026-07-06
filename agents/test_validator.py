@@ -478,13 +478,15 @@ async def test_run_accepts_a_resolved_world_with_recorded_lod_reductions(tmp_pat
         '            custom string layer = "biome/r.usda"\n'
         "            custom int lodLevel = 1\n"
         "            custom double lodScale = 0.5\n"
-        "            custom double authoredTriangles = 202144.0\n"
-        "            custom double effectiveTriangles = 101072.0\n"
+        "            custom double authoredTriangles = 100000.0\n"
+        "            custom double effectiveTriangles = 50000.0\n"
         "        }\n    }"
     )
-    # authored 602144, shed 202144 -> 101072 (reductions 101072), observed 501072 (within).
+    # authored 602144; biome (its real 100000) shed to 50000 (reductions 50000), observed 552144
+    # (within). The directive's authoredTriangles == biome's real metric, so the per-directive
+    # grounding stays silent alongside the sum re-derivation.
     body = _opt_body(
-        budget=1_500_000, authored=SUMMED_PRIOR, observed=501_072.0, over_budget=False,
+        budget=1_500_000, authored=SUMMED_PRIOR, observed=552_144.0, over_budget=False,
         directives=directives,
     )
     verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
