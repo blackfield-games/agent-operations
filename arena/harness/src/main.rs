@@ -34,7 +34,8 @@ use arena_core::{
     SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
 };
 use arena_match::{
-    JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker, SignatureVerifier, SnapshotError,
+    IdentityVerifier, JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker,
+    RegistrySnapshot, RegistryVerifier, SignatureVerifier, SnapshotError,
 };
 use arena_proto::{
     check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
@@ -76,6 +77,14 @@ struct Args {
     /// back atomically after the match. Only a `--mode` run moves a ladder, so the flag
     /// is consulted on that path; `None` keeps the in-memory-only behaviour.
     ladder_file: Option<PathBuf>,
+    /// On-chain-registered agent addresses eligible for a ranked seat, each supplied by a
+    /// repeated `--registered <addr>` — the arena-side view of `AgentRegistry.isRegistered`
+    /// the matchmaker gates ranked admission on. A ranked seat must present a valid
+    /// signature (possession) AND claim an address in this set; a registered set that omits
+    /// a signed seat rejects it (it could never settle on-chain). Empty (no `--registered`)
+    /// leaves the gate UNENFORCED — byte-identical to the possession-only ranked path — so
+    /// only a run that lists a registry enforces membership. Consulted on the `--mode` path.
+    registered: Vec<String>,
     /// The builtin arena whose static geometry — vision blockers + world pickups — the
     /// match plays under, resolved through [`arena_map`]. Set by `--map <key>`; the
     /// default `""` is the empty arena (no occlusion, no items), byte-identical to the
@@ -698,6 +707,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut mode: Option<MatchMode> = None;
     let mut human_seats: Vec<SeatId> = Vec::new();
     let mut ladder_file: Option<PathBuf> = None;
+    let mut registered: Vec<String> = Vec::new();
     let mut arena: &'static str = "";
     let mut perception_memory: u16 = 0;
     let mut fov: u8 = 4;
@@ -790,6 +800,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .collect();
             }
             "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
+            "--registered" => registered.push(it.next().expect("--registered needs an agent address")),
             "--map" => arena = parse_arena(&it.next().expect("--map needs a value")),
             "--perception-memory" => {
                 perception_memory = it
@@ -952,6 +963,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         mode,
         human_seats,
         ladder_file,
+        registered,
         arena,
         perception_memory,
         fov,
@@ -1743,7 +1755,11 @@ fn settle_finished(
 /// can parse a machine-readable frame (never the old human-formatted delta line) to
 /// surface an A2A author's ladder standing. A no-op (casual / human / Mixed / replay)
 /// emits nothing and is not an error; the emission has no wire effect on the match.
-fn settle_ranked_ladder(mm: &Matchmaker<SignatureVerifier>, result: &MatchResult, seats: &[SeatInfo]) {
+fn settle_ranked_ladder<V: IdentityVerifier>(
+    mm: &Matchmaker<V>,
+    result: &MatchResult,
+    seats: &[SeatInfo],
+) {
     // Fold both settle arms into one (seat, delta) list: the 1v1 delta lands `.a` on the
     // first outcome seat and `.b` on the second (canonical order); the field carries its
     // own seats. A no-op arm (never registered / already settled) bails before any emit.
@@ -1860,19 +1876,32 @@ fn abort_ladder(path: &Path, err: &LadderFileError) -> ! {
 /// flag, or a missing / empty file, starts a fresh `DEFAULT_RATING` ladder — byte-identical
 /// to the pre-persistence harness. A present but corrupt or wrong-schema file aborts the
 /// run via [`abort_ladder`] rather than silently resetting standings.
-fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<SignatureVerifier> {
+fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<RegistryVerifier<SignatureVerifier>> {
     // Carry the same Rules the direct path forms under (rules_from), so a matchmade match
     // plays under exactly the tuning a hand-seated one does — this is what threads
     // --perception-memory through the --mode/ranked path the matchmaker owns.
     let params = MatchParams { rules: rules_from(args), ..matchmaker_params(n, args.max_ticks, args.arena) };
+    let verifier = build_ranked_verifier(args);
     let Some(path) = &args.ladder_file else {
-        return Matchmaker::new(SignatureVerifier, params);
+        return Matchmaker::new(verifier, params);
     };
     match read_ladder_file(path) {
-        Ok(None) => Matchmaker::new(SignatureVerifier, params),
-        Ok(Some(snapshot)) => Matchmaker::from_snapshot(SignatureVerifier, params, snapshot)
+        Ok(None) => Matchmaker::new(verifier, params),
+        Ok(Some(snapshot)) => Matchmaker::from_snapshot(verifier, params, snapshot)
             .unwrap_or_else(|e| abort_ladder(path, &LadderFileError::Restore(e))),
         Err(e) => abort_ladder(path, &e),
+    }
+}
+
+/// Build the ranked identity verifier: enforce registration in the `--registered` set when
+/// any address is listed (a ranked seat then needs possession AND membership), otherwise
+/// leave registration unenforced (possession-only — the historical ranked path). The
+/// possession check (`SignatureVerifier`) is the inner gate either way.
+fn build_ranked_verifier(args: &Args) -> RegistryVerifier<SignatureVerifier> {
+    if args.registered.is_empty() {
+        RegistryVerifier::unenforced(SignatureVerifier)
+    } else {
+        RegistryVerifier::enforcing(SignatureVerifier, RegistrySnapshot::from_addresses(&args.registered))
     }
 }
 
@@ -1951,7 +1980,7 @@ fn handshake_matchmade(
     settler: &Option<MockSettler>,
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
-) -> (Matchmaker<SignatureVerifier>, Match) {
+) -> (Matchmaker<RegistryVerifier<SignatureVerifier>>, Match) {
     let mm = build_matchmaker(args, n);
 
     for seat in 0..n {
@@ -2815,6 +2844,7 @@ mod tests {
             mode: Some(mode),
             human_seats,
             ladder_file: None,
+            registered: Vec::new(),
             arena: "",
             perception_memory: 0,
             fov: 4,
@@ -2908,6 +2938,7 @@ mod tests {
             mode: None,
             human_seats: vec![],
             ladder_file: None,
+            registered: Vec::new(),
             arena,
             perception_memory,
             fov: 4,
