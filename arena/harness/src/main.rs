@@ -78,14 +78,24 @@ struct Args {
     /// is consulted on that path; `None` keeps the in-memory-only behaviour.
     ladder_file: Option<PathBuf>,
     /// On-chain-registered agent addresses eligible for a ranked seat, each supplied by a
-    /// repeated `--registered <addr>` — the arena-side view of `AgentRegistry.isRegistered`
-    /// the matchmaker gates ranked (`Agent`-mode) admission on. A ranked seat must present a
-    /// valid signature (possession) AND claim an address in this set; a registered set that
-    /// omits a signed ranked seat rejects it (it could never settle on-chain). Registration
-    /// is a ranked concern only — the matchmaker never consults it for `Mixed` casual
-    /// cross-play or `Human` seats. Empty (no `--registered`) leaves it UNENFORCED —
-    /// byte-identical to the possession-only ranked path. Consulted on the `--mode` path.
-    registered: Vec<String>,
+    /// repeated `--registered <addr>[:<reputation>]` — the arena-side view of
+    /// `AgentRegistry.isRegistered` + `reputationOf` the matchmaker gates ranked
+    /// (`Agent`-mode) admission on. A ranked seat must present a valid signature (possession)
+    /// AND claim an address in this set; a registered set that omits a signed ranked seat
+    /// rejects it (it could never settle on-chain). The optional `:<reputation>` suffix (a
+    /// signed integer; absent = 0) carries the agent's on-chain reputation for the
+    /// `--min-reputation` floor. Registration is a ranked concern only — the matchmaker never
+    /// consults it for `Mixed` casual cross-play or `Human` seats. Empty (no `--registered`)
+    /// leaves it UNENFORCED — byte-identical to the possession-only ranked path. Consulted on
+    /// the `--mode` path.
+    registered: Vec<(String, i128)>,
+    /// Minimum on-chain reputation a ranked (`Agent`-mode) seat must have, set by
+    /// `--min-reputation <int>`. A registered seat whose `--registered` reputation is below
+    /// this is rejected at admission, keeping agents driven deeply negative by prior losses
+    /// out of ranked queues. `None` (the default) is no floor — byte-identical to the
+    /// registration-only path. Gates only alongside `--registered` (reputation is sourced
+    /// there), so a floor with no registered set is inert.
+    min_reputation: Option<i128>,
     /// The builtin arena whose static geometry — vision blockers + world pickups — the
     /// match plays under, resolved through [`arena_map`]. Set by `--map <key>`; the
     /// default `""` is the empty arena (no occlusion, no items), byte-identical to the
@@ -708,7 +718,8 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut mode: Option<MatchMode> = None;
     let mut human_seats: Vec<SeatId> = Vec::new();
     let mut ladder_file: Option<PathBuf> = None;
-    let mut registered: Vec<String> = Vec::new();
+    let mut registered: Vec<(String, i128)> = Vec::new();
+    let mut min_reputation: Option<i128> = None;
     let mut arena: &'static str = "";
     let mut perception_memory: u16 = 0;
     let mut fov: u8 = 4;
@@ -802,10 +813,27 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             }
             "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
             "--registered" => {
-                let addr = it.next().expect("--registered needs an agent address");
-                let addr = addr.trim();
+                let raw = it.next().expect("--registered needs an agent address");
+                let raw = raw.trim();
+                assert!(!raw.is_empty(), "--registered needs a non-empty agent address");
+                // Optional ':<reputation>' suffix carries the agent's signed on-chain
+                // reputation for the --min-reputation floor. Addresses are 0x-hex (no colon),
+                // so splitting on the last ':' is unambiguous; absent => reputation 0, so the
+                // bare `--registered <addr>` form is unchanged.
+                let (addr, rep) = match raw.rsplit_once(':') {
+                    Some((a, r)) => (
+                        a.trim(),
+                        r.trim().parse::<i128>().expect("--registered reputation must be a signed integer"),
+                    ),
+                    None => (raw, 0),
+                };
                 assert!(!addr.is_empty(), "--registered needs a non-empty agent address");
-                registered.push(addr.to_string());
+                registered.push((addr.to_string(), rep));
+            }
+            "--min-reputation" => {
+                let v = it.next().expect("--min-reputation needs an integer");
+                min_reputation =
+                    Some(v.trim().parse::<i128>().expect("--min-reputation must be a signed integer"));
             }
             "--map" => arena = parse_arena(&it.next().expect("--map needs a value")),
             "--perception-memory" => {
@@ -970,6 +998,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         human_seats,
         ladder_file,
         registered,
+        min_reputation,
         arena,
         perception_memory,
         fov,
@@ -1894,15 +1923,24 @@ fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<SignatureVerifier> {
         },
     };
     // The matchmaker scopes registration to ranked (Agent) seats itself, so passing the
-    // registry unconditionally is safe — a Mixed/Human run simply never consults it.
-    base.with_ranked_registry(registry)
+    // registry + floor unconditionally is safe — a Mixed/Human run simply never consults them.
+    base.with_ranked_registry(registry).with_ranked_reputation_floor(ranked_reputation_floor_from(args))
 }
 
 /// The ranked-registration eligibility set from `--registered`, or `None` (unenforced —
 /// possession-only) when no address is listed. Each address is trimmed on parse and empties
 /// rejected, so an unset `$VAR` can't silently produce an enforce-but-match-nobody registry.
+/// Carries each entry's reputation (default 0) for the `--min-reputation` floor.
 fn ranked_registry_from(args: &Args) -> Option<RegistrySnapshot> {
-    (!args.registered.is_empty()).then(|| RegistrySnapshot::from_addresses(&args.registered))
+    (!args.registered.is_empty())
+        .then(|| RegistrySnapshot::from_entries(args.registered.iter().map(|(a, r)| (a, *r))))
+}
+
+/// The ranked reputation floor from `--min-reputation`, or `i128::MIN` (no effective gate)
+/// when unset. Inert unless a `--registered` set is also supplied — the matchmaker only
+/// consults the floor alongside a registry (reputation is sourced there).
+fn ranked_reputation_floor_from(args: &Args) -> i128 {
+    args.min_reputation.unwrap_or(i128::MIN)
 }
 
 /// Map a seat's Join (its claimed `agent_id` + `signature_hex`) to a matchmaker
@@ -2845,6 +2883,7 @@ mod tests {
             human_seats,
             ladder_file: None,
             registered: Vec::new(),
+            min_reputation: None,
             arena: "",
             perception_memory: 0,
             fov: 4,
@@ -2939,6 +2978,7 @@ mod tests {
             human_seats: vec![],
             ladder_file: None,
             registered: Vec::new(),
+            min_reputation: None,
             arena,
             perception_memory,
             fov: 4,
@@ -3009,10 +3049,11 @@ mod tests {
     fn parse_registered_trims_and_collects_each_occurrence() {
         // Each --registered is one address; whitespace (e.g. a trailing newline from a
         // shell/file read) is trimmed so it still matches the canonical recovered address.
+        // A bare address carries reputation 0 (the default for a registered-but-unrated agent).
         let parsed = parse_args_from(
             ["--registered", "0xAbC", "--registered", " 0xdef\n", "--seats", "2"].into_iter().map(String::from),
         );
-        assert_eq!(parsed.registered, vec!["0xAbC".to_string(), "0xdef".to_string()]);
+        assert_eq!(parsed.registered, vec![("0xAbC".to_string(), 0), ("0xdef".to_string(), 0)]);
     }
 
     #[test]
@@ -6507,7 +6548,7 @@ mod tests {
         let outsider_addr = address_from_verifying_key(outsider_sk.verifying_key());
 
         // Only the registered agent is listed as eligible.
-        let args = Args { registered: vec![registered_addr.clone()], ..direct_args(2, "", 0) };
+        let args = Args { registered: vec![(registered_addr.clone(), 0)], ..direct_args(2, "", 0) };
         let mm = build_matchmaker(&args, 2);
 
         let nonce0 = nonce_for(id(), 0);
@@ -6550,7 +6591,7 @@ mod tests {
         let addr = address_from_verifying_key(sk.verifying_key());
         // Register some OTHER agent, not this one.
         let other = address_from_verifying_key(other_join_key().verifying_key());
-        let args = Args { registered: vec![other], ..direct_args(2, "", 0) };
+        let args = Args { registered: vec![(other, 0)], ..direct_args(2, "", 0) };
         let mm = build_matchmaker(&args, 2);
         let nonce0 = nonce_for(id(), 0);
         let req = join_request_for(MatchMode::Mixed, 0, &[], &addr, &sign_join_proof(&sk, &addr, nonce0.as_bytes()));
