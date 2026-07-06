@@ -190,6 +190,68 @@ impl RegistrySnapshot {
     }
 }
 
+/// Composes on-chain registration eligibility over an inner identity check: a
+/// ranked seat is admitted only when the inner verifier accepts (key *possession* —
+/// typically [`SignatureVerifier`]) **and** the claimed identity is registered in
+/// the [`RegistrySnapshot`]. This is the production ranked gate the arena design
+/// calls for (arena-04 stubbed it and deferred registration to "a later task"):
+/// possession proves the connection controls the address; registration proves that
+/// address is an eligible on-chain agent — the arena counterpart of the
+/// `AgentRegistry.isRegistered` check `MatchSettlement` enforces at match-open. So a
+/// ranked match this gate forms is one that can actually settle; rejecting an
+/// unregistered key holder here avoids forming a match that would only revert with
+/// `AgentNotRegistered` at settle.
+///
+/// The two checks are independent, and both must hold: a registered address whose
+/// key the connection does *not* hold fails the inner check (a forged claim), and a
+/// key holder that is not registered fails the snapshot (ineligible). Only both
+/// together admit a ranked seat.
+///
+/// Registration enforcement is operator config, so [`unenforced`](Self::unenforced)
+/// delegates entirely to the inner verifier — an unconfigured matchmaker is
+/// byte-identical to using the inner verifier alone (the historical possession-only
+/// ranked path), matching the crate's "unconfigured = prior behaviour" convention.
+#[derive(Debug, Clone)]
+pub struct RegistryVerifier<V> {
+    inner: V,
+    /// The registered set to gate on, or `None` to not enforce registration at all.
+    /// `None` is distinct from `Some(empty)`: the former delegates to `inner`, the
+    /// latter rejects every ranked seat (nobody is registered).
+    registered: Option<RegistrySnapshot>,
+}
+
+impl<V> RegistryVerifier<V> {
+    /// Gate ranked admission on membership in `registered` *and* the inner check.
+    pub fn enforcing(inner: V, registered: RegistrySnapshot) -> Self {
+        Self { inner, registered: Some(registered) }
+    }
+
+    /// Do not enforce registration — delegate entirely to `inner`. The inner
+    /// possession check still runs; only the registration gate is off. Lets the same
+    /// composed type carry the "no on-chain gate configured" case without a second
+    /// matchmaker type.
+    pub fn unenforced(inner: V) -> Self {
+        Self { inner, registered: None }
+    }
+}
+
+impl<V: IdentityVerifier> IdentityVerifier for RegistryVerifier<V> {
+    fn verify(&self, agent_id: &str, nonce: &[u8], signature_hex: &str) -> bool {
+        // Both checks must hold; the result is order-independent. Check the cheap
+        // registration set first so an unregistered claim short-circuits *before* the
+        // expensive ECDSA recovery the inner SignatureVerifier runs — a registered
+        // address still pays recovery to prove possession, an unregistered one never
+        // does (a flood of unregistered ranked joins can't force recovery work). When
+        // registration is unenforced, this is exactly the inner check.
+        if let Some(registered) = &self.registered {
+            if !registered.is_registered(agent_id) {
+                return false;
+            }
+        }
+        self.inner.verify(agent_id, nonce, signature_hex)
+    }
+}
+
 /// A request for a seat: who is joining, what kind of controller they are, and —
 /// for a ranked agent — the identity token proving the claim. The matchmaker
 /// admits or rejects this against the requested mode before queuing it.
