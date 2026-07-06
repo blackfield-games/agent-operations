@@ -199,7 +199,7 @@ contract MatchSettlementHandler is Test {
         for (uint256 i = 0; i < n; i++) {
             ag[i] = actors[i]; // a distinct prefix -> a valid roster
         }
-        stake = bound(stake, 0, 100 ether);
+        stake = bound(stake, 1, 100 ether); // openFieldMatch rejects a zero-stake wager (NoWager)
         bytes32 id = keccak256(abi.encode("field", nonce++));
         settlement.openFieldMatch(id, ag, stake);
         fieldMatchIds.push(id);

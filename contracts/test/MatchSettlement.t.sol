@@ -1768,16 +1768,22 @@ contract MatchSettlementTest is Test {
         settlement.openFieldMatch(FIELD, ag, STAKE);
     }
 
-    function test_openFieldMatch_zeroStakeAllowed() public {
+    /// @dev A field WAGER needs a positive stake. A zero-stake openFieldMatch could never
+    ///      fund a seat (fundField reverts NoWager at stake 0) so settleFieldWager's
+    ///      full-funding precondition is unreachable — the id would be burned into a
+    ///      dead-end reachable only by cancel/expire, never settled. The no-escrow
+    ///      reputation-only field is settleField (direct, no open), so openFieldMatch
+    ///      rejects stake 0 up front. The guard precedes _requireFreshId, so a rejected
+    ///      open does NOT consume the single-use id — a corrected positive open still works.
+    function test_openFieldMatch_revertsZeroStake() public {
         address[] memory ag = _roster3();
-        _openField(FIELD, ag, 0);
-        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Open, "zero-stake field opens");
-        vm.prank(alice);
-        vm.expectRevert(MatchSettlement.NoWager.selector);
-        settlement.fundField(FIELD); // no escrow path on a zero-stake field
         vm.prank(attester);
-        settlement.cancelFieldMatch(FIELD);
-        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Cancelled);
+        vm.expectRevert(MatchSettlement.NoWager.selector);
+        settlement.openFieldMatch(FIELD, ag, 0);
+        _openField(FIELD, ag, STAKE);
+        assertTrue(
+            _fieldStatus(FIELD) == MatchSettlement.Status.Open, "the same id reopens with a positive stake"
+        );
     }
 
     /// @dev FM2 shared fence: a matchId is at most ONE record across all three openers. A
@@ -2397,17 +2403,11 @@ contract MatchSettlementTest is Test {
         settlement.settleFieldWager(FIELD, ps, ds, HASH);
     }
 
-    // FM4: a zero-stake field can never fund a seat, so it can never be wager-settled.
-    function test_settleFieldWager_revertsZeroStakeField() public {
-        _enableVariable(RATING_CAP);
-        address[] memory ag = _roster3();
-        _openField(FIELD, ag, 0);
-        uint256[] memory ps = _payouts3(0, 0, 0);
-        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
-        vm.expectRevert(MatchSettlement.NotFullyFunded.selector);
-        vm.prank(attester);
-        settlement.settleFieldWager(FIELD, ps, ds, HASH);
-    }
+    // A zero-stake field can no longer reach settleFieldWager: openFieldMatch rejects
+    // stake 0 up front (NoWager — see test_openFieldMatch_revertsZeroStake), so the field
+    // is unconstructible here. The fundedBits==0 -> NotFullyFunded edge this once covered
+    // is covered by test_settleFieldWager_revertsUnfundedField (a positive-stake field
+    // nobody funds).
 
     function test_settleFieldWager_revertsNonAttester() public {
         _enableVariable(RATING_CAP);
