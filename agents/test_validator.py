@@ -1556,6 +1556,81 @@ async def test_run_npc_intent_gate_does_not_special_case_the_fallback_archetype(
     assert verdict.accepted, verdict.issues
 
 
+# ---- director intent:factions re-derivation: the roster ITSELF must match the brief's region ----
+#
+# The PRODUCER twin of the npc factions/selection CONSUMERS above. Those gates re-derive npc's PICK off
+# the director's roster, so a STALE director roster npc faithfully followed is invisible to them. These
+# pin that the validator re-derives the roster ITSELF via director._faction_roster off the brief:
+# accepting a region-true roster, rejecting a present stale one (routed to director, the pipeline-
+# earliest node), and staying silent on an absent roster (the empty-roster fallback the npc gate owns).
+
+
+async def test_run_accepts_a_region_true_director_factions_roster(tmp_path):
+    # FM1 (no false reject): the director's roster IS what the brief's region determines
+    # (director._faction_roster), so the re-derivation gate stays silent and the world — with npc's
+    # region-true pick from it — validates end-to-end. The gate adds no false reject to a correct region.
+    roster = director._faction_roster(REGION)
+    layers = _set_with(tmp_path, {
+        "director": _director_body(factions=",".join(roster)),
+        "npc": _npc_body(npc._select_archetype(REGION, roster, frozenset())),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert not any("_faction_roster" in i for i in verdict.issues)
+
+
+async def test_run_rejects_a_stale_director_roster_npc_faithfully_followed(tmp_path):
+    # FM2 (the exploit the consumer gates structurally miss): the director ships a STALE roster (authored
+    # for another region) and npc faithfully mirrors it — npc's pick is a member of, AND the region-true
+    # selection FROM, that stale roster, so the factions-membership and selection gates BOTH stay silent.
+    # Only re-deriving the roster itself off the brief catches the wrong region's factions. Rejected,
+    # named director ALONE (npc is blameless — it followed the roster), routed to director.
+    stale = ["raider", "sentinel"]
+    assert stale != director._faction_roster(REGION)  # premise: a roster from another region
+    pick = npc._select_archetype(REGION, stale, frozenset())  # exactly what npc.run emits reading it
+    assert pick in stale  # premise: npc's pick is a faithful member of the stale roster
+    layers = _set_with(tmp_path, {
+        "director": _director_body(factions=",".join(stale)),
+        "npc": _npc_body(pick),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:factions" in i and "director._faction_roster" in i for i in verdict.issues)
+    # npc followed the roster faithfully, so ONLY the director is blamed — the proof that the consumer
+    # gates stayed silent and the producer gate alone caught the stale roster.
+    assert verdict.failing_specialists == ["director"]
+    assert _route_back_target(verdict) == "director"
+
+
+async def test_run_director_factions_gate_silent_without_a_roster(tmp_path):
+    # FM3 (back-compat): a director that seeds NO intent:factions is the empty-roster fallback the npc gate
+    # already owns — the re-derivation gate stays silent rather than demanding the roster's presence (which
+    # would false-reject every placeholder / pre-factions director). npc's region-true fallback validates.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(),  # no intent:factions
+        "npc": _npc_body(_REGION_ARCHETYPE),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert not any("_faction_roster" in i for i in verdict.issues)
+
+
+def test_director_factions_consistency_flags_a_stale_roster_and_skips_an_absent_one(tmp_path):
+    # Unit-level (mirrors the selection gate's direct-call pins): the gate re-derives director._faction_roster
+    # off the brief. A region-true roster AND an absent roster both yield [] (no false reject; the empty-roster
+    # fallback is the npc gate's concern); a PRESENT stale roster yields exactly one director-named issue.
+    def issues(factions):
+        bodies = {"director": _director_body(factions=factions)} if factions is not None else {}
+        layers = _set_with(tmp_path, bodies)
+        return validator._director_factions_consistency(_brief(), layers, tmp_path)
+
+    assert issues(",".join(director._faction_roster(REGION))) == []  # region-true: silent
+    assert issues(None) == []  # absent roster: silent (the fallback)
+    stale = issues("raider,sentinel")  # present + wrong: one issue naming director + the helper
+    assert len(stale) == 1
+    assert "director" in stale[0] and "_faction_roster" in stale[0]
+
+
 # ---- npc must_not loop: a barred archetype (civilians) must never reach the layer ----
 #
 # The director DECLARES intent:must_not and npc HONORS it by excluding the barred archetype
