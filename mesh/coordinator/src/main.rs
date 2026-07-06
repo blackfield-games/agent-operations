@@ -835,6 +835,10 @@ fn validate_args(args: &Args) -> Result<()> {
         args.relay_batch_size > 0,
         "relay_batch_size must be >= 1 (0 would claim an empty batch every tick and never drain the receipt backlog)"
     );
+    anyhow::ensure!(
+        args.relay_batch_size <= RELAY_BATCH_SIZE_MAX,
+        "relay_batch_size must be <= {RELAY_BATCH_SIZE_MAX} (the RenderReceipts.MAX_BATCH on-chain cap; a larger batch reverts BatchTooLarge on every drain and never settles the backlog)"
+    );
     // A zero body timeout makes `TimeoutLayer` respond 408 to every POST before its
     // body can arrive — registration + submit over HTTP become a total outage.
     anyhow::ensure!(
@@ -1646,6 +1650,14 @@ const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 /// (`--relay-batch-size` / `COORDINATOR_RELAY_BATCH_SIZE`); a deeper backlog can
 /// raise it, a heavier per-element cost lower it.
 const DEFAULT_RELAY_BATCH_SIZE: usize = 32;
+
+/// Hard upper bound on `relay_batch_size`, mirroring the on-chain
+/// `RenderReceipts.MAX_BATCH` (64) that caps an `issueReceipts` batch. The contract
+/// reverts `BatchTooLarge` above it, so a `relay_batch_size` past this would make every
+/// on-chain drain revert and never settle the receipt backlog. Reject it at startup — a
+/// fail-fast config error an operator sees at boot, not a silent on-chain outage. Kept in
+/// lockstep with the contract constant by hand (the coordinator does not read the ABI).
+const RELAY_BATCH_SIZE_MAX: usize = 64;
 
 /// Default cap on the number of `queued` jobs the runtime ingestion endpoint
 /// (`POST /jobs`) will admit. Sized far above any legitimate early backlog (the
@@ -4265,6 +4277,22 @@ mod tests {
         a.relay_interval_secs = 0;
         a.spender_interval_secs = 0;
         assert!(validate_args(&a).is_ok(), "the dev-mock intervals clamp at spawn, not at validation");
+    }
+
+    #[test]
+    fn validate_args_rejects_a_relay_batch_size_above_the_contract_cap() {
+        // relay_batch_size caps the on-chain issueReceipts batch, which RenderReceipts
+        // bounds at MAX_BATCH (mirrored here as RELAY_BATCH_SIZE_MAX). A batch past the
+        // cap reverts BatchTooLarge on every drain and never settles, so reject it at
+        // startup. The cap itself is inclusive (a batch AT it is a valid on-chain call);
+        // one above is rejected and the message names the knob so an operator can fix it.
+        let mut a = Args::parse_from(["coordinator"]);
+        a.relay_batch_size = RELAY_BATCH_SIZE_MAX;
+        assert!(validate_args(&a).is_ok(), "a relay_batch_size AT the contract cap must validate");
+
+        a.relay_batch_size = RELAY_BATCH_SIZE_MAX + 1;
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(err.contains("relay_batch_size"), "the reject must name the knob: {err}");
     }
 
     /// The common [`StoreConfig`] the test helpers build on: the test-chosen
