@@ -17,6 +17,7 @@ from pathlib import Path
 
 from biome import biome
 from common.types import LayerSpec, RegionCoord, WorldBrief
+from director import director
 from lighting import lighting
 from npc import npc
 from optimization import optimization
@@ -1477,10 +1478,11 @@ async def test_run_intent_gate_degrades_on_a_missing_biome_layer(tmp_path):
 async def test_run_accepts_npc_archetype_in_the_director_roster(tmp_path):
     # FM1 (no false reject): npc draws ONE archetype from a non-empty roster by a region hash; the layer
     # emitting exactly that region-true pick validates — the factions gate sees a member and the
-    # selection gate re-derives the SAME pick. Derived from npc._select_archetype so it stays in
-    # lock-step. (A roster member that is NOT the region-true pick is now the selection gate's concern,
-    # pinned in test_run_rejects_a_legal_but_off_selection_npc_archetype — no longer accepted here.)
-    roster = ["raider", "sentinel"]
+    # selection gate re-derives the SAME pick. The roster is the REGION-TRUE one (director's own
+    # _faction_roster) so the director intent:factions re-derivation gate stays silent too; both roster
+    # and pick track their producers in lock-step. (A roster member that is NOT the region-true pick is
+    # now the selection gate's concern, pinned in test_npc_archetype_consistency_rejects_a_legal_but_off_selection_member.)
+    roster = director._faction_roster(REGION)
     archetype = npc._select_archetype(REGION, roster, frozenset())
     layers = _set_with(tmp_path, {
         "director": _director_body(factions=",".join(roster)),
@@ -1491,12 +1493,15 @@ async def test_run_accepts_npc_archetype_in_the_director_roster(tmp_path):
 
 
 async def test_run_rejects_an_off_roster_npc_archetype_and_routes_to_npc(tmp_path):
-    # FM2 (false accept): the director rosters {raider, sentinel} but npc's layer spawns
+    # FM2 (false accept): the director rosters the REGION-TRUE factions but npc's layer spawns
     # "drone" — a stale/desynced/tampered pick not in the roster. The gate must catch it,
     # name npc, and key the message off intent:factions (never the word "director", which
-    # is pipeline-earlier) so the text-scan fallback agrees and route-back targets npc.
+    # is pipeline-earlier) so the text-scan fallback agrees and route-back targets npc. The roster
+    # is region-true so ONLY the off-roster pick fails — the director re-derivation gate stays silent.
+    roster = director._faction_roster(REGION)
+    assert "drone" not in roster  # premise: drone is the off-roster pick, not a region-true member
     layers = _set_with(tmp_path, {
-        "director": _director_body(factions="raider,sentinel"),
+        "director": _director_body(factions=",".join(roster)),
         "npc": _npc_body("drone"),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -1525,8 +1530,9 @@ async def test_run_npc_intent_gate_silent_when_director_seeds_no_roster(tmp_path
 async def test_run_npc_intent_gate_degrades_on_a_missing_npc_layer(tmp_path):
     # FM3 (missing-layer degrade): the director rosters factions but npc's FILE is gone.
     # The intent gate must skip the unreadable layer (never crash the final gate); the
-    # missing-layer gate rejects and routes back to npc.
-    bodies = {"director": _director_body(factions="raider,sentinel")}
+    # missing-layer gate rejects and routes back to npc. The roster is region-true so the
+    # director re-derivation gate stays silent — the missing npc layer is the only fault.
+    bodies = {"director": _director_body(factions=",".join(director._faction_roster(REGION)))}
     verdict = await validator.run(
         _brief(), _set_with_missing(tmp_path, bodies, missing="npc"), layers_root=tmp_path
     )
@@ -1607,10 +1613,14 @@ async def test_run_rejects_a_civilian_under_an_empty_roster(tmp_path):
 
 async def test_run_must_not_npc_gate_accepts_a_non_forbidden_archetype(tmp_path):
     # FM1 (no false reject): the director forbids civilians but npc spawns an ALLOWED archetype
-    # — the gate must stay silent. The ban bars only the named archetype, nothing else.
+    # — the gate must stay silent. The ban bars only the named archetype, nothing else. The roster is
+    # region-true and npc spawns the region-true SELECTED, non-forbidden pick, so the director
+    # re-derivation and the selection gate stay silent too — isolating the must_not branch.
+    roster = director._faction_roster(REGION)
+    archetype = npc._select_archetype(REGION, roster, npc._forbidden_archetypes(["civilians"]))
     layers = _set_with(tmp_path, {
-        "director": _director_body(factions="raider,sentinel", must_not="civilians"),
-        "npc": _npc_body("raider"),
+        "director": _director_body(factions=",".join(roster), must_not="civilians"),
+        "npc": _npc_body(archetype),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert verdict.accepted, verdict.issues
@@ -2561,7 +2571,7 @@ async def test_run_rejects_an_npc_archetype_that_disagrees_with_the_brief(tmp_pa
     # re-synced (_npc_roster_metric_set does both) — so the triangle gate, the spawn-count gate, AND the
     # budget gate stay silent — ships the region's crowd as the wrong archetype at the wrong per-character
     # budget. Only the brief re-derivation sees it: rejected, routed to npc, naming both archetypes.
-    roster = ["raider", "sentinel"]
+    roster = director._faction_roster(REGION)  # region-true, so only the off-SELECTION swap fails
     picked = npc._select_archetype(REGION, roster, frozenset())  # the region-true pick
     off = next(a for a in roster if a != picked)  # a legal member, not the selection
     assert npc._character_tris(off) != npc._character_tris(picked)  # premise: a real per-character budget swap
@@ -2580,7 +2590,9 @@ async def test_run_leaves_a_non_member_npc_archetype_to_the_factions_gate_not_th
     # intent:factions loop; the selection gate SKIPS it. The run rejects (factions) but carries NO
     # _select_archetype selection message — the two gates never both fire on the same off-roster pick.
     npc_tris = float(_REGION_SPAWNS * npc._character_tris("drone"))
-    layers = _npc_roster_metric_set(tmp_path, roster=["raider", "sentinel"], archetype="drone", npc_tris=npc_tris)
+    roster = list(director._faction_roster(REGION))  # region-true, so the director gate is silent
+    assert "drone" not in roster  # premise: drone is the non-member the factions gate owns
+    layers = _npc_roster_metric_set(tmp_path, roster=roster, archetype="drone", npc_tris=npc_tris)
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert not verdict.accepted
     assert any("intent:factions" in i and "drone" in i for i in verdict.issues)  # the factions gate owns it
