@@ -1584,17 +1584,22 @@ async def test_run_rejects_a_forbidden_civilian_npc_archetype_and_routes_to_npc(
 
 
 async def test_run_rejects_a_civilian_even_when_the_roster_names_it(tmp_path):
-    # Non-redundancy with the factions branch (case B): a desynced roster that WRONGLY rosters
-    # civilian makes the membership check pass, yet the must_not branch must still reject — the
-    # ban outranks roster membership.
+    # Non-redundancy with the factions membership branch (case B): a desynced roster that WRONGLY rosters
+    # civilian makes the membership check pass, yet the must_not branch must STILL reject — the ban
+    # outranks roster membership. A civilian-naming roster can never be region-true (_faction_roster
+    # excludes civilians), so the director intent:factions re-derivation gate ALSO fires: both npc (the
+    # must_not violation) and director (the illegal roster) are blamed, and route-back targets the
+    # pipeline-earliest — director, the root cause. The must_not branch's non-redundancy property is
+    # still proven by the presence of its intent:must_not civilian issue.
     layers = _set_with(tmp_path, {
         "director": _director_body(factions="civilian,raider", must_not="civilians"),
         "npc": _npc_body("civilian"),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert not verdict.accepted
-    assert any("intent:must_not" in i and "civilian" in i for i in verdict.issues)
-    assert _route_back_target(verdict) == "npc"
+    assert any("intent:must_not" in i and "civilian" in i for i in verdict.issues)  # the ban still fires
+    assert {"director", "npc"} <= set(verdict.failing_specialists)
+    assert _route_back_target(verdict) == "director"  # the illegal roster is the pipeline-earliest cause
 
 
 async def test_run_rejects_a_civilian_under_an_empty_roster(tmp_path):
@@ -1627,11 +1632,14 @@ async def test_run_must_not_npc_gate_accepts_a_non_forbidden_archetype(tmp_path)
 
 
 async def test_run_must_not_npc_gate_silent_without_the_civilians_token(tmp_path):
-    # FM4 (token scope): a must_not that does NOT name civilians imposes no npc ban, so an npc layer
-    # spawning a civilian validates against the must_not branch. Only the civilians token bars the
-    # civilian archetype (interior_volumes maps to no archetype — pinned in test_npc's
-    # _forbidden_archetypes unit test — and keeps biome silent too). The roster "civilian,raider" makes
-    # civilian the region-true pick so the selection gate also stays silent, isolating the must_not branch.
+    # FM4 (token scope): a must_not that does NOT name civilians imposes no npc ban, so the must_not->npc
+    # branch stays SILENT on an npc civilian. Isolating that branch needs civilian to be the roster's
+    # region-true SELECTION pick (else the selection gate fires), which needs civilian in the roster —
+    # but _faction_roster can never emit civilian, so the director intent:factions re-derivation gate now
+    # independently rejects that desynced roster. The world is therefore rejected for the DIRECTOR roster,
+    # NOT a must_not civilian complaint: the must_not branch's silence is proven by the ABSENCE of any
+    # intent:must_not civilian issue and by director being the SOLE blame (interior_volumes maps to no
+    # archetype — pinned in test_npc's _forbidden_archetypes unit test).
     roster = ["civilian", "raider"]
     assert npc._select_archetype(REGION, roster, frozenset()) == "civilian"  # premise: civilian selected
     layers = _set_with(tmp_path, {
@@ -1639,7 +1647,9 @@ async def test_run_must_not_npc_gate_silent_without_the_civilians_token(tmp_path
         "npc": _npc_body("civilian"),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
-    assert verdict.accepted, verdict.issues
+    assert not verdict.accepted  # the desynced civilian-naming roster is caught by the director gate
+    assert not any("intent:must_not" in i and "civilian" in i for i in verdict.issues)  # must_not silent
+    assert verdict.failing_specialists == ["director"]  # only the roster; npc's must_not branch did not fire
 
 
 async def test_run_must_not_npc_gate_degrades_on_a_missing_npc_layer(tmp_path):

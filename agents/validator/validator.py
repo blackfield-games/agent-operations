@@ -21,6 +21,7 @@ from collections import Counter
 from pathlib import Path
 
 from common.types import WorldBrief, LayerSpec, ValidatorVerdict
+from director import director
 from prop import prop
 from biome import biome
 from lighting import lighting
@@ -330,6 +331,20 @@ async def run(
     for specialist, message in _intent_attributions(brief, wellformed, layers_root):
         issues.append(message)
         failing.add(specialist)
+
+    # Director intent:factions re-derivation — the PRODUCER twin of the four count/grid brief-re-derivation
+    # gates and of the npc factions/selection CONSUMERS above. Those consumers re-derive npc's PICK off the
+    # director's roster, so a STALE director roster that npc faithfully mirrored is invisible to them (the
+    # pick is a member of, and the selection from, the stale roster) and ships the wrong region's factions
+    # accepted. Re-derive the roster ITSELF via director._faction_roster off the brief and reject a
+    # mismatch, naming director so route-back re-runs it. Runs over the well-formed director only (a
+    # missing/malformed director is already rejected + attributed above, so this never double-reports);
+    # silent on an absent roster (the empty-roster fallback the npc gate handles).
+    director_layer = next((layer for layer in layers if layer.specialist == "director"), None)
+    if director_layer is not None and director_layer in wellformed:
+        for message in _director_factions_consistency(brief, layers, layers_root):
+            issues.append(message)
+            failing.add("director")
 
     # NPC archetype vs the brief + director roster — the SELECTION twin of the four count/grid brief-re-
     # derivation gates (terrain grid / biome scatter / npc spawn / prop placement) and the npc sibling of
@@ -664,6 +679,42 @@ def _intent_attributions(
                     f"interior_volumes (the frontier rule); re-run {layer.specialist}",
                 ))
     return out
+
+
+def _director_factions_consistency(
+    brief: WorldBrief, layers: list[LayerSpec], layers_root: Path
+) -> list[str]:
+    """Why the director's emitted ``intent:factions`` roster disagrees with the roster the brief's
+    region determines, or [] when they agree — the PRODUCER-side re-derivation the npc factions and
+    selection gates structurally cannot do.
+
+    ``director.run`` emits ``_faction_roster(brief.region.region_id)`` (a stable per-region hash-ranked
+    subset of ``FACTION_ARCHETYPES``); npc draws its single ``archetype`` from that roster, and the npc
+    factions membership + selection gates re-derive npc's PICK *off the director's own roster*. So a
+    STALE director layer — a roster authored for another region, or tampered — is INVISIBLE to those
+    gates: npc's pick is a member of, and the region-true selection FROM, the stale roster, so both stay
+    silent while the wrong region's factions ship accepted. Only re-deriving the roster ITSELF off the
+    brief (the same brief ``director.run`` consumed) catches it — the producer twin of the four
+    terrain/biome/npc/prop count/selection brief-re-derivation gates. Reuse director's OWN
+    ``_faction_roster`` so a ``FACTION_ARCHETYPES``/``ROSTER_SIZE``/salt change tracks in lock-step, and
+    reject a present roster that is not byte-identical to it (the director emits a canonical SORTED
+    roster, so any member/order/duplicate deviation is not what ``director.run`` produces). The message
+    NAMES director — unlike the downstream gates, director IS the route-back target here, so both the
+    structured attribution and the text-scan fallback correctly re-run the pipeline-earliest node. Fires
+    ONLY for a PRESENT ``intent:factions`` that disagrees: an absent roster is the empty-roster fallback
+    the npc gate already owns (demanding its presence would false-reject every placeholder / pre-factions
+    director), and a missing/unreadable director degrades to [] via ``_director_intent`` (already rejected
+    by the missing-specialist gate, so this never double-reports — FM3)."""
+    emitted = _director_intent(layers, layers_root, "factions")
+    if not emitted:
+        return []
+    expected = director._faction_roster(brief.region.region_id)
+    if emitted == expected:
+        return []
+    return [
+        f"intent:factions stale: director rostered {emitted} but the brief's region determines "
+        f"{expected} (director._faction_roster) — a stale or tampered director roster; re-run director"
+    ]
 
 
 def _is_finite_number(value: object) -> bool:
