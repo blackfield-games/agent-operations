@@ -13,6 +13,7 @@ import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step
 ///         identity/bond token.
 interface IAgentRegistry {
     function isRegistered(address agent) external view returns (bool);
+    function wasRegistered(address agent) external view returns (bool);
     function recordMatchResult(address agent, int256 reputationDelta) external;
     function TOKEN() external view returns (address);
 }
@@ -637,9 +638,11 @@ contract MatchSettlement is Ownable2Step {
     ///         `VariableSettleDisabled` — off by default, byte-identical to fixed-only);
     ///         the field has `>= 2` seats (`FieldTooSmall`, which also rejects empty/one)
     ///         and `<= MAX_FIELD` (`FieldTooLarge`, the gas-bound on the O(n²) scan);
-    ///         `agents` and `deltas` are equal-length (`LengthMismatch`); every agent is
-    ///         registered (`AgentNotRegistered`) and DISTINCT (`DuplicateAgent` — a repeat
-    ///         would double-write that agent and break the field's zero-sum intent); each
+    ///         `agents` and `deltas` are equal-length (`LengthMismatch`); every agent was
+    ///         EVER registered (`AgentNotRegistered` — tolerates a seat that has since
+    ///         deregistered, so a loss cannot be dodged by leaving before settle) and
+    ///         DISTINCT (`DuplicateAgent` — a repeat would double-write that agent and
+    ///         break the field's zero-sum intent); each
     ///         `|delta| <= maxRatingDelta` (`RatingDeltaTooLarge` — the same per-match
     ///         magnitude ceiling on attester power as the 1v1 variable path); and the
     ///         deltas sum to EXACTLY 0 (`NonZeroSum` — no reputation minted or burned, the
@@ -675,7 +678,12 @@ contract MatchSettlement is Ownable2Step {
         int256 sum = 0;
         for (uint256 i = 0; i < n; i++) {
             address a = agents[i];
-            if (!registry.isRegistered(a)) revert AgentNotRegistered(a);
+            // Tolerate a seat that has since deregistered — a match is settled AFTER it is
+            // played, and reputation persists across deregistration (recordMatchResult gates
+            // on `registeredAt != 0`, so a loss cannot be dodged by leaving before settle).
+            // The 1v1 `_applyDecisive` and `settleFieldWager` siblings likewise tolerate it;
+            // only a NEVER-registered address (`registeredAt == 0`) is rejected here.
+            if (!registry.wasRegistered(a)) revert AgentNotRegistered(a);
             for (uint256 j = 0; j < i; j++) {
                 if (agents[j] == a) revert DuplicateAgent(a);
             }
