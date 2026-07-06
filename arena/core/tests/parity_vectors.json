@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v46",
+  "domain": "blackfield/arena/parity-vectors/v47",
   "protocol_version": 1,
   "spawns": [
     {
@@ -5462,6 +5462,84 @@
           "replay_hash": "7e8cc994a091acceebbac3199328905e84f0500dde6202e623b83b08d7c747ec"
         }
       }
+    }
+  ],
+  "melee_cadence": [
+    {
+      "label": "reload_does_not_shorten_the_swing_gate",
+      "melee_cooldown": 15,
+      "fire_cooldown": 6,
+      "reload_tick": 5,
+      "timeline": [
+        [
+          true,
+          15
+        ],
+        [
+          false,
+          14
+        ],
+        [
+          false,
+          13
+        ],
+        [
+          false,
+          12
+        ],
+        [
+          false,
+          11
+        ],
+        [
+          false,
+          10
+        ],
+        [
+          false,
+          9
+        ],
+        [
+          false,
+          8
+        ],
+        [
+          false,
+          7
+        ],
+        [
+          false,
+          6
+        ],
+        [
+          false,
+          5
+        ],
+        [
+          false,
+          4
+        ],
+        [
+          false,
+          3
+        ],
+        [
+          false,
+          2
+        ],
+        [
+          false,
+          1
+        ],
+        [
+          true,
+          15
+        ],
+        [
+          false,
+          14
+        ]
+      ]
     }
   ]
 }

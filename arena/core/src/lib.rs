@@ -4054,6 +4054,34 @@ pub struct FireCycleCase {
     pub timeline: Vec<(bool, u16, u16)>,
 }
 
+/// A pinned melee swing-cadence case (domain v47): seat 0 holds MELEE fire against a
+/// point-blank enemy, and a `reload` is pressed mid-cooldown. Unlike the ranged
+/// [`FireCycleCase`], a swing draws no ammo ([`Rules::mag_size`] is irrelevant) and is gated
+/// only by [`Rules::melee_cooldown`] — so the discharge signal is the TARGET's health drop
+/// (melee lands instantly, the same tick), not an ammo delta, and the recorded gate is
+/// `melee_cooldown` not `fire_cooldown`. The load-bearing convention: a reload does NOT
+/// shorten the swing gate (melee has no magazine to refill), so the next swing still waits
+/// the full `melee_cooldown`. A twin that re-armed the shorter `fire_cooldown` on a melee
+/// reload — letting a swing->reload->swing loop out-cadence `melee_cooldown` — lands its
+/// second swing early and diverges here. Distinct from `fire_cycle` (the ranged
+/// ammo-drawing cycle) and `melee_cleave` (one swing's struck SET, never the cadence).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeleeCadenceCase {
+    pub label: String,
+    /// The melee swing gate — melee's only rate limiter, armed by each landed swing.
+    pub melee_cooldown: u16,
+    /// The ranged [`Rules::fire_cooldown`] a mode-blind reload would WRONGLY arm; kept
+    /// DISTINCT from `melee_cooldown` so such a reload visibly shortens the gate.
+    pub fire_cooldown: u16,
+    /// The tick a `reload` is pressed instead of a swing, or `None`.
+    pub reload_tick: Option<u16>,
+    /// `(struck, cooldown)` after each `step`: `struck` is whether seat 0's swing landed this
+    /// tick (the target lost health), `cooldown` the swing gate afterwards. Pinning the whole
+    /// timeline fixes the cadence tick-for-tick, so an early-swinging twin records a different
+    /// struck stream.
+    pub timeline: Vec<(bool, u16)>,
+}
+
 /// One target's outcome in a [`MeleeCleaveCase`] swing: where it stood relative to the
 /// shooter, whether the cleave struck it, and the health it lost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4905,6 +4933,13 @@ pub struct ParityVectors {
     /// [`Live`]: MatchPhase::Live
     pub starting_phase: Vec<StartingPhaseCase>,
     pub matches: Vec<MatchCase>,
+    /// melee swing-cadence cases (domain v47): seat 0 holds a MELEE swing against a
+    /// point-blank enemy with a `reload` pressed mid-cooldown, recording per-tick struck +
+    /// swing gate. Pins that melee is gated by `melee_cooldown` (not `fire_cooldown`) and,
+    /// crucially, that a reload does NOT shorten that gate — melee has no magazine, so a
+    /// swing->reload->swing loop cannot out-cadence `melee_cooldown`. The melee twin the ranged
+    /// `fire_cycle` cycle (ammo-draw + `fire_cooldown`) structurally cannot express.
+    pub melee_cadence: Vec<MeleeCadenceCase>,
 }
 
 /// Domain tag for the parity-vector set — see [`ParityVectors::domain`]. Bumped to
@@ -5247,8 +5282,14 @@ pub struct ParityVectors {
 /// placed above the other (a placement-only twin would split them), and an all-forfeit equal-rating field that moves
 /// nobody. This is a settlement READ, NOT a replay-digest input — the `forfeited` flag is DERIVED from the already-
 /// committed v7 forfeit stream, so the parity domain bump is ORTHOGONAL to the replay digest, which stays put; no
-/// committed match hash moves. A deliberate convention every twin must follow.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v46";
+/// committed match hash moves. A deliberate convention every twin must follow. Bumped to v47 for the new
+/// `melee_cadence` category — the melee swing-cadence twin the ranged `fire_cycle` cycle structurally cannot
+/// express (a swing draws no ammo and is gated by `melee_cooldown`, not `fire_cooldown`). Its load-bearing rule:
+/// a `reload` does NOT shorten the melee swing gate (melee has no magazine), so a swing->reload->swing loop cannot
+/// out-cadence `melee_cooldown`. This is a NEW additive category pinning a sim-behaviour fix; like `starting_phase`
+/// it moves NO committed match hash (the fire cycle emits no `replay_hash`), so the ranged `fire_cycle`/`matches`
+/// goldens stay byte-identical and only the new vector plus the domain tag change.
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v47";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -6142,6 +6183,42 @@ fn fire_cycle_case(label: &str, mode: WeaponMode, fire_cooldown: u16, mag_size: 
         timeline.push((fired, m.pawns[0].ammo, m.pawns[0].cooldown));
     }
     FireCycleCase { label: label.to_string(), weapon_mode: mode, fire_cooldown, mag_size, reload_tick, timeline }
+}
+
+fn melee_cadence_case(label: &str, melee_cooldown: u16, fire_cooldown: u16, reload_tick: Option<u16>, ticks: u16) -> MeleeCadenceCase {
+    let rules = Rules { weapon_mode: WeaponMode::Melee, melee_cooldown, fire_cooldown, spawn_jitter: 0, ..Default::default() };
+    let roster = vec![parity_seat(0, 0), parity_seat(1, 1)];
+    let mut m = Match::new(parity_match_id(), parity_config(2), rules, roster, Vec::new(), 1);
+    m.pawns[0].pos = Vec2::ZERO;
+    m.pawns[0].facing = EAST;
+    // Seat 1 idles point-blank (1500 < the 2 m default melee_range) on the enemy team with a
+    // huge health pool, so every swing connects yet it never downs — the match stays Live and
+    // only the cadence is recorded.
+    m.pawns[1].pos = Vec2 { x: 1500, y: 0 };
+    m.pawns[1].health = 50_000;
+    let swing = ActionIntent {
+        move_dir: Vec2::ZERO,
+        aim: EAST,
+        buttons: arena_proto::ActionButtons { fire: true, jump: false, ability: false, reload: false },
+    };
+    let reload = ActionIntent {
+        move_dir: Vec2::ZERO,
+        aim: EAST,
+        buttons: arena_proto::ActionButtons { fire: false, jump: false, ability: false, reload: true },
+    };
+    let mut timeline = Vec::new();
+    for t in 0..ticks {
+        let hp_before = m.pawns[1].health;
+        let press = if reload_tick == Some(t) { reload } else { swing };
+        let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+        intents.insert(0, press);
+        m.step(&intents);
+        // A melee swing draws no ammo, so the mode-neutral discharge signal is the TARGET's
+        // health drop — melee lands instantly (same tick), never a delayed projectile hit.
+        let struck = m.pawns[1].health < hp_before;
+        timeline.push((struck, m.pawns[0].cooldown));
+    }
+    MeleeCadenceCase { label: label.to_string(), melee_cooldown, fire_cooldown, reload_tick, timeline }
 }
 
 /// Build a Starting-phase countdown case: construct a two-seat match with `starting_ticks`,
@@ -7743,6 +7820,15 @@ pub fn parity_vectors() -> ParityVectors {
                 Rules { damage: 100, spawn_radius: 2 * POSITION_SCALE, spawn_jitter: 0, pickup_radius: 1500, ..Default::default() },
                 vec![PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x: -2 * POSITION_SCALE, y: 0 }, amount: 5 }],
             ),
+        ],
+        melee_cadence: vec![
+            // Swing at tick 0 (arms melee_cooldown 15), RELOAD at tick 5 (mid-cooldown), then
+            // hold swing: the reload leaves the gate untouched, so the 2nd swing lands at tick
+            // 15 — a full melee_cooldown later. A mode-blind reload arming fire_cooldown 6 would
+            // reopen the gate and land it at tick 11 (reload_tick + fire_cooldown), so the two
+            // cadences diverge. fire_cooldown is kept DISTINCT from melee_cooldown for exactly
+            // that reason.
+            melee_cadence_case("reload_does_not_shorten_the_swing_gate", 15, 6, Some(5), 17),
         ],
     }
 }
