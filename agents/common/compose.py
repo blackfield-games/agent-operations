@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 # come from the region_id, `/` from the specialist subdir, `.` from the extension).
 # Anything else — empty, the `@` delimiter, a newline, whitespace, quotes — is
 # rejected rather than escaped, so behavior is unambiguous.
+#
+# This is a SYNTAX allowlist only: dot-segments (`.`/`..`) match it (every char is
+# allowed), so compose_world rejects those separately as path traversal — a `..`
+# sublayer would resolve outside layers/, and no downstream gate re-parses
+# world.usda to catch it. The twin jobs._asset_url rejects the same segments.
 _SAFE_LAYER_PATH = re.compile(r"[A-Za-z0-9._/+-]+")
 
 # strongest → weakest
@@ -89,6 +94,13 @@ def compose_world(layers: list[LayerSpec], out_dir: Path) -> Path:
                     f"paths must be non-empty and match {_SAFE_LAYER_PATH.pattern} "
                     f"(no '@', newline, whitespace, or quotes that would break the "
                     f"USDA asset reference)"
+                )
+            if any(seg in (".", "..") for seg in layer.path.split("/")):
+                raise ValueError(
+                    f"{specialist} emitted a traversal layer path {layer.path!r}: "
+                    f"a '.'/'..' segment resolves outside layers/ (the twin "
+                    f"jobs._asset_url rejects the same segments), and no downstream "
+                    f"gate re-parses world.usda to catch it"
                 )
             ordered.append(layer.path)
 
