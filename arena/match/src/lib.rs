@@ -2813,6 +2813,14 @@ mod tests {
             .with_ranked_registry(Some(RegistrySnapshot::from_addresses(registered.iter())))
     }
 
+    /// A ranked matchmaker gated on `entries` (address -> signed reputation) with a
+    /// reputation `floor` — the composed registration + floor gate.
+    fn reputation_mm(entries: &[(String, i128)], floor: i128) -> Matchmaker<SignatureVerifier> {
+        Matchmaker::new(SignatureVerifier, MatchParams::default())
+            .with_ranked_registry(Some(RegistrySnapshot::from_entries(entries.iter().map(|(a, r)| (a, *r)))))
+            .with_ranked_reputation_floor(floor)
+    }
+
     #[test]
     fn agent_mode_admits_a_registered_key_holder() {
         // End to end on the real verifier: two registered key holders form a ranked
@@ -2916,6 +2924,97 @@ mod tests {
                 .into_formed()
                 .is_some(),
             "an unconfigured ranked registry admits signed seats exactly like the bare gate"
+        );
+    }
+
+    #[test]
+    fn registry_snapshot_carries_signed_reputation() {
+        // FM2: a loss drives reputation negative; the snapshot must keep the sign, not store
+        // it unsigned/truncated where it would wrap to a large positive and clear any floor.
+        let snap = RegistrySnapshot::from_entries([("0xNEG", -5_000_i128), ("0xPOS", 42)]);
+        assert_eq!(snap.reputation_of("0xneg"), Some(-5_000), "a negative reputation stays negative");
+        assert_eq!(snap.reputation_of("0xpos"), Some(42), "case-insensitive lookup, positive value");
+        assert_eq!(snap.reputation_of("0xmissing"), None, "an unregistered address has no reputation");
+        // from_addresses registers with unknown (zero) reputation — the contract's default
+        // for a registered-but-unrated agent, and back-compatible with the address-only path.
+        let bare = RegistrySnapshot::from_addresses(["0xABC"]);
+        assert_eq!(bare.reputation_of("0xabc"), Some(0), "from_addresses defaults reputation to 0");
+        assert!(bare.is_registered("0xABC"), "and still registers the address");
+    }
+
+    #[test]
+    fn reputation_floor_rejects_below_admits_at_and_above() {
+        // The three arms of the floor gate against a fixed floor of 100, all on a genuine
+        // signature so the rejection is purely about standing, not possession.
+        let a = agent_key();
+        let addr = agent_addr(&a);
+        let nonce: &[u8] = b"chal";
+        let sig = sign_join(&a, PROTOCOL_VERSION, &addr, nonce);
+        let floor = 100_i128;
+
+        let below = reputation_mm(&[(addr.clone(), 99)], floor);
+        assert!(
+            matches!(
+                below.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(addr.as_str(), sig.clone())),
+                Err(JoinError::ReputationBelowFloor { reputation: 99, floor: 100, .. })
+            ),
+            "reputation one below the floor is rejected with the distinct reason"
+        );
+        assert_eq!(below.waiting(MatchMode::Agent), 0, "a below-floor claim never enters the queue");
+
+        let at = reputation_mm(&[(addr.clone(), 100)], floor);
+        assert!(
+            at.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(addr.as_str(), sig.clone()))
+                .expect("a seat exactly at the floor is admitted")
+                .is_queued(),
+            "the floor is inclusive: reputation == floor is admitted"
+        );
+
+        let above = reputation_mm(&[(addr.clone(), 101)], floor);
+        assert!(
+            above
+                .join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(addr.as_str(), sig))
+                .expect("a seat above the floor is admitted")
+                .is_queued(),
+            "reputation above the floor is admitted"
+        );
+    }
+
+    #[test]
+    fn default_reputation_floor_is_no_effective_gate() {
+        // FM3: with a registry but no floor set (default i128::MIN), even the most negative
+        // reputation is admitted — the registration-only behavior is preserved, so only a
+        // configured deployment enforces a floor.
+        let a = agent_key();
+        let addr = agent_addr(&a);
+        let nonce: &[u8] = b"chal";
+        let sig = sign_join(&a, PROTOCOL_VERSION, &addr, nonce);
+        let mm = Matchmaker::new(SignatureVerifier, MatchParams::default())
+            .with_ranked_registry(Some(RegistrySnapshot::from_entries([(&addr, i128::MIN)])));
+        assert!(
+            mm.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(addr.as_str(), sig))
+                .expect("the default floor admits any registered signed seat")
+                .is_queued(),
+            "an unset floor (i128::MIN) is no effective gate — nothing is below it"
+        );
+    }
+
+    #[test]
+    fn reputation_floor_is_inert_without_a_registry() {
+        // Reputation lives on the snapshot, so a floor with no registry has nothing to
+        // compare against — it never fires, and a signed seat is admitted on possession
+        // alone (the registration-only default, unchanged).
+        let a = agent_key();
+        let addr = agent_addr(&a);
+        let nonce: &[u8] = b"chal";
+        let sig = sign_join(&a, PROTOCOL_VERSION, &addr, nonce);
+        let mm = Matchmaker::new(SignatureVerifier, MatchParams::default())
+            .with_ranked_reputation_floor(1_000_000);
+        assert!(
+            mm.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(addr.as_str(), sig))
+                .expect("a floor with no registry does not gate")
+                .is_queued(),
+            "the reputation floor is inert without a ranked registry to source reputation from"
         );
     }
 
