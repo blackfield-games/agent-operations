@@ -1864,6 +1864,19 @@ def test_run_local_match_forwards_fov_and_omits_it_at_the_default(monkeypatch):
     assert argv[argv.index("--mode") + 1] == "agent"
 
 
+def test_run_local_match_rejects_an_out_of_range_perception_memory():
+    # perception_memory is a u16 tick window (0..=65535, 0 = off); a negative is inert in core's
+    # `> 0` gate and an over-u16 value wraps (65536 -> 0, also off), so it raises before any spawn
+    # — the u16 fence every sibling numeric knob has, mirroring the harness u16 rather than
+    # forwarding a value the harness aborts on. A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -45, 65536, 70000):
+        with pytest.raises(ValueError, match="perception_memory"):
+            run_local_match("/no/such/harness", [0, 1], policies, perception_memory=bad)
+
+
 def test_run_local_match_rejects_an_out_of_range_fov():
     # The cone is an octant spread in 0..=4; an out-of-range value raises before any spawn
     # (mirroring the ladder_file/mode preflights) rather than letting the harness saturate a
