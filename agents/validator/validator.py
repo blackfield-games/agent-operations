@@ -175,7 +175,12 @@ async def run(
     # verdict the metric gate owns when metric and body agree).
     if opt is not None and not missing and metrics_ok and opt in wellformed:
         opt_text = (layers_root / opt.path).read_text()
-        for message in _budget_self_consistency(opt, opt_text, _summed_prior_triangles(layers)):
+        for message in _budget_self_consistency(
+            opt,
+            opt_text,
+            _summed_prior_triangles(layers),
+            _prior_triangles_by_specialist(layers),
+        ):
             issues.append(message)
             failing.add("optimization")
 
@@ -846,6 +851,16 @@ def _opt_bool(text: str, key: str) -> bool | None:
     return True if raw == "true" else False if raw == "false" else None
 
 
+def _opt_string(text: str, key: str) -> str | None:
+    """Optimization body string field `key` with its USD double-quotes stripped, or None
+    when absent or not a quoted literal — how a directive's `specialist`/`layer` identity
+    is read back (the optimizer writes them via `usd_str`)."""
+    raw = _opt_scalar(text, key)
+    if raw is None or len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
+        return None
+    return raw[1:-1]
+
+
 def _opt_reductions(text: str) -> float | None:
     """Σ(authoredTriangles − effectiveTriangles) over the emitted LodDirectives — the
     geometry the recorded LOD shedding removed. None when a directive is malformed (a
@@ -861,7 +876,9 @@ def _opt_reductions(text: str) -> float | None:
     return total
 
 
-def _lod_directive_legality(opt_path: str, text: str) -> list[str]:
+def _lod_directive_legality(
+    opt_path: str, text: str, prior_by_specialist: dict[str, float] | None = None
+) -> list[str]:
     """Why a recorded LodDirective is not a shed the optimizer could legally have made,
     or [] when every one is — the per-directive twin of the sum re-derivation above.
 
@@ -877,7 +894,20 @@ def _lod_directive_legality(opt_path: str, text: str) -> list[str]:
     each directive's legal scale + effective across the trust boundary with the producer's
     own ``optimization._lod_scale``/``MAX_LOD`` (the lock-step reuse the terrain/biome/npc/
     prop/lighting gates use), and reject a mismatch, naming optimization so it re-runs. An
-    absent or non-numeric lodLevel/lodScale is an illegal directive, not a crash."""
+    absent or non-numeric lodLevel/lodScale is an illegal directive, not a crash.
+
+    When ``prior_by_specialist`` is supplied (the run() path), a shed that is otherwise legal
+    is ALSO grounded against the layer it names: its authoredTriangles must equal that
+    specialist's real triangle metric. The effective check above pins effective to authored,
+    and ``_budget_self_consistency`` ties only the TOTAL authored to the summed geometry — so
+    an inflated per-directive authored (a shed crediting a bigger layer than the geometry
+    holds) with a ratio-legal effective fabricates a reduction the sum reconciles to, and an
+    over-budget world ships accepted. Match each directive's ``specialist`` to a current prior
+    layer and reject an authoredTriangles that is not that layer's metric (or a ``specialist``
+    naming no prior layer — a phantom shed crediting geometry that isn't there). Runs only for
+    a shed already legal by scale + effective (an illegal one is rejected regardless) and only
+    when the map is given, so the direct-call unit path (no map) keeps its legality-only
+    contract — the per-layer twin of the sum's ``authored == prior_triangles`` grounding."""
     out: list[str] = []
     floor = 1 << optimization.MAX_LOD
     for block in re.finditer(r'def Scope "(Lod_\d+)"\s*\{(.*?)\}', text, re.DOTALL):
@@ -916,6 +946,25 @@ def _lod_directive_legality(opt_path: str, text: str) -> list[str]:
                 f"{int(level)}) — a fabricated reduction the optimizer's 1/{floor} floor "
                 f"could not produce; re-run optimization"
             )
+            continue
+        if prior_by_specialist is None:
+            continue
+        specialist = _opt_string(body, "specialist")
+        if specialist not in prior_by_specialist:
+            out.append(
+                f"optimization layer {opt_path} directive {name} names {specialist!r}, not a "
+                f"current prior layer — a phantom shed crediting a reduction to geometry that "
+                f"isn't there; re-run optimization"
+            )
+        elif not math.isclose(
+            authored, prior_by_specialist[specialist], rel_tol=1e-9, abs_tol=1e-6
+        ):
+            out.append(
+                f"optimization layer {opt_path} directive {name} authoredTriangles "
+                f"{authored:.0f} != the {prior_by_specialist[specialist]:.0f} triangles the "
+                f"{specialist} layer holds — an inflated authored base fabricating a reduction "
+                f"the summed budget cannot see; re-run optimization"
+            )
     return out
 
 
@@ -935,7 +984,28 @@ def _summed_prior_triangles(layers: list[LayerSpec]) -> float:
     return total
 
 
-def _budget_self_consistency(opt: LayerSpec, text: str, prior_triangles: float) -> list[str]:
+def _prior_triangles_by_specialist(layers: list[LayerSpec]) -> dict[str, float]:
+    """{specialist: triangles} over the current geometry layers — the per-layer breakdown
+    each recorded LodDirective's authoredTriangles must match the one it names, the
+    component twin of _summed_prior_triangles's total (sum of these == that total). Skips
+    optimization (it sheds the others, not itself) and any non-finite metric (already
+    rejected upstream), exactly as the sum does."""
+    out: dict[str, float] = {}
+    for layer in layers:
+        if layer.specialist == "optimization":
+            continue
+        value = layer.metrics.get("triangles", 0.0)
+        if _is_finite_number(value):
+            out[layer.specialist] = value
+    return out
+
+
+def _budget_self_consistency(
+    opt: LayerSpec,
+    text: str,
+    prior_triangles: float,
+    prior_by_specialist: dict[str, float] | None = None,
+) -> list[str]:
     """Why optimization's emitted artifact disagrees with its over_budget metric or the
     current geometry, or [] when they are mutually consistent — the validator re-deriving
     the budget verdict instead of trusting the metric across the optimizer trust boundary.
@@ -1005,7 +1075,7 @@ def _budget_self_consistency(opt: LayerSpec, text: str, prior_triangles: float) 
             f"!= the {prior_triangles:.0f} summed from the current prior layers — geometry "
             f"changed after optimization last ran; re-run optimization"
         )
-    out.extend(_lod_directive_legality(opt.path, text))
+    out.extend(_lod_directive_legality(opt.path, text, prior_by_specialist))
     return out
 
 
