@@ -29,7 +29,7 @@
 //!   completes a match pulls its whole roster under that lock — no concurrent join
 //!   can double-seat a participant or start a match a seat short.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -120,22 +120,36 @@ impl IdentityVerifier for StubIdentityVerifier {
 }
 
 /// A point-in-time view of which agent identities are registered on-chain in the
-/// `AgentRegistry`, so the matchmaker can gate a *ranked* seat on registration
-/// eligibility — the arena mirror of the `AgentRegistry.isRegistered` check
-/// `MatchSettlement` enforces at match-open (`AgentNotRegistered`). A ranked seat
-/// whose address is not registered would form a match that plays but can never
-/// settle on-chain, so [`Matchmaker::with_ranked_registry`] catches it at the door.
+/// `AgentRegistry` and each one's reputation, so the matchmaker can gate a *ranked*
+/// seat on registration eligibility — the arena mirror of the `AgentRegistry.isRegistered`
+/// check `MatchSettlement` enforces at match-open (`AgentNotRegistered`) — and on a
+/// minimum reputation floor (`AgentRegistry.reputationOf`). A ranked seat whose address is
+/// not registered would form a match that plays but can never settle on-chain, so
+/// [`Matchmaker::with_ranked_registry`] catches it at the door; a registered seat driven
+/// below the floor by prior losses/penalties is likewise held out of ranked queues (see
+/// [`Matchmaker::with_ranked_reputation_floor`]).
 ///
 /// The matchmaker never calls the chain on its hot path: an operator loads the
-/// registered set out of band — replaying the registry's `Registered` /
-/// `Deregistered` events, or an `isRegistered` sweep — and supplies it. Addresses are
-/// held lowercased and compared case-insensitively, matching [`verify_join_signature`]'s
-/// identity comparison (the recovered address is lowercase, compared
-/// `eq_ignore_ascii_case`), so `0xABC` and `0xabc` are the same registrant here as
-/// they are to the signature gate.
+/// registered set out of band — replaying the registry's `Registered` / `Deregistered` /
+/// `MatchRecorded` events, or an `isRegistered` + `reputationOf` sweep — and supplies it.
+/// Addresses are held lowercased and compared case-insensitively, matching
+/// [`verify_join_signature`]'s identity comparison (the recovered address is lowercase,
+/// compared `eq_ignore_ascii_case`), so `0xABC` and `0xabc` are the same registrant here
+/// as they are to the signature gate.
+///
+/// Reputation is a **signed** `i128`, mirroring the contract's `int256 reputation` (a loss
+/// lowers it below zero — the whole point of a floor, so the value must not lose its sign).
+/// `i128` is narrower than the contract's `int256`, but it faithfully holds any
+/// realistically-accumulated reputation: the settlement delta is ether-scaled (~1e18 per
+/// match), so overflowing `i128` (~1.7e38) would take on the order of 1e20 matches — while
+/// `i64` overflows after ~9 ether. An operator loading a value that genuinely exceeds
+/// `i128` (a crafted or runaway on-chain figure) must clamp it before building the snapshot;
+/// the registry is trusted operator config, the same trust model as the address set.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RegistrySnapshot {
-    registered: BTreeSet<String>,
+    /// Lowercased address -> signed on-chain reputation. Presence is registration; the
+    /// value is the standing the reputation floor is compared against.
+    registered: BTreeMap<String, i128>,
 }
 
 impl RegistrySnapshot {
@@ -146,20 +160,43 @@ impl RegistrySnapshot {
         Self::default()
     }
 
-    /// Build a snapshot from an iterator of registered addresses — the
-    /// `Registered`-minus-`Deregistered` set replayed from the registry's event log,
-    /// or an `isRegistered` sweep. Lowercased so lookups are case-insensitive.
+    /// Build a snapshot from registered addresses with **unknown reputation**, each
+    /// defaulted to `0` (the contract's default for a registered-but-unrated agent) — the
+    /// `Registered`-minus-`Deregistered` set replayed from the registry's event log, or an
+    /// `isRegistered` sweep. Lowercased so lookups are case-insensitive. Use
+    /// [`from_entries`](Self::from_entries) to carry real reputation for the floor gate.
     pub fn from_addresses<I, S>(addrs: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Self { registered: addrs.into_iter().map(|a| a.as_ref().to_ascii_lowercase()).collect() }
+        Self { registered: addrs.into_iter().map(|a| (a.as_ref().to_ascii_lowercase(), 0)).collect() }
+    }
+
+    /// Build a snapshot from `(address, reputation)` pairs — an `isRegistered` +
+    /// `reputationOf` sweep, or an event replay that tracks `MatchRecorded`. The signed
+    /// reputation is carried verbatim (a negative value stays negative) so the floor gate
+    /// compares against real on-chain standing. Lowercased for case-insensitive lookup.
+    pub fn from_entries<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, i128)>,
+        S: AsRef<str>,
+    {
+        Self {
+            registered: entries.into_iter().map(|(a, r)| (a.as_ref().to_ascii_lowercase(), r)).collect(),
+        }
     }
 
     /// `true` iff `agent_id` is in the registered set (case-insensitive).
     pub fn is_registered(&self, agent_id: &str) -> bool {
-        self.registered.contains(&agent_id.to_ascii_lowercase())
+        self.registered.contains_key(&agent_id.to_ascii_lowercase())
+    }
+
+    /// The registrant's signed reputation, or `None` if `agent_id` is not registered
+    /// (case-insensitive) — so a single lookup yields both membership and the value the
+    /// reputation floor is compared against.
+    pub fn reputation_of(&self, agent_id: &str) -> Option<i128> {
+        self.registered.get(&agent_id.to_ascii_lowercase()).copied()
     }
 }
 
@@ -223,6 +260,14 @@ pub enum JoinError {
     /// it would form could never settle. Only raised when a ranked registry is
     /// configured (see [`Matchmaker::with_ranked_registry`]).
     NotRegistered { agent_id: String },
+    /// A ranked (`Agent`-mode) seat is a registered on-chain identity that proved
+    /// possession, but its reputation is below the matchmaker's configured floor — an
+    /// agent driven deeply negative by prior losses/penalties is held out of ranked
+    /// queues. Distinct from [`NotRegistered`](Self::NotRegistered): the identity IS
+    /// eligible, its standing just isn't. Only raised when a ranked registry is
+    /// configured and a floor above `i128::MIN` is set (see
+    /// [`Matchmaker::with_ranked_reputation_floor`]).
+    ReputationBelowFloor { agent_id: String, reputation: i128, floor: i128 },
 }
 
 impl std::fmt::Display for JoinError {
@@ -236,6 +281,12 @@ impl std::fmt::Display for JoinError {
             }
             JoinError::NotRegistered { agent_id } => {
                 write!(f, "join rejected: ranked agent {agent_id} is not a registered on-chain identity")
+            }
+            JoinError::ReputationBelowFloor { agent_id, reputation, floor } => {
+                write!(
+                    f,
+                    "join rejected: ranked agent {agent_id} reputation {reputation} is below the floor {floor}"
+                )
             }
         }
     }
@@ -547,6 +598,14 @@ pub struct Matchmaker<V> {
     /// alone; `Mixed` casual cross-play and `Human` never touch it. Set via
     /// [`with_ranked_registry`](Self::with_ranked_registry); `None` by default.
     ranked_registry: Option<RegistrySnapshot>,
+    /// The minimum on-chain reputation a ranked (`Agent`-mode) seat must have — a seat
+    /// whose [`RegistrySnapshot`] reputation is below this is rejected at admission. Only
+    /// consulted alongside `ranked_registry` (reputation lives there); with no registry
+    /// there is nothing to gate on. `i128::MIN` (the default) is no effective gate — no
+    /// value can be below it — so an unconfigured matchmaker is byte-identical to the
+    /// registration-only path. Set via
+    /// [`with_ranked_reputation_floor`](Self::with_ranked_reputation_floor).
+    ranked_reputation_floor: i128,
 }
 
 impl<V: IdentityVerifier> Matchmaker<V> {
@@ -575,7 +634,13 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             params.seats_per_match,
             params.team_size
         );
-        Self { state: Mutex::new(State::default()), verifier, params, ranked_registry: None }
+        Self {
+            state: Mutex::new(State::default()),
+            verifier,
+            params,
+            ranked_registry: None,
+            ranked_reputation_floor: i128::MIN,
+        }
     }
 
     /// Gate ranked (`Agent`-mode) admission on on-chain registration eligibility: a
@@ -590,6 +655,20 @@ impl<V: IdentityVerifier> Matchmaker<V> {
     /// [`from_snapshot`](Self::from_snapshot).
     pub fn with_ranked_registry(mut self, registry: Option<RegistrySnapshot>) -> Self {
         self.ranked_registry = registry;
+        self
+    }
+
+    /// Gate ranked (`Agent`-mode) admission on a minimum on-chain reputation: a seat whose
+    /// [`RegistrySnapshot`] reputation is below `floor` is rejected with
+    /// [`JoinError::ReputationBelowFloor`], keeping agents driven deeply negative by prior
+    /// losses out of ranked queues. The floor is compared `>= floor` (inclusive: a seat
+    /// exactly at the floor is admitted). It gates only in combination with a ranked
+    /// registry — reputation is carried there, so without [`with_ranked_registry`](Self::with_ranked_registry)
+    /// there is nothing to compare and the floor is inert. `i128::MIN` (the default) is no
+    /// effective gate. Builder-style so it composes onto [`new`](Self::new) /
+    /// [`with_ranked_registry`](Self::with_ranked_registry).
+    pub fn with_ranked_reputation_floor(mut self, floor: i128) -> Self {
+        self.ranked_reputation_floor = floor;
         self
     }
 
@@ -685,17 +764,27 @@ impl<V: IdentityVerifier> Matchmaker<V> {
                 }
                 None => {}
             }
-            // A ranked (Agent-mode) seat must also be a registered on-chain identity when
-            // a registry is configured: only Agent matches settle (see `build`), so a
-            // ranked seat that isn't registered would form a match that reverts
-            // `AgentNotRegistered` at settle. Registration is scoped to Agent seats —
-            // Mixed casual cross-play never settles, so an honest possession-verified
-            // Mixed agent is not gated on registration. Runs after possession above, so a
-            // NotRegistered result always carries a genuine key.
+            // A ranked (Agent-mode) seat must also be a registered on-chain identity in
+            // good standing when a registry is configured: only Agent matches settle (see
+            // `build`), so a ranked seat that isn't registered would form a match that
+            // reverts `AgentNotRegistered` at settle, and a registered seat driven below the
+            // reputation floor is held out of ranked queues. Both draw on one snapshot
+            // lookup: `None` is not-registered, `Some(rep)` below the floor is under-standing.
+            // Registration+floor are scoped to Agent seats — Mixed casual cross-play never
+            // settles, so an honest possession-verified Mixed agent is not gated. Runs after
+            // possession above, so either rejection always carries a genuine key.
             if mode == MatchMode::Agent {
                 if let Some(registry) = &self.ranked_registry {
-                    if !registry.is_registered(&req.agent_id) {
-                        return Err(JoinError::NotRegistered { agent_id: req.agent_id.clone() });
+                    match registry.reputation_of(&req.agent_id) {
+                        None => return Err(JoinError::NotRegistered { agent_id: req.agent_id.clone() }),
+                        Some(reputation) if reputation < self.ranked_reputation_floor => {
+                            return Err(JoinError::ReputationBelowFloor {
+                                agent_id: req.agent_id.clone(),
+                                reputation,
+                                floor: self.ranked_reputation_floor,
+                            });
+                        }
+                        Some(_) => {}
                     }
                 }
             }
