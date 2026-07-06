@@ -313,6 +313,31 @@ def test_compose_rejects_other_usda_breaking_paths(tmp_path, bad_path):
     assert not (tmp_path / "world.usda").exists()
 
 
+def test_compose_rejects_traversal_layer_path(tmp_path):
+    """A `..` segment passes the USDA-syntax allowlist (every char is allowed) but
+    resolves outside layers/, so the earner's USD resolver would fetch an arbitrary
+    file — silently, since no downstream gate re-parses world.usda. Reject it
+    fail-fast, the twin of jobs._asset_url's 'not URL-safe' guard (which only fires
+    when an asset_base_url is configured, so compose is the always-on gate)."""
+    layers = [
+        LayerSpec(specialist="terrain", region_id="r+0000_+0000_l0", path="terrain/../../../etc/evil.usda", summary="x", metrics={}),
+    ]
+    with pytest.raises(ValueError, match="traversal"):
+        compose_world(layers, tmp_path)
+    assert not (tmp_path / "world.usda").exists()
+
+
+def test_compose_rejects_lone_dot_segment_layer_path(tmp_path):
+    """The lone-dot `.` segment jobs._asset_url rejects for consistency is likewise
+    rejected here, so the two path validators agree on the same input class (FM3)."""
+    layers = [
+        LayerSpec(specialist="biome", region_id="r+0000_+0000_l0", path="biome/./a.usda", summary="x", metrics={}),
+    ]
+    with pytest.raises(ValueError, match="traversal"):
+        compose_world(layers, tmp_path)
+    assert not (tmp_path / "world.usda").exists()
+
+
 def test_compose_accepts_legitimate_relative_paths(tmp_path):
     """FM1 discriminator: the allowlist must NOT reject the real convention —
     nested subdirs, the `+`/`-`/`_` region-id chars, and dots all compose
