@@ -493,15 +493,18 @@ async def test_run_accepts_a_resolved_world_with_recorded_lod_reductions(tmp_pat
     assert verdict.accepted, verdict.issues
 
 
-def _lod_directive(*, level, scale, authored, effective, name="Lod_0", drop=()):
+def _lod_directive(*, level, scale, authored, effective, name="Lod_0", drop=(), specialist=None):
     """One LodDirectives block for the halving-legality unit test. `drop` omits fields
-    (to model a malformed directive)."""
+    (to model a malformed directive); `specialist` adds the named-layer identity the
+    per-directive authored grounding reads back."""
     lines = [
         f'        custom int lodLevel = {level}',
         f'        custom double lodScale = {scale}',
         f'        custom double authoredTriangles = {authored}',
         f'        custom double effectiveTriangles = {effective}',
     ]
+    if specialist is not None:
+        lines.insert(0, f'        custom string specialist = "{specialist}"')
     kept = "\n".join(line for line in lines if not any(f" {d} =" in line for d in drop))
     return f'    def Scope "{name}"\n    {{\n{kept}\n    }}'
 
@@ -589,6 +592,59 @@ async def test_run_rejects_a_lod_directive_whose_scale_mismatches_its_level(tmp_
     assert not verdict.accepted
     assert _route_back_target(verdict) == "optimization"
     assert any("lodScale" in issue for issue in verdict.issues), verdict.issues
+
+
+async def test_run_rejects_an_inflated_directive_authored_the_sum_cannot_see(tmp_path):
+    # FM2 (the false-accept neither the sum re-derivation NOR the per-directive scale/effective
+    # legality can see): a directive claims to shed biome at authoredTriangles=400000 — 4x biome's
+    # real 100000 — at a RATIO-LEGAL effective (400000*0.125=50000), fabricating a 350000 reduction
+    # off a phantom-sized base. observed is set to authored_top - that reduction so observed ==
+    # authored - Σreduction still balances, and at budget 300000 the fabricated observed 252144 reads
+    # UNDER budget (overBudget false). The scale check (0.125==legal for level 3) and effective check
+    # (50000==400000*0.125) BOTH pass, so absent the authored grounding this ships ACCEPTED — yet biome
+    # really holds 100000 and floors at 12500, so the world is genuinely over budget (fully shed:
+    # 262144+12500+96000+144000 = 514644 > 300000). Grounding authored to the named layer catches it.
+    reductions = 400000.0 - 50000.0
+    observed = SUMMED_PRIOR - reductions  # 602144 - 350000 = 252144, under budget 300000
+    directives = (
+        '\n\n    def Scope "LodDirectives"\n    {\n'
+        '        def Scope "Lod_0"\n        {\n'
+        '            custom string specialist = "biome"\n'
+        '            custom string layer = "biome/r.usda"\n'
+        "            custom int lodLevel = 3\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 400000.0\n"
+        "            custom double effectiveTriangles = 50000.0\n"
+        "        }\n    }"
+    )
+    body = _opt_body(budget=300_000, authored=SUMMED_PRIOR, observed=observed, over_budget=False, directives=directives)
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert "optimization" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "optimization"
+    assert any("authoredTriangles" in i and "inflated authored base" in i for i in verdict.issues), verdict.issues
+
+
+def test_lod_directive_grounding_flags_inflated_and_phantom_authored():
+    # The per-directive authored grounding, which runs ONLY when a prior-triangle map is passed
+    # (the run() path): a directive whose authoredTriangles equals the named layer's real metric is
+    # silent; an INFLATED authored with a ratio-legal effective is flagged; a directive naming no
+    # prior layer is a phantom shed. Without the map the legality-only contract holds (grounding
+    # skipped even when authored matches nothing) — the branch-level twin of the run() exploit above.
+    prior = {"biome": 100000.0, "prop": 96000.0}
+
+    correct = _lod_directive(level=1, scale=0.5, authored=100000.0, effective=50000.0, specialist="biome")
+    assert validator._lod_directive_legality("optimization/r.usda", correct, prior) == []
+    # no map -> grounding skipped even though nothing would match (the direct-call legality-only path)
+    assert validator._lod_directive_legality("optimization/r.usda", correct) == []
+
+    inflated = _lod_directive(level=3, scale=0.125, authored=400000.0, effective=50000.0, specialist="biome")
+    msgs = validator._lod_directive_legality("optimization/r.usda", inflated, prior)
+    assert len(msgs) == 1 and "inflated authored base" in msgs[0] and "biome" in msgs[0]
+
+    phantom = _lod_directive(level=1, scale=0.5, authored=80000.0, effective=40000.0, specialist="ghost")
+    msgs = validator._lod_directive_legality("optimization/r.usda", phantom, prior)
+    assert len(msgs) == 1 and "phantom shed" in msgs[0] and "'ghost'" in msgs[0]
 
 
 async def test_run_skips_re_derivation_when_a_geometry_layer_is_missing(tmp_path):
