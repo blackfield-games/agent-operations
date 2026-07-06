@@ -345,6 +345,14 @@ async def run(
         for message in _director_factions_consistency(brief, layers, layers_root):
             issues.append(message)
             failing.add("director")
+        # The beats twin: the director's intent:beats mood line drives lighting's Atmosphere, and the
+        # lighting-beats gates re-check lighting's fog against that SAME line — so a stale line lighting
+        # faithfully followed is invisible to them (drivenBy and density both agree with it). Re-derive
+        # the line itself via director._region_beats and reject a mismatch, likewise naming director.
+        # Same well-formed-director guard; silent on an absent line (the fog-less fallback lighting owns).
+        for message in _director_beats_consistency(brief, layers, layers_root):
+            issues.append(message)
+            failing.add("director")
 
     # NPC archetype vs the brief + director roster — the SELECTION twin of the four count/grid brief-re-
     # derivation gates (terrain grid / biome scatter / npc spawn / prop placement) and the npc sibling of
@@ -714,6 +722,54 @@ def _director_factions_consistency(
     return [
         f"intent:factions stale: director rostered {emitted} but the brief's region determines "
         f"{expected} (director._faction_roster) — a stale or tampered director roster; re-run director"
+    ]
+
+
+def _director_beats_consistency(
+    brief: WorldBrief, layers: list[LayerSpec], layers_root: Path
+) -> list[str]:
+    """Why the director's emitted ``intent:beats`` mood line disagrees with the line the brief's region
+    determines, or [] when they agree — the PRODUCER-side re-derivation the lighting beats gates cannot
+    do, the beats twin of ``_director_factions_consistency``.
+
+    ``director.run`` seeds ``". ".join(_region_beats(region)) + "."`` (a stable per-region subset of
+    ``BEAT_VOCAB`` joined into one free-form line); lighting reads that SAME line and re-derives its
+    Atmosphere ``drivenBy``/``density`` off it, and the validator's lighting-beats gates re-check
+    lighting's fog *against the director's own line*. So a STALE director layer — a mood line authored for
+    another region, or tampered — is INVISIBLE to those gates: lighting faithfully drove its fog from the
+    stale line, so both ``drivenBy`` and ``density`` agree with it and stay silent while the wrong region's
+    mood ships accepted. Only re-deriving the line ITSELF off the brief (the same brief ``director.run``
+    consumed) catches it — the producer twin of the factions roster gate and of the four count/selection
+    gates. Reuse director's OWN ``_region_beats`` and the exact ``". ".join(...) + "."`` join so a
+    ``BEAT_VOCAB``/``BEATS_SIZE``/salt change tracks in lock-step, and compare the whole LINE byte-for-byte
+    — never a recognized-token SET, which a stale line whose modeled tokens coincidentally match would slip,
+    and the ``". "`` separator + trailing period are part of what ``director.run`` produces. The message
+    NAMES director — unlike the downstream lighting gates, director IS the route-back target here, so both
+    the structured attribution and the text-scan fallback re-run the pipeline-earliest node (director leads
+    ``PIPELINE_ORDER``, so even a beat phrase that some day collided with a later specialist's name could
+    not misroute). Fires ONLY for a PRESENT ``intent:beats`` that disagrees: an absent line is the fog-less
+    fallback lighting already owns (demanding its presence would false-reject every placeholder / pre-beats
+    director), and a missing/unreadable director degrades to [] (already rejected by the missing-specialist
+    gate, so this never double-reports — FM3). Reads the raw line rather than ``_director_intent`` (which
+    comma-splits for the token-list intents): beats is a free-form line, so the byte-exact compare needs it
+    whole."""
+    director_spec = next((layer for layer in layers if layer.specialist == "director"), None)
+    if director_spec is None:
+        return []
+    try:
+        text = (layers_root / director_spec.path).read_text()
+    except OSError:
+        return []
+    match = re.search(r'intent:beats\s*=\s*"([^"]*)"', text)
+    if not match or not match.group(1):
+        return []
+    emitted = match.group(1)
+    expected = ". ".join(director._region_beats(brief.region.region_id)) + "."
+    if emitted == expected:
+        return []
+    return [
+        f"intent:beats stale: director seeded {emitted!r} but the brief's region determines "
+        f"{expected!r} (director._region_beats) — a stale or tampered director beats line; re-run director"
     ]
 
 
