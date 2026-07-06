@@ -130,6 +130,17 @@ contract RenderReceipts is Ownable2Step {
     uint256 public revokedCount;
     mapping(address coordinator => bool authorized) public authorizedCoordinators;
 
+    /// @notice Hard upper bound on an `issueReceipts` batch — caps the O(n) fence/attest/
+    ///         persist/fee-route loop (and its single N-element `multiAttest`) so one batch
+    ///         can never approach the block gas limit, even from a buggy or compromised
+    ///         coordinator. 64 is well above the coordinator's default relay drain chunk
+    ///         (`relay_batch_size`, 32) and any realistic settle wave, so it never rejects a
+    ///         legitimate batch; it exists purely to make the batch's gas envelope a contract
+    ///         guarantee rather than a trust assumption — exactly as `MatchSettlement.MAX_FIELD`
+    ///         does for a field roster. The coordinator mirrors this cap as a boot-time guard,
+    ///         so a mis-set `relay_batch_size` fails fast rather than reverting every drain.
+    uint256 public constant MAX_BATCH = 64;
+
     event ReceiptIssued(
         bytes32 indexed uid,
         address indexed earner,
@@ -155,6 +166,7 @@ contract RenderReceipts is Ownable2Step {
     error ZeroFeeRate();
     error ZeroFeeToken();
     error EmptyBatch();
+    error BatchTooLarge();
 
     constructor(address eas_, address owner_, address regionAuthority_, uint256 renderFeeRate_)
         Ownable(owner_)
@@ -298,9 +310,11 @@ contract RenderReceipts is Ownable2Step {
     ///         fee-share route — but amortized: a coordinator settling the N jobs that
     ///         landed in one block pays one base tx cost and one attestation call.
     ///
-    ///         An empty batch reverts (`EmptyBatch`) rather than silently attesting nothing
-    ///         — a zero-length call is a caller bug, not a no-op. Authorization and the
-    ///         schema gate are identical to `issueReceipt`.
+    ///         An empty batch reverts (`EmptyBatch`) and a batch above `MAX_BATCH` reverts
+    ///         (`BatchTooLarge`, the gas-envelope bound) rather than silently attesting
+    ///         nothing or running unbounded — a zero-length or oversized call is a caller
+    ///         bug, not a no-op. Authorization and the schema gate are identical to
+    ///         `issueReceipt`.
     ///
     ///         Atomicity: every effect runs in this one tx, so ANY element reverting — a
     ///         jobId already issued OR repeated within this batch (it hits the fence an
@@ -321,6 +335,7 @@ contract RenderReceipts is Ownable2Step {
 
         uint256 n = items.length;
         if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
 
         // Phase 1 (checks + effects): fence each job, credit the counters, and build the one
         // multiAttest payload. The fence is per ELEMENT, so a jobId repeated within the batch
