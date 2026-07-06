@@ -1451,11 +1451,18 @@ mod tests {
         let job = dev_job();
 
         // The coordinator gates the submit with 409 (not in-flight / already done).
-        // poll_once must back off, NOT keep polling — so a persistent rejection
-        // can't spin a tight render→submit→reject loop (keep_polling_after_submit).
+        // poll_once must render, submit, then back off — NOT keep polling — so a
+        // persistent rejection can't spin a tight render→submit→reject loop
+        // (keep_polling_after_submit). The GET carries x-dispatch-seq so poll_once
+        // proceeds PAST the header fail-close (main.rs:744) into the submit path this
+        // test covers — without it poll_once returns early and never reaches the 409.
         Mock::given(method("GET"))
             .and(path("/jobs/next"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&job))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-dispatch-seq", "1")
+                    .set_body_json(&job),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -1468,6 +1475,15 @@ mod tests {
 
         let keep = poll_once(&client, &args, &session, &all_supported(), None).await.unwrap();
         assert!(!keep, "a 409-rejected submit must back off, not keep polling");
+
+        // The back-off must be the POST-SUBMIT disposition, not the header fail-close:
+        // assert the submit actually happened, so a regression that skips the submit or
+        // flips keep_polling_after_submit to true on a non-2xx is caught here.
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().any(|r| r.url.path().ends_with("/submit")),
+            "poll_once must reach the submit before backing off on the 409: {requests:?}"
+        );
     }
 
     #[tokio::test]
