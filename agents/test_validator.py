@@ -625,6 +625,36 @@ async def test_run_rejects_an_inflated_directive_authored_the_sum_cannot_see(tmp
     assert any("authoredTriangles" in i and "inflated authored base" in i for i in verdict.issues), verdict.issues
 
 
+async def test_run_rejects_a_directive_shedding_a_floor_layer(tmp_path):
+    # The floor-layer sibling of the inflated/phantom fabricated reductions: a directive sheds
+    # TERRAIN — the do-not-shed floor. authoredTriangles=262144 IS terrain's real metric (so the
+    # authored grounding stays silent) and 262144*0.125=32768 is a ratio-legal level-3 effective,
+    # fabricating a 229376 reduction of geometry the optimizer never touches. observed is set to
+    # authored - that reduction (372768) so the sum balances and reads UNDER the 500k budget. But
+    # terrain is floored and never decimated at runtime, so the world really renders at its full
+    # authored 602144 (> 500000) — a genuinely over-budget world shipped accepted. Scale, effective,
+    # authored==terrain's metric and the sum ALL pass; only the floor-eligibility check rejects it.
+    reductions = 262144.0 - 32768.0
+    observed = SUMMED_PRIOR - reductions  # 602144 - 229376 = 372768, under budget 500000
+    directives = (
+        '\n\n    def Scope "LodDirectives"\n    {\n'
+        '        def Scope "Lod_0"\n        {\n'
+        '            custom string specialist = "terrain"\n'
+        '            custom string layer = "terrain/r.usda"\n'
+        "            custom int lodLevel = 3\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 262144.0\n"
+        "            custom double effectiveTriangles = 32768.0\n"
+        "        }\n    }"
+    )
+    body = _opt_body(budget=500_000, authored=SUMMED_PRIOR, observed=observed, over_budget=False, directives=directives)
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert "optimization" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "optimization"
+    assert any("floor layer" in i and "terrain" in i for i in verdict.issues), verdict.issues
+
+
 def test_lod_directive_grounding_flags_inflated_and_phantom_authored():
     # The per-directive authored grounding, which runs ONLY when a prior-triangle map is passed
     # (the run() path): a directive whose authoredTriangles equals the named layer's real metric is
@@ -645,6 +675,29 @@ def test_lod_directive_grounding_flags_inflated_and_phantom_authored():
     phantom = _lod_directive(level=1, scale=0.5, authored=80000.0, effective=40000.0, specialist="ghost")
     msgs = validator._lod_directive_legality("optimization/r.usda", phantom, prior)
     assert len(msgs) == 1 and "phantom shed" in msgs[0] and "'ghost'" in msgs[0]
+
+
+def test_lod_directive_grounding_rejects_a_floor_layer_shed():
+    # The optimizer routes floor-set specialists (optimization._resolve_floor(), default {'terrain'})
+    # into floor_total and NEVER into the sheddable set, so no honest layer records a shed of one. A
+    # terrain shed is a fabricated reduction of always-present geometry — rejected even though its
+    # authoredTriangles equals terrain's real metric (the authored grounding stays silent) and its
+    # scale/effective are ratio-legal. The floor check runs only with the map (the grounding path) and
+    # is ordered before phantom/authored so a floored name gives one clear reason.
+    prior = {"terrain": 262144.0, "biome": 100000.0}
+
+    floor_shed = _lod_directive(level=3, scale=0.125, authored=262144.0, effective=32768.0, specialist="terrain")
+    msgs = validator._lod_directive_legality("optimization/r.usda", floor_shed, prior)
+    assert len(msgs) == 1 and "floor layer" in msgs[0] and "terrain" in msgs[0]
+    assert "inflated" not in msgs[0] and "phantom" not in msgs[0]  # authored legal + present; floor is the reason
+    # no map -> legality-only, floor check skipped like the authored grounding
+    assert validator._lod_directive_legality("optimization/r.usda", floor_shed) == []
+
+    # a stale floor NAME (floored but absent from the current prior layers) resolves to the floor
+    # issue, not phantom — floor is checked first so the more specific reason wins (FM4).
+    stale = _lod_directive(level=1, scale=0.5, authored=50000.0, effective=25000.0, specialist="terrain")
+    msgs = validator._lod_directive_legality("optimization/r.usda", stale, {"biome": 100000.0})
+    assert len(msgs) == 1 and "floor layer" in msgs[0] and "phantom" not in msgs[0]
 
 
 async def test_run_skips_re_derivation_when_a_geometry_layer_is_missing(tmp_path):
