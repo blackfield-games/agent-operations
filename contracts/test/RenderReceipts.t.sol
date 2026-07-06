@@ -295,6 +295,123 @@ contract ReentrantIssueRevokeEAS is IEAS {
     }
 }
 
+/// @dev Hostile EAS that reenters issueReceipts (the BATCH path) mid-`multiAttest` — the
+///      batch twin of ReentrantEAS / ReentrantIssueRevokeEAS. `reenterRevoke` false: reenter
+///      issueReceipts with an already-fenced jobId to prove the phase-1 `receiptIssued` fence
+///      is set for EVERY element BEFORE the external multiAttest, so a reentrant re-issue is
+///      rejected (DuplicateReceipt) even though the whole batch's attest window is still open.
+///      `reenterRevoke` true: reenter revokeReceipt in the same window — the receipt is fenced
+///      but its uid is not yet persisted (phase 3), so the uid==0 guard rejects it (NotIssued),
+///      not AlreadyRevoked. Returns the uids the outer call needs (MockEAS's derivation) so the
+///      outer batch completes cleanly and its post-state can be asserted.
+contract ReentrantMultiAttestEAS is IEAS {
+    RenderReceipts public target;
+    address public reEarner;
+    bytes32 public reJobId;
+    bool public reenterRevoke;
+    uint256 public multiAttestCalls;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    function arm(RenderReceipts target_, address earner_, bytes32 jobId_, bool reenterRevoke_) external {
+        target = target_;
+        reEarner = earner_;
+        reJobId = jobId_;
+        reenterRevoke = reenterRevoke_;
+    }
+
+    function attest(IEAS.AttestationRequest calldata) external payable returns (bytes32) {
+        revert("not implemented");
+    }
+
+    function revoke(IEAS.RevocationRequest calldata) external payable {
+        revert("not implemented");
+    }
+
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata multiRequests)
+        external
+        payable
+        returns (bytes32[] memory)
+    {
+        multiAttestCalls++;
+        if (!reentered) {
+            reentered = true;
+            if (reenterRevoke) {
+                try target.revokeReceipt(reJobId) {}
+                catch (bytes memory err) {
+                    reentryReverted = true;
+                    reentryRevertSelector = bytes4(err);
+                }
+            } else {
+                RenderReceipts.ReceiptRequest[] memory dup = new RenderReceipts.ReceiptRequest[](1);
+                dup[0] = RenderReceipts.ReceiptRequest(reEarner, reJobId, 1, 0, bytes32(0), bytes32(0));
+                try target.issueReceipts(dup) returns (bytes32[] memory) {}
+                catch (bytes memory err) {
+                    reentryReverted = true;
+                    reentryRevertSelector = bytes4(err);
+                }
+            }
+        }
+        // Return the flat uids the outer call expects, in submission order (MockEAS's derivation).
+        uint256 total;
+        for (uint256 g = 0; g < multiRequests.length; g++) {
+            total += multiRequests[g].data.length;
+        }
+        bytes32[] memory uids = new bytes32[](total);
+        uint256 k;
+        for (uint256 g = 0; g < multiRequests.length; g++) {
+            bytes32 schema = multiRequests[g].schema;
+            IEAS.AttestationRequestData[] calldata items = multiRequests[g].data;
+            for (uint256 i = 0; i < items.length; i++) {
+                uids[k++] = keccak256(abi.encode(schema, items[i].recipient, items[i].data));
+            }
+        }
+        return uids;
+    }
+}
+
+/// @dev Hostile fee token that reenters issueReceipts (the BATCH path) with an already-
+///      materialized jobId during the phase-4 fee `transferFrom` — the batch twin of
+///      ReentrantFeeToken. Proves the per-element fence still rejects a reentrant re-issue
+///      (DuplicateReceipt) in phase 4, after the batch's attestations are minted, when a
+///      malicious fee token gets control. The one-shot latch lets the outer route's second hop
+///      (RegionAuthority pulling from RenderReceipts) complete without recursing.
+contract ReentrantBatchFeeToken is ERC20 {
+    RenderReceipts public target;
+    address public reEarner;
+    bytes32 public reJobId;
+    bool public armed;
+    bool public reentered;
+    bool public reentryReverted;
+    bytes4 public reentryRevertSelector;
+
+    constructor() ERC20("ReentrantBatch", "REB") {
+        _mint(msg.sender, 1_000_000 ether);
+    }
+
+    function arm(RenderReceipts target_, address earner_, bytes32 jobId_) external {
+        target = target_;
+        reEarner = earner_;
+        reJobId = jobId_;
+        armed = true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        if (armed && !reentered) {
+            reentered = true;
+            RenderReceipts.ReceiptRequest[] memory dup = new RenderReceipts.ReceiptRequest[](1);
+            dup[0] = RenderReceipts.ReceiptRequest(reEarner, reJobId, 1, 0, bytes32(0), bytes32(0));
+            try target.issueReceipts(dup) returns (bytes32[] memory) {}
+            catch (bytes memory err) {
+                reentryReverted = true;
+                reentryRevertSelector = bytes4(err);
+            }
+        }
+        return super.transferFrom(from, to, amount);
+    }
+}
+
 contract MockSchemaRegistry is ISchemaRegistry {
     bytes32 public constant FIXED_UID = keccak256("blackfield.render.schema.v1");
 
@@ -1523,6 +1640,125 @@ contract RenderReceiptsTest is Test {
         assertEq(receipts.receiptCount(), 1);
         assertEq(receipts.receiptsByEarner(earner), 1);
         assertEq(eas.lastData(), abi.encode(earner, jobId, rs, jk, oh, bytes32(0)));
+    }
+
+    // --- batch issuance reentrancy: the multi-phase CEI proofs the single path already has ---
+    //
+    // issueReceipts is a 4-phase multiAttest with a structurally LARGER attest/fee window than
+    // the single issueReceipt: all N jobs are fenced-but-fee-pending across element 0's route.
+    // Its reentrancy safety rests entirely on phase ordering (fence in phase 1 BEFORE the
+    // external multiAttest; uid stays 0 until phase 3). These pin that ordering — the batch
+    // analog of test_issueReceipt_reentrant{Attest,RevokeDuringAttest,FeeToken}* — so a refactor
+    // that moved the fence out of phase 1 reddens here rather than shipping a double-issue.
+
+    /// @dev The batch twin of test_issueReceipt_reentrantAttestCannotDoubleIssue: a hostile EAS
+    ///      reenters issueReceipts with an already-batched jobId mid-multiAttest. Phase 1 fenced
+    ///      it before the external call, so the reentry hits DuplicateReceipt; the outer batch
+    ///      still issues exactly one receipt (one multiAttest, no double-issue).
+    function test_issueReceipts_reentrantMultiAttestCannotDoubleIssue() public {
+        ReentrantMultiAttestEAS reentrantEas = new ReentrantMultiAttestEAS();
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner, address(region), RENDER_FEE_RATE);
+
+        bytes32 jobId = keccak256("batch-reentrant-issue-job");
+        reentrantEas.arm(r, earner, jobId, false); // reenter issueReceipts (double-issue attempt)
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(reentrantEas), true); // the reentry's msg.sender is the EAS
+        vm.stopPrank();
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](1);
+        items[0] = _req(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.prank(coordinator);
+        r.issueReceipts(items);
+
+        assertTrue(reentrantEas.reentered());
+        assertTrue(reentrantEas.reentryReverted());
+        assertEq(reentrantEas.reentryRevertSelector(), RenderReceipts.DuplicateReceipt.selector);
+
+        // One multiAttest (the reentry reverted in phase 1, never reaching a second), one receipt.
+        assertEq(reentrantEas.multiAttestCalls(), 1);
+        assertEq(r.receiptCount(), 1);
+        assertEq(r.receiptsByEarner(earner), 1);
+    }
+
+    /// @dev The batch twin of test_issueReceipt_reentrantRevokeDuringAttestIsRejected: a hostile
+    ///      EAS reenters revokeReceipt mid-multiAttest, the window where the receipt is fenced
+    ///      (phase 1) but its uid is not yet persisted (phase 3). The uid==0 guard rejects it as
+    ///      NotIssued (not AlreadyRevoked), and the outer batch completes with one LIVE receipt.
+    function test_issueReceipts_reentrantRevokeDuringMultiAttestIsRejected() public {
+        ReentrantMultiAttestEAS reentrantEas = new ReentrantMultiAttestEAS();
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner, address(region), RENDER_FEE_RATE);
+
+        bytes32 jobId = keccak256("batch-reentrant-revoke-job");
+        reentrantEas.arm(r, earner, jobId, true); // reenter revokeReceipt mid-attest
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(reentrantEas), true);
+        vm.stopPrank();
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](1);
+        items[0] = _req(earner, jobId, 10, 0, bytes32(0), bytes32(0));
+
+        vm.prank(coordinator);
+        r.issueReceipts(items);
+
+        assertTrue(reentrantEas.reentered());
+        assertTrue(reentrantEas.reentryReverted());
+        assertEq(reentrantEas.reentryRevertSelector(), RenderReceipts.NotIssued.selector);
+
+        assertEq(r.receiptCount(), 1);
+        assertFalse(r.receiptRevoked(jobId));
+    }
+
+    /// @dev The batch twin of test_issueReceipt_reentrantFeeTokenCannotDoubleIssue: a hostile fee
+    ///      token reenters issueReceipts during the phase-4 fee pull, after the batch's
+    ///      attestations are minted. The per-element fence still rejects the re-issue
+    ///      (DuplicateReceipt); one receipt, one fee deposit — the fence holds under the pull.
+    function test_issueReceipts_reentrantFeeTokenCannotDoubleIssue() public {
+        ReentrantBatchFeeToken evil = new ReentrantBatchFeeToken(); // this test holds the supply
+        MockEAS localEas = new MockEAS();
+        RegionAuthority evilRegion = new RegionAuthority(address(evil), STAKE, owner);
+        RenderReceipts r = new RenderReceipts(address(localEas), owner, address(evilRegion), RENDER_FEE_RATE);
+
+        // Claim the region BEFORE arming, so claim's own transferFrom doesn't reenter.
+        evil.transfer(regionHolder, STAKE);
+        vm.startPrank(regionHolder);
+        evil.approve(address(evilRegion), STAKE);
+        evilRegion.claim(claimedRegion, STAKE);
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(evil), true); // the reentry's msg.sender is the token
+        vm.stopPrank();
+
+        evil.transfer(coordinator, 1 ether);
+        vm.prank(coordinator);
+        evil.approve(address(r), type(uint256).max);
+
+        bytes32 jobId = keccak256("batch-reentrant-fee-job");
+        evil.arm(r, earner, jobId);
+
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](1);
+        items[0] = _req(earner, jobId, 1, 0, bytes32(0), claimedRegionId);
+
+        vm.prank(coordinator);
+        r.issueReceipts(items);
+
+        assertTrue(evil.reentered());
+        assertTrue(evil.reentryReverted());
+        assertEq(evil.reentryRevertSelector(), RenderReceipts.DuplicateReceipt.selector);
+
+        // One receipt, one multiAttest, one deposit — the fence held under the hostile phase-4 pull.
+        assertEq(localEas.multiAttestCalls(), 1);
+        assertEq(r.receiptCount(), 1);
+        assertEq(evilRegion.accruedFees(claimedRegion), RENDER_FEE_RATE * 1);
     }
 
     // --- Ownable2Step ---
