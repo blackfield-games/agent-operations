@@ -25,7 +25,7 @@
 //!   completes a match pulls its whole roster under that lock — no concurrent join
 //!   can double-seat a participant or start a match a seat short.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -112,6 +112,81 @@ impl IdentityVerifier for StubIdentityVerifier {
         // never satisfy a ranked seat by coincidentally matching an empty allowlist
         // entry; otherwise require an exact match against the registered token.
         !token.is_empty() && self.authorized.get(agent_id).is_some_and(|t| t == token)
+    }
+}
+
+/// A point-in-time view of which agent identities are registered on-chain in the
+/// `AgentRegistry`, so the matchmaker can gate a ranked seat on registration
+/// *eligibility* — the arena mirror of the `AgentRegistry.isRegistered` check
+/// `MatchSettlement` enforces at match-open (`AgentNotRegistered`). Admitting a key
+/// holder whose address is *not* registered would form a ranked match that plays
+/// but can never settle on-chain; this snapshot lets that be caught at the door.
+///
+/// The matchmaker never calls the chain on its hot path: an operator loads the
+/// registered set out of band — replaying the registry's `Registered` /
+/// `Deregistered` events, or an `isRegistered` sweep — and refreshes it. Addresses
+/// are held lowercased and compared case-insensitively, matching
+/// [`verify_join_signature`]'s identity comparison (the recovered address is
+/// lowercase, compared `eq_ignore_ascii_case`), so `0xABC` and `0xabc` are the same
+/// registrant here as they are to the signature gate.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RegistrySnapshot {
+    registered: BTreeSet<String>,
+}
+
+impl RegistrySnapshot {
+    /// An empty snapshot — no identity registered. Distinct from *unenforced*: a
+    /// [`RegistryVerifier`] built over an empty snapshot rejects every ranked seat
+    /// (nobody is registered), whereas [`RegistryVerifier::unenforced`] does not gate
+    /// on registration at all. Keeping the two apart is deliberate — conflating
+    /// "no registrants" with "gate off" would silently admit everyone.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark `agent_id` as a registered on-chain identity. Lowercased on insert so
+    /// lookups are case-insensitive. Chainable, so a roster reads as one expression.
+    pub fn register(&mut self, agent_id: impl AsRef<str>) -> &mut Self {
+        self.registered.insert(agent_id.as_ref().to_ascii_lowercase());
+        self
+    }
+
+    /// Drop `agent_id` from the registered set — the mirror of the registry's
+    /// `Deregistered` event, so an event-driven updater can apply a deregistration
+    /// incrementally without rebuilding the whole snapshot. A no-op if it was not
+    /// registered.
+    pub fn deregister(&mut self, agent_id: impl AsRef<str>) -> &mut Self {
+        self.registered.remove(&agent_id.as_ref().to_ascii_lowercase());
+        self
+    }
+
+    /// Build a snapshot from an iterator of registered addresses — e.g. the
+    /// `Registered`-minus-`Deregistered` set replayed from the registry's event log,
+    /// or an `isRegistered` sweep of known agents.
+    pub fn from_addresses<I, S>(addrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut snapshot = Self::new();
+        for addr in addrs {
+            snapshot.register(addr);
+        }
+        snapshot
+    }
+
+    /// `true` iff `agent_id` is in the registered set (case-insensitive).
+    pub fn is_registered(&self, agent_id: &str) -> bool {
+        self.registered.contains(&agent_id.to_ascii_lowercase())
+    }
+
+    /// How many identities are registered.
+    pub fn len(&self) -> usize {
+        self.registered.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.registered.is_empty()
     }
 }
 
