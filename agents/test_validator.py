@@ -1861,6 +1861,13 @@ async def test_run_interiors_gate_degrades_on_a_missing_director(tmp_path):
 # vocabulary via _recognized_beats rather than a hardcoded keyword set.
 
 
+# The region-true mood line director.run seeds for the test REGION — it joins the region's per-region
+# beat phrases into exactly this free-form line. The run fixtures below carry it (not an arbitrary line)
+# so the director intent:beats re-derivation gate stays silent on the lighting-gate fixtures, reused from
+# director's OWN _region_beats so a BEAT_VOCAB/BEATS_SIZE/salt change flips it in lock-step.
+_REGION_BEATS_LINE = ". ".join(director._region_beats(REGION)) + "."
+
+
 # The recognition/density VARIETY these run gates once exercised is pinned at unit level (here and in
 # test_lighting.py), not through validator.run: the director intent:beats re-derivation gate below now
 # demands a region-true beats line on every well-formed director, and a region's beats are a FIXED
@@ -1885,8 +1892,9 @@ def test_lighting_beats_recognition_and_density_variety_are_unit_pinned():
 
 async def test_run_accepts_lighting_atmosphere_driven_by_recognized_beats(tmp_path):
     # FM1 (no false reject): the director names beats lighting models and lighting emits the
-    # Atmosphere driven by exactly those recognized tokens — nothing unmet, byte-clean.
-    beats = "scorched earth. drifting ash. recent conflict."
+    # Atmosphere driven by exactly those recognized tokens — nothing unmet, byte-clean. The
+    # region-true line keeps the new director intent:beats gate silent (it re-derives the same line).
+    beats = _REGION_BEATS_LINE
     layers = _set_with(tmp_path, {
         "director": _director_body(beats=beats),
         "lighting": _lighting_body(driven_by=lighting._recognized_beats(beats)),
@@ -1901,8 +1909,9 @@ async def test_run_rejects_a_dropped_atmosphere_and_routes_to_lighting(tmp_path)
     # Atmosphere (a stale layer authored before beats drove fog). The gate must catch it,
     # name lighting, and key the message off intent:beats (never "director", pipeline-earlier)
     # so the text-scan fallback agrees with the structured attribution and routes to lighting.
+    # The director line is region-true, so only the dropped-atmosphere (lighting) violation fires.
     layers = _set_with(tmp_path, {
-        "director": _director_body(beats="scorched earth. drifting ash. recent conflict."),
+        "director": _director_body(beats=_REGION_BEATS_LINE),
         "lighting": _lighting_body(driven_by=None),
     })
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
@@ -1917,7 +1926,7 @@ async def test_run_lighting_intent_gate_degrades_on_a_missing_lighting_layer(tmp
     # FM3 (missing-layer degrade): the director names recognized beats but lighting's FILE is
     # gone. The intent gate must skip the unreadable layer (never crash the final gate); the
     # missing-layer/well-formedness gate rejects and routes back to lighting.
-    bodies = {"director": _director_body(beats="scorched earth. drifting ash.")}
+    bodies = {"director": _director_body(beats=_REGION_BEATS_LINE)}
     verdict = await validator.run(
         _brief(), _set_with_missing(tmp_path, bodies, missing="lighting"), layers_root=tmp_path
     )
@@ -1932,8 +1941,9 @@ async def test_run_lighting_intent_gate_tracks_recognized_beats_vocabulary(tmp_p
     # Recompute the recognized tokens from the helper: a layer driven by them is accepted; one
     # driven by a STRICT SUBSET (a stale layer that lost a beat the director still names) is
     # rejected and routed back to lighting. Both halves recompute via the helper, so a future
-    # BEAT_FOG_DENSITY change flips the fixture's expectation in lock-step.
-    beats = "scorched earth. drifting ash. choking dust."
+    # BEAT_FOG_DENSITY change flips the fixture's expectation in lock-step. The director line is
+    # region-true (the new director-beats gate stays silent), so lighting is the only route-back target.
+    beats = _REGION_BEATS_LINE
     recognized = lighting._recognized_beats(beats)
     assert len(recognized) >= 2  # need a token to drop for the reject half
 
@@ -1966,9 +1976,9 @@ async def test_run_rejects_a_stale_lighting_density_and_routes_to_lighting(tmp_p
     # stale/tampered fog magnitude). The gate must catch it, name lighting, and key the message off
     # intent:beats (never a pipeline-earlier specialist) so the text-scan fallback agrees with the
     # structured attribution and routes back to lighting.
-    beats = "drifting ash. recent conflict."
+    beats = _REGION_BEATS_LINE  # region-true, so only the density (lighting) violation fires
     recognized = lighting._recognized_beats(beats)
-    wrong = lighting._fog_density(recognized) + 0.15  # 0.45 -> 0.60, far beyond abs_tol
+    wrong = lighting._fog_density(recognized) + 0.15  # well past abs_tol from what the beats sum to
     layers = _set_with(tmp_path, {
         "director": _director_body(beats=beats),
         "lighting": _lighting_body(driven_by=recognized, density=wrong),
@@ -1986,7 +1996,7 @@ async def test_run_lighting_density_not_reported_when_drivenby_already_wrong(tmp
     # the drivenBy-correct branch, so a layer with BOTH a stale drivenBy and a wrong density yields a
     # single lighting issue (the drivenBy one), never also a density complaint that double-routes the
     # same root cause.
-    beats = "scorched earth. drifting ash. recent conflict."
+    beats = _REGION_BEATS_LINE  # region-true, so the director-beats gate adds no competing issue
     recognized = lighting._recognized_beats(beats)
     layers = _set_with(tmp_path, {
         "director": _director_body(beats=beats),
@@ -2005,7 +2015,7 @@ async def test_run_lighting_density_tracks_the_fog_table_in_lock_step(tmp_path):
     # never a re-summed BEAT_FOG_DENSITY copy — a layer emitting exactly _fog_density(recognized) is
     # accepted while one off by a hundredth (> abs_tol) is rejected, both recomputed via the helper
     # so a future fog-table change flips the fixture's expectation in lock-step.
-    beats = "drifting ash. choking dust. distant storm."
+    beats = _REGION_BEATS_LINE  # region-true, so lighting is the only route-back target on the reject half
     recognized = lighting._recognized_beats(beats)
     expected = lighting._fog_density(recognized)
     assert len(recognized) >= 2  # premise: a non-trivial accumulated sum
