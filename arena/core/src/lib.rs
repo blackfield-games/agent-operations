@@ -3591,18 +3591,25 @@ pub fn ranked_field_delta(result: &MatchResult, ratings: &[i32], k: i32) -> Opti
     }
     let n = outcomes.len();
     let mut sums = vec![0i64; n];
+    // A forfeit DISQUALIFIES the whole team (its `placement` already demotes it below
+    // every clean team), so team-DQ — not the personal `forfeited` flag — gates the
+    // no-gain draw below. For a singleton team (FFA, team == seat) team-DQ is exactly
+    // the personal flag, so every FFA field/parity vector stays byte-identical.
+    let dq_teams: BTreeSet<TeamId> = outcomes.iter().filter(|o| o.forfeited).map(|o| o.team).collect();
     for i in 0..n {
         for j in (i + 1)..n {
-            // Two forfeiters draw their pairwise game: neither abandoned "better", so
-            // neither takes rating from the other. This is the FFA generalization of the
-            // 1v1 all-forfeit no-contest (see [`settlement`]) — a non-forfeiter still
-            // outplaces and beats a forfeiter (the DQ penalty holds, since `forfeited`
-            // never both-true against a survivor), but a higher-score leaver no longer
-            // gains over a lower-score one (closing the leave-with-a-lead exploit for the
-            // field). An all-forfeit field is then every-pair-a-draw ⇒ every delta zero, a
-            // true no-contest, and a two-seat all-forfeit result matches `ranked_delta`'s
-            // now-`Draw` settlement bit-for-bit.
-            let outcome = if outcomes[i].forfeited && outcomes[j].forfeited {
+            // Two seats on DQ'd teams draw their pairwise game: a forfeit disqualifies the
+            // whole team, so neither DQ'd team abandoned "better" and neither takes rating
+            // from the other — INCLUDING a non-forfeiting survivor on a DQ'd team, whose
+            // `placement` is its team's. Keying on the team (not the personal `forfeited`
+            // flag) closes leave-with-a-lead at the TEAM level: a 2v2 where both teams are
+            // DQ'd but one out-scores the other no longer lets the leader's leaver gain over
+            // the trailing team's honest survivor. A seat on a CLEAN team still outplaces and
+            // beats any DQ'd-team seat (the clean team is never in `dq_teams`, so the pair
+            // ranks by placement, and a DQ'd team places strictly below). An all-DQ field is
+            // then every-pair-a-draw ⇒ every delta zero, a true no-contest, and a two-seat
+            // all-forfeit result matches `ranked_delta`'s `Draw` settlement bit-for-bit.
+            let outcome = if dq_teams.contains(&outcomes[i].team) && dq_teams.contains(&outcomes[j].team) {
                 MatchOutcome::Draw
             } else if outcomes[i].placement < outcomes[j].placement {
                 MatchOutcome::WinA
