@@ -1985,7 +1985,14 @@ impl Match {
             };
             if intent.buttons.reload {
                 self.pawns[i].ammo = self.rules.mag_size;
-                self.pawns[i].cooldown = self.rules.fire_cooldown;
+                // Melee has no magazine: a reload refills the (unused) ammo but must NOT
+                // touch the cooldown — that field IS the melee swing gate, so re-arming it
+                // with the shorter fire_cooldown would let a swing->reload->swing loop
+                // out-cadence melee_cooldown. Ranged modes share fire_cooldown for both fire
+                // and reload, so this leaves the Hitscan/Projectile cycle byte-identical.
+                if self.rules.weapon_mode != WeaponMode::Melee {
+                    self.pawns[i].cooldown = self.rules.fire_cooldown;
+                }
                 continue;
             }
             if intent.buttons.fire && self.pawns[i].cooldown == 0 {
@@ -13614,6 +13621,48 @@ mod tests {
         assert_eq!(m.pawns[1].health, 10, "the first swing lands");
         step_with(&mut m, &[fire]);
         assert_eq!(m.pawns[1].health, 10, "a second swing within melee_cooldown is refused");
+    }
+
+    #[test]
+    fn melee_reload_does_not_shorten_the_swing_gate() {
+        // reload shares the `cooldown` field with the melee swing gate; a mode-blind reload
+        // once re-armed it to the SHORTER fire_cooldown, letting a swing->reload->swing loop
+        // beat melee_cooldown. In melee a reload now leaves the gate untouched (no magazine to
+        // refill), so the next swing still waits the full melee_cooldown.
+        let mut m = melee_match(2);
+        m.pawns[0].pos = Vec2::ZERO;
+        m.pawns[0].facing = EAST;
+        m.pawns[1].pos = Vec2 { x: POSITION_SCALE, y: 0 };
+        m.pawns[1].health = 10_000; // survives many swings — only the cadence is under test
+        assert!(
+            m.rules.fire_cooldown < m.rules.melee_cooldown,
+            "the fixture must have a SHORTER fire_cooldown, else the bug is invisible"
+        );
+        let swing = (0u8, intent(Vec2::ZERO, EAST, true));
+        let reload = (
+            0u8,
+            ActionIntent {
+                move_dir: Vec2::ZERO,
+                aim: EAST,
+                buttons: ActionButtons { fire: false, jump: false, ability: false, reload: true },
+            },
+        );
+        step_with(&mut m, &[swing]); // first swing lands, arms melee_cooldown
+        let hp1 = m.pawns[1].health;
+        assert!(hp1 < 10_000, "the first swing lands");
+        step_with(&mut m, &[reload]); // reload mid-cooldown must not reopen the gate early
+        // Under the bug the reload re-arms fire_cooldown and the next swing lands fire_cooldown
+        // ticks later; with the fix the gate stays closed the FULL melee_cooldown (mc-1 ticks
+        // decremented since the swing, minus the reload tick -> mc-2 more refusals here).
+        for i in 0..(m.rules.melee_cooldown - 2) {
+            step_with(&mut m, &[swing]);
+            assert_eq!(m.pawns[1].health, hp1, "refused swing {i}: the gate stays closed the full melee_cooldown despite the reload");
+        }
+        step_with(&mut m, &[swing]); // the gate is open exactly melee_cooldown ticks after the first swing
+        assert!(
+            m.pawns[1].health < hp1,
+            "the 2nd swing lands only after the full melee_cooldown — not fire_cooldown after the reload"
+        );
     }
 
     #[test]
