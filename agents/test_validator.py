@@ -2037,6 +2037,82 @@ async def test_run_lighting_density_tracks_the_fog_table_in_lock_step(tmp_path):
     assert _route_back_target(verdict) == "lighting"
 
 
+# ---- director intent:beats re-derivation: the PRODUCER twin of the lighting-beats CONSUMER gates ----
+#
+# The lighting gates above re-check lighting's fog against the director's OWN mood line, so a STALE line
+# lighting faithfully followed is invisible to them. These pin that the validator re-derives the line
+# ITSELF via director._region_beats off the brief: accepting a region-true line, rejecting a present stale
+# one (routed to director, the pipeline-earliest node), and staying silent on an absent line (the fog-less
+# fallback lighting owns). The beats twin of the director intent:factions re-derivation gate.
+
+
+async def test_run_accepts_a_region_true_director_beats_line(tmp_path):
+    # FM1 (no false reject): the director's mood line IS what the brief's region determines
+    # (director._region_beats joined), so the re-derivation gate stays silent and the world — with
+    # lighting's Atmosphere driven from it — validates end-to-end. The gate adds no false reject.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=_REGION_BEATS_LINE),
+        "lighting": _lighting_body(driven_by=lighting._recognized_beats(_REGION_BEATS_LINE)),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert not any("_region_beats" in i for i in verdict.issues)
+
+
+async def test_run_rejects_a_stale_director_beats_line_lighting_faithfully_followed(tmp_path):
+    # FM2 (the exploit the lighting gates structurally miss): the director ships a STALE mood line (authored
+    # for another region) and lighting faithfully drives its Atmosphere from it — drivenBy is exactly the
+    # stale line's recognized beats AND density is what they sum to — so the lighting drivenBy and density
+    # gates BOTH stay silent. Only re-deriving the line itself off the brief catches the wrong region's
+    # mood. Rejected, named director ALONE (lighting is blameless — it followed the line), routed to director.
+    stale = ". ".join(director._region_beats("r+0000_+0000_l0")) + "."
+    assert stale != _REGION_BEATS_LINE  # premise: a mood line from another region
+    recognized = lighting._recognized_beats(stale)  # exactly what lighting.run drives from reading it
+    assert recognized  # premise: lighting faithfully models the stale line (a non-empty Atmosphere)
+    layers = _set_with(tmp_path, {
+        "director": _director_body(beats=stale),
+        "lighting": _lighting_body(driven_by=recognized),  # density defaults to _fog_density(recognized)
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:beats" in i and "director._region_beats" in i for i in verdict.issues)
+    # lighting followed the line faithfully, so ONLY the director is blamed — the proof that the lighting
+    # gates stayed silent and the producer gate alone caught the stale line.
+    assert verdict.failing_specialists == ["director"]
+    assert _route_back_target(verdict) == "director"
+
+
+async def test_run_director_beats_gate_silent_without_a_line(tmp_path):
+    # FM3 (back-compat): a director that seeds NO intent:beats is the fog-less fallback lighting already
+    # owns — the re-derivation gate stays silent rather than demanding the line's presence (which would
+    # false-reject every placeholder / pre-beats director). Lighting's no-Atmosphere palette validates.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(),  # no intent:beats
+        "lighting": _lighting_body(driven_by=None),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert verdict.accepted, verdict.issues
+    assert not any("_region_beats" in i for i in verdict.issues)
+
+
+def test_director_beats_consistency_flags_a_stale_line_and_skips_an_absent_one(tmp_path):
+    # Unit-level (mirrors the factions gate's direct-call pin): the gate re-derives director._region_beats
+    # off the brief. A region-true line AND an absent line both yield [] (no false reject; the fog-less
+    # fallback is lighting's concern); a PRESENT stale line yields exactly one director-named issue.
+    def issues(beats):
+        bodies = {"director": _director_body(beats=beats)} if beats is not None else {}
+        layers = _set_with(tmp_path, bodies)
+        return validator._director_beats_consistency(_brief(), layers, tmp_path)
+
+    assert issues(_REGION_BEATS_LINE) == []  # region-true: silent
+    assert issues(None) == []  # absent line: silent (the fallback)
+    other = ". ".join(director._region_beats("r+0000_+0000_l0")) + "."
+    assert other != _REGION_BEATS_LINE  # premise: a genuinely different region's line
+    stale = issues(other)  # present + wrong: one issue naming director + the helper
+    assert len(stale) == 1
+    assert "director" in stale[0] and "_region_beats" in stale[0]
+
+
 # ---- terrain triangle self-consistency: the metric must match the declared heightfield ----
 #
 # Defense-in-depth across the terrain trust boundary, the geometry-emitter twin of the budget
