@@ -1353,6 +1353,50 @@ mod tests {
     }
 
     #[test]
+    fn registry_snapshot_membership_is_case_insensitive() {
+        // The registered set must agree with verify_join_signature's identity
+        // comparison (recovered address is lowercase, compared eq_ignore_ascii_case),
+        // so a registrant stored under one casing matches a join claiming another.
+        let mut snap = RegistrySnapshot::new();
+        snap.register("0xABC");
+        assert!(snap.is_registered("0xABC"), "same casing");
+        assert!(snap.is_registered("0xabc"), "lowercased claim matches");
+        assert!(snap.is_registered("0xAbC"), "mixed casing matches");
+        assert!(!snap.is_registered("0xdef"), "an unregistered address is not a member");
+    }
+
+    #[test]
+    fn registry_snapshot_from_addresses_dedups_by_casing() {
+        // Two casings of one address are one registrant, not two — otherwise a
+        // deregistration under one casing would leave the other live.
+        let snap = RegistrySnapshot::from_addresses(["0xA", "0xa", "0xB"]);
+        assert_eq!(snap.len(), 2, "0xA and 0xa collapse to one member");
+        assert!(snap.is_registered("0xa"));
+        assert!(snap.is_registered("0xb"));
+    }
+
+    #[test]
+    fn registry_snapshot_deregister_removes_and_is_a_noop_when_absent() {
+        // Mirrors the registry's Deregistered event: an event-driven updater drops a
+        // member incrementally (case-insensitively), and dropping an absent one is
+        // harmless.
+        let mut snap = RegistrySnapshot::from_addresses(["0xA", "0xB"]);
+        snap.deregister("0xa");
+        assert!(!snap.is_registered("0xA"), "deregistered case-insensitively");
+        assert_eq!(snap.len(), 1);
+        snap.deregister("0xnever");
+        assert_eq!(snap.len(), 1, "deregistering a non-member is a no-op");
+    }
+
+    #[test]
+    fn registry_snapshot_new_is_empty_and_registers_no_one() {
+        let snap = RegistrySnapshot::new();
+        assert!(snap.is_empty());
+        assert_eq!(snap.len(), 0);
+        assert!(!snap.is_registered("0xanything"), "an empty snapshot registers no identity");
+    }
+
+    #[test]
     fn join_request_constructors_set_kind_and_token() {
         let h = JoinRequest::human("alice");
         assert_eq!(h.kind, ControllerKind::Human);
@@ -2741,6 +2785,127 @@ mod tests {
         assert!(
             matches!(mm.join(MatchMode::Agent, b"chal", casual()), Err(JoinError::Unauthenticated { .. })),
             "an empty signature is not a ranked claim"
+        );
+    }
+
+    #[test]
+    fn registry_verifier_requires_both_registration_and_inner() {
+        // Compose over the stub inner (no crypto) to exercise the four arms: only a
+        // registered identity whose inner check also passes is admitted.
+        let mut inner = StubIdentityVerifier::new();
+        inner.authorize("0xa", "tok");
+        inner.authorize("0xb", "tok");
+        let v = RegistryVerifier::enforcing(inner, RegistrySnapshot::from_addresses(["0xa"]));
+
+        assert!(v.verify("0xa", b"n", "tok"), "registered AND possessed is admitted");
+        assert!(!v.verify("0xa", b"n", "wrong"), "registered but wrong token — no possession — rejected");
+        assert!(!v.verify("0xb", b"n", "tok"), "possessed but UNREGISTERED rejected (the new gate)");
+        assert!(!v.verify("0xc", b"n", "tok"), "neither registered nor possessed rejected");
+    }
+
+    #[test]
+    fn registry_verifier_unenforced_delegates_to_inner() {
+        let mut inner = StubIdentityVerifier::new();
+        inner.authorize("0xa", "tok");
+        let open = RegistryVerifier::unenforced(inner.clone());
+        assert!(open.verify("0xa", b"n", "tok"), "unenforced admits whatever inner admits");
+        assert!(!open.verify("0xa", b"n", "wrong"), "the inner possession check still gates");
+        assert!(!open.verify("0xb", b"n", "tok"), "an unauthorized identity is still rejected");
+
+        // An EMPTY *enforcing* snapshot is not the same as unenforced: it registers no
+        // one, so it rejects even the authorized identity — conflating the two would
+        // silently admit everyone.
+        let closed = RegistryVerifier::enforcing(inner, RegistrySnapshot::new());
+        assert!(!closed.verify("0xa", b"n", "tok"), "an empty registered set rejects the authorized");
+    }
+
+    fn registered_mm(registered: &[String]) -> Matchmaker<RegistryVerifier<SignatureVerifier>> {
+        let snap = RegistrySnapshot::from_addresses(registered.iter());
+        Matchmaker::new(RegistryVerifier::enforcing(SignatureVerifier, snap), MatchParams::default())
+    }
+
+    #[test]
+    fn agent_mode_admits_a_registered_key_holder() {
+        // End to end on the real verifier: two registered key holders form a ranked
+        // match. addr_a is registered under UPPERCASE to prove the snapshot's
+        // case-insensitivity agrees with the recovered (lowercase) address.
+        let (a, b) = (agent_key(), other_key());
+        let (addr_a, addr_b) = (agent_addr(&a), agent_addr(&b));
+        let mm = registered_mm(&[addr_a.to_uppercase(), addr_b.clone()]);
+        let (nonce_a, nonce_b): (&[u8], &[u8]) = (b"chal-a", b"chal-b");
+        let sig_a = sign_join(&a, PROTOCOL_VERSION, &addr_a, nonce_a);
+        let sig_b = sign_join(&b, PROTOCOL_VERSION, &addr_b, nonce_b);
+        assert!(mm
+            .join(MatchMode::Agent, nonce_a, JoinRequest::ranked_agent(addr_a.as_str(), sig_a))
+            .unwrap()
+            .is_queued());
+        let m = mm
+            .join(MatchMode::Agent, nonce_b, JoinRequest::ranked_agent(addr_b.as_str(), sig_b))
+            .unwrap()
+            .into_formed()
+            .expect("two registered signed agents form a ranked match");
+        assert_eq!(m.phase(), MatchPhase::Live);
+    }
+
+    #[test]
+    fn agent_mode_rejects_an_unregistered_key_holder() {
+        // The heart of this task: an agent that HOLDS its key and signs correctly is
+        // still rejected at ranked admission when its address is not registered — the
+        // match it would form could never settle (MatchSettlement AgentNotRegistered).
+        let a = agent_key();
+        let addr_a = agent_addr(&a);
+        let mm = registered_mm(&[agent_addr(&other_key())]); // some OTHER agent is registered
+        let nonce: &[u8] = b"chal-a";
+        let sig_a = sign_join(&a, PROTOCOL_VERSION, &addr_a, nonce);
+        assert!(
+            matches!(
+                mm.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(addr_a.as_str(), sig_a)),
+                Err(JoinError::Unauthenticated { .. })
+            ),
+            "a key-holder that is not registered is rejected at ranked admission"
+        );
+        assert_eq!(mm.waiting(MatchMode::Agent), 0, "the unregistered claim never entered the queue");
+    }
+
+    #[test]
+    fn agent_mode_registration_does_not_replace_possession() {
+        // The victim address IS registered, but the attacker holds a different key and
+        // signs claiming the victim. Recovery yields the attacker's address, so the
+        // inner possession check fails — registration alone never admits a forger.
+        let victim = agent_addr(&agent_key());
+        let mm = registered_mm(std::slice::from_ref(&victim));
+        let nonce: &[u8] = b"chal";
+        let forged = sign_join(&other_key(), PROTOCOL_VERSION, &victim, nonce);
+        assert!(
+            matches!(
+                mm.join(MatchMode::Agent, nonce, JoinRequest::ranked_agent(victim.as_str(), forged)),
+                Err(JoinError::Unauthenticated { .. })
+            ),
+            "a registered address still requires proven possession"
+        );
+        assert_eq!(mm.waiting(MatchMode::Agent), 0);
+    }
+
+    #[test]
+    fn unenforced_registry_verifier_matches_the_bare_signature_gate() {
+        // A matchmaker over an unenforced RegistryVerifier forms the same ranked match
+        // a bare SignatureVerifier does — no registration configured = prior behaviour.
+        let mm = Matchmaker::new(RegistryVerifier::unenforced(SignatureVerifier), MatchParams::default());
+        let (a, b) = (agent_key(), other_key());
+        let (addr_a, addr_b) = (agent_addr(&a), agent_addr(&b));
+        let (nonce_a, nonce_b): (&[u8], &[u8]) = (b"chal-a", b"chal-b");
+        let sig_a = sign_join(&a, PROTOCOL_VERSION, &addr_a, nonce_a);
+        let sig_b = sign_join(&b, PROTOCOL_VERSION, &addr_b, nonce_b);
+        assert!(mm
+            .join(MatchMode::Agent, nonce_a, JoinRequest::ranked_agent(addr_a.as_str(), sig_a))
+            .unwrap()
+            .is_queued());
+        assert!(
+            mm.join(MatchMode::Agent, nonce_b, JoinRequest::ranked_agent(addr_b.as_str(), sig_b))
+                .unwrap()
+                .into_formed()
+                .is_some(),
+            "unenforced admits signed seats exactly like the bare gate"
         );
     }
 
