@@ -4238,6 +4238,35 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
 
+    #[test]
+    fn validate_args_rejects_zero_valued_startup_knobs() {
+        // Every Args field defaults, so parse_from with no flags is the valid baseline.
+        assert!(validate_args(&Args::parse_from(["coordinator"])).is_ok(), "the defaults must validate");
+
+        // The reaper is always spawned and tokio::time::interval panics on a zero
+        // period, so a zero reap interval is a hard startup error, not a silent dead
+        // task. The reject must name the knob so an operator can fix it.
+        let mut a = Args::parse_from(["coordinator"]);
+        a.reap_interval_secs = 0;
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(err.contains("reap_interval_secs"), "the reject must name the knob: {err}");
+
+        // The two siblings this consolidates stay guarded.
+        let mut a = Args::parse_from(["coordinator"]);
+        a.relay_batch_size = 0;
+        assert!(validate_args(&a).is_err(), "a zero relay_batch_size is still rejected");
+        let mut a = Args::parse_from(["coordinator"]);
+        a.http_body_timeout_secs = 0;
+        assert!(validate_args(&a).is_err(), "a zero http_body_timeout_secs is still rejected");
+
+        // The dev-mock relay/spender intervals are NOT startup-rejected — they clamp
+        // to a 1s floor at their spawn site — so a zero there must still validate.
+        let mut a = Args::parse_from(["coordinator"]);
+        a.relay_interval_secs = 0;
+        a.spender_interval_secs = 0;
+        assert!(validate_args(&a).is_ok(), "the dev-mock intervals clamp at spawn, not at validation");
+    }
+
     /// The common [`StoreConfig`] the test helpers build on: the test-chosen
     /// attempt/fault/TTL knobs plus the production defaults. Tests that exercise one
     /// knob override just that field via struct-update (`StoreConfig { knob: x,
