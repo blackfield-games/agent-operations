@@ -106,6 +106,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     event MinterSet(address indexed minter);
     event MintFeeRateSet(uint256 rate);
     event RoyaltyRateSet(uint256 rate);
+    event URISet(string uri);
     event RoyaltyRouted(uint256 indexed templateId, uint256 indexed regionId, uint256 amount);
 
     error NotMinter();
@@ -178,8 +179,13 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         emit RoyaltyRateSet(rate);
     }
 
+    /// @notice Owner rotates the ERC1155 metadata base for every token. OZ's `_setURI`
+    ///         assigns storage and emits nothing, so this is the only signal an off-chain
+    ///         indexer keying its artifact-metadata cache off config events (as it does for
+    ///         `MintFeeRateSet`/`RoyaltyRateSet`) gets that the base moved.
     function setURI(string calldata newURI) external onlyOwner {
         _setURI(newURI);
+        emit URISet(newURI);
     }
 
     /// @param maxSupply Hard cap on cumulative units mintable for this template;
