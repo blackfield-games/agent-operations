@@ -324,6 +324,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_scheme_char_url() {
+        // A NON-empty scheme over a NON-empty remainder is still refused when the
+        // scheme carries a byte outside the RFC-3986 set (alphanumeric plus `+-.`):
+        // `is_fetchable_url` gates on `scheme.bytes().all(...)`. These cases trip ONLY
+        // that clause — the emptiness clauses (pinned by the sibling `rejects_*_url`
+        // tests) all pass — so this pins the scheme-char check that would otherwise be a
+        // silent mutation escape (dropping the `.all(...)` predicate reddens only here).
+        for url in ["ht tp://host", "htt!p://host", "ht*tp://host"] {
+            let mut r = valid();
+            r.output_url = url.into();
+            assert_eq!(
+                validate_result(&r),
+                Err(ValidationError::MalformedOutputUrl),
+                "{url} has an invalid scheme char and must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn accepts_https_and_ipfs_urls() {
         for url in ["https://cdn.blackfield.games/x.usda", "ipfs://bafy123", "ar://tx"] {
             let mut r = valid();
