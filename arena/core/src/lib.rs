@@ -9643,6 +9643,62 @@ mod tests {
     }
 
     #[test]
+    fn a_projectile_does_not_strike_a_body_behind_the_muzzle() {
+        // The directional gate — the projectile twin of hitscan's `dot <= 0` and melee's
+        // frontal arc. Without it, segment_hits_disc's start-half-disc strikes any body
+        // within hit_radius of the launch point in ANY direction, so a shot fired EAST
+        // hits a point-blank enemy standing to the WEST in the back. The gate drops a
+        // strictly-behind body (along < 0) while keeping the abeam point-blank side-clip
+        // (along == 0, the `< 0` not `<= 0` boundary) and every forward hit.
+        let radius = Rules::default().hit_radius; // 1500 (1.5 m)
+
+        // Fire EAST from the origin with the sole enemy at `enemy`; fly the shot out and
+        // report whether it damaged the enemy.
+        let fires_and_hits = |enemy: Vec2| {
+            let rules = Rules { weapon_mode: WeaponMode::Projectile, spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            for p in &mut m.pawns {
+                match p.seat {
+                    0 => {
+                        p.pos = Vec2::ZERO;
+                        p.facing = EAST;
+                    }
+                    1 => p.pos = enemy,
+                    _ => {}
+                }
+            }
+            let before = m.pawns.iter().find(|p| p.seat == 1).unwrap().health;
+            step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, true))]);
+            let mut ticks = 0;
+            while !m.projectiles.is_empty() && ticks < 50 {
+                step_with(&mut m, &[]);
+                ticks += 1;
+            }
+            m.pawns.iter().find(|p| p.seat == 1).unwrap().health < before
+        };
+
+        // Behind the muzzle (1 m due WEST, inside the body radius): the shot flies AWAY,
+        // so the enemy is NOT struck — the back-shot the gate closes (along = -1000·vx < 0).
+        let behind = Vec2 { x: -POSITION_SCALE, y: 0 };
+        assert!(within(Vec2::ZERO, behind, radius), "the behind body is within hit_radius of the muzzle — only the gate spares it");
+        assert!(!fires_and_hits(behind), "a shot fired east does not strike a body behind the muzzle");
+
+        // Dead in front (5 m EAST): a plain forward hit, untouched by the gate.
+        assert!(fires_and_hits(Vec2 { x: 5 * POSITION_SCALE, y: 0 }), "a forward target is still hit");
+
+        // Abeam the muzzle (1 m due NORTH, inside the body radius): along == 0, kept — the
+        // disc's point-blank side-clip, matching melee. This pins the `< 0` boundary: an
+        // over-tight `<= 0` would wrongly spare it.
+        let abeam = Vec2 { x: 0, y: POSITION_SCALE };
+        assert!(within(Vec2::ZERO, abeam, radius), "the abeam body overlaps the muzzle");
+        assert!(fires_and_hits(abeam), "a body abeam the muzzle (along == 0) is still clipped — the point-blank side-hit");
+
+        // Perpendicular forward clip (1 m north of a point 5 m ahead): the sweep passes
+        // within radius with a forward projection (along > 0) — still a hit.
+        assert!(fires_and_hits(Vec2 { x: 5 * POSITION_SCALE, y: POSITION_SCALE }), "a forward side-clip still hits");
+    }
+
+    #[test]
     fn a_clean_shot_expires_past_weapon_range() {
         // FM4: a shot that hits nothing flies until it has travelled past weapon_range,
         // then leaves the live set — it does not accumulate forever.
