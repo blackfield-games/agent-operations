@@ -283,6 +283,37 @@ mod tests {
         assert_eq!(verify_signature(&job_a, hash, &dev_address(), &sig_for_a), Ok(()));
     }
 
+    #[test]
+    fn pre_tag_result_signature_is_rejected() {
+        // The domain-tag cutover, from the verifier's side: a signature made over
+        // the pre-v1 preimage keccak256(job_id || output_hash) — the form every
+        // result signature committed to before `signing_digest` gained its
+        // b"blackfield/result/v1" tag — must no longer validate. The coordinator
+        // recomputes the tagged digest, recovers a different key, and rejects it.
+        // The intended hard cutover, exactly like hello v1->v2; both the signer and
+        // this verifier share the one constructor, so there is no mirror left behind.
+        let sk = dev_key();
+        let job_id = Uuid::new_v4();
+        let hash = "abc123";
+
+        let pre_tag_digest: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(job_id.as_bytes());
+            h.update(hash.as_bytes());
+            h.finalize().into()
+        };
+        let stale_sig = sign_digest_for_test(&sk, &pre_tag_digest);
+        assert_eq!(
+            verify_signature(&job_id, hash, &dev_address(), &stale_sig),
+            Err(VerifyError::AddressMismatch),
+        );
+
+        // Sanity: the same signer over the CURRENT tagged digest still verifies, so
+        // the rejection is the cutover, not a broken key or signer.
+        let current_sig = sign(&sk, &job_id, hash);
+        assert_eq!(verify_signature(&job_id, hash, &dev_address(), &current_sig), Ok(()));
+    }
+
     /// 256-bit big-endian `a - b` (a >= b). Used to flip a low-S signature to its
     /// malleable high-S counterpart `s' = n - s` without pulling in scalar types.
     fn be_sub(a: &[u8; 32], b: &[u8]) -> [u8; 32] {
