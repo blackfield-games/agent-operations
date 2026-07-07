@@ -655,6 +655,60 @@ async def test_run_rejects_a_directive_shedding_a_floor_layer(tmp_path):
     assert any("floor layer" in i and "terrain" in i for i in verdict.issues), verdict.issues
 
 
+async def test_run_rejects_a_directive_shedding_a_layer_twice(tmp_path):
+    # The multiplicity sibling of the fabricated reductions: four ratio-legal LOD3 sheds, but PROP
+    # is recorded TWICE. _opt_reductions sums (authored - effective) with no dedup and no per-layer
+    # cap, and _budget_self_consistency ties only the TOTAL to the summed geometry, so prop is
+    # credited a 168000 reduction (84000 twice) though it can physically give only 84000. Σreductions
+    # 381500 (biome 87500 + prop 84000 + npc 126000 + prop 84000); observed set to 602144 - 381500 =
+    # 220644, under the 300000 budget. Every existing gate passes: each names a real sheddable,
+    # authored == its metric, scale/effective ratio-legal, observed == authored - Σreduction. But the
+    # world is genuinely over budget — even fully shed it renders at 262144 + 12500 + 12000 + 18000 =
+    # 304644 > 300000. The multiplicity check rejects the repeat and routes back to optimization.
+    directives = (
+        '\n\n    def Scope "LodDirectives"\n    {\n'
+        '        def Scope "Lod_0"\n        {\n'
+        '            custom string specialist = "biome"\n'
+        '            custom string layer = "biome/r.usda"\n'
+        "            custom int lodLevel = 3\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 100000.0\n"
+        "            custom double effectiveTriangles = 12500.0\n"
+        "        }\n"
+        '        def Scope "Lod_1"\n        {\n'
+        '            custom string specialist = "prop"\n'
+        '            custom string layer = "prop/r.usda"\n'
+        "            custom int lodLevel = 3\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 96000.0\n"
+        "            custom double effectiveTriangles = 12000.0\n"
+        "        }\n"
+        '        def Scope "Lod_2"\n        {\n'
+        '            custom string specialist = "npc"\n'
+        '            custom string layer = "npc/r.usda"\n'
+        "            custom int lodLevel = 3\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 144000.0\n"
+        "            custom double effectiveTriangles = 18000.0\n"
+        "        }\n"
+        '        def Scope "Lod_3"\n        {\n'
+        '            custom string specialist = "prop"\n'
+        '            custom string layer = "prop/r.usda"\n'
+        "            custom int lodLevel = 3\n"
+        "            custom double lodScale = 0.125\n"
+        "            custom double authoredTriangles = 96000.0\n"
+        "            custom double effectiveTriangles = 12000.0\n"
+        "        }\n    }"
+    )
+    observed = SUMMED_PRIOR - 381_500.0  # 220644, under budget
+    body = _opt_body(budget=300_000, authored=SUMMED_PRIOR, observed=observed, over_budget=False, directives=directives)
+    verdict = await validator.run(_brief(), _opt_override(tmp_path, body=body), layers_root=tmp_path)
+    assert not verdict.accepted
+    assert "optimization" in verdict.failing_specialists
+    assert _route_back_target(verdict) == "optimization"
+    assert any("already shed" in i and "prop" in i for i in verdict.issues), verdict.issues
+
+
 def test_lod_directive_grounding_flags_inflated_and_phantom_authored():
     # The per-directive authored grounding, which runs ONLY when a prior-triangle map is passed
     # (the run() path): a directive whose authoredTriangles equals the named layer's real metric is
@@ -698,6 +752,30 @@ def test_lod_directive_grounding_rejects_a_floor_layer_shed():
     stale = _lod_directive(level=1, scale=0.5, authored=50000.0, effective=25000.0, specialist="terrain")
     msgs = validator._lod_directive_legality("optimization/r.usda", stale, {"biome": 100000.0})
     assert len(msgs) == 1 and "floor layer" in msgs[0] and "phantom" not in msgs[0]
+
+
+def test_lod_directive_grounding_rejects_a_double_shed():
+    # The multiplicity twin of the per-directive grounding: _opt_reductions sums (authored -
+    # effective) over every Lod_N block with no dedup or per-layer cap, and the sum re-derivation
+    # ties only the TOTAL to the summed geometry — so two ratio-legal directives naming the SAME
+    # layer double-count its reduction (a specialist is shed at most once; _resolve emits one
+    # directive per sheddable index). The repeat is rejected and NAMED; the first, and a single
+    # shed of a distinct layer, stay silent. Runs only with the map (the grounding path); ordered
+    # last so a floored/phantom/inflated repeat is reported for its own reason, not as a dup.
+    prior = {"biome": 100000.0, "prop": 96000.0}
+
+    first = _lod_directive(level=3, scale=0.125, authored=96000.0, effective=12000.0, specialist="prop")
+    repeat = _lod_directive(level=3, scale=0.125, authored=96000.0, effective=12000.0, specialist="prop", name="Lod_1")
+    msgs = validator._lod_directive_legality("optimization/r.usda", f"{first}\n{repeat}", prior)
+    assert len(msgs) == 1 and "already shed" in msgs[0] and "prop" in msgs[0]
+    assert "Lod_1" in msgs[0]  # the repeat is flagged, not the first legal shed
+
+    # a distinct second layer is not a repeat — both shed once, both grounded
+    biome = _lod_directive(level=1, scale=0.5, authored=100000.0, effective=50000.0, specialist="biome", name="Lod_1")
+    assert validator._lod_directive_legality("optimization/r.usda", f"{first}\n{biome}", prior) == []
+
+    # no map -> legality-only, the multiplicity check skipped like the rest of the grounding
+    assert validator._lod_directive_legality("optimization/r.usda", f"{first}\n{repeat}") == []
 
 
 async def test_run_skips_re_derivation_when_a_geometry_layer_is_missing(tmp_path):
