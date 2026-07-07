@@ -1375,6 +1375,28 @@ async def test_run_rejects_a_dropped_must_have_and_routes_to_prop(tmp_path):
     assert _route_back_target(verdict) == "prop"
 
 
+async def test_run_rejects_an_over_placed_required_asset_and_routes_to_prop(tmp_path):
+    # FM1/FM2 (false accept, the equality complement of the dropped case): prop places BOTH
+    # must-haves — but also a DUPLICATE comms_tower_01 and an unrequested (real, in ASSET_TRIS)
+    # fuel_depot_01. The must-have gate is satisfied (all demanded present) and a triangle-honest
+    # metric would price the extra markers, so only the exact-multiset check catches a region
+    # carrying MORE than its must-have set. Reject and name prop — never director, or a "director"
+    # mention in the message would misroute the route-back to the director loop.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_have="comms_tower,convoy_wreck"),
+        "prop": _prop_body(["comms_tower_01", "convoy_wreck_01", "comms_tower_01", "fuel_depot_01"]),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any(
+        "over-placed" in i and "comms_tower_01" in i and "fuel_depot_01" in i for i in verdict.issues
+    )
+    assert "prop" in verdict.failing_specialists
+    assert not any("director" in i for i in verdict.issues)  # must not misroute to the director loop
+    assert _failing_specialist(verdict.issues) == "prop"
+    assert _route_back_target(verdict) == "prop"
+
+
 async def test_run_rejects_an_uncapped_biome_under_a_capping_director(tmp_path):
     # FM2 (false accept, biome twin): the director's must_not carries the cap token but
     # biome emits no vegetationCapped marker — rejected and routed back to biome.
