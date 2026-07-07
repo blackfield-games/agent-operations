@@ -1660,6 +1660,23 @@ mod tests {
     }
 
     #[test]
+    fn sign_join_matches_the_committed_golden() {
+        // The signature twin of join_digest_matches_the_committed_golden. RFC6979 is
+        // deterministic, so k256's sign_prehash_recoverable must emit the exact 65
+        // [r||s||v] bytes the Python SDK pins (_GOLDEN_SIG) for the same key over the
+        // same digest — the shared dev_key()/dev_address()/CHAL fixture. This pins
+        // signature DETERMINISM (RFC6979 k, low-S, recovery id), not merely a valid
+        // sig: a non-deterministic or high-S signer would emit different bytes and this
+        // absolute pin catches it — if the two sides diverge, the SDK produces a
+        // signature the Gateway won't admit. A legit signing change regenerates both
+        // sides in lock-step.
+        assert_eq!(
+            sign_join(&dev_key(), PROTOCOL_VERSION, &dev_address(), CHAL),
+            "3916c5207f17a13677b955c5179113ffbf054b56ad9953f47c187d5f58e11673634419a9a57b018ff14c85bda46716b1706d318fa1411b84f2c33989eb55493101"
+        );
+    }
+
+    #[test]
     fn version_handshake_accepts_match_and_rejects_drift() {
         assert!(check_version(PROTOCOL_VERSION).is_ok());
         // A peer one version ahead or behind is rejected with both versions
