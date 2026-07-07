@@ -11,16 +11,31 @@ use uuid::Uuid;
 /// the coordinator. Both sides MUST agree byte-for-byte, so the construction is
 /// fixed here and shared.
 ///
-/// Message bytes = `job_id` (16 raw bytes, UUID big-endian) || `output_hash`
-/// (the ASCII bytes of the lowercase hex string, e.g. the 64 chars of a sha256
-/// digest). The digest is `keccak256(message)`.
+/// Bytes = `keccak256( DOMAIN || job_id (16 raw bytes, UUID big-endian) ||
+/// len(output_hash) || output_hash )`, where `DOMAIN` is `b"blackfield/result/v1"`
+/// and `len` is a big-endian `u32`. `output_hash` is the ASCII bytes of the
+/// lowercase hex string (e.g. the 64 chars of a sha256 digest), length-prefixed
+/// so a future bound field can never alias across its boundary; `job_id` is a
+/// fixed-width 16 bytes, so — like [`hello_digest`]'s fixed-width `vram_gb` — it
+/// carries no length prefix.
 ///
-/// Note we hash the hex *string* bytes of `output_hash`, not the decoded
-/// digest, because `output_hash` is carried on the wire as a hex string and we
-/// want the signature to commit to exactly what is transmitted.
+/// The `DOMAIN` tag separates this from [`hello_digest`] (parity with the twin),
+/// so a result attestation can never double as a registration signature. The
+/// `v1` version fixes the migration path: a future `v2` retires `v1` in lockstep
+/// so a stale signature can never validate, exactly as `hello_digest`'s `v2`
+/// retired its pre-nonce `v1`. Because the tag is folded into the signed bytes,
+/// adding it is a HARD CUTOVER — every pre-tag result signature is invalidated;
+/// the earner signer and the coordinator verifier share this one constructor, so
+/// they move together.
+///
+/// We hash the hex *string* bytes of `output_hash`, not the decoded digest,
+/// because `output_hash` is carried on the wire as a hex string and the signature
+/// should commit to exactly what is transmitted.
 pub fn signing_digest(job_id: &Uuid, output_hash: &str) -> [u8; 32] {
     let mut hasher = Keccak256::new();
+    hasher.update(b"blackfield/result/v1");
     hasher.update(job_id.as_bytes());
+    hasher.update((output_hash.len() as u32).to_be_bytes());
     hasher.update(output_hash.as_bytes());
     hasher.finalize().into()
 }
