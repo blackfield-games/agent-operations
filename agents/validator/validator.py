@@ -635,8 +635,8 @@ def _intent_attributions(
     # for the recognizer — lossless, since _recognized_beats re-tokenizes on every
     # non-alphanumeric (comma included), so the split-then-join round-trips to the raw line.
     recognized = lighting._recognized_beats(" ".join(_director_intent(layers, layers_root, "beats")))
+    lighting_text = _layer_text(layers, "lighting", layers_root)
     if recognized:
-        lighting_text = _layer_text(layers, "lighting", layers_root)
         if lighting_text is not None:
             atmosphere = re.search(r'def Volume "Atmosphere"\s*\{(.*?)\}', lighting_text, re.DOTALL)
             driven = re.search(r'drivenBy\s*=\s*"([^"]*)"', atmosphere.group(1)) if atmosphere else None
@@ -675,6 +675,19 @@ def _intent_attributions(
                         f"the {expected:.2f} its recognized beats {recognized} sum to "
                         f"(a stale or tampered fog magnitude); re-run lighting",
                     ))
+    elif lighting_text is not None and re.search(r'def Volume "Atmosphere"', lighting_text):
+        # The empty-recognized mirror of the drivenBy equality above: with no modeled beat,
+        # lighting.run emits the fog-less palette (no Atmosphere), so a layer that carries one
+        # fabricates fog for a mood no beat seeded — a stale/tampered layer. The drivenBy check
+        # guards only the non-empty case (recorded != set(recognized)); this closes the empty
+        # case so the gate enforces the Atmosphere↔recognized equality both ways. Keyed off
+        # intent:beats and names lighting (never a pipeline-earlier specialist) so the text-scan
+        # fallback agrees with the structured attribution.
+        out.append((
+            "lighting",
+            "intent:beats unmet: lighting drives an Atmosphere volume but no modeled beat is "
+            "recognized — a stale or tampered fog layer; re-run lighting",
+        ))
 
     # The must_not->interiors gate closes the FIFTH intent — the "no enclosed interiors"
     # frontier rule (intent:must_not = interior_volumes) the module docstring lists as a
