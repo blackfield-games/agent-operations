@@ -613,6 +613,25 @@
       "ticks_to_hit": null,
       "damage": 0,
       "target_downed": false
+    },
+    {
+      "label": "abeam_muzzle_point_blank_clip",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": 0,
+        "y": 1000
+      },
+      "projectile_speed": 2000,
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "blockers": [],
+      "ticks_to_hit": 1,
+      "damage": 25,
+      "target_downed": false
     }
   ],
   "vertical_hits": [

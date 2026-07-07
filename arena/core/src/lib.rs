@@ -2354,14 +2354,17 @@ impl Match {
                 if !t.alive || t.seat == proj.shooter || (!self.rules.friendly_fire && t.team == proj.team) {
                     continue;
                 }
-                // Directional gate — the projectile twin of hitscan's `dot <= 0` and
-                // melee's frontal arc: reject a body strictly BEHIND the shot's travel.
-                // `segment_hits_disc`'s start-half-disc otherwise strikes anything within
-                // `radius` of the launch point in ANY direction, so a shot fired AWAY from
-                // a point-blank enemy would hit it in the back. Dot the offset with the
-                // shot's own velocity (its launched heading, not the pawn's current
-                // facing); `< 0` (not `<= 0`) keeps an abeam body — the disc's real
-                // point-blank side-clip, matching melee — and drops only the behind hit.
+                // Directional gate — the projectile analogue of the directional filters
+                // its sibling modes apply (hitscan's `dot <= 0`, melee's frontal arc):
+                // reject a body strictly BEHIND the shot's travel. `segment_hits_disc`'s
+                // start-half-disc otherwise strikes anything within `radius` of the launch
+                // point in ANY direction, so a shot fired AWAY from a point-blank enemy
+                // would hit it in the back. Dot the offset with the shot's own velocity
+                // (its launched heading, not the pawn's current facing). The boundary is
+                // `< 0`, deliberately NOT hitscan's `<= 0`: a projectile is a swept DISC,
+                // so a body exactly abeam the muzzle (along == 0) is a genuine point-blank
+                // side-clip and stays hittable (matching melee's point-blank rule) — only
+                // the strictly-behind hit is dropped.
                 let along = (t.pos.x as i128 - from.x as i128) * proj.vel.x as i128
                     + (t.pos.y as i128 - from.y as i128) * proj.vel.y as i128;
                 if along < 0 {
@@ -7121,6 +7124,13 @@ pub fn parity_vectors() -> ParityVectors {
             // (along < 0), so the shot flown AWAY from it never lands. The projectile twin
             // of hitscan's dot<=0 / melee's frontal arc; a twin without the gate hits it.
             projectile_case("behind_muzzle_clean_miss", Vec2::ZERO, EAST, Vec2 { x: -POSITION_SCALE, y: 0 }, 2 * POSITION_SCALE, range, radius, vec![]),
+            // Abeam the muzzle: a body 1 m due NORTH of an east-firing shot projects
+            // exactly perpendicular to the travel (along == 0) yet sits inside hit_radius
+            // of the launch point, so the swept disc clips it point-blank on the first
+            // step. This is the boundary the gate keeps: a twin using `<= 0` instead of
+            // `< 0` would spare this side-clip and diverge, so this case (a HIT) is the
+            // cross-impl pin of the `< 0` choice its behind-miss sibling cannot make.
+            projectile_case("abeam_muzzle_point_blank_clip", Vec2::ZERO, EAST, Vec2 { x: 0, y: POSITION_SCALE }, 2 * POSITION_SCALE, range, radius, vec![]),
         ],
         vertical_hits: vec![
             // Tolerance off: z is ignored, so a target 5 m up is hit exactly as on the

@@ -158,6 +158,15 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     assert_eq!(behind.ticks_to_hit, None, "a shot fired away from a body behind the muzzle never strikes it");
     assert_eq!(behind.damage, 0, "the behind-muzzle body takes no damage from a forward shot");
     assert!(within(behind.shooter_position, behind.target_position, behind.hit_radius), "the behind body is within hit_radius of the muzzle — only the gate spares it");
+    // The abeam boundary (v48): a body exactly perpendicular to the travel (along == 0)
+    // but inside hit_radius IS clipped point-blank — the gate is `< 0`, not `<= 0`. This
+    // HIT is what pins the boundary as a cross-impl contract: the behind-miss above passes
+    // under either boundary, so a twin using `<= 0` would spare this side-clip and diverge
+    // here. It is the sibling of behind_muzzle_clean_miss the unit test alone cannot bind.
+    let abeam = v.projectiles.iter().find(|c| c.label == "abeam_muzzle_point_blank_clip").unwrap();
+    assert_eq!(abeam.ticks_to_hit, Some(1), "a body abeam the muzzle is clipped point-blank on the first swept step");
+    assert!(abeam.damage > 0, "the abeam point-blank side-clip deals damage");
+    assert!(within(abeam.shooter_position, abeam.target_position, abeam.hit_radius), "the abeam body is within hit_radius of the muzzle");
 
     // z-coupled combat (v4): the vertical hit rule gates every weapon mode. With the
     // tolerance off a high target is hit (z ignored); with it on, a target above the
