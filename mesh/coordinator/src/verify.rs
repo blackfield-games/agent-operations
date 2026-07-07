@@ -372,6 +372,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unrecoverable_signature_rejected() {
+        // The fourth VerifyError variant, the one with no reject sibling. It is built
+        // inside verify_recovered_address — shared by the result and hello gates — so
+        // this one verify_signature test covers the shared recover branch for both. A
+        // well-formed 65-byte [r||s||v] whose r is a valid scalar but NOT a secp256k1
+        // x-coordinate clears from_slice, the low-S gate, and the recovery-id parse,
+        // then recover_from_prehash finds no point at x=r and errs. r=5 is the smallest
+        // x whose x³+7 is a quadratic non-residue mod p (no curve point has it); s=1 is
+        // a valid low-S scalar and v=0 a valid recovery id, so the only reachable reject
+        // is Unrecoverable — not the encoding/canonical siblings that gate before it.
+        let job_id = Uuid::new_v4();
+        let mut raw = [0u8; 65];
+        raw[31] = 5; // r = 5: a valid scalar that is not a curve x-coordinate
+        raw[63] = 1; // s = 1: low-S, in [1, n/2]
+        raw[64] = 0; // v = 0: a valid recovery id
+        assert_eq!(
+            verify_signature(&job_id, "abc123", &dev_address(), &hex::encode(raw)),
+            Err(VerifyError::Unrecoverable)
+        );
+    }
+
     /// A `Hello` signed by the key whose address it claims verifies — the
     /// registration analogue of `valid_signature_verifies`.
     #[test]
