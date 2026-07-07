@@ -2354,6 +2354,19 @@ impl Match {
                 if !t.alive || t.seat == proj.shooter || (!self.rules.friendly_fire && t.team == proj.team) {
                     continue;
                 }
+                // Directional gate — the projectile twin of hitscan's `dot <= 0` and
+                // melee's frontal arc: reject a body strictly BEHIND the shot's travel.
+                // `segment_hits_disc`'s start-half-disc otherwise strikes anything within
+                // `radius` of the launch point in ANY direction, so a shot fired AWAY from
+                // a point-blank enemy would hit it in the back. Dot the offset with the
+                // shot's own velocity (its launched heading, not the pawn's current
+                // facing); `< 0` (not `<= 0`) keeps an abeam body — the disc's real
+                // point-blank side-clip, matching melee — and drops only the behind hit.
+                let along = (t.pos.x as i128 - from.x as i128) * proj.vel.x as i128
+                    + (t.pos.y as i128 - from.y as i128) * proj.vel.y as i128;
+                if along < 0 {
+                    continue;
+                }
                 if !segment_hits_disc(from, to, t.pos, radius) {
                     continue;
                 }
