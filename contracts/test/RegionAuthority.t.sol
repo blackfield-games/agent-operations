@@ -305,6 +305,17 @@ contract RegionAuthorityTest is Test {
         region.depositFees(TILE, FEE);
     }
 
+    function test_depositFees_zeroAmountPrecedesUnknownRegion() public {
+        // Guard ORDER: the amount check precedes the region-existence check. A zero-amount
+        // deposit to an UNCLAIMED tile reverts ZeroAmount, not UnknownRegion — both guards
+        // would trip, so this pins amount-first, mirroring claim()'s ZeroStake-before-
+        // existence order (test_claim_revertsZeroAmount). TILE is never claimed here, so
+        // the two sibling reject tests (each of which trips only one guard) leave this open.
+        vm.expectRevert(RegionAuthority.ZeroAmount.selector); // NOT UnknownRegion
+        vm.prank(bob);
+        region.depositFees(TILE, 0);
+    }
+
     /// @dev regionExists is the non-reverting twin of depositFees's UnknownRegion guard:
     ///      false for an unclaimed region (so a fee source can skip rather than revert),
     ///      true once claimed, and false again after the holder unstakes (burns) it. This
