@@ -3212,6 +3212,37 @@ contract MatchSettlementTest is Test {
         vm.prank(attester);
         s.settleField(MATCH, ag, ds, HASH);
     }
+
+    /// @dev FM2 wager variant: settleFieldWager reverts SchemaNotSet on the field-schema guard —
+    ///      the last field-settle consumer that was unpinned (settle + settleField each have a twin).
+    ///      Open+fund the 3-seat field first so the schema guard, not the status/NotFullyFunded checks
+    ///      it sits above, is what reverts: a reorder that dropped it below them would redden this.
+    function test_settleFieldWager_revertsWhenSchemaUnregistered() public {
+        MatchSettlement s = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
+        _wireFresh(s, false); // variable path enabled (maxRatingDelta set); field schema NOT registered
+        _registerAgent(dave, "dave-bot");
+        vm.prank(dave);
+        token.approve(address(s), type(uint256).max); // _wireFresh approves only alice + bob
+
+        address[] memory ag = _field(alice, bob, dave);
+        vm.prank(attester);
+        s.openFieldMatch(FIELD, ag, STAKE);
+        vm.prank(alice);
+        s.fundField(FIELD);
+        vm.prank(bob);
+        s.fundField(FIELD);
+        vm.prank(dave);
+        s.fundField(FIELD);
+
+        // Valid, pot-conserving vectors so ONLY the schema guard can revert — with the guard deleted the
+        // settle would attest under a zero schema and succeed, reddening this expectRevert.
+        uint256[] memory ps = _payouts3(STAKE, STAKE, STAKE);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+
+        vm.expectRevert(MatchSettlement.SchemaNotSet.selector);
+        vm.prank(attester);
+        s.settleFieldWager(FIELD, ps, ds, HASH);
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
