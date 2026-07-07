@@ -1623,6 +1623,23 @@ mod tests {
     }
 
     #[test]
+    fn join_digest_matches_the_committed_golden() {
+        // The absolute-byte twin of the clamp/frame parity goldens. binds_every_field
+        // above proves the digest is injective but not WHICH bytes it commits to, so a
+        // refactor of the domain tag, field order, or length-prefixing passes every
+        // relative test while silently hashing different bytes than the SDK signs —
+        // verify_join_signature would then recover no ranked seat's claimed agent_id and
+        // every ranked join is rejected AddressMismatch. This pins the exact digest the
+        // Python SDK pins (agents/test_arena_client.py _GOLDEN_DIGEST) over the same
+        // dev_address()/CHAL fixture; a legit layout change regenerates both sides in
+        // lock-step.
+        assert_eq!(
+            hex::encode(join_digest(PROTOCOL_VERSION, &dev_address(), CHAL)),
+            "099de3d1b29be2ae5bf35f85b55f43711757cf609229be790d0acebe35f178dd"
+        );
+    }
+
+    #[test]
     fn version_handshake_accepts_match_and_rejects_drift() {
         assert!(check_version(PROTOCOL_VERSION).is_ok());
         // A peer one version ahead or behind is rejected with both versions
