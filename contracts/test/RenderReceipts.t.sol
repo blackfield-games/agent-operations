@@ -1418,6 +1418,27 @@ contract RenderReceiptsTest is Test {
         receipts.issueReceipts(items);
     }
 
+    /// @dev The batch phase-4 twin of test_issueReceipt_routesFeeToClaimedRegion: each element's
+    ///      RenderFeeRouted fires per element — the audit topic off-chain indexers key region-fee
+    ///      accrual on, asserted for the batch path for the first time. DISTINCT renderSeconds so the
+    ///      two expected fees differ: an arg swap (regionId/amount) or a constant-fee regression the
+    ///      equal-amount case would mask reddens here.
+    function test_issueReceipts_emitsRenderFeeRoutedPerElement() public {
+        _arm();
+        _fundCoordinator(1 ether);
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](2);
+        items[0] = _req(earner, keccak256("fe1"), 100, 0, bytes32(0), claimedRegionId);
+        items[1] = _req(earner, keccak256("fe2"), 250, 0, bytes32(0), claimedRegionId);
+
+        vm.expectEmit(true, true, false, true);
+        emit RenderFeeRouted(items[0].jobId, claimedRegion, RENDER_FEE_RATE * 100);
+        vm.expectEmit(true, true, false, true);
+        emit RenderFeeRouted(items[1].jobId, claimedRegion, RENDER_FEE_RATE * 250);
+
+        vm.prank(coordinator);
+        receipts.issueReceipts(items);
+    }
+
     /// @dev FM2: each jobId maps to ITS OWN multiAttest uid end-to-end — a revoke routed by
     ///      jobId reaches the right attestation. Reverse-order revoke so a mis-index can't
     ///      pass by coincidence; the per-earner decrements also track the stored earner.
