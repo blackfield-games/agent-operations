@@ -2248,6 +2248,26 @@ async def test_run_lighting_density_tracks_the_fog_table_in_lock_step(tmp_path):
     assert _route_back_target(verdict) == "lighting"
 
 
+async def test_run_rejects_a_fabricated_atmosphere_when_no_beat_is_recognized(tmp_path):
+    # The OVER-emission complement of the drivenBy equality: the director seeds NO intent:beats, so the
+    # validator's recognized set is empty and lighting.run emits the fog-less palette (no Atmosphere). A
+    # stale/tampered lighting layer that FABRICATES a `def Volume "Atmosphere"` anyway — fog for a mood no
+    # beat seeded — is the empty-set mirror the non-empty drivenBy check (recorded != set(recognized))
+    # structurally cannot see (that branch is skipped when recognized is empty). This is the exact
+    # complement of test_run_director_beats_gate_silent_without_a_line (same fixture, but lighting now
+    # carries an Atmosphere). Rejected, named lighting ALONE — the director-beats producer gate stays
+    # silent on an absent line, so no pipeline-earlier specialist co-fires — keyed off intent:beats.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(),  # no intent:beats -> the validator's recognized set is empty
+        "lighting": _lighting_body(driven_by=["smoke"]),  # a fabricated Atmosphere no beat justifies
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("intent:beats" in i and "lighting" in i and "no modeled beat" in i for i in verdict.issues)
+    assert verdict.failing_specialists == ["lighting"]  # no director-beats co-fire; lighting is the sole target
+    assert _route_back_target(verdict) == "lighting"
+
+
 # ---- director intent:beats re-derivation: the PRODUCER twin of the lighting-beats CONSUMER gates ----
 #
 # The lighting gates above re-check lighting's fog against the director's OWN mood line, so a STALE line
