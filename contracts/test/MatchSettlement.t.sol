@@ -160,6 +160,7 @@ contract MatchSettlementTest is Test {
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
     event SettleWindowSet(uint64 settleWindow);
+    event MatchAttested(bytes32 indexed matchId, bytes32 indexed uid);
     event MatchAttestationRevoked(bytes32 indexed matchId, bytes32 indexed uid);
 
     function setUp() public {
@@ -2753,6 +2754,27 @@ contract MatchSettlementTest is Test {
 
         bytes32 expected = keccak256(abi.encode(settlement.schemaUid(), bob, eas.lastData()));
         assertEq(settlement.matchAttestationUid(MATCH), expected, "uid of the exact payload persisted");
+    }
+
+    /// @dev The attest half of the settlement lifecycle emit pair: every settle path funnels
+    ///      through `_attestSettled`, which emits `MatchAttested(matchId, uid)` — the topic
+    ///      off-chain indexers key on to locate a match's canonical settlement proof. Unlike
+    ///      the revoke sibling, the emit fires DURING settle, so the uid can't be read back
+    ///      first; reconstruct it from the same 1v1 payload the decode test above pins
+    ///      (`+REP_DELTA` for an agentA win) and MockEAS's `keccak256(schema, recipient, data)`.
+    ///      Both indexed topics are checked, so a dropped, arg-transposed, or stale-uid emit
+    ///      reddens while the storage assertions stay green.
+    function test_settle_emitsMatchAttested() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+
+        bytes memory data = abi.encode(MATCH, alice, bob, alice, HASH, int256(REP_DELTA));
+        bytes32 uid = keccak256(abi.encode(settlement.schemaUid(), alice, data));
+
+        vm.expectEmit(true, true, false, false);
+        emit MatchAttested(MATCH, uid);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
     }
 
     /// @dev FM4 draw edge: a draw shares the 1v1 schema but names NO winner (winner==0,
