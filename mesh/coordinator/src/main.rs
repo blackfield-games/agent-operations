@@ -12509,6 +12509,39 @@ mod tests {
         assert_eq!(store.job_status(&id).unwrap().as_deref(), Some("failed"));
     }
 
+    /// Invariant lock: `reap_expired` must never resurrect a job that already
+    /// settled to `done`. A past-deadline in_flight job that `record_completed`
+    /// moved to `done` before the sweep stays `done` — nothing is requeued or
+    /// dead-lettered and the row is untouched. Today the scan's
+    /// `WHERE status = in_flight` already filters it out; the `AND status = in_flight`
+    /// re-guard on the UPDATE (the belt-and-suspenders reap_stale_holders /
+    /// reap_ttl_expired carry) keeps this true even if the reaper is ever refactored
+    /// to drop the store lock between the scan and the write.
+    #[test]
+    fn reap_expired_never_resurrects_a_settled_job() {
+        let mut store = Store::open_in_memory().unwrap();
+        let job = job_with_deadline(0); // past-deadline the moment it is in_flight
+        let id = job.id;
+        store.enqueue(&job).unwrap();
+        store.take_next(|_| true).unwrap(); // → in_flight
+
+        // Settle it to `done` before the reap sweep runs.
+        assert!(store.record_completed(&signed_result(id, "render-1")).unwrap());
+        assert_eq!(store.job_status(&id).unwrap().as_deref(), Some("done"));
+
+        // A reap sweep well past the deadline must leave the settled job untouched.
+        let outcome = store.reap_expired(now_secs() + 10_000, 2).unwrap();
+        assert!(outcome.requeued.is_empty(), "a settled job is never requeued");
+        assert!(outcome.failed.is_empty(), "a settled job is never dead-lettered");
+        assert_eq!(
+            store.job_status(&id).unwrap().as_deref(),
+            Some("done"),
+            "reap_expired must not resurrect a settled job",
+        );
+        assert_eq!(store.completed_count().unwrap(), 1);
+        assert_eq!(store.in_flight_count().unwrap(), 0);
+    }
+
     // ---- liveness-based holder reaping (reap_stale_holders) ----
 
     /// `take_next_for` stamps the holder; the anonymous `take_next` leaves it NULL,
