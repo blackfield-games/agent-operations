@@ -9808,6 +9808,36 @@ mod tests {
     }
 
     #[test]
+    fn fine_aim_leaves_a_projectile_launch_velocity_octant_native() {
+        // `aim_mode` refines ONLY the instant hitscan beam (the in-front test in
+        // `resolve_fire`); a projectile is octant-native — `spawn_projectile` takes its
+        // launch velocity from the 8-way octant snap of the shooter's facing regardless
+        // of `aim_mode`, and commits an octant-quantized `facing`. Pin that boundary so a
+        // UE5 twin (or a refactor) that wired `fine_unit` into projectile spawn — a
+        // plausible reading of "fine aim" — diverges here instead of silently.
+        let facing: Bam = 2048; // sub-octant: snaps to the due-East octant, but the fine
+                                // beam for it points ~11.25° off the East axis.
+        // Non-vacuity: this facing genuinely distinguishes the two aim tables — the octant
+        // snap is due-East (zero y), the fine beam is off-axis (non-zero y) — so a mutant
+        // spawning via `fine_unit` WOULD bend the launch vector. Derived from the real
+        // fns, so a wrong facing choice fails here loudly rather than passing vacuously.
+        assert_eq!(octant_unit(facing).1, 0, "facing snaps to the due-East octant (zero y)");
+        assert_ne!(fine_unit(facing).1, 0, "the fine beam for this facing is off the East axis");
+
+        let launch = |aim_mode: AimMode| {
+            let rules = Rules { weapon_mode: WeaponMode::Projectile, aim_mode, spawn_jitter: 0, ..Default::default() };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), 1);
+            m.pawns[0].facing = facing;
+            m.spawn_projectile(0);
+            m.projectiles[0].vel
+        };
+        let octant = launch(AimMode::Octant);
+        let fine = launch(AimMode::Fine);
+        assert_eq!(fine, octant, "AimMode::Fine must not bend a projectile's octant-native launch velocity");
+        assert_eq!(fine.y, 0, "a fine-bent launch would carry a non-zero y; the octant-native launch flies due East");
+    }
+
+    #[test]
     fn the_live_projectile_cap_bounds_a_fire_spammer() {
         // FM4 (DoS): a fire-every-tick agent cannot grow the live set — hence per-tick
         // O(live · seats) work — without bound. With fire_cooldown 0 and a deep
