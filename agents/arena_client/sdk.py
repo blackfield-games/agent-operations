@@ -633,7 +633,10 @@ def run_local_match(
     observation each tick (carrying `starting_remaining`, no reply read) via `pump_starting`,
     so a countdown-aware policy reads the countdown through `on_starting` while the client
     sends nothing until `Live`. Forwarded as `--starting-ticks <n>` (value-flag, like
-    `gravity`) on BOTH paths via `MatchParams.rules`, only when nonzero. `starting_ticks` is
+    `gravity`) on BOTH paths via `MatchParams.rules`, only when nonzero. A negative or
+    `> u32::MAX` value raises before any spawn (the harness parses `--starting-ticks` as a
+    `u32` and panics on a negative, so a bad value would abort the match late — reject it
+    loudly here instead, mirroring the sibling fences). `starting_ticks` is
     outside `canonical_encoding`, so a countdown match's `replay_hash` is byte-identical to
     the no-countdown one — the pre-live delay is digest-inert. Default `0` opens `Live` at
     tick 0 and adds no token — byte-identical argv.
@@ -992,6 +995,14 @@ def run_local_match(
         # (off) and a value past i32::MAX would wrap the fall integration negative (also off) —
         # reject both loudly here, mirroring the harness's u32-then-i32 parse_gravity fence.
         raise ValueError(f"gravity is a downward magnitude in 0..=2**31-1 (0 = off); got {gravity}")
+    if not 0 <= starting_ticks <= 2**32 - 1:
+        # Core opens the Starting countdown on starting_ticks > 0 and streams starting_remaining (a
+        # u32) down from it, so a negative reads as "no countdown" (off) and a value past u32::MAX
+        # would wrap — reject both loudly here, mirroring the harness's u32 --starting-ticks parse
+        # (which panics on a negative), rather than forwarding a value the harness aborts on.
+        raise ValueError(
+            f"starting_ticks is a pre-live countdown in 0..=2**32-1 (0 = open Live directly); got {starting_ticks}"
+        )
     if not 0 <= vertical_hit_tolerance <= 2**31 - 1:
         # Core gates z-coupled hits on vertical_hit_tolerance > 0, so a negative reads as off (planar)
         # and a value past i32::MAX wraps the band negative (also off) — reject both loudly here,
