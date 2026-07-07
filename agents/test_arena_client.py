@@ -1683,6 +1683,21 @@ def test_run_local_match_rejects_an_out_of_range_starting_ticks():
             run_local_match("/no/such/harness", [0, 1], policies, starting_ticks=bad)
 
 
+def test_run_local_match_rejects_an_out_of_range_seed():
+    # seed forwards raw as --seed <n>, which core parses as a u64 (main.rs `let mut seed: u64`) and
+    # panics at startup on a negative / past-u64::MAX value. It is the base determinism-arg family's
+    # unfenced sibling, so it raises before any spawn like the starting_ticks fence — width u64 (wider
+    # than the u32 twins) with BOTH bounds enforced, so a negative (the seed=hash(...) footgun) and an
+    # overflow both reject while the default 0 stays valid. The bogus harness path proves the guard
+    # precedes spawn: a real spawn attempt would raise a non-matching OSError, not this ValueError.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -3, 2**64, 2**80):
+        with pytest.raises(ValueError, match="seed"):
+            run_local_match("/no/such/harness", [0, 1], policies, seed=bad)
+
+
 def test_run_local_match_selects_a_named_arena_and_surfaces_its_geometry():
     # arena="reference" plays the match under the reference arena: each seat's Start frame
     # carries the central occluder + the two health pickups, read back via starts=. The
