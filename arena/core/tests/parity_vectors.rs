@@ -1129,6 +1129,57 @@ fn parity_vectors_pin_the_discriminating_conventions() {
         assert!(!fired && ammo == 0, "once the mag is empty the zero-cooldown fire is refused on emptiness alone");
     }
 
+    // Melee swing cadence (v47): melee is gated by melee_cooldown (NOT fire_cooldown) and draws no
+    // ammo, so a reload — which has no magazine to refill — must not shorten the swing gate. The
+    // reference recompute is melee's OWN state machine (independent of the sim): the cooldown counts
+    // down at tick start, a press at cooldown 0 SWINGS (struck, arms melee_cooldown), and a reload is
+    // inert on the gate. A twin that re-armed the shorter fire_cooldown on a melee reload records a
+    // different struck stream here — the melee cadence the ranged fire_cycle model structurally can't
+    // express (its fired=cooldown0&&ammo>0 discharge never trips when a swing draws no ammo).
+    let mcad = |label: &str| v.melee_cadence.iter().find(|c| c.label == label).unwrap();
+    for c in &v.melee_cadence {
+        assert_ne!(c.fire_cooldown, c.melee_cooldown, "{}: fire and melee cooldowns must differ, else a mode-blind reload is invisible", c.label);
+        let mut cooldown = 0u16;
+        let expected: Vec<(bool, u16)> = (0..c.timeline.len() as u16)
+            .map(|t| {
+                cooldown = cooldown.saturating_sub(1);
+                let struck = if c.reload_tick == Some(t) {
+                    false // melee has no magazine: a reload leaves the swing gate untouched
+                } else if cooldown == 0 {
+                    cooldown = c.melee_cooldown;
+                    true
+                } else {
+                    false
+                };
+                (struck, cooldown)
+            })
+            .collect();
+        assert_eq!(c.timeline, expected, "{}: the melee swing cadence must match the reference — a reload never shortens the gate", c.label);
+    }
+    // The discriminator: swing at 0, RELOAD mid-cooldown, then held swing — the two swings land
+    // EXACTLY melee_cooldown apart, so the reload did not reopen the gate at the shorter fire_cooldown.
+    let swing_gate = mcad("reload_does_not_shorten_the_swing_gate");
+    let rt = swing_gate.reload_tick.expect("the case presses reload mid-cooldown") as usize;
+    let swings: Vec<usize> = swing_gate.timeline.iter().enumerate().filter(|(_, &(s, _))| s).map(|(i, _)| i).collect();
+    assert_eq!(swings, vec![0, usize::from(swing_gate.melee_cooldown)], "the two swings land exactly melee_cooldown apart — the mid-cooldown reload did NOT shorten the gate");
+    for w in swings.windows(2) {
+        assert_eq!(w[1] - w[0], usize::from(swing_gate.melee_cooldown), "consecutive swings are spaced exactly melee_cooldown apart, reload notwithstanding");
+    }
+    // The reload lands strictly inside the first swing's gate, and the bug it pins would have reopened
+    // the gate at rt + fire_cooldown — strictly before melee_cooldown, so the cadences split there.
+    assert!(rt > 0 && rt < usize::from(swing_gate.melee_cooldown), "the reload lands mid-cooldown (after the 1st swing, before the gate reopens)");
+    assert!(
+        rt + usize::from(swing_gate.fire_cooldown) < usize::from(swing_gate.melee_cooldown),
+        "the mode-blind bug would have reopened the gate strictly early (rt + fire_cooldown < melee_cooldown)"
+    );
+    // The reload tick neither swings nor resets the gate: the cooldown keeps its natural countdown.
+    assert!(!swing_gate.timeline[rt].0, "no swing on the reload tick");
+    assert_eq!(
+        swing_gate.timeline[rt].1,
+        swing_gate.timeline[rt - 1].1 - 1,
+        "the reload leaves the gate on its natural countdown — not re-armed to the shorter fire_cooldown"
+    );
+
     // Melee cleave (v21): one swing strikes EVERY eligible target (alive enemy within melee_range,
     // inside the MELEE_ARC_SPREAD frontal arc, with a clear sightline), each for melee_damage — not
     // just the nearest. A twin that strikes only the nearest, uses the wrong arc/range edge,
