@@ -134,6 +134,20 @@ contract RegionAuthorityTest is Test {
         region.claim(TILE, STAKE);
     }
 
+    function test_claim_stakeTooLowPrecedesAlreadyClaimed() public {
+        // Guard ORDER: the stake gate precedes the AlreadyClaimed check. Re-claiming an
+        // already-held tile with a TOO-LOW amount reverts StakeTooLow, not AlreadyClaimed
+        // — both guards would trip, so this pins that a malformed stake is reported before
+        // the tile's claimed state. Complements test_claim_revertsAlreadyClaimed (which
+        // re-claims with a VALID amount, so only AlreadyClaimed trips there).
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+
+        vm.expectRevert(RegionAuthority.StakeTooLow.selector); // NOT AlreadyClaimed
+        vm.prank(bob);
+        region.claim(TILE, STAKE - 1);
+    }
+
     function test_claim_revertsWhenNotApproved() public {
         address carol = address(0xCA201);
         assertTrue(token.transfer(carol, STAKE));
