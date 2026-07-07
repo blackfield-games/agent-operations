@@ -881,6 +881,19 @@
     "type": "event"
   },
   {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "string",
+        "name": "uri",
+        "type": "string"
+      }
+    ],
+    "name": "URISet",
+    "type": "event"
+  },
+  {
     "inputs": [
       {
         "internalType": "address",
