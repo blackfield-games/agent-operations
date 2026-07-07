@@ -1003,6 +1003,12 @@ def run_local_match(
         raise ValueError(
             f"starting_ticks is a pre-live countdown in 0..=2**32-1 (0 = open Live directly); got {starting_ticks}"
         )
+    if not 0 <= seed <= 2**64 - 1:
+        # The harness parses --seed as a u64 (main.rs `let mut seed: u64`) and panics at startup on a
+        # negative / > u64::MAX seed, so a bad value aborts late (GatewayClosed / watchdog kill) rather
+        # than here — reject loudly, mirroring the sibling fences. Width is u64 (wider than the u32
+        # twins); the common footgun is seed=hash(...), Python's hash() being signed and often negative.
+        raise ValueError(f"seed is a determinism input in 0..=2**64-1 (0 = default); got {seed}")
     if not 0 <= vertical_hit_tolerance <= 2**31 - 1:
         # Core gates z-coupled hits on vertical_hit_tolerance > 0, so a negative reads as off (planar)
         # and a value past i32::MAX wraps the band negative (also off) — reject both loudly here,
