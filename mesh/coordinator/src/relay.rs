@@ -507,6 +507,7 @@ mod tests {
         Ok,
         AlreadyIssued,
         Transient,
+        NotAuthorized,
     }
     struct SeqRelay {
         mode: SeqMode,
@@ -519,6 +520,7 @@ mod tests {
                 SeqMode::Ok => Ok(format!("0xseq-{}", att.job_id)),
                 SeqMode::AlreadyIssued => Err(RelayError::AlreadyIssued),
                 SeqMode::Transient => Err(RelayError::Transient("seq transient".into())),
+                SeqMode::NotAuthorized => Err(RelayError::NotAuthorized),
             }
         }
     }
@@ -554,6 +556,22 @@ mod tests {
         assert!(matches!(
             r.submit_batch(&atts(&["a", "b"])).await,
             Err(BatchRelayError::Transient(_))
+        ));
+        assert_eq!(*r.calls.lock().unwrap(), 1, "stops at the first failure");
+    }
+
+    /// A submit-only transport that hits an unauthorized signer surfaces it as a
+    /// whole-batch `Permanent` (a global config fault the drain halts on) — never a
+    /// per-element outcome that could be dead-lettered — and short-circuits.
+    #[tokio::test]
+    async fn default_submit_batch_maps_not_authorized_to_permanent() {
+        let r = SeqRelay {
+            mode: SeqMode::NotAuthorized,
+            calls: Mutex::new(0),
+        };
+        assert!(matches!(
+            r.submit_batch(&atts(&["a", "b"])).await,
+            Err(BatchRelayError::Permanent(_))
         ));
         assert_eq!(*r.calls.lock().unwrap(), 1, "stops at the first failure");
     }
