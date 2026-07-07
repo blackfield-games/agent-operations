@@ -66,7 +66,7 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     // LOAD-BEARING convention, mutation-checked, so a wrong twin convention fails at
     // least one vector — not a happy-path tautology.
     let v = parity_vectors();
-    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v47");
+    assert_eq!(v.domain, "blackfield/arena/parity-vectors/v48");
     assert_eq!(v.protocol_version, arena_proto::PROTOCOL_VERSION);
 
     // Spawns: both facing branches and a perturbed spawn line are present, so the
@@ -149,6 +149,15 @@ fn parity_vectors_pin_the_discriminating_conventions() {
     let front = v.projectiles.iter().find(|c| c.label == "pawn_in_front_of_wall_is_hit").unwrap();
     assert_eq!(front.ticks_to_hit, Some(1), "a target in front of a wall is hit on the first swept step");
     assert!(front.damage > 0 && !front.blockers.is_empty(), "cover behind the target shields nothing");
+    // Directional gate (v48): a body BEHIND the muzzle is not struck by a shot flown away
+    // from it, even though it sits inside hit_radius of the launch point — a twin whose
+    // projectile lacks the forward-hemisphere gate (hitscan's dot<=0 / melee's arc) hits it
+    // in the back. The independent range test confirms the case is discriminating: the body
+    // IS within radius of the muzzle, so only the directional filter spares it.
+    let behind = v.projectiles.iter().find(|c| c.label == "behind_muzzle_clean_miss").unwrap();
+    assert_eq!(behind.ticks_to_hit, None, "a shot fired away from a body behind the muzzle never strikes it");
+    assert_eq!(behind.damage, 0, "the behind-muzzle body takes no damage from a forward shot");
+    assert!(within(behind.shooter_position, behind.target_position, behind.hit_radius), "the behind body is within hit_radius of the muzzle — only the gate spares it");
 
     // z-coupled combat (v4): the vertical hit rule gates every weapon mode. With the
     // tolerance off a high target is hit (z ignored); with it on, a target above the

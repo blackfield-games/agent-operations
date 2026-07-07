@@ -1,5 +1,5 @@
 {
-  "domain": "blackfield/arena/parity-vectors/v47",
+  "domain": "blackfield/arena/parity-vectors/v48",
   "protocol_version": 1,
   "spawns": [
     {
@@ -593,6 +593,25 @@
       ],
       "ticks_to_hit": 1,
       "damage": 25,
+      "target_downed": false
+    },
+    {
+      "label": "behind_muzzle_clean_miss",
+      "shooter_position": {
+        "x": 0,
+        "y": 0
+      },
+      "shooter_facing": 0,
+      "target_position": {
+        "x": -1000,
+        "y": 0
+      },
+      "projectile_speed": 2000,
+      "weapon_range": 30000,
+      "hit_radius": 1500,
+      "blockers": [],
+      "ticks_to_hit": null,
+      "damage": 0,
       "target_downed": false
     }
   ],

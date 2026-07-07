@@ -5302,7 +5302,7 @@ pub struct ParityVectors {
 /// out-cadence `melee_cooldown`. This is a NEW additive category pinning a sim-behaviour fix; like `starting_phase`
 /// it moves NO committed match hash (the fire cycle emits no `replay_hash`), so the ranged `fire_cycle`/`matches`
 /// goldens stay byte-identical and only the new vector plus the domain tag change.
-const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v47";
+const PARITY_VECTORS_DOMAIN: &str = "blackfield/arena/parity-vectors/v48";
 /// A fixed, v4-shaped match id so every generated record is byte-reproducible (a
 /// random id would hash into the digest and make the set non-canonical).
 const PARITY_MATCH_ID: &str = "00000000-0000-4000-8000-0000000000a1";
@@ -7115,6 +7115,12 @@ pub fn parity_vectors() -> ParityVectors {
             // reaches the wall — the shot resolves the body first, so cover behind the
             // target gives it nothing (a wall-first twin would wrongly absorb the shot).
             projectile_case("pawn_in_front_of_wall_is_hit", Vec2::ZERO, EAST, Vec2 { x: 3 * POSITION_SCALE, y: 0 }, 5 * POSITION_SCALE, range, radius, vec![Blocker { min: Vec2 { x: 3_200, y: -2_000 }, max: Vec2 { x: 4_000, y: 2_000 }, height: 0 }]),
+            // Behind the muzzle: a body 1 m due WEST of an east-firing shot sits inside
+            // the 1.5 m hit_radius of the launch point, so segment_hits_disc's start-disc
+            // would strike it — but the directional gate rejects a strictly-behind body
+            // (along < 0), so the shot flown AWAY from it never lands. The projectile twin
+            // of hitscan's dot<=0 / melee's frontal arc; a twin without the gate hits it.
+            projectile_case("behind_muzzle_clean_miss", Vec2::ZERO, EAST, Vec2 { x: -POSITION_SCALE, y: 0 }, 2 * POSITION_SCALE, range, radius, vec![]),
         ],
         vertical_hits: vec![
             // Tolerance off: z is ignored, so a target 5 m up is hit exactly as on the
