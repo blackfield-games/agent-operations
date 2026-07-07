@@ -27,13 +27,23 @@ pub enum RelayError {
     /// re-submit hit the contract's per-job fence. The drain marks it submitted
     /// and moves on rather than retrying forever.
     AlreadyIssued,
+    /// The coordinator signer is not in `RenderReceipts.authorizedCoordinators`
+    /// (the contract reverts `NotAuthorized`). Every `issueReceipt` reverts until
+    /// the owner calls `setAuthorizedCoordinator`, so this is a loud, distinct
+    /// operator-config error — NOT a per-row fault to quarantine one receipt over.
+    /// The drain stops; the backlog (visible at `/stats pending_attestations`)
+    /// stays put until authorization lands, then resumes on the next tick.
+    NotAuthorized,
     /// A transient fault (RPC timeout, nonce contention, a reorg). The receipt is
     /// not on-chain; the row stays pending and is retried on the next drain tick.
     Transient(String),
-    /// A non-retryable fault (the signer is not an authorized coordinator, an
-    /// argument the contract rejects). Retrying in a hot loop or dropping the
-    /// receipt are both wrong, so the drain stops and surfaces it loudly for the
-    /// operator; the row stays pending.
+    /// A non-retryable fault that is NOT a global config problem — e.g. the
+    /// contract reverts on a receipt naming a region whose render fee the
+    /// coordinator can't cover. Retrying in a hot loop or dropping the receipt are
+    /// both wrong, so the drain DEAD-LETTERS this one row (quarantined + retained,
+    /// surfaced at `/stats dead_lettered_attestations`) and CONTINUES, so one poison
+    /// receipt never blocks the rest of the backlog. Unlike `NotAuthorized`, the
+    /// fault is per-row, not global.
     Permanent(String),
 }
 
@@ -96,6 +106,14 @@ pub trait Relay: Send + Sync {
                 match self.submit(att).await {
                     Ok(uid) => uids.push(uid),
                     Err(RelayError::AlreadyIssued) => uids.push(ALREADY_ISSUED_UID.to_string()),
+                    Err(RelayError::NotAuthorized) => {
+                        // A global config fault (unauthorized signer) — halt the
+                        // whole batch loudly, same as a native `multiAttest` revert
+                        // for authorization would; never a per-element dead-letter.
+                        return Err(BatchRelayError::Permanent(
+                            "coordinator signer not authorized on RenderReceipts".into(),
+                        ));
+                    }
                     Err(RelayError::Transient(m)) => return Err(BatchRelayError::Transient(m)),
                     Err(RelayError::Permanent(m)) => return Err(BatchRelayError::Permanent(m)),
                 }
@@ -124,6 +142,10 @@ struct MockInner {
     transient_remaining: usize,
     /// Always fail single `submit` with `Permanent`.
     permanent: bool,
+    /// Always fail single `submit` with `NotAuthorized` (the coordinator signer is
+    /// not authorized on RenderReceipts — a global fault the drain halts on, never
+    /// a per-row dead-letter).
+    not_authorized: bool,
     /// Always fail single `submit` with `AlreadyIssued` (models a receipt already
     /// on-chain).
     already_issued: bool,
@@ -162,6 +184,7 @@ impl MockRelay {
             inner: Mutex::new(MockInner {
                 transient_remaining: 0,
                 permanent: false,
+                not_authorized: false,
                 already_issued: false,
                 already_issued_jobs: Vec::new(),
                 permanent_jobs: Vec::new(),
@@ -186,7 +209,7 @@ impl MockRelay {
         m
     }
 
-    /// Always fail with `Permanent` (e.g. an unauthorized signer).
+    /// Always fail with `Permanent` (a per-row non-retryable fault).
     #[cfg(test)]
     pub fn permanent() -> Self {
         let mut m = Self::succeeding();
@@ -301,6 +324,9 @@ impl Relay for MockRelay {
         }
         let mut inner = self.inner.lock().unwrap();
         inner.calls += 1;
+        if inner.not_authorized {
+            return Err(RelayError::NotAuthorized);
+        }
         if inner.permanent || inner.permanent_jobs.contains(&att.job_id) {
             return Err(RelayError::Permanent("mock permanent".into()));
         }

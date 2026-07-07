@@ -2030,6 +2030,17 @@ async fn drain_singly<R: Relay>(
                 tracing::info!(%job_id, "relay: receipt already on-chain; marking submitted");
                 ALREADY_ISSUED_UID.to_string()
             }
+            Err(RelayError::NotAuthorized) => {
+                // A global config fault, not a per-row one: the coordinator signer
+                // is not in RenderReceipts.authorizedCoordinators, so EVERY receipt
+                // would revert. Dead-lettering the chunk one-by-one would quarantine
+                // the whole (self-healing) backlog; instead halt loudly and leave
+                // every remaining row pending, so the drain auto-resumes once the
+                // owner calls setAuthorizedCoordinator. Mirrors drain_debits'
+                // NotAuthorized arm.
+                tracing::error!(%job_id, "relay: NotAuthorized — the coordinator signer is not authorized on RenderReceipts (owner must call setAuthorizedCoordinator); draining paused");
+                return false;
+            }
             Err(RelayError::Transient(msg)) => {
                 tracing::warn!(%job_id, %msg, "relay: transient submit failure; retrying next tick");
                 return false;
