@@ -510,13 +510,28 @@ def _intent_attributions(
     if required:
         prop_text = _layer_text(layers, "prop", layers_root)
         if prop_text is not None:
+            required_counts = Counter(required)
             placed = Counter(re.findall(r'requiredAsset\s*=\s*"([^"]+)"', prop_text))
-            dropped = sorted(a for a, n in Counter(required).items() if placed[a] < n)
+            dropped = sorted(a for a, n in required_counts.items() if placed[a] < n)
             if dropped:
                 out.append((
                     "prop",
                     f"intent:must_have unmet: prop must place must-have asset(s) {dropped} "
                     f"but its layer carries no Required prim referencing them",
+                ))
+            # The equality complement of `dropped`: the re-derived multiset is EXACT, so a marker
+            # over the must-have set (a duplicated hero, or an unrequested asset the director never
+            # demanded) is as much a desync as a dropped one — the must-have gate alone passes it
+            # (all demanded present) and the triangle gate prices whatever markers are in the body,
+            # so an honestly-inflated metric ships doubled/unrequested hero geometry accepted. Name
+            # prop, not the director, or the route-back misfires to the director loop.
+            extra = sorted(a for a, n in placed.items() if n > required_counts[a])
+            if extra:
+                out.append((
+                    "prop",
+                    f"intent:must_have over-placed: prop placed unrequested or duplicate "
+                    f"required asset(s) {extra} — its layer carries more Required prims than the "
+                    f"must-have set demands; re-run prop",
                 ))
 
     if biome._caps_vegetation(_director_intent(layers, layers_root, "must_not")):
