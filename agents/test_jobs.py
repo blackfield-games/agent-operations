@@ -381,6 +381,23 @@ def test_spec_rejects_out_of_range_region():
     assert _spec(region=RegionCoord(x=2**31 - 1, y=-(2**31), layer=255)).region.layer == 255
 
 
+def test_spec_rejects_region_below_lower_bounds():
+    # The sibling above pins the HIGH reject edges (layer 256, x 2**31) and the accept
+    # boundaries (x=_I32_MAX, y=_I32_MIN, layer=_U8_MAX); the opposite reject edges have
+    # no test. Each of these is a two-sided bound in _region_and_inputs_within_proto_widths
+    # (RegionCoord leaves x/y/layer as unconstrained int, so this validator IS the gate),
+    # and each case here is refused ONLY by the untested half — dropping that half accepts
+    # a spec the coordinator's u8/i32 deserialize would 422. A negative layer is the
+    # production-plausible one (an off-by-one in layer arithmetic), the i32 corners its
+    # same-family mirror at values a real grid never reaches.
+    with pytest.raises(ValidationError):
+        _spec(region=RegionCoord(x=0, y=0, layer=-1))  # layer u8 underflow (0 <= r.layer)
+    with pytest.raises(ValidationError):
+        _spec(region=RegionCoord(x=_I32_MIN - 1, y=0, layer=0))  # x below i32 floor
+    with pytest.raises(ValidationError):
+        _spec(region=RegionCoord(x=0, y=_I32_MAX + 1, layer=0))  # y above i32 ceiling
+
+
 # --- cross-language bound parity (base-emission FM3) ---
 # RenderJobSpec mirrors the coordinator's validate_job_spec bounds (and the proto
 # RegionCoord field widths) BY HAND across Rust and Python. These guards read the
