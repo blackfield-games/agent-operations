@@ -2317,16 +2317,18 @@ impl Store {
     /// Sum of `render_seconds` across all recorded results — the mesh-output
     /// metric surfaced at `/stats` ("N render-seconds produced"). Decodes each
     /// stored `JobResult` in Rust and sums its `render_seconds`, mirroring the
-    /// per-kind decode pattern. Widened to `u64` so a large mesh-wide total
-    /// can't overflow the `u32` per-result field. Zero when nothing has
-    /// completed.
+    /// per-kind decode pattern. Widened to `u64` and summed with `checked_add`,
+    /// so even an implausible mesh-wide overflow errors rather than silently
+    /// wrapping — matching `total_payout_wei`. Zero when nothing has completed.
     pub fn total_render_seconds(&self) -> Result<u64> {
         let mut stmt = self.conn.prepare("SELECT result_json FROM results")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut total: u64 = 0;
         for row in rows {
             let result: JobResult = serde_json::from_str(&row?)?;
-            total += result.render_seconds as u64;
+            total = total
+                .checked_add(result.render_seconds as u64)
+                .ok_or_else(|| anyhow::anyhow!("total_render_seconds overflowed u64"))?;
         }
         Ok(total)
     }
@@ -2365,7 +2367,9 @@ impl Store {
     /// Sum of `render_seconds` grouped by earner address, for the `GET /earners`
     /// leaderboard. Decodes each recorded `JobResult` and accumulates its
     /// `render_seconds` (widened to `u64`, mirroring `total_render_seconds`)
-    /// under its `results.earner` key. Empty map when nothing has completed.
+    /// under its `results.earner` key with `checked_add` (an implausible overflow
+    /// errors rather than wraps, mirroring `payout_wei_by_earner`). Empty map when
+    /// nothing has completed.
     pub fn render_seconds_by_earner(&self) -> Result<HashMap<String, u64>> {
         let mut stmt = self
             .conn
@@ -2379,7 +2383,10 @@ impl Store {
         for row in rows {
             let (earner, result_json) = row?;
             let result: JobResult = serde_json::from_str(&result_json)?;
-            *totals.entry(earner).or_insert(0) += result.render_seconds as u64;
+            let slot = totals.entry(earner).or_insert(0);
+            *slot = slot
+                .checked_add(result.render_seconds as u64)
+                .ok_or_else(|| anyhow::anyhow!("render_seconds_by_earner overflowed u64"))?;
         }
         Ok(totals)
     }
