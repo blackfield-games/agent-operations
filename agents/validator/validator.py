@@ -910,12 +910,24 @@ def _lod_directive_legality(
     and never into the sheddable candidates, so a recorded floor shed is a fabricated reduction
     of always-present geometry that grounds cleanly (terrain's authored legally equals its
     metric, so the check above stays silent). Checked first, before phantom/authored, so a
-    floored name resolves to that one specific reason. Runs only for
+    floored name resolves to that one specific reason.
+
+    Finally, as the trailing else of that grounded chain, it rejects a directive whose
+    ``specialist`` was already shed by an earlier one. ``_opt_reductions`` SUMS (authored −
+    effective) over every ``Lod_N`` block with no dedup and no per-layer cap, and
+    ``_budget_self_consistency`` ties only the TOTAL to the summed geometry — so two
+    ratio-legal directives naming the same layer double-count its reduction (Σreductions
+    un-caps past the geometry the layer can physically give) and the over-budget world
+    reconciles to accepted. ``optimization._resolve`` enumerates each sheddable index exactly
+    once (one directive per specialist), so a repeat is a tamper/desync the ``seen`` set
+    catches. Tracked per-run (initialised before the loop) so a later validation of a
+    legitimately single shed of the same layer is not false-rejected. Runs only for
     a shed already legal by scale + effective (an illegal one is rejected regardless) and only
     when the map is given, so the direct-call unit path (no map) keeps its legality-only
     contract — the per-layer twin of the sum's ``authored == prior_triangles`` grounding."""
     out: list[str] = []
     floor = 1 << optimization.MAX_LOD
+    seen: set[str] = set()
     for block in re.finditer(r'def Scope "(Lod_\d+)"\s*\{(.*?)\}', text, re.DOTALL):
         name, body = block.group(1), block.group(2)
         level = _opt_number(body, "lodLevel")
@@ -977,6 +989,14 @@ def _lod_directive_legality(
                 f"{specialist} layer holds — an inflated authored base fabricating a reduction "
                 f"the summed budget cannot see; re-run optimization"
             )
+        elif specialist in seen:
+            out.append(
+                f"optimization layer {opt_path} directive {name} sheds {specialist!r} "
+                f"already shed by an earlier directive — a double-counted reduction the "
+                f"optimizer never emits (one directive per layer); re-run optimization"
+            )
+        else:
+            seen.add(specialist)
     return out
 
 
