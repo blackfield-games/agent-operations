@@ -345,6 +345,17 @@ def test_spec_rejects_malformed_or_overlarge_payout():
     assert _spec(max_payout_wei=str(MAX_PAYOUT_WEI)).max_payout_wei == str(MAX_PAYOUT_WEI)
 
 
+def test_spec_accepts_zero_payout():
+    # A free render is a valid payout: the coordinator parses max_payout_wei as a u128,
+    # for which 0 is in range (validate.rs only upper-bounds it). The lower bound here is
+    # inclusive (0 <= wei) — the OPPOSITE of the sibling deadline_secs=Field(gt=0), whose
+    # zero edge is rejected — so a bound tightened to 0 < wei would make the producer
+    # stricter than the coordinator and drop a legitimate zero spec.
+    assert _spec(max_payout_wei="0").max_payout_wei == "0"
+    # a lenient zero form still re-emits as the canonical "0" the u128 parse accepts
+    assert _spec(max_payout_wei="00").max_payout_wei == "0"
+
+
 def test_spec_canonicalizes_payout():
     # A lenient input is re-emitted as a plain decimal the coordinator's u128 parse
     # accepts (no leading zeros, no underscores).
