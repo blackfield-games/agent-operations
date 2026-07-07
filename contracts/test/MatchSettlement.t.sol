@@ -659,6 +659,29 @@ contract MatchSettlementTest is Test {
         settlement.settleDraw(MATCH, HASH);
     }
 
+    /// @dev _applyDraw records reputation for both seats before refunding stake, so a
+    ///      deauthorized writer must revert the whole draw — the last settle path without
+    ///      a NotReputationWriter propagation test (settle/settleField/settleFieldWager
+    ///      each have one). settleDrawRanked shares _applyDraw, so this covers both draw
+    ///      entries. Assert status stays Open and escrow is untouched: the write precedes
+    ///      the refund, so a CEI slip that refunded first would drain escrow on the revert.
+    function test_settleDraw_revertsWhenNotReputationWriter() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(owner);
+        registry.setReputationWriter(address(settlement), false);
+
+        vm.expectRevert(AgentRegistry.NotReputationWriter.selector);
+        vm.prank(attester);
+        settlement.settleDraw(MATCH, HASH);
+        assertEq(token.balanceOf(address(settlement)), 2 * STAKE, "escrow untouched on revert");
+        assertTrue(_status(MATCH) == MatchSettlement.Status.Open, "match remains Open");
+
+        vm.prank(attester);
+        settlement.cancelMatch(MATCH);
+        assertEq(token.balanceOf(address(settlement)), 0, "funds recovered via cancel");
+    }
+
     // --- cancelMatch ---
 
     function test_cancelMatch_refundsBothFundedSeats() public {
