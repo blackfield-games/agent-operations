@@ -45,6 +45,7 @@ contract ArtifactTemplateTest is Test {
     event MinterSet(address indexed minter);
     event MintFeeRateSet(uint256 rate);
     event RoyaltyRateSet(uint256 rate);
+    event URISet(string uri);
     event RoyaltyRouted(uint256 indexed templateId, uint256 indexed regionId, uint256 amount);
     // ComputeMeter's debit event, re-declared for expectEmit against the meter.
     event Spent(address indexed buyer, address indexed spender, uint256 amount, bytes32 jobId);
@@ -190,7 +191,9 @@ contract ArtifactTemplateTest is Test {
 
     // --- setURI ---
 
-    function test_setURI_updatesUri() public {
+    function test_setURI_updatesAndEmits() public {
+        vm.expectEmit(false, false, false, true);
+        emit URISet("ipfs://v2/{id}.json");
         vm.prank(owner);
         art.setURI("ipfs://v2/{id}.json");
         assertEq(art.uri(123), "ipfs://v2/{id}.json");
