@@ -426,6 +426,26 @@ contract ComputeMeterTest is Test {
         meter.spendOnce(buyer, 100 ether, jobId);
     }
 
+    function test_spendOnce_authPrecedesFence() public {
+        // Guard ORDER: auth is the first-class gate. An unauthorized caller replaying a
+        // jobId the authorized spender already spent reverts NotAuthorized, not
+        // AlreadySpent — both guards would trip, so this pins that auth is checked
+        // FIRST. Defense-in-depth: an outsider who can't spend anyway learns only "not
+        // authorized", never the job's fenced state (no idempotency-fence oracle leak).
+        vm.startPrank(buyer);
+        token.approve(address(meter), 100 ether);
+        meter.deposit(100 ether);
+        vm.stopPrank();
+
+        bytes32 jobId = keccak256("render-1");
+        vm.prank(spender);
+        meter.spendOnce(buyer, 40 ether, jobId); // authorized spend arms the fence
+
+        vm.prank(address(0xBAD));
+        vm.expectRevert(ComputeMeter.NotAuthorized.selector); // NOT AlreadySpent
+        meter.spendOnce(buyer, 40 ether, jobId);
+    }
+
     function test_spendOnce_failedFirstCallLeavesJobRetryable() public {
         // A first spendOnce that reverts (InsufficientCredit) must NOT consume the
         // jobId — the fence is rolled back with the revert, so the relay can retry
