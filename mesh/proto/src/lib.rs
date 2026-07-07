@@ -355,6 +355,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn signing_digest_binds_domain_and_fields() {
+        // The result signature commits to both signed fields and — like its twin
+        // hello_digest — to a domain/version tag that separates it from any other
+        // earner-signed digest and pins the migration path.
+        let job = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let hash = "deadbeef".repeat(8); // 64-char hex, as a real output_hash
+        let base = signing_digest(&job, &hash);
+
+        // Binds both signed fields.
+        let other_job = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001").unwrap();
+        assert_ne!(base, signing_digest(&other_job, &hash), "job_id");
+        assert_ne!(base, signing_digest(&job, &"cafebabe".repeat(8)), "output_hash");
+
+        // The domain tag itself is bound: dropping only the tag (keeping the length
+        // prefix) changes the digest, so a result signature is domain-separated from
+        // any untagged constructor — this is the property parity with hello_digest adds.
+        let no_domain_tag: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(job.as_bytes());
+            h.update((hash.len() as u32).to_be_bytes());
+            h.update(hash.as_bytes());
+            h.finalize().into()
+        };
+        assert_ne!(base, no_domain_tag, "the b\"blackfield/result/v1\" domain tag is bound");
+
+        // Hard cutover: the v1 tag retires the pre-tag form keccak256(job_id ||
+        // output_hash) every legacy result signature committed to, so a stale
+        // signature can never validate — the lockstep retirement hello_digest's v2
+        // performed on its pre-nonce v1.
+        let legacy: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(job.as_bytes());
+            h.update(hash.as_bytes());
+            h.finalize().into()
+        };
+        assert_ne!(base, legacy, "domain tag retires the pre-v1 form");
+
+        // output_hash is length-prefixed, not bare-appended (parity with
+        // hello_digest's variable fields), so a future bound field can never alias
+        // across its boundary.
+        let no_len_prefix: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"blackfield/result/v1");
+            h.update(job.as_bytes());
+            h.update(hash.as_bytes());
+            h.finalize().into()
+        };
+        assert_ne!(base, no_len_prefix, "output_hash carries a length prefix");
+    }
+
     // -----------------------------------------------------------------------
     // Wire-shape contract tests — lock the JSON serialization of every public
     // type so an accidental rename or tag change fails CI immediately.
