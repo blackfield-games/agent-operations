@@ -9305,6 +9305,63 @@ mod tests {
     }
 
     #[test]
+    fn fine_aim_leaves_the_perception_cone_octant_native() {
+        // `aim_mode` refines ONLY the instant hitscan beam (the in-front test in
+        // `resolve_fire`); the parity-bounded perception cone (`observe` → `perceives` →
+        // `in_fov` at `fov_octant_spread`) is octant-native and never reads `aim_mode`.
+        // Observation parity is a SECURITY bound — a seat sees only what it could
+        // perceive, never full world state — so pin the ANTI-OMNISCIENCE direction: an
+        // enemy just OUTSIDE the octant cone stays ABSENT under Fine exactly as under
+        // Octant. Fine must not rotate or widen the cone to surface a hidden entity. A
+        // UE5 twin (or a refactor) that wired fine aim into the FOV cone would leak the
+        // edge enemy here instead of silently granting an omniscience advantage.
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "obs".into() },
+            SeatInfo { seat: 1, team: 1, controller: "north".into() },
+        ];
+        let facing: Bam = EAST; // octant 0
+        let north = Vec2 { x: 0, y: 10 * POSITION_SCALE }; // due North — bearing octant 2
+        // Non-vacuity: the spread-1 cone admits octants {7, 0, 1}; the North enemy sits
+        // exactly one octant beyond that edge (distance 2), in range and unoccluded, so
+        // ONLY the cone hides it — a widened or rotated cone would reveal it. Derived
+        // from the real octant fns so a wrong placement fails loudly, not vacuously.
+        assert_eq!(octant_index(facing), 0, "facing snaps to the East octant");
+        assert_eq!(bearing_octant(north.x as i64, north.y as i64), 2, "the enemy bears due North");
+        assert_eq!(circular_octant_distance(0, 2), 2, "North is two octants off — just outside the spread-1 cone");
+
+        let build = |aim_mode: AimMode| {
+            let rules = Rules {
+                perception_range: 100 * POSITION_SCALE,
+                fov_octant_spread: 1,
+                aim_mode,
+                spawn_jitter: 0,
+                ..Default::default()
+            };
+            let mut m = Match::new(MID.parse().unwrap(), config(2), rules, seats.clone(), Vec::new(), 1);
+            for p in &mut m.pawns {
+                match p.seat {
+                    0 => {
+                        p.pos = Vec2::ZERO;
+                        p.facing = facing;
+                    }
+                    1 => p.pos = north,
+                    _ => {}
+                }
+            }
+            m
+        };
+        let sees_north = |m: &Match| m.observe(0).visible.iter().any(|e| e.entity_id == 1);
+
+        let octant = build(AimMode::Octant);
+        let fine = build(AimMode::Fine);
+        assert!(!sees_north(&octant), "the North enemy is outside the octant cone");
+        assert!(!sees_north(&fine), "AimMode::Fine must not widen or rotate the cone to reveal the North enemy");
+        // Security bound: the FULL observation under Fine obeys the octant-recomputed
+        // parity bound in both directions — not merely the North entity.
+        assert_parity_bound(&fine);
+    }
+
+    #[test]
     fn observe_occludes_an_enemy_behind_a_blocker_and_does_not_leak_it() {
         // Integration: an in-range, in-cone enemy directly behind a wall is excluded
         // from the visible set and its position never leaks; remove the wall and the
