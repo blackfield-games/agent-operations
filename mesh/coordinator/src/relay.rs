@@ -68,8 +68,10 @@ pub enum BatchRelayError {
     /// with every row still pending — single submits would hit the same fault, so
     /// the fallback is skipped.
     Transient(String),
-    /// A non-retryable fault for the whole batch (the signer is not an authorized
-    /// coordinator). The drain stops loudly; every row stays pending.
+    /// A non-retryable fault for the whole batch (e.g. the signer is not an
+    /// authorized coordinator). The drain stops loudly; every row stays pending.
+    /// The single-submit twin of this global halt is [`RelayError::NotAuthorized`];
+    /// a per-row single-submit fault is [`RelayError::Permanent`] (dead-letter).
     Permanent(String),
 }
 
