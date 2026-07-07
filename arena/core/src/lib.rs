@@ -13794,6 +13794,39 @@ mod tests {
     }
 
     #[test]
+    fn fine_aim_leaves_the_melee_cleave_arc_octant_native() {
+        // `aim_mode` refines ONLY the instant hitscan beam (the in-front test in
+        // `resolve_fire`); the melee CLEAVE arc is gated by `in_fov` — the `octant_index`
+        // snap of the shooter's facing vs the target's `bearing_octant`, at the fixed
+        // `MELEE_ARC_SPREAD` — and never consults `aim_mode`. Pin that boundary so a UE5
+        // twin (or a refactor) that tightened the cleave under "fine aim" — a plausible
+        // reading — diverges here instead of silently clipping a struck enemy.
+        let facing: Bam = EAST; // octant 0
+        let off = POSITION_SCALE; // (off, off) bears due-NE, 1.41 m — inside the 2 m default reach
+        // Non-vacuity: the target bears exactly ONE octant off the facing — inside the
+        // spread-1 cleave arc, but the first enemy a narrowed (spread-0) arc would drop.
+        // Derived from the real octant fns so a wrong placement fails loudly, not vacuously.
+        assert_eq!(octant_index(facing), 0, "facing snaps to the East octant");
+        assert_eq!(bearing_octant(off as i64, off as i64), 1, "the target bears NE — one octant off the facing");
+        assert_eq!(circular_octant_distance(0, 1), MELEE_ARC_SPREAD as usize, "the NE target sits exactly on the cleave-arc edge");
+
+        let cleave = |aim_mode: AimMode| {
+            let mut m = melee_match(2);
+            m.rules.aim_mode = aim_mode;
+            m.pawns[0].pos = Vec2::ZERO;
+            m.pawns[0].facing = facing;
+            m.pawns[1].pos = Vec2 { x: off, y: off };
+            let before = m.pawns[1].health;
+            m.resolve_melee(0);
+            before - m.pawns[1].health // damage the NE target took
+        };
+        let octant = cleave(AimMode::Octant);
+        let fine = cleave(AimMode::Fine);
+        assert!(octant > 0, "the NE target is inside the spread-1 cleave arc and is struck");
+        assert_eq!(fine, octant, "AimMode::Fine must not narrow or rotate the octant-native cleave arc");
+    }
+
+    #[test]
     fn melee_needs_no_ammo() {
         // Melee is the always-available fallback: an empty magazine still swings, and
         // ammo is neither required nor decremented (no underflow).
