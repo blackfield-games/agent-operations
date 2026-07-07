@@ -160,6 +160,7 @@ contract MatchSettlementTest is Test {
     event ReputationDeltaSet(uint256 reputationDelta);
     event MaxRatingDeltaSet(uint256 maxRatingDelta);
     event SettleWindowSet(uint64 settleWindow);
+    event SchemaRegistered(bytes32 indexed matchUid, bytes32 indexed fieldUid);
     event MatchAttested(bytes32 indexed matchId, bytes32 indexed uid);
     event MatchAttestationRevoked(bytes32 indexed matchId, bytes32 indexed uid);
 
@@ -243,6 +244,46 @@ contract MatchSettlementTest is Test {
         AgentRegistry zeroTokenRegistry = new AgentRegistry(address(0), 0, owner);
         vm.expectRevert(MatchSettlement.ZeroToken.selector);
         new MatchSettlement(address(eas), address(zeroTokenRegistry), owner, REP_DELTA);
+    }
+
+    // --- registerSchema (the single deploy step that arms every settle path; onlyOwner) ---
+
+    /// @dev registerSchema wires the two DISTINCT schemas (1v1 vs field) — the only signal an
+    ///      off-chain indexer gets telling it which uid decodes which attestation shape. Assert the
+    ///      emit's two indexed topics AND both storage slots on a FRESH (unwired) settlement so the
+    ///      bytes32(0)->set arming is observable and a fieldSchemaUid=matchUid desync is caught (the
+    ///      return tuple alone would not catch it). MockSchemaRegistry.register returns
+    ///      keccak256(bytes(schema)), so both uids are deterministic from the verbatim src literals.
+    function test_registerSchema_onlyOwnerAndEmits() public {
+        bytes32 expMatch = keccak256(
+            bytes(
+                "bytes32 matchId, address agentA, address agentB, address winner, bytes32 replayHash, int256 deltaA"
+            )
+        );
+        bytes32 expField = keccak256(
+            bytes("bytes32 matchId, address[] agents, int256[] deltas, bytes32 replayHash, uint256 pot")
+        );
+
+        MatchSettlement fresh = new MatchSettlement(address(eas), address(registry), owner, REP_DELTA);
+        assertEq(fresh.schemaUid(), bytes32(0), "fresh settlement starts unarmed");
+        assertEq(fresh.fieldSchemaUid(), bytes32(0), "fresh settlement starts unarmed");
+
+        // Construct the registry before the prank so prank applies to registerSchema, not the CREATE.
+        MockSchemaRegistry schemaReg = new MockSchemaRegistry();
+        vm.expectEmit(true, true, false, false);
+        emit SchemaRegistered(expMatch, expField);
+        vm.prank(owner);
+        (bytes32 matchUid, bytes32 fieldUid) = fresh.registerSchema(address(schemaReg));
+
+        assertEq(matchUid, expMatch, "returned 1v1 uid");
+        assertEq(fieldUid, expField, "returned field uid");
+        assertTrue(matchUid != fieldUid, "the 1v1 and field schemas must be distinct uids");
+        assertEq(fresh.schemaUid(), expMatch, "stored 1v1 schema uid");
+        assertEq(fresh.fieldSchemaUid(), expField, "stored field schema uid");
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        fresh.registerSchema(address(schemaReg));
     }
 
     // --- openMatch (FM2: attester gating; idempotency: single-use id) ---
