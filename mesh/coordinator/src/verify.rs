@@ -461,6 +461,53 @@ mod tests {
     }
 
     #[test]
+    fn pre_tag_hello_signature_is_rejected() {
+        // The hello domain cutover, from the verifier's side: a signature over the v1
+        // hello preimage — b"blackfield/hello/v1" with NO nonce field, the form every
+        // Hello committed to before 6b3241d folded the anti-replay nonce in and bumped
+        // the tag to v2 — must no longer validate. verify_hello_signature recomputes the
+        // v2 digest (v2-tagged, nonce-bound), recovers a different key, and rejects it:
+        // the intended hard cutover, the registration twin of
+        // pre_tag_result_signature_is_rejected. Signer and verifier now share the one v2
+        // constructor, so no un-upgraded mirror is left behind.
+        let sk = dev_key();
+        let addr = dev_address();
+        let supported = [JobKind::Terrain, JobKind::DiffusionTile];
+        let n: &[u8] = b"chal";
+
+        // The reconstructed v1 preimage: the "…/v1" tag and the same length-delimited
+        // fields, but no nonce — signed here so the stale proof commits to exactly it.
+        let pre_v2_digest: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"blackfield/hello/v1");
+            h.update((addr.len() as u32).to_be_bytes());
+            h.update(addr.as_bytes());
+            h.update(("RTX 4090".len() as u32).to_be_bytes());
+            h.update(b"RTX 4090");
+            h.update(24u32.to_be_bytes());
+            h.update((supported.len() as u32).to_be_bytes());
+            for kind in &supported {
+                h.update(kind.as_u16().to_be_bytes());
+            }
+            h.finalize().into()
+        };
+        let stale_sig = sign_digest_for_test(&sk, &pre_v2_digest);
+        assert_eq!(
+            verify_hello_signature(&addr, "RTX 4090", 24, &supported, n, &stale_sig),
+            Err(VerifyError::AddressMismatch),
+        );
+
+        // Sanity: the same signer over the CURRENT v2 digest still verifies, so the
+        // rejection is the cutover, not a broken key or signer.
+        let current_sig =
+            sign_digest_for_test(&sk, &hello_digest(&addr, "RTX 4090", 24, &supported, n));
+        assert_eq!(
+            verify_hello_signature(&addr, "RTX 4090", 24, &supported, n, &current_sig),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn canonical_earner_address_folds_to_the_recovered_address() {
         // The recovered address is the canonical lowercase identity.
         let recovered = dev_address();
