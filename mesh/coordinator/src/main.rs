@@ -6152,6 +6152,37 @@ mod tests {
         assert_eq!(pending(&state).await, 2, "both stay pending for the next tick");
     }
 
+    /// A `NotAuthorized` single (the coordinator signer isn't on
+    /// `RenderReceipts.authorizedCoordinators`) inside a reverted batch HALTS the
+    /// drain — a GLOBAL misconfig is never folded into the per-row dead-letter path,
+    /// so the whole (self-healing, one `setAuthorizedCoordinator`-away) backlog is
+    /// preserved and resumes once authorization lands. The attestation twin of
+    /// `drain_debits_surfaces_not_authorized_without_dropping`; contrast
+    /// `drain_dead_letters_the_poison_receipt_and_drains_the_rest`, where a per-row
+    /// `Permanent` fault dead-letters that one receipt and drains the rest.
+    #[tokio::test]
+    async fn drain_singly_halts_on_not_authorized_without_dead_lettering() {
+        let state = test_state_empty().await;
+        settle_n(&state, 2).await;
+
+        // The reverted batch drops to the single-submit fallback, where the
+        // unauthorized signer faults the first submit.
+        let relay = MockRelay::not_authorized().with_batch_reverts();
+        drain_attestations(&state, &relay, TEST_BATCH).await;
+
+        assert_eq!(
+            dead_lettered_attestations(&state).await,
+            0,
+            "a global auth fault is never per-row dead-lettered"
+        );
+        assert_eq!(pending(&state).await, 2, "both stay pending until authorization lands");
+        assert_eq!(
+            relay.calls(),
+            1,
+            "halted on the FIRST unauthorized submit, not marched through the chunk dead-lettering each"
+        );
+    }
+
     /// FM4: a dead-lettered receipt is not re-claimed by a later drain (the claim
     /// skips dead-lettered rows) and the mark is idempotent — so an eventual
     /// operator re-drive cannot double-attest or double-mark.

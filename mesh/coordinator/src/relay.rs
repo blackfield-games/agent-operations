@@ -217,6 +217,16 @@ impl MockRelay {
         m
     }
 
+    /// Always fail with `NotAuthorized` (the coordinator signer is not authorized
+    /// on RenderReceipts — a global config fault). Composed with
+    /// `with_batch_reverts()` it drives the single-submit fallback's halt path.
+    #[cfg(test)]
+    pub fn not_authorized() -> Self {
+        let mut m = Self::succeeding();
+        m.inner.get_mut().unwrap().not_authorized = true;
+        m
+    }
+
     /// Always fail with `AlreadyIssued` (the receipt is already on-chain).
     #[cfg(test)]
     pub fn already_issued() -> Self {
