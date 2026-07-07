@@ -409,6 +409,37 @@ contract RegionAuthorityTest is Test {
         region.claimFees(TILE);
     }
 
+    function test_withdrawable_accumulatesAcrossTwoSettlements() public {
+        // Two SEPARATE fee settlements to the SAME holder (no withdraw between) must SUM
+        // in withdrawable[alice] — the `+=` accrual in _update. alice holds two regions,
+        // each with its own accrued fee, and transfers both away; the second settlement
+        // must ADD to the first, not overwrite it. Every other unit test settles once per
+        // holder, so this is the only deterministic pin of the accumulation (otherwise a
+        // `= accrued` overwrite rides on the fuzz invariant, which double-settles an actor
+        // only probabilistically).
+        uint256 tile2 = uint256(keccak256("region:3,4,0"));
+        uint256 fee1 = 30 ether;
+        uint256 fee2 = 45 ether;
+
+        vm.startPrank(alice);
+        region.claim(TILE, STAKE);
+        region.claim(tile2, STAKE);
+        vm.stopPrank();
+
+        vm.startPrank(bob);
+        region.depositFees(TILE, fee1);
+        region.depositFees(tile2, fee2);
+        vm.stopPrank();
+
+        vm.startPrank(alice);
+        region.transferFrom(alice, bob, TILE); // _update settles fee1 -> withdrawable[alice]
+        region.transferFrom(alice, bob, tile2); // _update settles fee2, ACCUMULATING onto fee1
+        vm.stopPrank();
+
+        assertEq(region.withdrawable(alice), fee1 + fee2, "two settlements accumulate, not overwrite");
+        assertEq(region.withdrawable(bob), 0, "fees route to the outgoing holder, not the buyer");
+    }
+
     function test_withdraw_paysSettledFees() public {
         vm.prank(alice);
         region.claim(TILE, STAKE);
