@@ -1081,18 +1081,26 @@ impl Store {
             let (id, spec_json, started_at, attempts) = row?;
             let job: JobSpec = serde_json::from_str(&spec_json)?;
             if now_secs - started_at >= job.deadline_secs as i64 {
+                // Guard on in_flight so a settle (record_completed, in_flight→done) that
+                // landed since the scan above is a no-op — the belt-and-suspenders
+                // reap_ttl_expired / reap_stale_holders / requeue all carry. Only rows
+                // actually transitioned are reported (changed==1 for a real expiry).
                 if attempts >= max_attempts {
-                    self.conn.execute(
-                        "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2",
-                        (STATUS_FAILED, &id),
+                    let changed = self.conn.execute(
+                        "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2 AND status = ?3",
+                        (STATUS_FAILED, &id, STATUS_IN_FLIGHT),
                     )?;
-                    outcome.failed.push(job.id);
+                    if changed > 0 {
+                        outcome.failed.push(job.id);
+                    }
                 } else {
-                    self.conn.execute(
-                        "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2",
-                        (STATUS_QUEUED, &id),
+                    let changed = self.conn.execute(
+                        "UPDATE jobs SET status = ?1, started_at = NULL WHERE id = ?2 AND status = ?3",
+                        (STATUS_QUEUED, &id, STATUS_IN_FLIGHT),
                     )?;
-                    outcome.requeued.push(job.id);
+                    if changed > 0 {
+                        outcome.requeued.push(job.id);
+                    }
                 }
             }
         }
