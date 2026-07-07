@@ -1603,6 +1603,26 @@ mod tests {
     }
 
     #[test]
+    fn verify_join_signature_rejects_an_unrecoverable_signature() {
+        // The fourth JoinVerifyError variant, the one with no reject sibling: a
+        // well-formed 65-byte [r||s||v] whose r is a valid scalar but NOT a secp256k1
+        // x-coordinate. It clears from_slice, the low-S gate, and the recovery-id
+        // parse, then recover_from_prehash finds no curve point at x=r and errs. r = 5
+        // is the smallest x whose x³+7 is a quadratic non-residue mod p (no point has
+        // it as an x-coordinate); s = 1 is a valid low-S scalar and v = 0 a valid
+        // recovery id, so the ONLY reachable reject is Unrecoverable — not the
+        // encoding/canonical siblings that gate before the recover step.
+        let mut raw = [0u8; 65];
+        raw[31] = 5; // r = 5: a valid scalar that is not a curve x-coordinate
+        raw[63] = 1; // s = 1: low-S, in [1, n/2]
+        raw[64] = 0; // v = 0: a valid recovery id
+        assert_eq!(
+            verify_join_signature(PROTOCOL_VERSION, &dev_address(), CHAL, &hex::encode(raw)),
+            Err(JoinVerifyError::Unrecoverable)
+        );
+    }
+
+    #[test]
     fn join_digest_binds_every_field() {
         // The signature commits to the whole Join AND the challenge nonce, so a
         // captured signature can't be reattached to a different identity/version
