@@ -2900,7 +2900,16 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             continue;
         }
         gpus_joined += 1;
-        total_vram_gb += info.vram_gb as u64;
+        // Magnitude sum: checked_add so an implausible mesh-wide overflow errors
+        // rather than silently wrapping /stats, matching the store.rs render/payout
+        // sums. (gpus_joined above stays a bare += — it's a bounded count.)
+        total_vram_gb = match total_vram_gb.checked_add(info.vram_gb as u64) {
+            Some(v) => v,
+            None => {
+                tracing::error!("stats: total_vram_gb overflowed u64");
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
         for kind in &info.supported {
             *supported_breakdown.entry(*kind).or_insert(0) += 1;
         }
