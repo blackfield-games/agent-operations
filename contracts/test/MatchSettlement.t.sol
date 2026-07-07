@@ -3243,6 +3243,27 @@ contract MatchSettlementTest is Test {
         vm.prank(attester);
         s.settleFieldWager(FIELD, ps, ds, HASH);
     }
+
+    /// @dev FM2 draw variant: settleDraw reverts SchemaNotSet on the 1v1 schema guard in
+    ///      _applyDraw — the last settle shape that was unpinned (settle + both field twins
+    ///      each have one). Open+fund both seats first so the schema guard, not the
+    ///      status/NotFullyFunded checks it sits above, is what reverts: a reorder that
+    ///      dropped it below them would redden this.
+    function test_settleDraw_revertsWhenSchemaUnregistered() public {
+        MatchSettlement s = new MatchSettlement(address(new MockEAS()), address(registry), owner, REP_DELTA);
+        _wireFresh(s, false); // schema deliberately NOT registered
+
+        vm.prank(attester);
+        s.openMatch(MATCH, alice, bob, STAKE);
+        vm.prank(alice);
+        s.fund(MATCH);
+        vm.prank(bob);
+        s.fund(MATCH);
+
+        vm.expectRevert(MatchSettlement.SchemaNotSet.selector);
+        vm.prank(attester);
+        s.settleDraw(MATCH, HASH);
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
