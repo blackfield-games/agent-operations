@@ -1669,6 +1669,20 @@ def test_run_local_match_forwards_starting_ticks_and_omits_it_by_default(monkeyp
     assert argv[argv.index("--starting-ticks") + 1] == "3"  # set: the count is the one next token
 
 
+def test_run_local_match_rejects_an_out_of_range_starting_ticks():
+    # starting_ticks is a u32 in core (0..=2**32-1), the pre-live countdown length. Unlike the None-sentinel
+    # deadline it defaults to 0 (off) and forwards on truthiness, so a negative is TRUTHY and would be forwarded
+    # as --starting-ticks -1 rather than swallowed as off — and the harness parses --starting-ticks as a u32 and
+    # panics on a negative / past-max value, so it raises before any spawn, mirroring the sibling fences. 0 stays
+    # the valid off case (tested above). A bogus harness path proves the guard precedes spawn.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -3, 2**32, 2**40):
+        with pytest.raises(ValueError, match="starting_ticks"):
+            run_local_match("/no/such/harness", [0, 1], policies, starting_ticks=bad)
+
+
 def test_run_local_match_selects_a_named_arena_and_surfaces_its_geometry():
     # arena="reference" plays the match under the reference arena: each seat's Start frame
     # carries the central occluder + the two health pickups, read back via starts=. The
