@@ -95,6 +95,45 @@ contract ComputeMeterHandler is Test {
         ghost_totalSpent += amount;
     }
 
+    /// @notice Debit a fuzzed batch of FRESH unique jobIds via spendOnceBatch — the batched
+    ///         twin of spendOnce. Each element's amount is bounded to its buyer's RUNNING
+    ///         credit (tracked across the batch so repeated buyers never overshoot), so the
+    ///         happy path debits rather than reverting. The batch's jobIds share the same
+    ///         nonce space as spendOnce and are pushed to the replay pool, so the accounting
+    ///         and at-most-once invariants must hold over a batch exactly as over N singles.
+    function spendOnceBatch(uint256 sizeSeed, uint256 seed) external {
+        uint256 size = bound(sizeSeed, 1, 8);
+        uint256[] memory remaining = new uint256[](actors.length);
+        for (uint256 i = 0; i < actors.length; i++) {
+            remaining[i] = meter.credit(actors[i]);
+        }
+
+        ComputeMeter.DebitRequest[] memory scratch = new ComputeMeter.DebitRequest[](size);
+        uint256 count;
+        uint256 batchTotal;
+        for (uint256 i = 0; i < size; i++) {
+            uint256 ai = uint256(keccak256(abi.encode(seed, i))) % actors.length;
+            if (remaining[ai] == 0) continue;
+            uint256 amount = bound(uint256(keccak256(abi.encode("amt", seed, i))), 1, remaining[ai]);
+            scratch[count++] = ComputeMeter.DebitRequest({
+                buyer: actors[ai], amount: amount, jobId: keccak256(abi.encode("spendOnce", spendOnceNonce++))
+            });
+            remaining[ai] -= amount;
+            batchTotal += amount;
+        }
+        if (count == 0) return;
+
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](count);
+        for (uint256 i = 0; i < count; i++) {
+            items[i] = scratch[i];
+            spendOnceJobIds.push(scratch[i].jobId);
+        }
+
+        vm.prank(address(this));
+        meter.spendOnceBatch(items);
+        ghost_totalSpent += batchTotal;
+    }
+
     /// @notice Replay a previously-spent jobId — it MUST revert AlreadySpent. If it
     ///         ever debits again, the fence is broken: record it for the invariant.
     function replaySpendOnce(uint256 seed, uint256 buyerSeed, uint256 amount) external {
