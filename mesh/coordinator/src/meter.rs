@@ -236,6 +236,10 @@ struct MockSpenderInner {
     batch_transient: bool,
     /// Fail `spend_batch` with `Permanent` (a whole-batch non-retryable fault).
     batch_permanent: bool,
+    /// Return ONE FEWER tx hash than elements from a "successful" `spend_batch` (models
+    /// a buggy live impl whose return count doesn't match the batch) — the drain must
+    /// mark nothing and back off rather than mis-map a debit to the wrong hash.
+    batch_short_count: bool,
     /// Total `spend` calls (successful or not).
     calls: usize,
     /// Total `spend_batch` calls — distinct from `calls`, so a test proves the happy
@@ -265,6 +269,7 @@ impl MockSpender {
                 batch_reverts: false,
                 batch_transient: false,
                 batch_permanent: false,
+                batch_short_count: false,
                 calls: 0,
                 batch_calls: 0,
                 spent: Vec::new(),
@@ -338,6 +343,14 @@ impl MockSpender {
     #[cfg(test)]
     pub fn with_batch_permanent(mut self) -> Self {
         self.inner.get_mut().unwrap().batch_permanent = true;
+        self
+    }
+
+    /// Make a "successful" `spend_batch` return one fewer hash than elements (a buggy
+    /// live impl), so a test pins that the drain marks nothing on a count mismatch.
+    #[cfg(test)]
+    pub fn with_batch_short_count(mut self) -> Self {
+        self.inner.get_mut().unwrap().batch_short_count = true;
         self
     }
 
@@ -488,7 +501,10 @@ impl Spender for MockSpender {
             inner.transient_remaining -= 1;
             return Err(BatchSpendError::Transient("mock batch transient".into()));
         }
-        let hashes: Vec<String> = debits.iter().map(batch_tx_hash).collect();
+        let mut hashes: Vec<String> = debits.iter().map(batch_tx_hash).collect();
+        if inner.batch_short_count {
+            hashes.pop(); // model a buggy live impl returning too few hashes
+        }
         for d in debits {
             inner.batch_spent.push(d.clone());
         }

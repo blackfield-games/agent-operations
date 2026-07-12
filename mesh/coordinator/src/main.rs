@@ -4441,6 +4441,31 @@ mod tests {
         assert!(err.contains("relay_batch_size"), "the reject must name the knob: {err}");
     }
 
+    #[test]
+    fn validate_args_rejects_a_zero_debit_batch_size() {
+        // A zero debit_batch_size would claim an empty chunk every tick and never drain
+        // the debit backlog — reject it at startup, naming the knob.
+        let mut a = Args::parse_from(["coordinator"]);
+        a.debit_batch_size = 0;
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(err.contains("debit_batch_size"), "the reject must name the knob: {err}");
+    }
+
+    #[test]
+    fn validate_args_rejects_a_debit_batch_size_above_the_contract_cap() {
+        // debit_batch_size caps the on-chain spendOnceBatch, which ComputeMeter bounds at
+        // MAX_BATCH (mirrored here as DEBIT_BATCH_SIZE_MAX). A batch past the cap reverts
+        // BatchTooLarge on every drain and never settles, so reject it at startup. The cap
+        // is inclusive (a batch AT it is a valid on-chain call); one above is rejected.
+        let mut a = Args::parse_from(["coordinator"]);
+        a.debit_batch_size = DEBIT_BATCH_SIZE_MAX;
+        assert!(validate_args(&a).is_ok(), "a debit_batch_size AT the contract cap must validate");
+
+        a.debit_batch_size = DEBIT_BATCH_SIZE_MAX + 1;
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(err.contains("debit_batch_size"), "the reject must name the knob: {err}");
+    }
+
     /// The common [`StoreConfig`] the test helpers build on: the test-chosen
     /// attempt/fault/TTL knobs plus the production defaults. Tests that exercise one
     /// knob override just that field via struct-update (`StoreConfig { knob: x,
@@ -7074,6 +7099,105 @@ mod tests {
             "the debit behind the poison head still settles"
         );
         assert_eq!(spender.calls(), 2, "one Permanent on the head, one success on the rest");
+    }
+
+    /// FM1: an atomic batch revert falls back to per-debit single spends — with clean
+    /// singles the whole chunk still drains, one spend at a time, so a spurious/partial
+    /// batch revert never strands the backlog.
+    #[tokio::test]
+    async fn drain_debits_reverted_batch_falls_back_to_single_spends() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let jobs = [seed_job(), seed_job()];
+        for job in &jobs {
+            settle_one_metered(&state, job).await;
+        }
+
+        let spender = MockSpender::succeeding().with_batch_reverts();
+        drain_debits_all(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 0, "the reverted batch still drains via singles");
+        assert_eq!(spender.batch_calls(), 1, "one batch attempt");
+        assert_eq!(spender.calls(), 2, "then one single spend per element in the fallback");
+        let mut spent = spender.spent();
+        spent.sort();
+        let mut expected: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
+        expected.sort();
+        assert_eq!(spent, expected);
+    }
+
+    /// A whole-batch transient error backs off with the entire chunk still pending and
+    /// NEVER reaches the per-debit fallback (single spends would hit the same fault).
+    #[tokio::test]
+    async fn drain_debits_transient_batch_leaves_all_pending() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        for job in [seed_job(), seed_job()] {
+            settle_one_metered(&state, &job).await;
+        }
+
+        let spender = MockSpender::succeeding().with_batch_transient();
+        drain_debits_all(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 2, "nothing dropped");
+        assert_eq!(dead_lettered_debits(&state).await, 0, "a transient batch is never dead-lettered");
+        assert_eq!(spender.batch_calls(), 1, "no hot loop");
+        assert_eq!(spender.calls(), 0, "a transient batch skips the fallback");
+    }
+
+    /// A whole-batch permanent error (e.g. an unauthorized spender key) halts the drain
+    /// loudly with every row still pending — never a per-row dead-letter of the chunk.
+    #[tokio::test]
+    async fn drain_debits_permanent_batch_leaves_all_pending() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        for job in [seed_job(), seed_job()] {
+            settle_one_metered(&state, &job).await;
+        }
+
+        let spender = MockSpender::succeeding().with_batch_permanent();
+        drain_debits_all(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 2, "nothing dropped");
+        assert_eq!(dead_lettered_debits(&state).await, 0, "a global batch fault is never per-row dead-lettered");
+        assert_eq!(spender.batch_calls(), 1, "no hot loop");
+        assert_eq!(spender.calls(), 0, "a permanent batch skips the fallback");
+    }
+
+    /// The drain claims at most `debit_batch_size` per `spendOnceBatch`: 5 pending rows
+    /// under a cap of 2 settle in ceil(5/2) = 3 batches, proving
+    /// `claim_oldest_pending_debit_batch` honours the limit and the outer loop drains
+    /// the rest over the following chunks in one tick.
+    #[tokio::test]
+    async fn drain_debits_caps_the_batch_at_debit_batch_size() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        for _ in 0..5 {
+            settle_one_metered(&state, &seed_job()).await;
+        }
+        assert_eq!(pending_debits(&state).await, 5);
+
+        let spender = MockSpender::succeeding();
+        drain_debits(&state, &spender, 2).await;
+
+        assert_eq!(pending_debits(&state).await, 0, "the whole backlog drains in one tick");
+        assert_eq!(spender.batch_calls(), 3, "ceil(5/2) = 3 capped batches");
+        assert_eq!(spender.batch_spent().len(), 5, "every row settled exactly once");
+    }
+
+    /// FM2: a native `spendOnceBatch` that returns the wrong number of settle-tx hashes
+    /// (a buggy live impl) marks NOTHING and backs off — never mis-maps a debit to
+    /// another element's hash. The chunk stays pending for the next tick.
+    #[tokio::test]
+    async fn drain_debits_marks_nothing_when_the_batch_returns_the_wrong_hash_count() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        for job in [seed_job(), seed_job()] {
+            settle_one_metered(&state, &job).await;
+        }
+
+        let spender = MockSpender::succeeding().with_batch_short_count();
+        drain_debits_all(&state, &spender).await;
+
+        assert_eq!(pending_debits(&state).await, 2, "a wrong-count batch marks nothing");
+        assert_eq!(dead_lettered_debits(&state).await, 0);
+        assert_eq!(spender.batch_calls(), 1, "no hot loop");
+        assert_eq!(spender.calls(), 0, "a count mismatch is not a revert — no fallback");
     }
 
     /// FM3: a dead-lettered debit is never re-driven — a later drain pass does NOT
