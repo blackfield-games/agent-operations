@@ -2069,12 +2069,6 @@ async fn drain_singly<R: Relay>(
     true
 }
 
-/// Marker `tx_hash` stored when the contract reports the debit is already spent
-/// (`ComputeMeter.spendOnce`'s jobId fence): the debit landed but the relay didn't
-/// capture its real tx hash (a crash recovered between a prior `spendOnce` and its
-/// local mark). The row is settled — it just carries this sentinel, not a spend tx.
-const ALREADY_SPENT_TX: &str = "already-spent";
-
 /// Spawn the debit relayer: every `interval_secs`, drain the pending-debit backlog
 /// through `spender`. Mirrors `spawn_relayer`; only the real binary spawns it.
 fn spawn_debit_relayer<S: Spender + 'static>(state: Arc<AppState>, spender: S, interval_secs: u64) {
@@ -2122,7 +2116,7 @@ async fn drain_debits<S: Spender>(state: &Arc<AppState>, spender: &S) {
             Ok(tx) => tx,
             Err(SpendError::AlreadySpent) => {
                 tracing::info!(%job_id, "spender: debit already spent on-chain; marking submitted");
-                ALREADY_SPENT_TX.to_string()
+                crate::meter::ALREADY_SPENT_TX.to_string()
             }
             Err(SpendError::NotAuthorized) => {
                 tracing::error!(%job_id, "spender: NotAuthorized — the spender key is not authorized on ComputeMeter (owner must call setSpender); draining paused");
