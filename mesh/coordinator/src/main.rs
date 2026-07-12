@@ -61,7 +61,7 @@ mod store;
 mod validate;
 mod verify;
 
-use meter::{SpendError, Spender};
+use meter::{BatchSpendError, SpendError, Spender};
 use relay::{BatchRelayError, Relay, RelayError, ALREADY_ISSUED_UID};
 use store::Store;
 
@@ -199,6 +199,16 @@ struct Args {
     /// `/stats pending_debits`.
     #[arg(long, env = "COORDINATOR_SPENDER_DEV_MOCK", default_value = "false")]
     spender_dev_mock: bool,
+    /// Max debits the debit relayer batches into one `ComputeMeter.spendOnceBatch`
+    /// call per drain step — the metering twin of `--relay-batch-size`.
+    /// `spendOnceBatch` is atomic — every element debits in one tx — so the cap keeps
+    /// a batch under the block gas limit (each element pays the per-`jobId` fence + a
+    /// credit check + counters + the `Spent` log). The drain claims at most this many,
+    /// submits one batch, and on a revert falls back to per-debit single spends; the
+    /// rest drains over the next steps/ticks. 32 leaves wide headroom under Base's
+    /// block gas; raise it to amortize a deeper backlog. Must be >= 1.
+    #[arg(long, env = "COORDINATOR_DEBIT_BATCH_SIZE", default_value_t = DEFAULT_DEBIT_BATCH_SIZE)]
+    debit_batch_size: usize,
     /// Shared-secret bearer token gating `POST /jobs` ingestion. When SET, a
     /// job-creation request must carry `Authorization: Bearer <token>` (compared
     /// in constant time); a request that is absent, malformed, or carries the
@@ -839,6 +849,14 @@ fn validate_args(args: &Args) -> Result<()> {
         args.relay_batch_size <= RELAY_BATCH_SIZE_MAX,
         "relay_batch_size must be <= {RELAY_BATCH_SIZE_MAX} (the RenderReceipts.MAX_BATCH on-chain cap; a larger batch reverts BatchTooLarge on every drain and never settles the backlog)"
     );
+    anyhow::ensure!(
+        args.debit_batch_size > 0,
+        "debit_batch_size must be >= 1 (0 would claim an empty batch every tick and never drain the debit backlog)"
+    );
+    anyhow::ensure!(
+        args.debit_batch_size <= DEBIT_BATCH_SIZE_MAX,
+        "debit_batch_size must be <= {DEBIT_BATCH_SIZE_MAX} (the ComputeMeter.MAX_BATCH on-chain cap; a larger batch reverts BatchTooLarge on every drain and never settles the backlog)"
+    );
     // A zero body timeout makes `TimeoutLayer` respond 408 to every POST before its
     // body can arrive — registration + submit over HTTP become a total outage.
     anyhow::ensure!(
@@ -942,6 +960,7 @@ async fn main() -> Result<()> {
             state.clone(),
             meter::MockSpender::succeeding(),
             args.spender_interval_secs,
+            args.debit_batch_size,
         );
     } else {
         tracing::info!(
@@ -1659,6 +1678,21 @@ const DEFAULT_RELAY_BATCH_SIZE: usize = 32;
 /// lockstep with the contract constant by hand (the coordinator does not read the ABI).
 const RELAY_BATCH_SIZE_MAX: usize = 64;
 
+/// Default cap on debits per `spendOnceBatch` — the metering twin of
+/// [`DEFAULT_RELAY_BATCH_SIZE`]. 32 keeps the atomic batch well under Base's block
+/// gas limit (each element pays the per-`jobId` fence + a credit check + counters +
+/// the `Spent` log) while amortizing the base tx cost across a settle wave. Backs
+/// `Args::debit_batch_size` (`--debit-batch-size` / `COORDINATOR_DEBIT_BATCH_SIZE`).
+const DEFAULT_DEBIT_BATCH_SIZE: usize = 32;
+
+/// Hard upper bound on `debit_batch_size`, mirroring the on-chain
+/// `ComputeMeter.MAX_BATCH` (64) that caps a `spendOnceBatch`. The contract reverts
+/// `BatchTooLarge` above it, so a `debit_batch_size` past this would make every
+/// on-chain drain revert and never settle the debit backlog. Reject it at startup — a
+/// fail-fast config error an operator sees at boot, not a silent on-chain outage. Kept
+/// in lockstep with the contract constant by hand (the coordinator does not read the ABI).
+const DEBIT_BATCH_SIZE_MAX: usize = 64;
+
 /// Default cap on the number of `queued` jobs the runtime ingestion endpoint
 /// (`POST /jobs`) will admit. Sized far above any legitimate early backlog (the
 /// boot-time seed is a handful of jobs, exempt anyway) so it never bites honest
@@ -2070,103 +2104,201 @@ async fn drain_singly<R: Relay>(
 }
 
 /// Spawn the debit relayer: every `interval_secs`, drain the pending-debit backlog
-/// through `spender`. Mirrors `spawn_relayer`; only the real binary spawns it.
-fn spawn_debit_relayer<S: Spender + 'static>(state: Arc<AppState>, spender: S, interval_secs: u64) {
+/// through `spender` in `batch_size`-capped chunks. Mirrors `spawn_relayer`; only the
+/// real binary spawns it.
+fn spawn_debit_relayer<S: Spender + 'static>(
+    state: Arc<AppState>,
+    spender: S,
+    interval_secs: u64,
+    batch_size: usize,
+) {
     tokio::spawn(async move {
         // Clamp to a 1s floor (see `spawn_relayer`): a zero period panics tokio's
         // interval, and this dev-mock-only loop clamps rather than hard-fails.
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
             tick.tick().await;
-            drain_debits(&state, &spender).await;
+            drain_debits(&state, &spender, batch_size).await;
         }
     });
 }
 
-/// Drain pending ComputeMeter debits oldest-first through `spender`, settling each
-/// to its on-chain spend tx hash — the metering twin of [`drain_attestations`].
+/// Drain pending ComputeMeter debits oldest-first through `spender` — the metering
+/// twin of [`drain_attestations`]. Claims up to `batch_size` rows and settles them
+/// through ONE `ComputeMeter.spendOnceBatch` (amortizing the base tx cost across a
+/// per-block settle wave), falling back to per-debit single spends on an atomic batch
+/// revert to isolate the offender.
 ///
-/// The store lock is NEVER held across the spend await: each debit is claimed
-/// under the lock, the lock is dropped for the (slow) on-chain call, and only
-/// re-acquired to mark the result, so settles and `/stats` never stall behind RPC
-/// latency. `AlreadySpent` is an idempotent success (the debit is on-chain after a
-/// recovered crash) so it is marked and the drain continues; `NotAuthorized` is
-/// surfaced loudly + distinctly and STOPS the batch (a global misconfig — the
-/// spender key needs `ComputeMeter.setSpender` — so every debit would revert); a
-/// transient error stops the batch (backs off to the next tick). A `Permanent`
-/// error is per-row: that one debit is DEAD-LETTERED (quarantined + retained +
-/// surfaced at `/stats dead_lettered_debits`) and the drain CONTINUES, so one poison
-/// debit never blocks the rest of the backlog. No debit is dropped or double-spent.
-async fn drain_debits<S: Spender>(state: &Arc<AppState>, spender: &S) {
+/// The store lock is NEVER held across the on-chain call: a chunk is claimed under the
+/// lock, the lock is dropped for the (slow) batch submit, and only re-acquired to mark
+/// each result, so settles and `/stats` never stall behind RPC latency. On a
+/// successful batch every claimed row is marked to its settle tx hash. A `Reverted`
+/// batch (all-or-nothing on-chain — one `AlreadySpent` fence or an underfunded buyer
+/// rolls it back) falls back to [`drain_debits_singly`], which isolates the offender:
+/// an `AlreadySpent` element is an idempotent success (marked), a per-row `Permanent`
+/// (e.g. `InsufficientCredit`) is DEAD-LETTERED (quarantined + retained + surfaced at
+/// `/stats dead_lettered_debits`) and the rest still drain, and a `NotAuthorized`
+/// global misconfig STOPS the drain loudly (every row stays pending until
+/// `setSpender`). A whole-batch `Transient`/`Permanent` error backs off with the chunk
+/// still pending. No debit is dropped or double-spent.
+async fn drain_debits<S: Spender>(state: &Arc<AppState>, spender: &S, batch_size: usize) {
     loop {
         let claimed = {
             let store = state.store.lock().await;
-            store.claim_oldest_pending_debit()
+            store.claim_oldest_pending_debit_batch(batch_size)
         }; // lock dropped before the on-chain spend below
         let claimed = match claimed {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(?e, "spender: claim_oldest_pending_debit failed");
+                tracing::error!(?e, "spender: claim_oldest_pending_debit_batch failed");
                 return;
             }
         };
-        let Some((job_id, debit)) = claimed else { return }; // backlog drained
+        if claimed.is_empty() {
+            return; // backlog drained
+        }
 
-        let tx_hash = match spender.spend(&debit).await {
+        let debits: Vec<crate::meter::PendingDebit> =
+            claimed.iter().map(|(_, d)| d.clone()).collect();
+        match spender.spend_batch(&debits).await {
+            Ok(hashes) => {
+                // A native spendOnceBatch settles every element in one tx, so it
+                // returns one settle-tx hash PER element (the batch tx for each, or N
+                // distinct ones from the sequential default). A short/long return would
+                // mis-map a debit to the wrong hash, so mark nothing and back off rather
+                // than corrupt the record.
+                if hashes.len() != claimed.len() {
+                    tracing::error!(
+                        got = hashes.len(),
+                        want = claimed.len(),
+                        "spender: spendOnceBatch returned the wrong tx-hash count; marking nothing"
+                    );
+                    return;
+                }
+                for ((job_id, _), tx_hash) in claimed.iter().zip(hashes.iter()) {
+                    if !mark_debited(state, job_id, tx_hash).await {
+                        return;
+                    }
+                }
+            }
+            Err(BatchSpendError::Reverted(msg)) => {
+                tracing::warn!(%msg, n = claimed.len(), "spender: batch reverted; isolating via single spends");
+                if !drain_debits_singly(state, spender, &claimed).await {
+                    return;
+                }
+            }
+            Err(BatchSpendError::Transient(msg)) => {
+                tracing::warn!(%msg, "spender: transient batch failure; retrying next tick");
+                return; // back off; the whole chunk stays pending
+            }
+            Err(BatchSpendError::Permanent(msg)) => {
+                tracing::error!(%msg, "spender: permanent batch failure; draining paused (check spender authorization on ComputeMeter)");
+                return; // whole chunk stays pending
+            }
+        }
+    }
+}
+
+/// Mark one debit settled under the lock. Returns `false` only on a store error (the
+/// caller stops the drain); a no-op re-mark (the row was already marked by a
+/// recovered/duplicate drain) is logged and treated as success so the rest keeps
+/// draining. Mirrors [`mark_relayed`].
+async fn mark_debited(state: &Arc<AppState>, job_id: &uuid::Uuid, tx_hash: &str) -> bool {
+    let marked = {
+        let store = state.store.lock().await;
+        store.mark_debit_submitted(job_id, tx_hash, now_secs())
+    };
+    match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(%job_id, "spender: debit already marked submitted");
+            true
+        }
+        Err(e) => {
+            tracing::error!(%job_id, ?e, "spender: mark_debit_submitted failed");
+            false
+        }
+    }
+}
+
+/// Quarantine one debit the spender hit a non-retryable (`Permanent`) error on, under
+/// the lock. Returns `false` only on a store error (the caller stops the drain); a
+/// no-op mark (the row was already settled or already dead-lettered by a
+/// recovered/duplicate drain) is logged and treated as handled. Mirrors
+/// [`dead_letter_attestation`].
+async fn dead_letter_debit(state: &Arc<AppState>, job_id: &uuid::Uuid) -> bool {
+    let marked = {
+        let store = state.store.lock().await;
+        store.mark_debit_dead_lettered(job_id, now_secs())
+    };
+    match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(%job_id, "spender: debit already settled or dead-lettered; skipping");
+            true
+        }
+        Err(e) => {
+            tracing::error!(%job_id, ?e, "spender: mark_debit_dead_lettered failed");
+            false
+        }
+    }
+}
+
+/// Isolate a reverted batch: re-spend each claimed debit singly so the one offending
+/// element (already on-chain, or underfunded) self-identifies while the rest still
+/// drain. Mirrors [`drain_singly`] — `AlreadySpent` is an idempotent success (marked
+/// with the sentinel), `Transient` backs off, a per-row `Permanent` DEAD-LETTERS that
+/// one debit (quarantined + retained + surfaced at `/stats dead_lettered_debits`) and
+/// CONTINUES, and a `NotAuthorized` global misconfig STOPS the drain (every remaining
+/// row stays pending until `setSpender`). Returns `true` once every debit was handled
+/// (so the outer loop claims the next chunk); a `Transient`/`NotAuthorized` single — or
+/// a store error — returns `false` to stop this tick, leaving the unhandled rows
+/// pending.
+async fn drain_debits_singly<S: Spender>(
+    state: &Arc<AppState>,
+    spender: &S,
+    claimed: &[(uuid::Uuid, crate::meter::PendingDebit)],
+) -> bool {
+    for (job_id, debit) in claimed {
+        let tx_hash = match spender.spend(debit).await {
             Ok(tx) => tx,
             Err(SpendError::AlreadySpent) => {
                 tracing::info!(%job_id, "spender: debit already spent on-chain; marking submitted");
                 crate::meter::ALREADY_SPENT_TX.to_string()
             }
             Err(SpendError::NotAuthorized) => {
+                // A global config fault (unauthorized spender key), not a per-row one:
+                // every debit would revert. Dead-lettering the chunk one-by-one would
+                // quarantine the whole (self-healing) backlog; instead halt loudly and
+                // leave every remaining row pending, so the drain auto-resumes once the
+                // owner calls setSpender. Mirrors drain_singly's NotAuthorized arm.
                 tracing::error!(%job_id, "spender: NotAuthorized — the spender key is not authorized on ComputeMeter (owner must call setSpender); draining paused");
-                return;
+                return false;
             }
             Err(SpendError::Transient(msg)) => {
                 tracing::warn!(%job_id, %msg, "spender: transient spend failure; retrying next tick");
-                return; // back off to the next tick
+                return false;
             }
             Err(SpendError::Permanent(msg)) => {
                 // A per-row, non-retryable fault (e.g. an underfunded buyer's
                 // InsufficientCredit) — NOT a global config problem like NotAuthorized.
-                // Quarantine THIS debit and keep draining the rest, so one poison row
-                // never blocks the backlog. The row is retained (the charge is still
-                // owed + auditable) and surfaced at `/stats dead_lettered_debits`. On a
-                // mark error the row stays pending, so back off rather than hot-loop.
-                tracing::error!(%job_id, %msg, "spender: permanent spend failure; dead-lettering and continuing (e.g. an underfunded buyer's InsufficientCredit)");
-                let marked = {
-                    let store = state.store.lock().await;
-                    store.mark_debit_dead_lettered(&job_id, now_secs())
-                };
-                match marked {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        tracing::warn!(%job_id, "spender: debit already settled or dead-lettered; skipping")
-                    }
-                    Err(e) => {
-                        tracing::error!(%job_id, ?e, "spender: mark_debit_dead_lettered failed");
-                        return;
-                    }
+                // Quarantine THIS debit and keep draining the rest of the chunk, so one
+                // poison debit never blocks the others. The row is retained (the charge
+                // is still owed + auditable) and surfaced at `/stats
+                // dead_lettered_debits`. On a mark error the row stays pending, so stop
+                // rather than hot-loop.
+                tracing::error!(%job_id, %msg, "spender: permanent spend failure; dead-lettering this debit and continuing (e.g. an underfunded buyer's InsufficientCredit)");
+                if !dead_letter_debit(state, job_id).await {
+                    return false;
                 }
                 continue;
             }
         };
-
-        let marked = {
-            let store = state.store.lock().await;
-            store.mark_debit_submitted(&job_id, &tx_hash, now_secs())
-        };
-        match marked {
-            Ok(true) => {}
-            // The row was already marked (a concurrent/duplicate drain) — not an
-            // error; keep draining the rest of the backlog.
-            Ok(false) => tracing::warn!(%job_id, "spender: debit already marked submitted"),
-            Err(e) => {
-                tracing::error!(%job_id, ?e, "spender: mark_debit_submitted failed");
-                return;
-            }
+        if !mark_debited(state, job_id, &tx_hash).await {
+            return false;
         }
     }
+    true
 }
 
 /// One synthetic queued job per `JobKind`, so a fresh coordinator presents the
@@ -2791,7 +2923,7 @@ async fn dead_lettered_debits(
     // `total` is the dead-letter count (the same value `/stats dead_lettered_debits`
     // shows). It equals the count of LISTABLE rows because no debit is ever both
     // dead-lettered and settled — `mark_debit_dead_lettered` requires `tx_hash IS
-    // NULL` and `claim_oldest_pending_debit` skips dead-lettered rows, so the listing's
+    // NULL` and `claim_oldest_pending_debit_batch` skips dead-lettered rows, so the listing's
     // extra `tx_hash IS NULL` filter never excludes a counted row. Thus `truncated` is
     // exact today; if that state-machine invariant ever changes, count the listable
     // predicate here instead.
@@ -6780,8 +6912,16 @@ mod tests {
         state.store.lock().await.dead_lettered_debit_count().unwrap()
     }
 
+    /// Drain the whole pending-debit backlog in one `spendOnceBatch` chunk (batch size
+    /// at the on-chain cap) — the common case for the many tests and dead-letter setups
+    /// that just need the backlog settled or quarantined; the batch-size-sensitive tests
+    /// call [`drain_debits`] directly with an explicit cap.
+    async fn drain_debits_all<S: Spender>(state: &Arc<AppState>, spender: &S) {
+        drain_debits(state, spender, DEBIT_BATCH_SIZE_MAX).await
+    }
+
     #[tokio::test]
-    async fn drain_debits_spends_each_pending_once_and_marks_it() {
+    async fn drain_debits_batches_all_pending_in_one_call() {
         let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
         let jobs = [seed_job(), seed_job()];
         for job in &jobs {
@@ -6790,15 +6930,16 @@ mod tests {
         assert_eq!(pending_debits(&state).await, 2);
 
         let spender = MockSpender::succeeding();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
 
         assert_eq!(pending_debits(&state).await, 0, "both debits drained");
-        assert_eq!(spender.calls(), 2);
-        let mut spent = spender.spent();
+        assert_eq!(spender.batch_calls(), 1, "one spendOnceBatch, not N single spends");
+        assert_eq!(spender.calls(), 0, "no single spends on the happy batch path");
+        let mut spent = spender.batch_spent();
         spent.sort();
         let mut expected: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
         expected.sort();
-        assert_eq!(spent, expected, "each pending debit spent exactly once");
+        assert_eq!(spent, expected, "each pending debit settled once through the batch");
     }
 
     #[tokio::test]
@@ -6808,13 +6949,14 @@ mod tests {
         settle_one_metered(&state, &job).await;
 
         let spender = MockSpender::succeeding();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
         assert_eq!(pending_debits(&state).await, 0);
-        assert_eq!(spender.calls(), 1);
+        assert_eq!(spender.batch_calls(), 1);
 
-        // Nothing pending → the spender is not called again.
-        drain_debits(&state, &spender).await;
-        assert_eq!(spender.calls(), 1, "an empty backlog spends nothing");
+        // Nothing pending → the claim returns an empty chunk and the spender is not
+        // called again (no wasted spendOnceBatch on an empty backlog).
+        drain_debits_all(&state, &spender).await;
+        assert_eq!(spender.batch_calls(), 1, "an empty backlog spends nothing");
     }
 
     /// FM4: the drain submits the buyer + amount EXACTLY as persisted at settle
@@ -6826,9 +6968,9 @@ mod tests {
         settle_one_metered(&state, &job).await;
 
         let spender = MockSpender::succeeding();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
 
-        let spent = spender.spent_debits();
+        let spent = spender.batch_spent_debits();
         assert_eq!(spent.len(), 1);
         assert_eq!(spent[0].buyer, TEST_BUYER);
         assert_eq!(spent[0].amount_wei, "1000000000000"); // DRAIN_RATE * 1, as persisted
@@ -6846,7 +6988,7 @@ mod tests {
         settle_one_metered(&state, &job).await;
 
         let spender = MockSpender::already_spent();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
 
         assert_eq!(pending_debits(&state).await, 0, "already-on-chain debit is marked");
         assert_eq!(spender.calls(), 1);
@@ -6860,21 +7002,21 @@ mod tests {
         settle_one_metered(&state, &job).await;
 
         let spender = MockSpender::transient_then_ok(1);
-        // First tick: the transient failure leaves the debit pending, not dropped.
-        drain_debits(&state, &spender).await;
+        // First tick: the transient batch failure leaves the debit pending, not dropped.
+        drain_debits_all(&state, &spender).await;
         assert_eq!(pending_debits(&state).await, 1, "transient failure is not terminal");
         assert_eq!(dead_lettered_debits(&state).await, 0, "a transient failure is retried, never dead-lettered");
-        assert_eq!(spender.calls(), 1);
-        assert!(spender.spent().is_empty());
+        assert_eq!(spender.batch_calls(), 1);
+        assert!(spender.batch_spent().is_empty());
 
-        // Next tick: it succeeds and drains.
-        drain_debits(&state, &spender).await;
+        // Next tick: the batch succeeds and drains.
+        drain_debits_all(&state, &spender).await;
         assert_eq!(pending_debits(&state).await, 0);
-        assert_eq!(spender.calls(), 2);
-        assert_eq!(spender.spent(), vec![eas::job_id_hex(&job.id)]);
+        assert_eq!(spender.batch_calls(), 2);
+        assert_eq!(spender.batch_spent(), vec![eas::job_id_hex(&job.id)]);
     }
 
-    /// A transient error stops the batch (so a flaky RPC backs off to the next
+    /// A transient batch error stops the drain (so a flaky RPC backs off to the next
     /// tick) without dropping any debit or hot-looping.
     #[tokio::test]
     async fn drain_debits_stops_the_batch_at_a_transient_error() {
@@ -6884,10 +7026,10 @@ mod tests {
         }
 
         let spender = MockSpender::transient_then_ok(usize::MAX); // never reaches ok
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
 
         assert_eq!(pending_debits(&state).await, 2, "nothing dropped");
-        assert_eq!(spender.calls(), 1, "batch stops at the first error — no hot loop");
+        assert_eq!(spender.batch_calls(), 1, "the batch backs off at the transient error — no hot loop");
     }
 
     /// A permanent error quarantines that one debit (dead-lettered, NOT dropped) and
@@ -6901,7 +7043,7 @@ mod tests {
         settle_one_metered(&state, &job).await;
 
         let spender = MockSpender::permanent();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
 
         assert_eq!(pending_debits(&state).await, 0, "the poison debit leaves the drainable backlog");
         assert_eq!(dead_lettered_debits(&state).await, 1, "it is quarantined, not dropped");
@@ -6922,7 +7064,7 @@ mod tests {
         assert_eq!(pending_debits(&state).await, 2);
 
         let spender = MockSpender::permanent_for(eas::job_id_hex(&poison.id));
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
 
         assert_eq!(pending_debits(&state).await, 0, "the backlog drains past the poison head");
         assert_eq!(dead_lettered_debits(&state).await, 1, "the poison is quarantined, not dropped");
@@ -6945,7 +7087,7 @@ mod tests {
         settle_one_metered(&state, &job).await;
 
         // First pass quarantines the poison.
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(&state).await, 1);
         assert_eq!(pending_debits(&state).await, 0);
 
@@ -6953,7 +7095,7 @@ mod tests {
         // dead-lettered row is not re-claimed, so nothing is spent and the quarantine
         // is unchanged — no double-submit.
         let spender = MockSpender::succeeding();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
         assert_eq!(spender.calls(), 0, "a dead-lettered debit is never re-claimed");
         assert!(spender.spent().is_empty(), "no double-submit on re-drive");
         assert_eq!(dead_lettered_debits(&state).await, 1, "still quarantined");
@@ -6971,7 +7113,9 @@ mod tests {
     /// FM3 (original): a `NotAuthorized` revert (the spender key isn't on
     /// `ComputeMeter.authorizedSpenders`) is a distinct, loud, non-retrying error —
     /// the backlog stalls visibly rather than silently looping like progress. It is a
-    /// GLOBAL misconfig, so it is NEVER folded into the per-row dead-letter path
+    /// GLOBAL misconfig checked before any element, so `spendOnceBatch` reverts it as a
+    /// whole-batch `Permanent`: the drain HALTS at the batch (never even reaching the
+    /// per-debit fallback), so nothing is dropped and nothing is per-row dead-lettered
     /// (quarantining it would silently dead-letter every debit on a one-call fix).
     #[tokio::test]
     async fn drain_debits_surfaces_not_authorized_without_dropping() {
@@ -6980,12 +7124,13 @@ mod tests {
         settle_one_metered(&state, &job).await;
 
         let spender = MockSpender::not_authorized();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
 
         assert_eq!(pending_debits(&state).await, 1, "unauthorized spender drops nothing");
         assert_eq!(dead_lettered_debits(&state).await, 0, "a global misconfig is never per-row dead-lettered");
-        assert_eq!(spender.calls(), 1, "no hot loop");
-        assert!(spender.spent().is_empty());
+        assert_eq!(spender.batch_calls(), 1, "the batch halts — no hot loop");
+        assert_eq!(spender.calls(), 0, "the global halt never reaches the per-debit fallback");
+        assert!(spender.batch_spent().is_empty());
     }
 
     // -- POST /debits/{id}/redrive — operator re-drive of a dead-lettered debit --
@@ -6994,7 +7139,7 @@ mod tests {
     /// is dead-lettered — the precondition for every re-drive test.
     async fn dead_letter_one(state: &Arc<AppState>, job: &JobSpec) {
         settle_one_metered(state, job).await;
-        drain_debits(state, &MockSpender::permanent()).await;
+        drain_debits_all(state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(state).await, 1, "precondition: one dead-lettered debit");
         assert_eq!(pending_debits(state).await, 0, "precondition: nothing drainable");
     }
@@ -7013,7 +7158,7 @@ mod tests {
         settle_one_metered(&state, &good).await;
 
         // Dead-letter the poison head; the good debit settles in the same pass.
-        drain_debits(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
+        drain_debits_all(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
         assert_eq!(dead_lettered_debits(&state).await, 1);
         assert_eq!(pending_debits(&state).await, 0, "good settled, poison quarantined");
 
@@ -7053,9 +7198,9 @@ mod tests {
 
         // Next drain settles it once.
         let spender = MockSpender::succeeding();
-        drain_debits(&state, &spender).await;
-        assert_eq!(spender.calls(), 1);
-        assert_eq!(spender.spent(), vec![eas::job_id_hex(&job.id)], "the re-armed debit settles exactly once");
+        drain_debits_all(&state, &spender).await;
+        assert_eq!(spender.batch_calls(), 1);
+        assert_eq!(spender.batch_spent(), vec![eas::job_id_hex(&job.id)], "the re-armed debit settles exactly once");
         assert_eq!(pending_debits(&state).await, 0);
         assert_eq!(dead_lettered_debits(&state).await, 0);
 
@@ -7066,8 +7211,8 @@ mod tests {
             "a settled debit can't be re-armed"
         );
         let spender2 = MockSpender::succeeding();
-        drain_debits(&state, &spender2).await;
-        assert_eq!(spender2.calls(), 0, "nothing left to claim — no second charge");
+        drain_debits_all(&state, &spender2).await;
+        assert_eq!(spender2.batch_calls(), 0, "nothing left to claim — no second charge");
     }
 
     /// FM3: if the buyer is STILL underfunded, re-driving then re-draining simply
@@ -7083,14 +7228,14 @@ mod tests {
         // Re-drive, then drain while the buyer is still underfunded (permanent again).
         assert!(state.store.lock().await.redrive_dead_lettered_debit(&job.id).unwrap());
         let spender = MockSpender::permanent();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
         assert_eq!(spender.calls(), 1, "one more attempt — not a hot loop");
         assert_eq!(dead_lettered_debits(&state).await, 1, "re-dead-lettered, not dropped");
         assert_eq!(pending_debits(&state).await, 0);
 
         // NOT auto-re-driven: a succeeding drain claims nothing until the next explicit re-drive.
         let spender2 = MockSpender::succeeding();
-        drain_debits(&state, &spender2).await;
+        drain_debits_all(&state, &spender2).await;
         assert_eq!(spender2.calls(), 0, "a re-dead-lettered debit is not auto-re-claimed");
         assert_eq!(dead_lettered_debits(&state).await, 1, "still quarantined");
     }
@@ -7201,13 +7346,13 @@ mod tests {
         let poison_b = seed_job();
         settle_one_metered(&state, &poison_a).await;
         settle_one_metered(&state, &poison_b).await;
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(&state).await, 2);
 
         // One good debit → settled (the poisons are skipped, stay quarantined).
         let good = seed_job();
         settle_one_metered(&state, &good).await;
-        drain_debits(&state, &MockSpender::succeeding()).await;
+        drain_debits_all(&state, &MockSpender::succeeding()).await;
         assert_eq!(dead_lettered_debits(&state).await, 2, "the poisons stay quarantined");
 
         // One fresh debit → still pending (never drained).
@@ -7225,9 +7370,9 @@ mod tests {
         // pending rows and never re-charges the paid one.
         let good_hex = eas::job_id_hex(&good.id);
         let spender = MockSpender::succeeding();
-        drain_debits(&state, &spender).await;
-        assert_eq!(spender.calls(), 3, "the 3 pending rows, not the settled good");
-        assert!(!spender.spent().contains(&good_hex), "the paid charge is never re-driven");
+        drain_debits_all(&state, &spender).await;
+        assert_eq!(spender.batch_spent().len(), 3, "the 3 pending rows, not the settled good");
+        assert!(!spender.batch_spent().contains(&good_hex), "the paid charge is never re-driven");
     }
 
     /// FM2 (auth): the bulk re-drive is a privileged mass-recovery action — a missing,
@@ -7240,7 +7385,7 @@ mod tests {
         let b = seed_job();
         settle_one_metered(&state, &a).await;
         settle_one_metered(&state, &b).await;
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(&state).await, 2);
 
         // Missing / blank / wrong token → 401, nothing re-armed.
@@ -7269,16 +7414,16 @@ mod tests {
         for j in &jobs {
             settle_one_metered(&state, j).await;
         }
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(&state).await, 3);
 
         // Bulk re-drive after the broad cause is fixed, then drain once.
         assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 3);
         assert_eq!(pending_debits(&state).await, 3);
         let spender = MockSpender::succeeding();
-        drain_debits(&state, &spender).await;
-        assert_eq!(spender.calls(), 3);
-        let mut spent = spender.spent();
+        drain_debits_all(&state, &spender).await;
+        assert_eq!(spender.batch_calls(), 1, "the 3 re-armed rows settle in one batch");
+        let mut spent = spender.batch_spent();
         spent.sort();
         let mut want: Vec<String> = jobs.iter().map(|j| eas::job_id_hex(&j.id)).collect();
         want.sort();
@@ -7289,8 +7434,8 @@ mod tests {
         // A second bulk re-drive once settled re-arms nothing, and a further drain charges nothing.
         assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 0, "all settled — nothing to re-arm");
         let spender2 = MockSpender::succeeding();
-        drain_debits(&state, &spender2).await;
-        assert_eq!(spender2.calls(), 0, "no second charge on a double bulk call");
+        drain_debits_all(&state, &spender2).await;
+        assert_eq!(spender2.batch_calls(), 0, "no second charge on a double bulk call");
     }
 
     // ---- redrive_count tracking ----
@@ -7345,7 +7490,7 @@ mod tests {
         settle_one_metered(&state, &poison).await; // settled first → claimed first (the head)
         settle_one_metered(&state, &good).await;
         // Dead-letter the poison head; the good debit settles in the same pass.
-        drain_debits(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
+        drain_debits_all(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
         assert_eq!(dead_lettered_debits(&state).await, 1);
         assert_eq!(debit_redrive_count(&state, poison.id).await, Some(0), "the dead-letter mark does not bump");
 
@@ -7359,7 +7504,7 @@ mod tests {
 
         // First real re-drive, then re-dead-letter (still underfunded): the count is exactly 1.
         assert!(state.store.lock().await.redrive_dead_lettered_debit(&poison.id).unwrap());
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(
             debit_redrive_count(&state, poison.id).await,
             Some(1),
@@ -7368,7 +7513,7 @@ mod tests {
 
         // Second real re-drive: the count accumulates to exactly 2 (+1 per re-arm).
         assert!(state.store.lock().await.redrive_dead_lettered_debit(&poison.id).unwrap());
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(debit_redrive_count(&state, poison.id).await, Some(2), "+1 per real re-arm");
     }
 
@@ -7381,7 +7526,7 @@ mod tests {
         for j in &jobs {
             settle_one_metered(&state, j).await;
         }
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(&state).await, 3);
         for j in &jobs {
             assert_eq!(debit_redrive_count(&state, j.id).await, Some(0), "a fresh dead-letter starts at 0");
@@ -7389,7 +7534,7 @@ mod tests {
 
         // First bulk wave: re-arm all three, then re-dead-letter (still failing).
         assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 3);
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(&state).await, 3, "all three re-dead-lettered");
         for j in &jobs {
             assert_eq!(debit_redrive_count(&state, j.id).await, Some(1), "exactly +1 per row per wave, never N");
@@ -7397,7 +7542,7 @@ mod tests {
 
         // Second bulk wave: each accumulates to exactly 2.
         assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 3);
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         for j in &jobs {
             assert_eq!(debit_redrive_count(&state, j.id).await, Some(2), "+1 per wave accumulates");
         }
@@ -7483,20 +7628,20 @@ mod tests {
         let b = seed_job();
         settle_one_metered(&state, &a).await;
         settle_one_metered(&state, &b).await;
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         assert_eq!(dead_lettered_debits(&state).await, 2);
 
         // Bulk re-drive, but the cause is still present → both re-dead-letter (one attempt each).
         assert_eq!(state.store.lock().await.redrive_all_dead_lettered_debits().unwrap(), 2);
         let spender = MockSpender::permanent();
-        drain_debits(&state, &spender).await;
+        drain_debits_all(&state, &spender).await;
         assert_eq!(spender.calls(), 2, "one more attempt per row — not a hot loop");
         assert_eq!(dead_lettered_debits(&state).await, 2, "re-dead-lettered, not dropped");
         assert_eq!(pending_debits(&state).await, 0);
 
         // Not auto-re-claimed: a succeeding drain claims nothing until the next explicit bulk re-drive.
         let spender2 = MockSpender::succeeding();
-        drain_debits(&state, &spender2).await;
+        drain_debits_all(&state, &spender2).await;
         assert_eq!(spender2.calls(), 0, "a re-dead-lettered set is not auto-re-claimed");
         assert_eq!(dead_lettered_debits(&state).await, 2);
     }
@@ -7549,7 +7694,7 @@ mod tests {
         settle_one_metered(&state, &poison).await; // settled first → claimed first (the head)
         settle_one_metered(&state, &good).await;
         // poison dead-letters, good settles in the same pass.
-        drain_debits(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
+        drain_debits_all(&state, &MockSpender::permanent_for(eas::job_id_hex(&poison.id))).await;
         // A third debit left pending (settled-metered, never drained).
         settle_one_metered(&state, &pending).await;
 
@@ -7599,7 +7744,7 @@ mod tests {
         let jobs = [seed_job(), seed_job(), seed_job()];
         for job in &jobs {
             settle_one_metered(&state, job).await;
-            drain_debits(&state, &MockSpender::permanent()).await; // dead-letter each in turn
+            drain_debits_all(&state, &MockSpender::permanent()).await; // dead-letter each in turn
         }
         let store = state.store.lock().await;
         // Capped: a limit of 2 over 3 dead-lettered returns the 2 OLDEST, in order.
@@ -7646,7 +7791,7 @@ mod tests {
         settle_one_metered(&state, &older).await; // oldest → the head of the oldest-first listing
         settle_one_metered(&state, &newer).await;
         // Each metered settle accrues both a debit and a receipt; dead-letter both kinds.
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         drain_attestations(&state, &relay_permanent_for(&[older.id, newer.id]), TEST_BATCH).await;
         assert_eq!(dead_lettered_debits(&state).await, 2);
         assert_eq!(dead_lettered_attestations(&state).await, 2);
@@ -7657,7 +7802,7 @@ mod tests {
             assert!(store.redrive_dead_lettered_debit(&older.id).unwrap());
             assert!(store.redrive_dead_lettered_attestation(&older.id).unwrap());
         }
-        drain_debits(&state, &MockSpender::permanent()).await;
+        drain_debits_all(&state, &MockSpender::permanent()).await;
         drain_attestations(&state, &relay_permanent_for(&[older.id]), TEST_BATCH).await;
         assert_eq!(dead_lettered_debits(&state).await, 2, "older re-dead-lettered, both still stuck");
         assert_eq!(dead_lettered_attestations(&state).await, 2);
@@ -7705,7 +7850,7 @@ mod tests {
 
         let drive = {
             let state = state.clone();
-            tokio::spawn(async move { drain_debits(&state, &spender).await })
+            tokio::spawn(async move { drain_debits_all(&state, &spender).await })
         };
 
         // The spend is now in-flight (claimed, lock dropped, awaiting release).
@@ -7733,7 +7878,7 @@ mod tests {
         let before = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(before["pending_debits"], 2);
 
-        drain_debits(&state, &MockSpender::succeeding()).await;
+        drain_debits_all(&state, &MockSpender::succeeding()).await;
 
         let after = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(after["pending_debits"], 0, "the backlog drains as debits land");
@@ -12918,7 +13063,7 @@ mod tests {
         // Quarantine one metered job's receipt AND its debit.
         let job = seed_job();
         settle_one_metered(&state, &job).await;
-        drain_debits(&state, &MockSpender::permanent()).await; // dead-letters the debit
+        drain_debits_all(&state, &MockSpender::permanent()).await; // dead-letters the debit
         let poison = MockRelay::succeeding()
             .with_batch_reverts()
             .with_permanent_job(eas::job_id_hex(&job.id));

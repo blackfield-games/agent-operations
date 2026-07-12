@@ -370,13 +370,6 @@ impl MockSpender {
             .collect()
     }
 
-    /// The full debits freshly spent — lets a test assert the amount + buyer
-    /// submitted are EXACTLY what was persisted at settle (never re-derived).
-    #[cfg(test)]
-    pub fn spent_debits(&self) -> Vec<PendingDebit> {
-        self.inner.lock().unwrap().spent.clone()
-    }
-
     /// Total `spend_batch` calls so far (the `spendOnceBatch` count).
     #[cfg(test)]
     pub fn batch_calls(&self) -> usize {
@@ -395,9 +388,9 @@ impl MockSpender {
             .collect()
     }
 
-    /// The full debits settled through a successful `spend_batch` — the batch twin
-    /// of `spent_debits`, so a test asserts the amount + buyer batched are EXACTLY
-    /// what was persisted at settle.
+    /// The full debits settled through a successful `spend_batch` — lets a test assert
+    /// the amount + buyer batched are EXACTLY what was persisted at settle (never
+    /// re-derived).
     #[cfg(test)]
     pub fn batch_spent_debits(&self) -> Vec<PendingDebit> {
         self.inner.lock().unwrap().batch_spent.clone()

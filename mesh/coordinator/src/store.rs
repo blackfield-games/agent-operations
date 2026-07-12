@@ -1797,63 +1797,18 @@ impl Store {
         Ok(count as usize)
     }
 
-    /// The oldest still-drainable debit (`tx_hash IS NULL` and not dead-lettered),
-    /// oldest-first by insert order, as `(job_id, PendingDebit)` — or `None` when the
-    /// drainable backlog is empty. The metering twin of
-    /// [`claim_oldest_pending_batch`](Self::claim_oldest_pending_batch): a pure read that does
-    /// NOT reserve or mutate the row, so the drain loop drops the store lock before
-    /// the slow on-chain `spend` and only re-acquires it to `mark_debit_submitted`.
-    /// A single drain task is the only caller and settles only ever INSERT new
-    /// pending rows, so no reservation is needed to avoid a double-claim. The
-    /// `dead_lettered_at IS NULL` filter is what unblocks the head-of-line: a
-    /// quarantined poison debit is skipped, never re-claimed, so the drain advances
-    /// to the next charge instead of hot-looping on the failure.
-    pub fn claim_oldest_pending_debit(
-        &self,
-    ) -> Result<Option<(uuid::Uuid, crate::meter::PendingDebit)>> {
-        let row = self.conn.query_row(
-            "SELECT job_id, buyer, amount_wei, job_id_b32
-             FROM pending_debits
-             WHERE tx_hash IS NULL AND dead_lettered_at IS NULL
-             ORDER BY created_at ASC, rowid ASC
-             LIMIT 1",
-            [],
-            |r| {
-                let job_id: String = r.get(0)?;
-                Ok((
-                    job_id,
-                    crate::meter::PendingDebit {
-                        buyer: r.get(1)?,
-                        amount_wei: r.get(2)?,
-                        job_id: r.get(3)?,
-                    },
-                ))
-            },
-        );
-        match row {
-            Ok((job_id, debit)) => {
-                let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
-                    anyhow::anyhow!("pending_debits.job_id not a uuid {job_id:?}: {e}")
-                })?;
-                Ok(Some((uuid, debit)))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// The oldest still-drainable debits (`tx_hash IS NULL` and not dead-lettered),
     /// oldest-first by insert order, up to `limit`, as `(job_id, PendingDebit)` — the
-    /// batched twin of [`claim_oldest_pending_debit`](Self::claim_oldest_pending_debit)
-    /// (the debit drain claims a chunk and settles it through one
-    /// `ComputeMeter.spendOnceBatch`) and the metering twin of
-    /// [`claim_oldest_pending_batch`](Self::claim_oldest_pending_batch). A pure read: it
-    /// does NOT reserve or mutate the rows, so the drain drops the store lock before the
-    /// slow on-chain batch and only re-acquires it to mark each. A single drain task is
-    /// the only caller and settles only ever INSERT new pending rows, so no reservation
-    /// is needed to avoid a double-claim. The `dead_lettered_at IS NULL` filter unblocks
-    /// the head-of-line — a quarantined poison debit is skipped, never re-claimed, so
-    /// the drain advances instead of wedging. `limit == 0` returns an empty batch.
+    /// metering twin of
+    /// [`claim_oldest_pending_batch`](Self::claim_oldest_pending_batch): the debit drain
+    /// claims a chunk and settles it through one `ComputeMeter.spendOnceBatch`. A pure
+    /// read: it does NOT reserve or mutate the rows, so the drain drops the store lock
+    /// before the slow on-chain batch and only re-acquires it to mark each. A single
+    /// drain task is the only caller and settles only ever INSERT new pending rows, so
+    /// no reservation is needed to avoid a double-claim. The `dead_lettered_at IS NULL`
+    /// filter unblocks the head-of-line — a quarantined poison debit is skipped, never
+    /// re-claimed, so the drain advances instead of wedging. `limit == 0` returns an
+    /// empty batch.
     pub fn claim_oldest_pending_debit_batch(
         &self,
         limit: usize,
@@ -2095,7 +2050,7 @@ impl Store {
 
     /// The oldest still-drainable attestations (`uid IS NULL` and not dead-lettered),
     /// oldest-first by insert order, capped at `limit` — the attestation-side twin of
-    /// [`claim_oldest_pending_debit`](Self::claim_oldest_pending_debit). Returns up to `limit`
+    /// [`claim_oldest_pending_debit_batch`](Self::claim_oldest_pending_debit_batch). Returns up to `limit`
     /// rows in the order the drain submits them, so a later submission-order zip
     /// against the uids `issueReceipts` returns maps each job to ITS OWN uid. A
     /// pure read: it does NOT reserve or mutate the rows,
