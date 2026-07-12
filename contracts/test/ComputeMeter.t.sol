@@ -500,6 +500,212 @@ contract ComputeMeterTest is Test {
         assertFalse(meter.spentJobs(jobId));
     }
 
+    // --- spendOnceBatch: the batched twin of spendOnce (mirrors RenderReceipts.issueReceipts) ---
+
+    /// @dev Fund `who`'s compute credit from the test contract's token balance (holds the
+    ///      MockToken supply minus setUp's transfer to `buyer`). depositFor pulls the caller.
+    function _fund(address who, uint256 amount) internal {
+        token.approve(address(meter), amount);
+        meter.depositFor(who, amount);
+    }
+
+    function _req(address b, uint256 a, bytes32 j) internal pure returns (ComputeMeter.DebitRequest memory) {
+        return ComputeMeter.DebitRequest({buyer: b, amount: a, jobId: j});
+    }
+
+    function test_spendOnceBatch_debitsEachElementAndEmitsPerElement() public {
+        _fund(buyer, 100 ether);
+
+        bytes32 j1 = keccak256("render-1");
+        bytes32 j2 = keccak256("render-2");
+        bytes32 j3 = keccak256("render-3");
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](3);
+        items[0] = _req(buyer, 30 ether, j1);
+        items[1] = _req(buyer, 20 ether, j2);
+        items[2] = _req(buyer, 10 ether, j3);
+
+        // One Spent per element, in submission order — same audit trail as three spendOnce.
+        vm.expectEmit(true, true, false, true);
+        emit Spent(buyer, spender, 30 ether, j1);
+        vm.expectEmit(true, true, false, true);
+        emit Spent(buyer, spender, 20 ether, j2);
+        vm.expectEmit(true, true, false, true);
+        emit Spent(buyer, spender, 10 ether, j3);
+        vm.prank(spender);
+        meter.spendOnceBatch(items);
+
+        assertEq(meter.credit(buyer), 40 ether, "credit drained by the batch sum");
+        assertEq(meter.spentByBuyer(buyer), 60 ether);
+        assertEq(meter.totalSpent(), 60 ether);
+        assertTrue(meter.spentJobs(j1) && meter.spentJobs(j2) && meter.spentJobs(j3), "every jobId fenced");
+    }
+
+    function test_spendOnceBatch_mixedBuyersEachDebitedFromOwnCredit() public {
+        // A batch can settle jobs for different buyers in one tx; each element debits ONLY
+        // its own buyer's credit — no cross-buyer bleed.
+        address buyer2 = address(0xB0B2);
+        _fund(buyer, 100 ether);
+        _fund(buyer2, 100 ether);
+
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](3);
+        items[0] = _req(buyer, 30 ether, keccak256("r1"));
+        items[1] = _req(buyer2, 45 ether, keccak256("r2"));
+        items[2] = _req(buyer, 10 ether, keccak256("r3"));
+
+        vm.prank(spender);
+        meter.spendOnceBatch(items);
+
+        assertEq(meter.credit(buyer), 60 ether, "buyer debited only its two elements");
+        assertEq(meter.credit(buyer2), 55 ether, "buyer2 debited only its one element");
+        assertEq(meter.spentByBuyer(buyer), 40 ether);
+        assertEq(meter.spentByBuyer(buyer2), 45 ether);
+        assertEq(meter.totalSpent(), 85 ether);
+    }
+
+    function test_spendOnceBatch_matchesNSpendOnce() public {
+        // Equivalence: a spendOnceBatch of N elements leaves identical per-buyer accounting
+        // to N sequential spendOnce calls. buyerA takes the singles, buyerB the batch.
+        address buyerB = address(0xB0B2);
+        _fund(buyer, 100 ether);
+        _fund(buyerB, 100 ether);
+
+        vm.startPrank(spender);
+        meter.spendOnce(buyer, 30 ether, keccak256("a1"));
+        meter.spendOnce(buyer, 20 ether, keccak256("a2"));
+        meter.spendOnce(buyer, 10 ether, keccak256("a3"));
+        vm.stopPrank();
+
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](3);
+        items[0] = _req(buyerB, 30 ether, keccak256("b1"));
+        items[1] = _req(buyerB, 20 ether, keccak256("b2"));
+        items[2] = _req(buyerB, 10 ether, keccak256("b3"));
+        vm.prank(spender);
+        meter.spendOnceBatch(items);
+
+        assertEq(meter.credit(buyer), meter.credit(buyerB), "batch and N singles drain equally");
+        assertEq(meter.spentByBuyer(buyer), meter.spentByBuyer(buyerB));
+        assertEq(meter.totalSpent(), 120 ether);
+    }
+
+    function test_spendOnceBatch_intraBatchDuplicateJobIdRevertsWholeBatch() public {
+        // A jobId repeated within one batch hits the fence the earlier element set and reverts
+        // the WHOLE batch — an intra-batch duplicate can never double-debit.
+        _fund(buyer, 100 ether);
+
+        bytes32 dup = keccak256("render-dup");
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](3);
+        items[0] = _req(buyer, 30 ether, dup);
+        items[1] = _req(buyer, 20 ether, keccak256("render-mid"));
+        items[2] = _req(buyer, 10 ether, dup);
+
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.AlreadySpent.selector);
+        meter.spendOnceBatch(items);
+
+        // All-or-nothing: NOTHING debited, no jobId fenced.
+        assertEq(meter.credit(buyer), 100 ether, "duplicate rolled back the whole batch");
+        assertEq(meter.totalSpent(), 0);
+        assertFalse(meter.spentJobs(dup));
+        assertFalse(meter.spentJobs(keccak256("render-mid")));
+    }
+
+    function test_spendOnceBatch_insufficientCreditRollsBackWholeBatch() public {
+        // A mid-batch element the buyer can't cover reverts the whole tx — never some jobs
+        // debited and some not, and the earlier element's fence rolls back too.
+        _fund(buyer, 50 ether);
+
+        bytes32 j1 = keccak256("render-1");
+        bytes32 j2 = keccak256("render-2");
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](2);
+        items[0] = _req(buyer, 30 ether, j1);
+        items[1] = _req(buyer, 30 ether, j2); // 30 + 30 > 50
+
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.InsufficientCredit.selector);
+        meter.spendOnceBatch(items);
+
+        assertEq(meter.credit(buyer), 50 ether, "no partial debit");
+        assertEq(meter.totalSpent(), 0);
+        assertFalse(meter.spentJobs(j1), "first element's fence rolled back, job stays retryable");
+        assertFalse(meter.spentJobs(j2));
+    }
+
+    function test_spendOnceBatch_alreadySpentFromPriorTxRevertsWholeBatch() public {
+        // The fence spans transactions: a batch containing a jobId a prior spendOnce already
+        // settled reverts AlreadySpent and debits nothing (the on-chain crash-recovery seam).
+        _fund(buyer, 100 ether);
+
+        bytes32 prior = keccak256("render-prior");
+        vm.prank(spender);
+        meter.spendOnce(buyer, 40 ether, prior);
+
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](2);
+        items[0] = _req(buyer, 10 ether, keccak256("render-new"));
+        items[1] = _req(buyer, 10 ether, prior);
+
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.AlreadySpent.selector);
+        meter.spendOnceBatch(items);
+
+        assertEq(meter.credit(buyer), 60 ether, "only the prior single debit stands");
+        assertEq(meter.totalSpent(), 40 ether);
+        assertFalse(meter.spentJobs(keccak256("render-new")), "the fresh element rolled back");
+    }
+
+    function test_spendOnceBatch_emptyBatchReverts() public {
+        // A zero-length batch is a caller bug (the relayer thinks it settled N, settled 0),
+        // not a silent no-op.
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](0);
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.EmptyBatch.selector);
+        meter.spendOnceBatch(items);
+    }
+
+    function test_spendOnceBatch_oversizedBatchReverts() public {
+        // MAX_BATCH + 1 reverts BatchTooLarge — the gas-envelope bound is a contract
+        // guarantee. The size guard precedes any debit, so no funding is needed.
+        uint256 over = meter.MAX_BATCH() + 1;
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](over);
+        for (uint256 i = 0; i < over; ++i) {
+            items[i] = _req(buyer, 1, keccak256(abi.encode("over", i)));
+        }
+        vm.prank(spender);
+        vm.expectRevert(ComputeMeter.BatchTooLarge.selector);
+        meter.spendOnceBatch(items);
+    }
+
+    function test_spendOnceBatch_atMaxBatchSucceeds() public {
+        // The MAX_BATCH boundary is inclusive: exactly 64 elements settle (65 reverts above).
+        _fund(buyer, 100 ether);
+        uint256 max = meter.MAX_BATCH();
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](max);
+        for (uint256 i = 0; i < max; ++i) {
+            items[i] = _req(buyer, 1, keccak256(abi.encode("max", i)));
+        }
+        vm.prank(spender);
+        meter.spendOnceBatch(items);
+
+        assertEq(meter.credit(buyer), 100 ether - max, "all 64 elements debited");
+        assertTrue(meter.spentJobs(keccak256(abi.encode("max", uint256(0)))));
+        assertTrue(meter.spentJobs(keccak256(abi.encode("max", max - 1))));
+    }
+
+    function test_spendOnceBatch_revertsForUnauthorized() public {
+        // Auth-before-fence: an unauthorized caller reverts NotAuthorized and writes no
+        // spentJobs state, even for an otherwise-valid single-element batch.
+        _fund(buyer, 100 ether);
+        bytes32 jobId = keccak256("render-1");
+        ComputeMeter.DebitRequest[] memory items = new ComputeMeter.DebitRequest[](1);
+        items[0] = _req(buyer, 10 ether, jobId);
+
+        vm.prank(address(0xBAD));
+        vm.expectRevert(ComputeMeter.NotAuthorized.selector);
+        meter.spendOnceBatch(items);
+
+        assertFalse(meter.spentJobs(jobId));
+        assertEq(meter.credit(buyer), 100 ether);
+    }
+
     function test_spend_remainsRepeatablePerJobId() public {
         // The load-bearing ArtifactTemplate guarantee: spend() does NOT consult the
         // fence, so the SAME jobId (a templateId, in ArtifactTemplate's case) debits
