@@ -1842,6 +1842,51 @@ impl Store {
         }
     }
 
+    /// The oldest still-drainable debits (`tx_hash IS NULL` and not dead-lettered),
+    /// oldest-first by insert order, up to `limit`, as `(job_id, PendingDebit)` — the
+    /// batched twin of [`claim_oldest_pending_debit`](Self::claim_oldest_pending_debit)
+    /// (the debit drain claims a chunk and settles it through one
+    /// `ComputeMeter.spendOnceBatch`) and the metering twin of
+    /// [`claim_oldest_pending_batch`](Self::claim_oldest_pending_batch). A pure read: it
+    /// does NOT reserve or mutate the rows, so the drain drops the store lock before the
+    /// slow on-chain batch and only re-acquires it to mark each. A single drain task is
+    /// the only caller and settles only ever INSERT new pending rows, so no reservation
+    /// is needed to avoid a double-claim. The `dead_lettered_at IS NULL` filter unblocks
+    /// the head-of-line — a quarantined poison debit is skipped, never re-claimed, so
+    /// the drain advances instead of wedging. `limit == 0` returns an empty batch.
+    pub fn claim_oldest_pending_debit_batch(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(uuid::Uuid, crate::meter::PendingDebit)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, buyer, amount_wei, job_id_b32
+             FROM pending_debits
+             WHERE tx_hash IS NULL AND dead_lettered_at IS NULL
+             ORDER BY created_at ASC, rowid ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            let job_id: String = r.get(0)?;
+            Ok((
+                job_id,
+                crate::meter::PendingDebit {
+                    buyer: r.get(1)?,
+                    amount_wei: r.get(2)?,
+                    job_id: r.get(3)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job_id, debit) = row?;
+            let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
+                anyhow::anyhow!("pending_debits.job_id not a uuid {job_id:?}: {e}")
+            })?;
+            out.push((uuid, debit));
+        }
+        Ok(out)
+    }
+
     /// Mark a pending debit spent on-chain by writing its `tx_hash` +
     /// `submitted_at`, but ONLY while it is still pending (`tx_hash IS NULL`).
     /// Returns whether a row was updated. The `tx_hash IS NULL` guard makes a
