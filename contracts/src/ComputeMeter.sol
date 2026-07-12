@@ -36,6 +36,15 @@ contract ComputeMeter is Ownable2Step {
     ///         `totalBurned` ("purchased"). Their gap is outstanding credit.
     uint256 public totalSpent;
 
+    /// @notice Hard upper bound on a `spendOnceBatch` — caps the O(n) fence + debit loop so
+    ///         one batch can never approach the block gas limit, even from a buggy or
+    ///         compromised spender. 64 mirrors `RenderReceipts.MAX_BATCH`: the render-debit
+    ///         relayer settles the same per-block render wave through both, so a batch that
+    ///         fits `issueReceipts` fits here. It sits well above the coordinator's default
+    ///         relay drain chunk, so it never rejects a legitimate batch — it makes the gas
+    ///         envelope a contract guarantee rather than a trust assumption.
+    uint256 public constant MAX_BATCH = 64;
+
     event Deposited(address indexed buyer, uint256 amount, uint256 newCredit);
     event Spent(address indexed buyer, address indexed spender, uint256 amount, bytes32 jobId);
     event SpenderSet(address indexed spender, bool authorized);
@@ -44,6 +53,8 @@ contract ComputeMeter is Ownable2Step {
     error InsufficientCredit();
     error AlreadySpent();
     error ZeroAddressBuyer();
+    error EmptyBatch();
+    error BatchTooLarge();
 
     constructor(address token_, address owner_) Ownable(owner_) {
         TOKEN = IERC20(token_);
@@ -105,6 +116,50 @@ contract ComputeMeter is Ownable2Step {
         if (spentJobs[jobId]) revert AlreadySpent();
         spentJobs[jobId] = true;
         _debit(buyer, amount, jobId);
+    }
+
+    /// @notice One element of a `spendOnceBatch` — the same three fields `spendOnce` takes
+    ///         positionally. A struct array (not three parallel vectors) so a batch can
+    ///         never be built with mismatched-length columns and the per-job fields stay
+    ///         grouped, mirroring `RenderReceipts.ReceiptRequest`.
+    struct DebitRequest {
+        address buyer;
+        uint256 amount;
+        bytes32 jobId;
+    }
+
+    /// @notice Debit a batch of validated jobs AT MOST ONCE each, in ONE transaction instead
+    ///         of N separate `spendOnce` calls — the batched twin of the idempotent
+    ///         render-debit path, for a relayer settling the N jobs that landed in one block.
+    ///         Every per-job effect of `spendOnce` applies PER ELEMENT: the `spentJobs`
+    ///         at-most-once fence, the credit check, the three accounting updates, and the
+    ///         `Spent` event — amortized to one base tx cost. This is the debit-side twin of
+    ///         `RenderReceipts.issueReceipts`, which the same relayer already uses to attest
+    ///         the same per-block wave in one call.
+    ///
+    ///         An empty batch reverts (`EmptyBatch`) and a batch above `MAX_BATCH` reverts
+    ///         (`BatchTooLarge`, the gas-envelope bound) rather than silently debiting nothing
+    ///         or running unbounded — a zero-length or oversized call is a caller bug, not a
+    ///         no-op. Authorization is identical to `spendOnce` and is checked before any
+    ///         effect.
+    ///
+    ///         Atomicity: every effect runs in this one tx, so ANY element reverting — a jobId
+    ///         already spent OR repeated within this batch (it hits the fence an earlier
+    ///         element set), or a buyer with insufficient credit — rolls the WHOLE batch back.
+    ///         All-or-nothing: never some jobs debited and some not. Only `spendOnce` is
+    ///         batched, not the repeatable `spend`: the render-debit relayer is the sole batch
+    ///         hot path; `spend`'s per-mint ArtifactTemplate fees are single by nature.
+    function spendOnceBatch(DebitRequest[] calldata items) external {
+        if (!authorizedSpenders[msg.sender]) revert NotAuthorized();
+        uint256 n = items.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
+        for (uint256 i = 0; i < n; ++i) {
+            DebitRequest calldata it = items[i];
+            if (spentJobs[it.jobId]) revert AlreadySpent();
+            spentJobs[it.jobId] = true;
+            _debit(it.buyer, it.amount, it.jobId);
+        }
     }
 
     /// @dev Shared debit core: the credit check, the three accounting updates, and

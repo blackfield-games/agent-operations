@@ -30,6 +30,19 @@
   },
   {
     "inputs": [],
+    "name": "MAX_BATCH",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "TOKEN",
     "outputs": [
       {
@@ -210,6 +223,36 @@
       }
     ],
     "name": "spendOnce",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "buyer",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "amount",
+            "type": "uint256"
+          },
+          {
+            "internalType": "bytes32",
+            "name": "jobId",
+            "type": "bytes32"
+          }
+        ],
+        "internalType": "struct ComputeMeter.DebitRequest[]",
+        "name": "items",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "spendOnceBatch",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -407,6 +450,16 @@
   {
     "inputs": [],
     "name": "AlreadySpent",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "BatchTooLarge",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "EmptyBatch",
     "type": "error"
   },
   {
