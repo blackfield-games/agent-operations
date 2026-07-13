@@ -21,6 +21,10 @@ contract MockToken is ERC20 {
 contract MockEAS is IEAS {
     IEAS.AttestationRequest public lastRequest;
     uint256 public attestCalls;
+    // Sum of elements attested through multiAttest (the batch path), tracked apart from
+    // attestCalls so the one-attestation-per-receipt invariant can span both forwards:
+    // a single issue bumps attestCalls, a batch of N bumps this by N.
+    uint256 public multiAttestedReceipts;
 
     bytes32 public lastSchema;
     address public lastRecipient;
@@ -56,12 +60,40 @@ contract MockEAS is IEAS {
         revokeCalls++;
     }
 
-    function multiAttest(IEAS.MultiAttestationRequest[] calldata)
+    /// @dev Mirrors `attest`'s per-element uid derivation so a batch-issued receipt is
+    ///      revocable (revoke checks isAttested[uid]) and returns the flat uid[] across all
+    ///      groups in submission order — exactly the real EAS. RenderReceipts sends one group,
+    ///      so the returned length equals that group's element count.
+    function multiAttest(IEAS.MultiAttestationRequest[] calldata multiRequests)
         external
         payable
         returns (bytes32[] memory)
     {
-        revert("not implemented");
+        uint256 total;
+        for (uint256 g = 0; g < multiRequests.length; g++) {
+            total += multiRequests[g].data.length;
+        }
+        multiAttestedReceipts += total;
+
+        bytes32[] memory uids = new bytes32[](total);
+        uint256 k;
+        for (uint256 g = 0; g < multiRequests.length; g++) {
+            bytes32 schema = multiRequests[g].schema;
+            IEAS.AttestationRequestData[] calldata items = multiRequests[g].data;
+            for (uint256 i = 0; i < items.length; i++) {
+                bytes32 uid = keccak256(abi.encode(schema, items[i].recipient, items[i].data));
+                isAttested[uid] = true;
+                uids[k++] = uid;
+                lastSchema = schema;
+                lastRecipient = items[i].recipient;
+                lastExpirationTime = items[i].expirationTime;
+                lastRevocable = items[i].revocable;
+                lastRefUid = items[i].refUid;
+                lastData = items[i].data;
+                lastValue = items[i].value;
+            }
+        }
+        return uids;
     }
 }
 
@@ -94,9 +126,14 @@ contract RenderReceiptsHandler is Test {
     address[] public actors;
     address[] public earners; // fixed earner-recipient pool; bounds receiptsByEarner's domain
     bytes32[] public jobs; // fixed jobId pool; collisions exercise the dedup guard
+    bytes32[] public batchJobs; // batch-issued jobIds; revokeReceipt draws these so batch receipts hit the revoke lifecycle
     mapping(address => bool) public isAuthorized;
     mapping(bytes32 => uint256) public ghost_successesByJob;
     uint256 public ghost_duplicateRejections;
+
+    // Fresh unique jobIds for every batch element, so the happy path issues rather than
+    // colliding on an already-fenced job (the batched twin of the fixed-pool single path).
+    uint256 public issueReceiptsNonce;
 
     uint256 public ghost_issued;
     uint256 public ghost_revoked;
@@ -163,13 +200,69 @@ contract RenderReceiptsHandler is Test {
         }
     }
 
+    /// @notice Drives bounded issueReceipts (batch) calls — the batched twin of issueReceipt
+    ///         and the relayer's per-block attestation hot path. Each element carries a FRESH
+    ///         unique jobId (so the all-or-nothing batch issues rather than reverting on a
+    ///         re-drawn job) recipient'd to the fixed earner pool; on success the jobIds land
+    ///         in batchJobs so revokeReceipt exercises the revoke lifecycle over batch
+    ///         receipts. The whole batch routes ONE multiAttest, so its N receipts must move
+    ///         the same global counters (receiptCount, receiptsByEarner, ghost_issued) as N
+    ///         single issues — the invariants prove the batch path keeps the books straight.
+    function issueReceipts(
+        uint256 actorSeed,
+        uint256 earnerSeed,
+        uint256 sizeSeed,
+        uint64 renderSeconds,
+        uint256 jobKindSeed,
+        bytes32 outputHash
+    ) external {
+        uint256 size = bound(sizeSeed, 1, 8);
+        RenderReceipts.ReceiptRequest[] memory items = new RenderReceipts.ReceiptRequest[](size);
+        for (uint256 i = 0; i < size; i++) {
+            address earner = earners[uint256(keccak256(abi.encode(earnerSeed, i))) % earners.length];
+            items[i] = RenderReceipts.ReceiptRequest({
+                earner: earner,
+                jobId: keccak256(abi.encode("issueReceipts", issueReceiptsNonce++)),
+                renderSeconds: renderSeconds,
+                jobKind: uint16(jobKindSeed % 5),
+                outputHash: outputHash,
+                // No region is minted in this test, so regionExists is false and the phase-4
+                // fee route skips — the coordinator needs no fee tokens (mirrors the single
+                // handler, which relies on the same no-region-minted skip).
+                regionId: bytes32(0)
+            });
+        }
+
+        address actor = actors[actorSeed % actors.length];
+        vm.prank(actor);
+        try receipts.issueReceipts(items) returns (bytes32[] memory) {
+            for (uint256 i = 0; i < size; i++) {
+                ghost_issued++;
+                batchJobs.push(items[i].jobId);
+            }
+            // An unauthorized actor must never reach here (issueReceipts reverts NotAuthorized
+            // before any effect); if one does, the no-unauthorized-issue invariant catches it.
+            if (!isAuthorized[actor]) ghost_unauthorizedSuccess = true;
+            // Every batch element forwards the canonical schema (multiAttest records the last).
+            if (eas.lastSchema() != receipts.schemaUid()) ghost_forwardMismatch = true;
+        } catch {
+            // Only expected revert is NotAuthorized (unauthorized actor); fresh jobIds never
+            // collide, so the all-or-nothing DuplicateReceipt path is a unit-test concern.
+        }
+    }
+
     /// @notice Drives bounded revokeReceipt calls over the same job/actor pools. Most
     ///         draws hit NotIssued/AlreadyRevoked/NotAuthorized (caught); the ones that
     ///         land on an issued, not-yet-revoked job exercise the decrement path so the
     ///         live==issued-revoked invariants are genuinely tested.
-    function revokeReceipt(uint256 actorSeed, uint256 jobSeed) external {
+    function revokeReceipt(uint256 actorSeed, uint256 jobSeed, uint256 poolSeed) external {
         address actor = actors[actorSeed % actors.length];
-        bytes32 jobId = jobs[jobSeed % jobs.length];
+        // Draw from the fixed single-issue pool or, when it has entries, the batch-issued
+        // pool — so the revoke lifecycle (live==issued-revoked, revoked-reconciles) is
+        // exercised over BOTH single and batch receipts.
+        bytes32 jobId = (poolSeed & 1 == 1 && batchJobs.length > 0)
+            ? batchJobs[jobSeed % batchJobs.length]
+            : jobs[jobSeed % jobs.length];
 
         vm.prank(actor);
         try receipts.revokeReceipt(jobId) {
@@ -245,10 +338,13 @@ contract RenderReceiptsInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// @dev Every issued receipt causes exactly one EAS attest call — no spurious or
-    ///      missing forwards.
+    /// @dev Every issued receipt causes exactly one EAS attestation — no spurious or missing
+    ///      forwards — whether via a single `attest` (issueReceipt) or a batched `multiAttest`
+    ///      (issueReceipts, which mints N receipts in one call). The two paths partition:
+    ///      single issues bump attestCalls, batch elements bump multiAttestedReceipts, and
+    ///      their sum must equal every receipt the handler observed issued.
     function invariant_oneAttestationPerIssuedReceipt() public view {
-        assertEq(eas.attestCalls(), handler.ghost_issued());
+        assertEq(eas.attestCalls() + eas.multiAttestedReceipts(), handler.ghost_issued());
     }
 
     /// @dev An unauthorized sender can never successfully issue a receipt.
