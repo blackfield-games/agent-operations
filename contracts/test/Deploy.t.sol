@@ -109,7 +109,14 @@ contract DeployTest is Test {
     }
 
     function test_schemaRegistered() public view {
-        assertEq(deployed.renderReceipts.schemaUid(), registry.FIXED_UID(), "schema uid");
+        assertEq(deployed.renderReceipts.schemaUid(), registry.FIXED_UID(), "receipts schema uid");
+        // MatchSettlement registers BOTH its schemas in the same deploy-time registerSchema:
+        // schemaUid gates the 1v1/ranked settle, fieldSchemaUid the field settle. Neither is
+        // read before the onlyAttester guard, so the negative attester test can't cover them —
+        // without these, a dropped or reordered registration in deploy() stays green here while
+        // every on-chain settle reverts SchemaNotSet.
+        assertEq(deployed.matchSettlement.schemaUid(), registry.FIXED_UID(), "match schema uid");
+        assertEq(deployed.matchSettlement.fieldSchemaUid(), registry.FIXED_UID(), "field schema uid");
     }
 
     function test_coordinatorAuthorized() public view {
