@@ -50,6 +50,12 @@ contract MatchSettlementHandler is Test {
     ///         agent's `matchesSettled` once, so a field settle adds `seats` (not a multiple
     ///         of two) to the per-agent sum — tracked apart from the 1v1 count.
     uint256 public ghost_fieldSeatsSettled;
+    /// @notice Seats settled via the escrow-free settleField (reputation-only field settle).
+    ///         Each seat's recordMatchResult bumps its agent's `matchesSettled` once, exactly
+    ///         like a wager seat — tracked apart from `ghost_fieldSeatsSettled` so the
+    ///         afterInvariant coverage guard proves the reputation-only path fired on its own,
+    ///         not vicariously through the wager path.
+    uint256 public ghost_fieldRepSeatsSettled;
 
     constructor(
         MatchSettlement settlement_,
@@ -296,6 +302,37 @@ contract MatchSettlementHandler is Test {
         }
     }
 
+    /// @notice Reputation-only N-seat field settle — the escrow-free twin of
+    ///         settleFieldWager, and the last public reputation-writing settle entrypoint the
+    ///         fuzzer did not drive. settleField mints a FRESH settled record (no open/fund
+    ///         step) and writes an arbitrary balanced reputation vector over a distinct,
+    ///         registered seat prefix. Holding zero-sum over it proves an interleaved N-way
+    ///         reputation write conserves standing for any bounded vector; each seat's
+    ///         recordMatchResult bump is tracked in `ghost_fieldRepSeatsSettled` for the
+    ///         settled-count invariant. It carries NO escrow term: the fresh id never held
+    ///         stake (settleField reverts _requireFreshId on a reused id, so it can never
+    ///         settle an open funded wager and strand its pot), leaving the escrow invariant
+    ///         untouched.
+    function settleField(uint256 sizeSeed, int256 dSeed) external {
+        if (settlement.maxRatingDelta() == 0) return;
+        // A 2..actors.length distinct prefix: every seat wasRegistered + is distinct in
+        // setUp, so the field is well-formed (no AgentNotRegistered / DuplicateAgent revert).
+        uint256 n = bound(sizeSeed, 2, actors.length);
+        address[] memory ag = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ag[i] = actors[i];
+        }
+        // Seats 0/1 carry the zero-sum ±d pair; the rest stay 0, so the vector sums to zero
+        // for any n >= 2 and any bounded magnitude the attester supplies.
+        int256[] memory ds = new int256[](n);
+        int256 d = bound(dSeed, int256(0), int256(settlement.maxRatingDelta()));
+        ds[0] = d;
+        ds[1] = -d;
+        bytes32 id = keccak256(abi.encode("settleField", nonce++));
+        settlement.settleField(id, ag, ds, keccak256(abi.encode("field-rep-replay", id)));
+        ghost_fieldRepSeatsSettled += n;
+    }
+
     /// @notice The escrow the contract MUST be holding: per open 1v1 match, `stake` for each
     ///         funded seat; per open field match, `stake` for each set bit of `fundedBits`.
     ///         Settled/cancelled/expired matches of either kind hold nothing.
@@ -391,21 +428,27 @@ contract MatchSettlementInvariantTest is Test {
     }
 
     /// @dev Each settled 1v1 match (decisive or draw, never a cancel) counts exactly once
-    ///      for BOTH agents (so it adds two to the per-agent sum), and each field-wager
-    ///      settle counts once for each of its seats — so the per-agent `matchesSettled` sum
-    ///      is `2 * 1v1-settles + field-seats-settled`, proving no settlement double-counts
-    ///      or under-counts a played match across either kind.
+    ///      for BOTH agents (so it adds two to the per-agent sum), and each field settle —
+    ///      wager or reputation-only — counts once for each of its seats — so the per-agent
+    ///      `matchesSettled` sum is `2 * 1v1-settles + wager-seats + reputation-seats`,
+    ///      proving no settlement double-counts or under-counts a played match across any kind.
     function invariant_matchesSettledCount() public view {
         assertEq(
-            handler.sumMatchesSettled(), 2 * handler.ghost_settledCount() + handler.ghost_fieldSeatsSettled()
+            handler.sumMatchesSettled(),
+            2 * handler.ghost_settledCount() + handler.ghost_fieldSeatsSettled()
+                + handler.ghost_fieldRepSeatsSettled()
         );
     }
 
-    /// @dev Coverage guard: prove the field-wager SETTLE path was actually exercised (not just
-    ///      open/fund/recover). Without the handler's inline full-funding the random sequencer
-    ///      effectively never reaches settleFieldWager, which would silently make the
-    ///      field-wager terms of the invariants above a no-op. Fails if that path goes dead.
+    /// @dev Coverage guard: prove BOTH field SETTLE paths were actually exercised (not just
+    ///      open/fund/recover). Without the wager handler's inline full-funding the random
+    ///      sequencer effectively never reaches settleFieldWager, which would silently make the
+    ///      field-wager terms of the invariants above a no-op; the escrow-free settleField has
+    ///      no such barrier but is likewise guarded so a regression that killed it (or made
+    ///      every call revert) can't leave the reputation-only field terms vacuously satisfied.
+    ///      Fails if either path goes dead.
     function afterInvariant() public view {
         assertGt(handler.ghost_fieldSeatsSettled(), 0, "field-wager settle path never exercised");
+        assertGt(handler.ghost_fieldRepSeatsSettled(), 0, "field reputation-only settle path never exercised");
     }
 }
