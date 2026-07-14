@@ -3287,6 +3287,34 @@ contract MatchSettlementTest is Test {
         vm.prank(attester);
         s.settleDraw(MATCH, HASH);
     }
+
+    // --- Ownable2Step ---
+
+    function test_ownership_twoStepTransfer() public {
+        address newOwner = address(0xDEAD);
+
+        vm.prank(owner);
+        settlement.transferOwnership(newOwner);
+
+        // Pending; owner unchanged until accepted.
+        assertEq(settlement.owner(), owner);
+        assertEq(settlement.pendingOwner(), newOwner);
+
+        // A non-pending account cannot accept.
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, carol));
+        vm.prank(carol);
+        settlement.acceptOwnership();
+
+        vm.prank(newOwner);
+        settlement.acceptOwnership();
+        assertEq(settlement.owner(), newOwner);
+        assertEq(settlement.pendingOwner(), address(0));
+
+        // Old owner is now powerless over the attester allowlist.
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        vm.prank(owner);
+        settlement.setAttester(attester, true);
+    }
 }
 
 /// @dev Shared payout callback so HookToken can drive a reentrancy attacker.
