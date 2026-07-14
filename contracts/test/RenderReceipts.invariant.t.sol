@@ -363,12 +363,17 @@ contract RenderReceiptsInvariantTest is Test {
         assertEq(handler.sumReceipts(), receipts.receiptCount());
     }
 
-    /// @dev Guards against the dedup/revoke invariants passing vacuously: by the end of
-    ///      the campaign the fuzzer must have actually replayed a jobId (dedup rejection)
-    ///      AND landed a successful revoke, so both paths were genuinely exercised.
+    /// @dev Guards against the invariants passing vacuously: by the end of the campaign the
+    ///      fuzzer must have actually replayed a jobId (dedup rejection), landed a successful
+    ///      revoke, AND driven a batch through multiAttest. The batch guard matters most: the
+    ///      issueReceipts handler swallows every revert, so without it a regression that made
+    ///      authorized batches revert would leave the batch path silently dead while every
+    ///      invariant still passed — the exact vacuous-pass this task's batch coverage exists
+    ///      to prevent. multiAttestedReceipts only moves when a batch reaches the EAS forward.
     function afterInvariant() external view {
         assertGt(handler.ghost_duplicateRejections(), 0);
         assertGt(handler.ghost_revoked(), 0);
+        assertGt(eas.multiAttestedReceipts(), 0);
     }
 
     /// @dev No jobId is ever issued more than once: the dedup guard holds under
