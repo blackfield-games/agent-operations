@@ -2148,6 +2148,50 @@ contract MatchSettlementTest is Test {
         assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Expired);
     }
 
+    function test_refundFieldExpired_refundsExactlyFundedSeats() public {
+        // The _refundField partial-funding branch through the DEADLINE gate — the twin of
+        // test_cancelFieldMatch_refundsExactlyFundedSeats (attester cancel) and the field analog of
+        // the 1v1 test_refundExpired_refundsOnlyFundedSeat: only funded seats are refunded, no
+        // stranded stake, under a distinct Expired terminal.
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        _fundField(FIELD, alice); // seat 0
+        _fundField(FIELD, dave); // seat 2 — bob (seat 1) does NOT fund
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        uint256 dBefore = token.balanceOf(dave);
+
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+
+        vm.expectEmit(true, false, false, true);
+        emit FieldMatchExpired(FIELD, 2 * STAKE);
+        vm.prank(carol); // permissionless third party triggers the void
+        settlement.refundFieldExpired(FIELD);
+
+        assertEq(token.balanceOf(alice), aBefore + STAKE, "funded seat 0 refunded");
+        assertEq(token.balanceOf(dave), dBefore + STAKE, "funded seat 2 refunded");
+        assertEq(token.balanceOf(bob), bBefore, "unfunded seat 1 gets nothing");
+        assertEq(token.balanceOf(address(settlement)), 0, "no stranded stake");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Expired);
+        assertEq(_fundedBits(FIELD), 0, "funded set cleared");
+    }
+
+    function test_refundFieldExpired_noFundedSeatsRefundsZero() public {
+        // The zero-funded emit twin of test_cancelFieldMatch_noFundedSeatsRefundsZero, under the
+        // Expired terminal: a never-funded field past deadline voids to Expired emitting a 0 refund.
+        address[] memory ag = _roster3();
+        _openField(FIELD, ag, STAKE);
+        (,,, uint64 deadline,) = settlement.fieldMatches(FIELD);
+        vm.warp(deadline);
+        vm.expectEmit(true, false, false, true);
+        emit FieldMatchExpired(FIELD, 0);
+        vm.prank(carol);
+        settlement.refundFieldExpired(FIELD);
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Expired);
+        assertEq(token.balanceOf(address(settlement)), 0, "nothing to refund, nothing stranded");
+    }
+
     function test_refundFieldExpired_revertsBeforeDeadline() public {
         address[] memory ag = _roster3();
         _openField(FIELD, ag, STAKE);
