@@ -2600,6 +2600,18 @@ def test_biome_triangle_consistency_tracks_the_per_instance_cost_in_lock_step():
     assert validator._biome_triangle_consistency(spec, _biome_body(capped=False, instance_count=c2)) != []
 
 
+def test_biome_scatter_count_consistency_verifies_a_present_zero_that_disagrees():
+    # The biome-not-terrain boundary (mirroring the npc/prop present-zero twins): biome's uncapped
+    # instanceCount floor is >= 0 (a 0-scatter region is a valid empty scatter, UNLIKE terrain's
+    # gridResolution which skips < 1). So a PRESENT 0 that disagrees with the brief (a tampered 0 over
+    # this nonzero-scatter region) is a REAL violation, not a skip — the exact case a `count <= 0` skip
+    # would wrongly swallow.
+    assert _UNCAPPED_COUNT > 0  # premise: this region scatters a nonzero uncapped count
+    spec = _biome_spec(0.0)
+    issues = validator._biome_scatter_count_consistency(_brief(), spec, _biome_body(capped=False, instance_count=0))
+    assert len(issues) == 1 and "instanceCount" in issues[0] and "biome" in issues[0]
+
+
 def _biome_metric_set(root: Path, *, count, biome_tris: float) -> list[LayerSpec]:
     """A full well-formed set with biome declaring `count` instances and metering `biome_tris`, the
     optimization body re-synced to the resulting summed geometry so the budget gate stays silent —
