@@ -7152,6 +7152,41 @@ mod tests {
         assert_eq!(spender.calls(), 1, "the fallback stops at the first transient — no hot loop");
     }
 
+    /// A `NotAuthorized` spend inside a reverted batch drops to the per-row fallback and HALTS
+    /// the drain WITHOUT dead-lettering — the debit twin of
+    /// `drain_singly_halts_on_not_authorized_without_dead_lettering`, and the `NotAuthorized`
+    /// sibling of `drain_debits_does_not_dead_letter_a_transient_single`. A global spender-auth
+    /// misconfig is never folded into the per-row dead-letter path: both rows stay pending and the
+    /// fallback halts on the FIRST unauthorized single (contrast the batch-level
+    /// `drain_debits_surfaces_not_authorized_without_dropping`, where the whole-batch `Permanent`
+    /// never even reaches this fallback).
+    #[tokio::test]
+    async fn drain_debits_singly_halts_on_not_authorized_without_dead_lettering() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+        let jobs = [seed_job(), seed_job()];
+        for job in &jobs {
+            settle_one_metered(&state, job).await;
+        }
+
+        // Batch reverts -> per-row fallback, whose first single spend is unauthorized (a global
+        // misconfig), halting the drain.
+        let spender = MockSpender::not_authorized().with_batch_reverts();
+        drain_debits_all(&state, &spender).await;
+
+        assert_eq!(
+            dead_lettered_debits(&state).await,
+            0,
+            "a global auth fault is never per-row dead-lettered"
+        );
+        assert_eq!(pending_debits(&state).await, 2, "both stay pending until authorization lands");
+        assert_eq!(spender.batch_calls(), 1, "one batch attempt, which reverted");
+        assert_eq!(
+            spender.calls(),
+            1,
+            "halted on the FIRST unauthorized single, not marched through the chunk dead-lettering each"
+        );
+    }
+
     /// A whole-batch transient error backs off with the entire chunk still pending and
     /// NEVER reaches the per-debit fallback (single spends would hit the same fault).
     #[tokio::test]
