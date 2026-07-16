@@ -541,15 +541,22 @@ struct JobSummary {
 /// field is non-`null` iff the job has a `pending_attestations` row — i.e. it is a
 /// validated render that OWES an on-chain receipt. `uid` and `submitted_at` stay `null`
 /// until the (operator-gated) relayer lands the receipt on Base, then carry the real EAS
-/// attestation uid + unix submit time. A client thus tells three states apart:
+/// attestation uid + unix submit time (+ a revocation stamp). A client thus tells
+/// four states apart:
 /// `attestation: null` (no receipt — the job has not settled into one, still
 /// queued/in-flight or a settle whose result did not map),
-/// `attestation: { uid: null, submitted_at: null }` (owed but not yet relayed), and
-/// `attestation: { uid, submitted_at }` (on-chain proof retrievable).
+/// `attestation: { uid: null, submitted_at: null, revoked_at: null }` (owed but not
+/// yet relayed), `attestation: { uid, submitted_at, revoked_at: null }` (on-chain
+/// proof retrievable, still live), and `attestation: { uid, submitted_at, revoked_at }`
+/// (the receipt was retracted on-chain — a render later found invalid, `revokeReceipt`
+/// landed, so the proof is no longer live even though its uid is still readable).
 #[derive(Debug, Serialize)]
 struct Attestation {
     uid: Option<String>,
     submitted_at: Option<i64>,
+    /// Unix second the on-chain attestation was revoked (`RenderReceipts.revokeReceipt`
+    /// landed), or `null` for a live receipt. Set only on a `uid`-bearing (landed) row.
+    revoked_at: Option<i64>,
 }
 
 /// Full detail for `GET /jobs/{id}`: the job's `JobSpec`, its recorded `JobResult` once
@@ -755,6 +762,23 @@ struct Stats {
     /// Nonzero here means a stuck receipt needs operator attention. 0 on a healthy
     /// mesh. Additive and optional.
     dead_lettered_attestations: usize,
+    /// Receipts whose on-chain attestation has been REVOKED — a settled render later
+    /// found invalid, retracted via `RenderReceipts.revokeReceipt`. Cumulative: it counts
+    /// landed corrections, so it only rises. 0 on a mesh where nothing has been revoked.
+    /// Additive and optional. The revoke twin of the issue-side backlog metrics.
+    revoked_attestations: usize,
+    /// Receipts with a revocation an operator has armed (`POST /receipts/{id}/revoke`)
+    /// that has not yet landed on-chain AND is still drainable — the revocation backlog
+    /// depth, the revoke twin of `pending_attestations`. Drains as the relayer lands each
+    /// `revokeReceipt`; excludes dead-lettered revocations. Additive and optional.
+    pending_revocations: usize,
+    /// Revocations the relayer quarantined after a non-retryable (`Permanent`)
+    /// `revokeReceipt` error — the revoke dead-letter depth, the twin of
+    /// `dead_lettered_attestations`. The correction is still owed: the row is retained
+    /// (prune keeps it while owed) and excluded from `pending_revocations` so one poison
+    /// revocation cannot block the rest. Nonzero here means a stuck correction needs
+    /// operator attention. 0 on a healthy mesh. Additive and optional.
+    dead_lettered_revocations: usize,
     /// Settled jobs whose ComputeMeter debit has not yet been spent on-chain AND is
     /// still drainable — the debit backlog depth (the metering twin of
     /// `pending_attestations`). A debit is enqueued only for a metered settle (a job
@@ -3340,6 +3364,27 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let revoked_attestations = match store.revoked_attestation_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: revoked_attestation_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let pending_revocations = match store.pending_revocation_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: pending_revocation_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let dead_lettered_revocations = match store.dead_lettered_revocation_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "stats: dead_lettered_revocation_count failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     let pending_debits = match store.pending_debit_count() {
         Ok(n) => n,
         Err(e) => {
@@ -3400,6 +3445,9 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         total_faults,
         pending_attestations,
         dead_lettered_attestations,
+        revoked_attestations,
+        pending_revocations,
+        dead_lettered_revocations,
         pending_debits,
         dead_lettered_debits,
         oldest_dead_lettered_attestation_secs,
@@ -3604,7 +3652,7 @@ async fn job_detail(
         }
     };
     let attestation = match store.attestation_readback(&id) {
-        Ok(Some((uid, submitted_at))) => Some(Attestation { uid, submitted_at }),
+        Ok(Some((uid, submitted_at, revoked_at))) => Some(Attestation { uid, submitted_at, revoked_at }),
         Ok(None) => None,
         Err(e) => {
             tracing::error!(?id, ?e, "job_detail: attestation_readback failed");

@@ -49,6 +49,13 @@ pub type DeadLetteredDebitRow = (uuid::Uuid, String, String, i64, u32);
 /// times it has been re-driven.
 pub type DeadLetteredAttestationRow = (uuid::Uuid, String, u64, u16, i64, u32);
 
+/// The `(uid, submitted_at, revoked_at)` triple [`Store::attestation_readback`] returns
+/// for a job that owes a receipt: each element is `None` until the corresponding
+/// on-chain step lands (issue, then a later revoke), so the `GET /jobs/{id}` read tells
+/// owed / relayed / revoked apart. Aliased to keep the readback signature within
+/// clippy's type-complexity bound.
+pub type AttestationReadback = (Option<String>, Option<i64>, Option<i64>);
+
 /// Treat an `ALTER TABLE ... ADD COLUMN` that fails only because the column
 /// already exists as a success — that is the expected case for a DB created on
 /// a later boot. Any other error propagates unchanged.
@@ -2388,19 +2395,25 @@ impl Store {
     /// while the receipt is still pending or dead-lettered. `Ok(None)` when no row
     /// exists at all — a job that has not settled into a receipt (still queued/in-flight,
     /// or a settle whose result did not map to one) — the clean absent the read path
-    /// renders as `null`. The outer `Option` (row presence) and the inner `uid`
-    /// (landed-on-chain) together let a client tell relayed / owed-but-unrelayed /
-    /// none apart — the three states the `/jobs/{id}` attestation field must NOT
-    /// collapse. The non-test read twin of the test-only
-    /// [`attestation_uid`](Self::attestation_uid).
+    /// renders as `null`. The outer `Option` (row presence), the inner `uid`
+    /// (landed-on-chain), and `revoked_at` (retracted on-chain) together let a client tell
+    /// none / owed-but-unrelayed / live-relayed / revoked apart — the four states the
+    /// `/jobs/{id}` attestation field must NOT collapse. The non-test read twin of the
+    /// test-only [`attestation_uid`](Self::attestation_uid).
     pub fn attestation_readback(
         &self,
         job_id: &uuid::Uuid,
-    ) -> Result<Option<(Option<String>, Option<i64>)>> {
+    ) -> Result<Option<AttestationReadback>> {
         let row = self.conn.query_row(
-            "SELECT uid, submitted_at FROM pending_attestations WHERE job_id = ?1",
+            "SELECT uid, submitted_at, revoked_at FROM pending_attestations WHERE job_id = ?1",
             [&job_id.to_string()],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
         );
         match row {
             Ok(v) => Ok(Some(v)),
