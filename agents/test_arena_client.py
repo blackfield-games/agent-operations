@@ -1378,6 +1378,41 @@ def test_baseline_vs_baseline_runs_a_real_decisive_deterministic_match():
     assert other[0].replay_hash != r0.replay_hash
 
 
+def test_run_local_match_forfeits_a_conceding_seat():
+    # The concede path end to end against the real core: seat 0's policy leaves on its first
+    # Live tick, so the SDK sends AgentMsg::Leave, the harness downs the seat (active.remove +
+    # m.forfeit), and the 1v1 ends before the tick cap with seat 0 a forfeit DQ (ranked
+    # strictly last, not alive) and seat 1 the lone survivor. Proves leave() drives a real
+    # durable forfeit — not merely a tick idle — through run_local_match with no bespoke wiring.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    class _Conceder:
+        def wants_leave(self, _obs):
+            return "conceding"
+
+        def __call__(self, obs):
+            return BaselinePolicy()(obs)  # a valid fallback; unreached — it concedes first tick
+
+    match_id = "11111111-2222-4333-8444-555555555555"
+    results = run_local_match(harness, [0, 1], {0: _Conceder(), 1: BaselinePolicy()},
+                              seed=12345, match_id=match_id)
+
+    assert set(results) == {0, 1}
+    r0 = results[0]
+    assert r0 == results[1], "every seat sees the same canonical result"
+    assert r0.match_id == match_id
+    # The concede ends the duel before the tick cap (a losing seat idling to max_ticks is the
+    # very state leave() removes), not at 0 (the forfeit lands on the next tick's step).
+    assert 0 < r0.final_tick < 3600
+
+    o0 = next(o for o in r0.outcomes if o.seat == 0)
+    o1 = next(o for o in r0.outcomes if o.seat == 1)
+    assert o0.forfeited and not o0.alive_at_end, "the leaver is a forfeit DQ, downed not surviving"
+    assert not o1.forfeited and o1.alive_at_end, "the opponent never left and survives"
+    assert o1.placement < o0.placement, "the forfeiter is ranked strictly below the survivor"
+
+
 def test_run_local_match_forms_a_ranked_match():
     # The agent-signs (arena-agent-join-signing) → harness-verifies
     # (arena-harness-verifies-ranked-join) loop, end to end: two seats join with
