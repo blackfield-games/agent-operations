@@ -2566,6 +2566,11 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/receipts/{id}/redrive", post(redrive_receipt))
         .route("/receipts/redrive-all", post(redrive_all_receipts))
         .route("/receipts/{id}/revoke", post(revoke_receipt))
+        // Operator recovery for a dead-lettered revocation (the revoke twin of
+        // /receipts/{id}/redrive): revoke-redrive-all is a one-segment sibling,
+        // distinct from the three-segment /{id}/revoke-redrive.
+        .route("/receipts/{id}/revoke-redrive", post(redrive_revocation))
+        .route("/receipts/revoke-redrive-all", post(redrive_all_revocations))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -3100,6 +3105,92 @@ async fn revoke_receipt(
         }
         Err(e) => {
             tracing::error!(%id, ?e, "revoke: request_revocation failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// `POST /receipts/{id}/revoke-redrive` — operator recovery: re-arm the dead-lettered
+/// revocation for job `{id}` so the next drain re-attempts the `revokeReceipt`, used
+/// after the `Permanent` cause is fixed (the coordinator signer re-authorized via
+/// `setCoordinator`, the disputed render re-confirmed invalid). A quarantined revocation
+/// is never auto-re-claimed (`claim_oldest_pending_revocation_batch` skips it), so this is
+/// the only path back into the drainable revocation backlog. The revoke twin of
+/// [`redrive_receipt`].
+///
+/// A privileged recovery action, so it carries the SAME bearer-token gate as `POST /jobs`
+/// and the redrive endpoints (`--ingest-token` / `COORDINATOR_INGEST_TOKEN`): with a token
+/// configured, a request without `Authorization: Bearer <token>` is rejected `401` before
+/// any store work; open when unset (the same dev posture as ingestion).
+///
+/// Returns `200` with `{"rearmed": bool}`: `true` when a dead-lettered, not-yet-revoked
+/// revocation was re-armed; `false` for the idempotent no-op cases (the row was not
+/// dead-lettered, was already revoked — re-arming would re-drive a settled correction, so
+/// the store refuses it — or no such receipt exists). A re-armed revocation re-enters the
+/// oldest-first drain and, if the cause is still unfixed, simply re-dead-letters on the next
+/// `Permanent` error — one attempt per re-drive, never an auto-retry.
+async fn redrive_revocation(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<RedriveResponse>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!(%id, "rejected: POST /receipts/{{id}}/revoke-redrive missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    match store.redrive_dead_lettered_revocation(&id) {
+        Ok(rearmed) => {
+            if rearmed {
+                tracing::info!(%id, "revoke re-drive: dead-lettered revocation re-armed for the next drain");
+            } else {
+                tracing::info!(%id, "revoke re-drive: no dead-lettered, un-revoked revocation to re-arm (no-op)");
+            }
+            Ok(Json(RedriveResponse { rearmed }))
+        }
+        Err(e) => {
+            tracing::error!(%id, ?e, "revoke re-drive: redrive_dead_lettered_revocation failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// `POST /receipts/revoke-redrive-all` — operator bulk recovery: re-arm EVERY
+/// dead-lettered revocation in one call, used after a BROAD `Permanent` cause is fixed
+/// (the coordinator signer re-authorized via `setCoordinator`) — the bulk twin of
+/// `POST /receipts/{id}/revoke-redrive`, the revoke twin of [`redrive_all_receipts`].
+///
+/// A privileged MASS-recovery action, so it carries the SAME bearer-token gate as
+/// `POST /jobs` and the single re-drive: with a token configured, a request without
+/// `Authorization: Bearer <token>` is rejected `401` before any store work; open when
+/// unset (the dev posture). The store clears only
+/// `revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL` rows, so a pending
+/// (drainable) or already-revoked correction is never touched.
+///
+/// Returns `200` with `{"rearmed": count}` — the number re-armed, `0` for the idempotent
+/// no-op (nothing dead-lettered). Each re-armed revocation re-enters the oldest-first drain
+/// and, if the broad cause is NOT actually fixed, simply re-dead-letters on the next
+/// `Permanent` error — one attempt per re-drive, never an auto-retry loop.
+async fn redrive_all_revocations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<BulkRedriveResponse>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!("rejected: POST /receipts/revoke-redrive-all missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    match store.redrive_all_dead_lettered_revocations() {
+        Ok(rearmed) => {
+            tracing::info!(rearmed, "bulk revoke re-drive: dead-lettered revocations re-armed for the next drain");
+            Ok(Json(BulkRedriveResponse { rearmed }))
+        }
+        Err(e) => {
+            tracing::error!(?e, "bulk revoke re-drive: redrive_all_dead_lettered_revocations failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
