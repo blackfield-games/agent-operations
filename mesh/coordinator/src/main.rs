@@ -614,6 +614,15 @@ struct BulkRedriveResponse {
     rearmed: usize,
 }
 
+/// Response for `POST /receipts/{id}/revoke`: whether the request armed a landed
+/// receipt's revocation for the next drain. `false` is a successful idempotent no-op —
+/// the receipt has not landed (still owed or absent), was already revoked, or a
+/// revocation was already requested — so an operator can safely replay the call.
+#[derive(Debug, Serialize)]
+struct RevokeResponse {
+    requested: bool,
+}
+
 /// One dead-lettered ComputeMeter debit in the operator listing (`GET
 /// /debits/dead-lettered`). `job_id` is the UUID an operator passes to `POST
 /// /debits/{id}/redrive`; `amount_wei` is the owed charge as the persisted decimal
@@ -2396,6 +2405,7 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         .route("/receipts/dead-lettered", get(dead_lettered_receipts))
         .route("/receipts/{id}/redrive", post(redrive_receipt))
         .route("/receipts/redrive-all", post(redrive_all_receipts))
+        .route("/receipts/{id}/revoke", post(revoke_receipt))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -2883,6 +2893,53 @@ async fn redrive_all_receipts(
         }
         Err(e) => {
             tracing::error!(?e, "bulk re-drive: redrive_all_dead_lettered_attestations failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// `POST /receipts/{id}/revoke` — operator correction: withdraw the on-chain EAS render
+/// receipt for job `{id}` after the render is found invalid out-of-band (a failed
+/// re-validation, a disputed output). The coordinator cannot prove a result bad at
+/// submit time — that needs the artifact + a GPU (see `validate.rs`) — so a
+/// well-formed-but-fraudulent render is accepted, metered, and attested, and can only
+/// be retracted afterward; this is that path, the OPPOSITE lifecycle direction from
+/// redrive (which re-submits a receipt that FAILED to land — this withdraws one that
+/// SUCCEEDED). It arms `revocation_requested_at`; the next relayer drain calls
+/// `RenderReceipts.revokeReceipt(jobId)` and marks the row revoked.
+///
+/// A privileged correction, so it carries the SAME bearer-token gate as `POST /jobs`
+/// and the redrive endpoints (`--ingest-token` / `COORDINATOR_INGEST_TOKEN`): when a
+/// token is configured, a request without `Authorization: Bearer <token>` is rejected
+/// `401` before any store work; open when unset (the same dev posture as ingestion).
+///
+/// Returns `200` with `{"requested": bool}`: `true` when a landed, not-yet-revoked
+/// receipt was armed; `false` for the idempotent no-op cases (the receipt has not landed
+/// — arming would drive a `revokeReceipt` that reverts `NotIssued` — was already
+/// revoked, or a revocation was already requested), so an operator can replay safely.
+async fn revoke_receipt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<RevokeResponse>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!(%id, "rejected: POST /receipts/{{id}}/revoke missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    match store.request_revocation(&id, now_secs()) {
+        Ok(requested) => {
+            if requested {
+                tracing::info!(%id, "revoke: landed receipt armed for on-chain revocation on the next drain");
+            } else {
+                tracing::info!(%id, "revoke: no landed, un-revoked receipt to arm (no-op)");
+            }
+            Ok(Json(RevokeResponse { requested }))
+        }
+        Err(e) => {
+            tracing::error!(%id, ?e, "revoke: request_revocation failed");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
