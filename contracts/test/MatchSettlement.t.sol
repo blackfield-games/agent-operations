@@ -2456,6 +2456,33 @@ contract MatchSettlementTest is Test {
         settlement.settleFieldWager(FIELD, ps, ds, HASH);
     }
 
+    // FM3 boundary: per-seat deltas exactly at ±cap settle — the cap is inclusive, the wager twin
+    // of test_settleField_atCapBoundarySettles. Only the over-cap revert (RATING_CAP + 1) above was
+    // pinned here, so a `d > cap` -> `d >= cap` slip would wrongly reject a legitimate exact-cap Elo
+    // delta while every other wager success test (|delta| <= 40 ether) stayed green.
+    function test_settleFieldWager_atCapBoundarySettles() public {
+        _enableVariable(RATING_CAP);
+        _openFundField3(STAKE);
+        uint256 aBefore = token.balanceOf(alice);
+        uint256 bBefore = token.balanceOf(bob);
+        uint256 dBefore = token.balanceOf(dave);
+
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether); // Σ == pot (300)
+        int256[] memory ds = _deltas(int256(RATING_CAP), -int256(RATING_CAP), 0); // Σ = 0, at ±cap
+
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+
+        assertEq(registry.reputationOf(alice), int256(RATING_CAP), "seat 0 reputation written at +cap");
+        assertEq(registry.reputationOf(bob), -int256(RATING_CAP), "seat 1 reputation written at -cap");
+        assertEq(registry.reputationOf(dave), 0, "seat 2 reputation");
+        assertEq(token.balanceOf(alice), aBefore + 150 ether, "pot released at the boundary");
+        assertEq(token.balanceOf(bob), bBefore + 90 ether);
+        assertEq(token.balanceOf(dave), dBefore + 60 ether);
+        assertEq(token.balanceOf(address(settlement)), 0, "no half-settle: pot fully distributed");
+        assertTrue(_fieldStatus(FIELD) == MatchSettlement.Status.Settled, "settled");
+    }
+
     // FM3 atomicity: if the registry rejects the reputation write the WHOLE settle reverts —
     // no pot is released, the match stays Open, and the escrow is still recoverable via cancel
     // (escrow liveness does not hard-depend on the reputation-writer grant). Mirrors the 1v1.
