@@ -75,6 +75,38 @@ pub enum BatchRelayError {
     Permanent(String),
 }
 
+/// Why a revocation ([`Relay::revoke`] → `RenderReceipts.revokeReceipt`) failed —
+/// the drain reacts to each exactly as it does to the [`RelayError`] twin, but on
+/// the OPPOSITE lifecycle direction: revoke WITHDRAWS a receipt that already landed
+/// on-chain (a render found invalid out-of-band after settlement), where `submit`
+/// ISSUES one that has not.
+#[derive(Debug)]
+pub enum RevokeError {
+    /// The receipt for this `jobId` is already revoked on-chain (the contract
+    /// reverted `AlreadyRevoked`). An *idempotent success*, the revoke twin of
+    /// [`RelayError::AlreadyIssued`]: a crash between a prior `revokeReceipt` and its
+    /// local mark left the row requested, and the re-drive hit the contract's per-job
+    /// fence. The drain marks it revoked and moves on rather than retrying forever.
+    AlreadyRevoked,
+    /// The coordinator signer is not in `RenderReceipts.authorizedCoordinators` (the
+    /// contract reverts `NotAuthorized`) — the SAME set that gates issuance, so once
+    /// the signer is deauthorized every `revokeReceipt` reverts until the owner calls
+    /// `setCoordinator`. A loud, distinct global-config error, NOT a per-row fault: the
+    /// drain halts and leaves every requested row pending so it auto-resumes once
+    /// authorization is restored. The revoke twin of [`RelayError::NotAuthorized`].
+    NotAuthorized,
+    /// A transient fault (RPC timeout, nonce contention, a reorg). The revocation is
+    /// not on-chain; the row stays requested and is retried on the next drain tick.
+    Transient(String),
+    /// A non-retryable fault that is NOT a global config problem — e.g. the contract
+    /// reverts `NotIssued` for a row the coordinator believed landed (a state anomaly).
+    /// Retrying in a hot loop or silently dropping the request are both wrong, so the
+    /// drain DEAD-LETTERS this one row (quarantined + retained, surfaced at
+    /// `/stats dead_lettered_revocations`) and CONTINUES, so one poison revocation never
+    /// blocks the rest. The revoke twin of [`RelayError::Permanent`].
+    Permanent(String),
+}
+
 /// Submits validated render receipts as `RenderReceipts` calls, returning the EAS
 /// attestation UID(s) on success. [`submit`](Relay::submit) is one
 /// `issueReceipt`; [`submit_batch`](Relay::submit_batch) is one
@@ -123,6 +155,17 @@ pub trait Relay: Send + Sync {
             Ok(uids)
         }
     }
+
+    /// Retract a receipt already on-chain via one
+    /// `RenderReceipts.revokeReceipt(jobId)` call — the correction path for a settled
+    /// render later found invalid. `job_id` is the contract's `bytes32 jobId` (the
+    /// 64-char lowercase-hex form the pending row carries in `job_id_b32`). Returns
+    /// `Ok(())` once the attestation is withdrawn; the [`RevokeError`] variants tell
+    /// the drain whether to mark, retry, halt, or dead-letter. No default: a revoke has
+    /// no sensible fallback (unlike [`submit_batch`](Relay::submit_batch)'s sequential
+    /// single submits), so every transport implements it — the live Base impl maps it
+    /// to `revokeReceipt`, the same signer that gates `submit`.
+    fn revoke(&self, job_id: &str) -> impl Future<Output = Result<(), RevokeError>> + Send;
 }
 
 /// In-process [`Relay`] for tests and the `--relay-dev-mock` local path. Never
@@ -176,6 +219,21 @@ struct MockInner {
     submitted: Vec<String>,
     /// `job_id`s included in a successful batch, in submission order.
     batch_submitted: Vec<String>,
+    /// Fail this many `revoke` calls with `Transient` before succeeding.
+    revoke_transient_remaining: usize,
+    /// Always fail `revoke` with `Permanent` (a per-row non-retryable revoke fault).
+    revoke_permanent: bool,
+    /// Always fail `revoke` with `NotAuthorized` (the coordinator signer is not
+    /// authorized on RenderReceipts — a global fault the drain halts on).
+    revoke_not_authorized: bool,
+    /// Always fail `revoke` with `AlreadyRevoked` (models a receipt already revoked
+    /// on-chain — an idempotent success the drain marks and moves past).
+    revoke_already_revoked: bool,
+    /// Total `revoke` calls (successful or not) — distinct from `calls`, so a test
+    /// proves the revoke drain halted on the FIRST unauthorized row, not marched on.
+    revoke_calls: usize,
+    /// `job_id`s successfully revoked, in call order.
+    revoked: Vec<String>,
 }
 
 impl MockRelay {
@@ -197,6 +255,12 @@ impl MockRelay {
                 batch_calls: 0,
                 submitted: Vec::new(),
                 batch_submitted: Vec::new(),
+                revoke_transient_remaining: 0,
+                revoke_permanent: false,
+                revoke_not_authorized: false,
+                revoke_already_revoked: false,
+                revoke_calls: 0,
+                revoked: Vec::new(),
             }),
             started: None,
             release: None,
@@ -311,6 +375,49 @@ impl MockRelay {
     pub fn batch_submitted(&self) -> Vec<String> {
         self.inner.lock().unwrap().batch_submitted.clone()
     }
+
+    /// Fail the first `n` `revoke` calls with `Transient`, then succeed.
+    #[cfg(test)]
+    pub fn with_revoke_transient(mut self, n: usize) -> Self {
+        self.inner.get_mut().unwrap().revoke_transient_remaining = n;
+        self
+    }
+
+    /// Always fail `revoke` with `Permanent` (a per-row non-retryable revoke fault
+    /// the drain dead-letters).
+    #[cfg(test)]
+    pub fn with_revoke_permanent(mut self) -> Self {
+        self.inner.get_mut().unwrap().revoke_permanent = true;
+        self
+    }
+
+    /// Always fail `revoke` with `NotAuthorized` (the coordinator signer is not
+    /// authorized on RenderReceipts — a global fault the drain halts on).
+    #[cfg(test)]
+    pub fn with_revoke_not_authorized(mut self) -> Self {
+        self.inner.get_mut().unwrap().revoke_not_authorized = true;
+        self
+    }
+
+    /// Always fail `revoke` with `AlreadyRevoked` (the receipt is already revoked
+    /// on-chain — an idempotent success the drain marks and moves past).
+    #[cfg(test)]
+    pub fn with_revoke_already_revoked(mut self) -> Self {
+        self.inner.get_mut().unwrap().revoke_already_revoked = true;
+        self
+    }
+
+    /// Total `revoke` calls so far.
+    #[cfg(test)]
+    pub fn revoke_calls(&self) -> usize {
+        self.inner.lock().unwrap().revoke_calls
+    }
+
+    /// `job_id`s successfully revoked, in call order.
+    #[cfg(test)]
+    pub fn revoked(&self) -> Vec<String> {
+        self.inner.lock().unwrap().revoked.clone()
+    }
 }
 
 /// Deterministic mock UID for a single `submit`, so a test can assert the drain
@@ -379,6 +486,32 @@ impl Relay for MockRelay {
             inner.batch_submitted.push(a.job_id.clone());
         }
         Ok(uids)
+    }
+
+    async fn revoke(&self, job_id: &str) -> Result<(), RevokeError> {
+        if let Some(s) = &self.started {
+            s.notify_one();
+        }
+        if let Some(r) = &self.release {
+            r.notified().await;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.revoke_calls += 1;
+        if inner.revoke_not_authorized {
+            return Err(RevokeError::NotAuthorized);
+        }
+        if inner.revoke_permanent {
+            return Err(RevokeError::Permanent("mock revoke permanent".into()));
+        }
+        if inner.revoke_already_revoked {
+            return Err(RevokeError::AlreadyRevoked);
+        }
+        if inner.revoke_transient_remaining > 0 {
+            inner.revoke_transient_remaining -= 1;
+            return Err(RevokeError::Transient("mock revoke transient".into()));
+        }
+        inner.revoked.push(job_id.to_string());
+        Ok(())
     }
 }
 
@@ -525,6 +658,12 @@ mod tests {
                 SeqMode::NotAuthorized => Err(RelayError::NotAuthorized),
             }
         }
+
+        // SeqRelay exists to exercise the default `submit_batch`; its `revoke` is never
+        // driven, so a trivial success satisfies the trait without another mode.
+        async fn revoke(&self, _job_id: &str) -> Result<(), RevokeError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -576,5 +715,75 @@ mod tests {
             Err(BatchRelayError::Permanent(_))
         ));
         assert_eq!(*r.calls.lock().unwrap(), 1, "stops at the first failure");
+    }
+
+    #[tokio::test]
+    async fn revoke_succeeds_and_records_the_call() {
+        let r = MockRelay::succeeding();
+        let job = "a".repeat(64);
+        r.revoke(&job).await.expect("succeeds");
+        assert_eq!(r.revoke_calls(), 1);
+        assert_eq!(r.revoked(), vec![job]);
+        // revoke and submit tallies are independent.
+        assert_eq!(r.calls(), 0, "a revoke is not a submit");
+    }
+
+    #[tokio::test]
+    async fn revoke_transient_then_ok_fails_then_succeeds() {
+        let r = MockRelay::succeeding().with_revoke_transient(2);
+        let job = "a".repeat(64);
+        assert!(matches!(r.revoke(&job).await, Err(RevokeError::Transient(_))));
+        assert!(matches!(r.revoke(&job).await, Err(RevokeError::Transient(_))));
+        assert!(r.revoke(&job).await.is_ok());
+        assert_eq!(r.revoke_calls(), 3);
+        // Only the successful call recorded a revocation.
+        assert_eq!(r.revoked(), vec![job]);
+    }
+
+    #[tokio::test]
+    async fn revoke_permanent_never_revokes() {
+        let r = MockRelay::succeeding().with_revoke_permanent();
+        assert!(matches!(
+            r.revoke(&"a".repeat(64)).await,
+            Err(RevokeError::Permanent(_))
+        ));
+        assert_eq!(r.revoke_calls(), 1);
+        assert!(r.revoked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_not_authorized_never_revokes() {
+        let r = MockRelay::succeeding().with_revoke_not_authorized();
+        assert!(matches!(
+            r.revoke(&"a".repeat(64)).await,
+            Err(RevokeError::NotAuthorized)
+        ));
+        assert_eq!(r.revoke_calls(), 1);
+        assert!(r.revoked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoke_already_revoked_is_an_idempotent_error() {
+        let r = MockRelay::succeeding().with_revoke_already_revoked();
+        assert!(matches!(
+            r.revoke(&"a".repeat(64)).await,
+            Err(RevokeError::AlreadyRevoked)
+        ));
+        assert_eq!(r.revoke_calls(), 1);
+        // AlreadyRevoked submits no new revocation; the drain treats it as success.
+        assert!(r.revoked().is_empty());
+    }
+
+    /// A relay scripted to fail `submit` still `revoke`s cleanly (and vice versa) —
+    /// the two directions are independently scripted, so an integration test can land
+    /// a receipt with a succeeding submit and then drive a failing revoke.
+    #[tokio::test]
+    async fn submit_and_revoke_outcomes_are_independent() {
+        let r = MockRelay::succeeding().with_revoke_not_authorized();
+        assert!(r.submit(&att()).await.is_ok(), "submit still succeeds");
+        assert!(matches!(
+            r.revoke(&att().job_id).await,
+            Err(RevokeError::NotAuthorized)
+        ));
     }
 }

@@ -6141,6 +6141,9 @@ mod tests {
                 // One fewer uid than requested.
                 Ok(atts.iter().skip(1).map(|_| "0xshort".to_string()).collect())
             }
+            async fn revoke(&self, _job_id: &str) -> Result<(), relay::RevokeError> {
+                Ok(())
+            }
         }
 
         let state = test_state_empty().await;
