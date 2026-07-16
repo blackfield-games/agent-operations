@@ -872,6 +872,121 @@ def test_lifecycle_hooks_fire_in_order_start_then_decisions_then_end():
     assert pol.order == ["start", "decide", "decide", "end"], "start once first, end once last"
 
 
+def test_wants_leave_concedes_the_match_and_sends_no_action():
+    # A policy that concedes via wants_leave (a reason on a Live tick) makes the client send
+    # AgentMsg::Leave INSTEAD of an act — the harness forfeits the seat — then read the
+    # server's terminal End (broadcast to every seat, the leaver included) so run() still
+    # returns the canonical result. __call__ raises: a conceding tick must never reach the
+    # action path, so dropping the wants_leave check would fire it (the mutation proof).
+    from arena_client.sdk import ArenaClient
+
+    class _Conceder:
+        def wants_leave(self, _obs):
+            return "gg"
+
+        def __call__(self, _obs):
+            raise AssertionError("a conceding tick never reaches the action decision")
+
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(),
+                       _observe_frame(phase="live"), _end_frame()])
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 2))
+    result = c.run(_Conceder())
+
+    assert [f for f in t.sent if f["type"] == "leave"] == [leave_frame("gg")], "exactly one leave, with the reason"
+    assert [f for f in t.sent if f["type"] == "act"] == [], "a conceding policy sends no act"
+    assert c.left_reason == "gg"
+    # done + result land from the End the leaver still reads — its outcome reflects the forfeit.
+    assert c.done and c.result is result
+
+
+def test_a_left_client_draws_no_action_from_a_later_observation():
+    # FM3 (act-after-leave): once the Leave is sent the client draws NO further act, even if
+    # the server races another Live observation before the End. The policy concedes on tick 0
+    # only (tick 1 wants nothing), so WITHOUT the post-leave guard the second observation would
+    # fall through to the action path and send an act — exactly one leave, zero acts is the proof.
+    from arena_client.sdk import ArenaClient
+
+    class _ConcedeOnce:
+        def __init__(self):
+            self.ticks = 0
+
+        def wants_leave(self, _obs):
+            self.ticks += 1
+            return "done" if self.ticks == 1 else None
+
+        def __call__(self, _obs):
+            return _intent(100, 0)
+
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(),
+                       _observe_frame(tick=0, phase="live"), _observe_frame(tick=1, phase="live"),
+                       _end_frame()])
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 4))
+    c.run(_ConcedeOnce())
+
+    assert [f for f in t.sent if f["type"] == "leave"] == [leave_frame("done")], "left exactly once"
+    assert [f for f in t.sent if f["type"] == "act"] == [], "no act before OR after the leave"
+
+
+def test_a_policy_without_wants_leave_never_leaves():
+    # The hook is optional (getattr-guarded): a plain Callable policy with no wants_leave
+    # attribute runs a full match to End sending only acts, never a Leave — so the
+    # parity-bounded Policy contract stays byte-identical (an unconditional leave reddens this).
+    from arena_client.sdk import ArenaClient
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(),
+                       _observe_frame(tick=0), _observe_frame(tick=1), _end_frame()])
+    ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 6)).run(_fixed_policy)
+    assert [f for f in t.sent if f["type"] == "leave"] == [], "a hookless policy never leaves"
+    assert len([f for f in t.sent if f["type"] == "act"]) == 2, "both live ticks still acted"
+
+
+def test_wants_leave_never_fires_during_the_starting_countdown():
+    # wants_leave is consulted only on a Live tick: a Leave during the pre-live countdown
+    # would sit in the pipe and be read as the stale first Live action, desyncing the match
+    # (the same reason an Act is withheld during Starting). A policy that always wants to leave
+    # draws NO leave on the Starting frames, exactly one on the Live frame — checking
+    # wants_leave BEFORE the phase guard would leave during the countdown (the mutation proof).
+    from arena_client.sdk import ArenaClient
+
+    class _AlwaysLeave:
+        def wants_leave(self, _obs):
+            return "bye"
+
+        def __call__(self, _obs):
+            return _intent(0, 0)
+
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(),
+                       _observe_frame(phase="starting", starting_remaining=2),
+                       _observe_frame(phase="starting", starting_remaining=1),
+                       _observe_frame(phase="live"), _end_frame()])
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 4))
+    c.run(_AlwaysLeave())
+
+    assert [f for f in t.sent if f["type"] == "leave"] == [leave_frame("bye")], "leaves once, on the Live tick only"
+
+
+def test_leave_before_connect_sends_nothing():
+    # leave() is safe to call before the handshake: no transport frame, no recorded reason —
+    # the guard needs a live, connected match, else the Leave races or the server rejects it.
+    from arena_client.sdk import ArenaClient
+    t = MockTransport([])
+    c = ArenaClient(t, agent_id="a")
+    c.leave("early")
+    assert t.sent == [] and c.left_reason is None
+
+
+def test_a_direct_leave_during_the_starting_countdown_is_a_noop():
+    # A direct client.leave() (an external-signal abandon) during the countdown sends nothing:
+    # the client has processed only a Starting observation, so _phase != "live" and the guard
+    # withholds the frame — the direct-call twin of the hook's Live gate.
+    from arena_client.sdk import ArenaClient
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(),
+                       _observe_frame(phase="starting", starting_remaining=1)])
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 2)).connect()
+    c.poll(_fixed_policy)  # process the Starting frame — _phase becomes "starting", no reply
+    c.leave("abort")
+    assert [f for f in t.sent if f["type"] == "leave"] == [] and c.left_reason is None
+
+
 def test_static_geometry_never_rides_the_parity_bounded_observation():
     # FM1 (parity): the static map is surfaced ONCE at Start, never on the per-tick
     # Observation — the security boundary. A blockers field on an Observation is
