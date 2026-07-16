@@ -987,6 +987,20 @@ def test_a_direct_leave_during_the_starting_countdown_is_a_noop():
     assert [f for f in t.sent if f["type"] == "leave"] == [] and c.left_reason is None
 
 
+def test_a_second_leave_is_a_noop():
+    # FM3 (double-send): once conceded, a second leave() — a retry, or a policy that also
+    # calls it — sends no second Leave frame (the guard latches on left_reason), so the
+    # server never sees two forfeits for one seat and the first reason stands.
+    from arena_client.sdk import ArenaClient
+    t = MockTransport([_challenge_frame(), _welcome_frame(), _start_frame(), _observe_frame(phase="live")])
+    c = ArenaClient(t, agent_id="a", clock=FakeClock([0.0] * 4)).connect()
+    c.poll(_fixed_policy)  # a Live observation sets _phase == "live"
+    c.leave("first")
+    c.leave("second")
+    assert [f for f in t.sent if f["type"] == "leave"] == [leave_frame("first")], "the second leave is a no-op"
+    assert c.left_reason == "first"
+
+
 def test_static_geometry_never_rides_the_parity_bounded_observation():
     # FM1 (parity): the static map is surfaced ONCE at Start, never on the per-tick
     # Observation — the security boundary. A blockers field on an Observation is
