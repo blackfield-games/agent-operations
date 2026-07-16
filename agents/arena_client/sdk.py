@@ -51,6 +51,7 @@ from .proto import (
     address_from_private_key,
     decode_gateway,
     join_frame,
+    leave_frame,
     sign_join,
 )
 
@@ -75,14 +76,26 @@ class StatefulPolicy(Protocol):
     score) every seat receives. It closes the lifecycle (start → starting → live → end)
     for a stateful/learning policy that must observe its own result in-band to adapt,
     which the SDK already receives but otherwise only hands back to the caller of
-    `run`/`poll`. All three hooks are getattr-guarded, so a plain callable with none of
-    them runs unchanged and the parity boundary is untouched (each hook carries only
-    map layout, the pre-live counter, or the public result — never a live private
-    field)."""
+    `run`/`poll`.
+
+    `wants_leave` is the fourth optional hook: on a Live tick, BEFORE the per-tick
+    `__call__`, the client consults it and — when it returns a reason string (not
+    `None`) — sends an `AgentMsg::Leave` INSTEAD of an action, conceding the match. The
+    harness consumes the Leave as a durable FORFEIT (the seat is downed and ranked a DQ,
+    not merely idled for the tick), so a policy that has clearly lost, or must abandon on
+    an external signal, can stop rather than answer to the tick cap. It fires only Live
+    (never during the Starting countdown, nor for a downed seat) and returning `None` is
+    the byte-identical non-leaving path.
+
+    All four hooks are getattr-guarded, so a plain callable with none of them runs
+    unchanged and the parity boundary is untouched (each hook carries only map layout,
+    the pre-live counter, the public result, or a concede decision over the public
+    `Observation` — never a live private field)."""
 
     def on_match_start(self, start: MatchStart) -> None: ...
     def on_starting(self, obs: Observation) -> None: ...
     def on_match_end(self, result: MatchResult) -> None: ...
+    def wants_leave(self, obs: Observation) -> str | None: ...
     def __call__(self, obs: Observation) -> ActionIntent: ...
 
 
@@ -168,6 +181,15 @@ class ArenaClient:
         self._started = False
         self.rejections: list[str] = []
         self.forfeits = 0
+        # Set once the policy concedes via `leave`/`wants_leave`: the reason sent in the
+        # `AgentMsg::Leave`. None until the seat forfeits. `done` is NOT set alongside it —
+        # the server broadcasts the terminal End to every seat, the leaver included, so the
+        # client still reads it and `result` reflects the canonical forfeit outcome.
+        self.left_reason: str | None = None
+        # Phase of the last observation processed ("starting"/"live"), so `leave` withholds
+        # a frame outside a Live tick — a Leave during the Starting countdown would sit in
+        # the pipe and be consumed as the stale first Live action, desyncing the match.
+        self._phase: str | None = None
 
     def __repr__(self) -> str:
         # A ranked client holds a secp256k1 private key whose secrecy IS the seat's
@@ -290,6 +312,12 @@ class ArenaClient:
         raise ProtocolError(f"unexpected mid-match frame {type(msg).__name__}")
 
     def _respond(self, obs: Observation, policy: Policy) -> None:
+        self._phase = obs.phase
+        if self.left_reason is not None:
+            # Already conceded — never draw another action, whatever arrives next. The
+            # server sends the leaver only the terminal End (read by `poll`, not here), so
+            # this guards a racing post-Leave observation from acting after the forfeit.
+            return
         if obs.phase != "live":
             # Pre-live (the Starting countdown): the server broadcasts the observation
             # without reading a reply (the arena harness pump_starting), so an Act here
@@ -306,6 +334,15 @@ class ArenaClient:
             # a lock-step transport stays in frame, and never fire.
             self._send(obs, _hold(obs.own.facing))
             return
+        leave_hook = getattr(policy, "wants_leave", None)
+        if callable(leave_hook):
+            # A live, alive seat may concede BEFORE it acts: a reason string sends the
+            # Leave instead of an action (optional getattr-guarded hook — a plain callable
+            # never leaves, so the parity boundary is untouched).
+            reason = leave_hook(obs)
+            if reason is not None:
+                self.leave(reason)
+                return
         start = self._clock()
         intent = policy(obs)
         elapsed_micros = (self._clock() - start) * 1_000_000
@@ -327,6 +364,21 @@ class ArenaClient:
             intent=intent,
         )
         self.transport.send(act_frame(action))
+
+    def leave(self, reason: str) -> None:
+        """Concede the match: send an `AgentMsg::Leave`, which the reference harness
+        consumes as a durable FORFEIT (the seat is downed and ranked a DQ, not merely
+        idled for the tick). A no-op unless a Live match is in progress — a leave before
+        connect, during the Starting countdown, after End, or a second leave sends
+        nothing (the harness would reject it or it would race the End), so it is safe to
+        call from an external-signal handler. `done` is deliberately NOT set here: the
+        server broadcasts the terminal End to every seat including the leaver, so the
+        client reads it on the next `poll` and `result` reflects the canonical forfeit
+        outcome (a leaver that stopped polling here would never learn how it placed)."""
+        if not self.connected or self.done or self._phase != "live" or self.left_reason is not None:
+            return
+        self.transport.send(leave_frame(reason))
+        self.left_reason = reason
 
     def run(self, policy: Policy) -> MatchResult:
         """Drive the connection to the match's End and return the result. For a
