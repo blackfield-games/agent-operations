@@ -1528,6 +1528,28 @@ async def test_run_capped_biome_magnitude_tracks_the_cap_in_lock_step(tmp_path):
     assert not off.accepted
 
 
+async def test_run_rejects_a_capped_biome_declaring_a_present_zero_count(tmp_path):
+    # The present-zero floor: a tampered instanceCount = 0 under the vegetationCapped marker. The
+    # gate skips an ABSENT/negative/non-integer count (field-presence is the well-formedness gate's
+    # concern), but a PRESENT 0 still verifies — a capped region never scatters 0 (the base is
+    # min(keyword, cap) > 0, jittered strictly up), so a 0 disagrees with the cap-reduced count: a
+    # real over-count masked as empty, not an unverifiable body to degrade on. Every other cap test
+    # uses a nonzero count or None, so a `count >= 0` -> `count > 0` slip would let this zero slide
+    # past accepted; this pins the >= 0 floor as a reject, not a skip.
+    assert _CAPPED_COUNT > 0  # premise: the cap-reduced scatter is nonzero, so 0 is a real desync
+    verdict = await validator.run(
+        _brief(), _capped_biome_set(tmp_path, count=0), layers_root=tmp_path
+    )
+    assert not verdict.accepted
+    assert len(verdict.issues) == 1
+    issue = verdict.issues[0]
+    assert "intent:must_not" in issue and "capped instanceCount 0 !=" in issue
+    assert str(_CAPPED_COUNT) in issue  # names the cap-reduced count the region should carry
+    assert "biome" in verdict.failing_specialists
+    assert _failing_specialist(verdict.issues) == "biome"
+    assert _route_back_target(verdict) == "biome"
+
+
 # ---- biome UNCAPPED scatter COUNT vs the brief: the else-branch twin of the cap magnitude ----
 #
 # The cap magnitude check above pins instanceCount to the brief ONLY under a vegetationCapped
