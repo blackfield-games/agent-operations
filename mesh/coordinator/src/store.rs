@@ -246,6 +246,7 @@ impl Store {
                AND created_at IS NOT NULL
                AND created_at <= ?3
                AND id NOT IN (SELECT job_id FROM pending_attestations WHERE uid IS NULL)
+               AND id NOT IN (SELECT job_id FROM pending_attestations WHERE revocation_requested_at IS NOT NULL AND revoked_at IS NULL)
                AND id NOT IN (SELECT job_id FROM pending_debits WHERE tx_hash IS NULL)
              LIMIT ?4",
         )?;
@@ -352,7 +353,21 @@ impl Store {
                  -- actual re-arm (see redrive_dead_lettered_attestation), never on the
                  -- relayer's own dead-letter mark: a row that keeps re-dead-lettering
                  -- into a still-unfixed cause shows a rising count in the listing.
-                 redrive_count  INTEGER NOT NULL DEFAULT 0
+                 redrive_count  INTEGER NOT NULL DEFAULT 0,
+                 -- Revocation lifecycle for a LANDED receipt (uid set) later found
+                 -- invalid, the mirror-image of the issue lifecycle above. An operator
+                 -- arms `revocation_requested_at` via POST /receipts/{id}/revoke; the
+                 -- relayer drains requested rows through RenderReceipts.revokeReceipt and
+                 -- stamps `revoked_at` once the attestation is withdrawn on-chain.
+                 -- `revocation_dead_lettered_at` quarantines a revocation the relayer hit
+                 -- a non-retryable (Permanent) error on — retained + auditable + surfaced
+                 -- at /stats, excluded from the drainable revocation backlog so one poison
+                 -- row never blocks the rest, exactly like `dead_lettered_at` for issue.
+                 -- A row is retained by prune_terminal_jobs while a revocation is OWED
+                 -- (requested, not yet revoked), so a stuck correction is never lost.
+                 revocation_requested_at    INTEGER,
+                 revoked_at                 INTEGER,
+                 revocation_dead_lettered_at INTEGER
              );
              -- Pending ComputeMeter debits: written atomically with the settle
              -- (see record_completed), the metering twin of pending_attestations,
@@ -409,6 +424,22 @@ impl Store {
         // duplicate-column error.
         ignore_duplicate_column(conn.execute(
             "ALTER TABLE pending_attestations ADD COLUMN redrive_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        ))?;
+        // Migrate pre-existing DBs (created before the receipt-revocation lifecycle).
+        // NULL on every existing row means "no revocation requested / not revoked / not
+        // quarantined", which is correct: nothing had been revoked yet. Mirrors the
+        // dead_lettered_at migration above; swallow only the duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_attestations ADD COLUMN revocation_requested_at INTEGER",
+            [],
+        ))?;
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_attestations ADD COLUMN revoked_at INTEGER",
+            [],
+        ))?;
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_attestations ADD COLUMN revocation_dead_lettered_at INTEGER",
             [],
         ))?;
         // Migrate pre-existing DBs (created before the debit relayer's `submitted_at`
@@ -1340,9 +1371,11 @@ impl Store {
         let cutoff = now_secs.saturating_sub(horizon_secs);
         let tx = self.conn.transaction()?;
         // Collect a bounded batch of prunable ids first (the NOT IN subqueries
-        // exclude jobs whose receipt/debit is still pending), then delete each job
-        // and its dependents. Selecting ids up front keeps the candidate statement
-        // and the delete statements from co-borrowing the transaction.
+        // exclude jobs whose receipt or debit is still pending, or whose landed
+        // receipt has an OWED revocation — requested but not yet withdrawn — so a
+        // stuck/in-flight correction is never pruned out from under the operator),
+        // then delete each job and its dependents. Selecting ids up front keeps the
+        // candidate statement and the delete statements from co-borrowing the transaction.
         let ids: Vec<String> = {
             let mut stmt = tx.prepare(
                 "SELECT id FROM jobs
@@ -1350,6 +1383,7 @@ impl Store {
                    AND created_at IS NOT NULL
                    AND created_at <= ?3
                    AND id NOT IN (SELECT job_id FROM pending_attestations WHERE uid IS NULL)
+                   AND id NOT IN (SELECT job_id FROM pending_attestations WHERE revocation_requested_at IS NOT NULL AND revoked_at IS NULL)
                    AND id NOT IN (SELECT job_id FROM pending_debits WHERE tx_hash IS NULL)
                  LIMIT ?4",
             )?;
@@ -2210,6 +2244,140 @@ impl Store {
             (),
         )?;
         Ok(updated)
+    }
+
+    /// Arm a revocation for a LANDED render receipt (`uid` set) later found invalid, so
+    /// the next relayer drain retracts it on-chain via `RenderReceipts.revokeReceipt`.
+    /// Sets `revocation_requested_at = now` ONLY where the receipt is on-chain (`uid IS
+    /// NOT NULL`), not already revoked (`revoked_at IS NULL`), not already requested
+    /// (`revocation_requested_at IS NULL`), and not quarantined
+    /// (`revocation_dead_lettered_at IS NULL`); returns whether a row was armed.
+    ///
+    /// The mirror-image of issuance: where the issue lifecycle relays an owed receipt
+    /// ONTO the chain, this relays a landed one's withdrawal, so it fires only once the
+    /// receipt has actually landed. A revoke of an owed-but-unrelayed (`uid IS NULL`),
+    /// absent, already-requested, or already-revoked receipt is an idempotent no-op
+    /// (returns false) an operator can safely replay — never arming a `revokeReceipt`
+    /// that would revert `NotIssued` on-chain, and never re-driving a landed revocation.
+    pub fn request_revocation(&self, job_id: &uuid::Uuid, now_secs: i64) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET revocation_requested_at = ?1
+             WHERE job_id = ?2 AND uid IS NOT NULL AND revoked_at IS NULL
+               AND revocation_requested_at IS NULL AND revocation_dead_lettered_at IS NULL",
+            (now_secs, job_id.to_string()),
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// The oldest receipts with an armed, not-yet-landed revocation
+    /// (`revocation_requested_at IS NOT NULL AND revoked_at IS NULL`, and not
+    /// quarantined), oldest-first by request time, up to `limit`, as `(job_id,
+    /// job_id_b32)` — `job_id_b32` is the contract's `bytes32 jobId` the drain passes to
+    /// [`Relay::revoke`](crate::relay::Relay::revoke). The revocation twin of
+    /// [`claim_oldest_pending_batch`](Self::claim_oldest_pending_batch): a pure read (no
+    /// reservation), so the drain drops the store lock across the slow on-chain revoke
+    /// and re-acquires it only to mark. The `revocation_dead_lettered_at IS NULL` filter
+    /// unblocks the head-of-line — a quarantined poison revocation is skipped, never
+    /// re-claimed, so the drain advances instead of wedging. `limit == 0` → empty vec.
+    pub fn claim_oldest_pending_revocation_batch(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(uuid::Uuid, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, job_id_b32 FROM pending_attestations
+             WHERE revocation_requested_at IS NOT NULL AND revoked_at IS NULL
+               AND revocation_dead_lettered_at IS NULL
+             ORDER BY revocation_requested_at ASC, rowid ASC
+             LIMIT ?1",
+        )?;
+        let rows =
+            stmt.query_map([limit as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job_id, b32) = row?;
+            let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
+                anyhow::anyhow!("pending_attestations.job_id not a uuid {job_id:?}: {e}")
+            })?;
+            out.push((uuid, b32));
+        }
+        Ok(out)
+    }
+
+    /// Mark a receipt's revocation landed on-chain: stamp `revoked_at = now` where the
+    /// receipt is on-chain (`uid IS NOT NULL`), a revocation was requested, and it is not
+    /// already revoked. Returns whether a row was marked. Idempotent — a second mark (a
+    /// crash-recovered or duplicate drain, or the on-chain `AlreadyRevoked`
+    /// idempotent-success arm) is a no-op (returns false), so a re-driven revocation
+    /// settles at most once. The revoke twin of [`mark_submitted`](Self::mark_submitted).
+    pub fn mark_revoked(&self, job_id: &uuid::Uuid, now_secs: i64) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET revoked_at = ?1
+             WHERE job_id = ?2 AND uid IS NOT NULL AND revocation_requested_at IS NOT NULL
+               AND revoked_at IS NULL",
+            (now_secs, job_id.to_string()),
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Quarantine a revocation the relayer hit a non-retryable (`Permanent`) error on:
+    /// stamp `revocation_dead_lettered_at = now` where the revocation is armed, not yet
+    /// landed, and not already quarantined. Returns whether a row was quarantined. The
+    /// row is retained (never deleted; [`prune_terminal_jobs`](Self::prune_terminal_jobs)
+    /// keeps it while the revocation is owed) and surfaced at
+    /// `/stats dead_lettered_revocations`, excluded from the drainable revocation backlog
+    /// so one poison row never blocks the rest. The revoke twin of
+    /// [`mark_attestation_dead_lettered`](Self::mark_attestation_dead_lettered).
+    pub fn mark_revocation_dead_lettered(&self, job_id: &uuid::Uuid, now_secs: i64) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET revocation_dead_lettered_at = ?1
+             WHERE job_id = ?2 AND revocation_requested_at IS NOT NULL AND revoked_at IS NULL
+               AND revocation_dead_lettered_at IS NULL",
+            (now_secs, job_id.to_string()),
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Number of receipts whose on-chain attestation has been revoked (`revoked_at IS
+    /// NOT NULL`), surfaced at `/stats revoked_attestations` — the cumulative count of
+    /// corrections that have landed. 0 where nothing has been revoked.
+    pub fn revoked_attestation_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_attestations WHERE revoked_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Number of receipts with an armed revocation not yet landed AND still drainable
+    /// (`revocation_requested_at IS NOT NULL AND revoked_at IS NULL`, not quarantined) —
+    /// the revocation backlog depth, the revoke twin of
+    /// [`pending_attestation_count`](Self::pending_attestation_count). Drains as the
+    /// relayer lands each `revokeReceipt`. Excludes dead-lettered revocations (see
+    /// [`dead_lettered_revocation_count`](Self::dead_lettered_revocation_count)).
+    pub fn pending_revocation_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_attestations
+             WHERE revocation_requested_at IS NOT NULL AND revoked_at IS NULL
+               AND revocation_dead_lettered_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Number of revocations the relayer quarantined after a non-retryable (`Permanent`)
+    /// `revokeReceipt` error — the dead-letter depth, surfaced at `/stats`. The
+    /// correction is still owed: the row is retained (prune keeps it while owed) but
+    /// excluded from the drainable backlog so it cannot block it. The revoke twin of
+    /// [`dead_lettered_attestation_count`](Self::dead_lettered_attestation_count).
+    pub fn dead_lettered_revocation_count(&self) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_attestations WHERE revocation_dead_lettered_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// The on-chain attestation obligation for a job, for the `GET /jobs/{id}` read
