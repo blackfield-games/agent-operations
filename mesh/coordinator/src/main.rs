@@ -6742,6 +6742,237 @@ mod tests {
         router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
     }
 
+    /// `POST /receipts/{id}/revoke` with an optional `Authorization` header (body-less).
+    async fn post_receipt_revoke(
+        state: Arc<AppState>,
+        id: Uuid,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/receipts/{id}/revoke"));
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    async fn revoked_receipts(state: &Arc<AppState>) -> usize {
+        state.store.lock().await.revoked_attestation_count().unwrap()
+    }
+    async fn pending_revocations(state: &Arc<AppState>) -> usize {
+        state.store.lock().await.pending_revocation_count().unwrap()
+    }
+    async fn dead_lettered_revocations(state: &Arc<AppState>) -> usize {
+        state.store.lock().await.dead_lettered_revocation_count().unwrap()
+    }
+
+    /// Settle + relay `n` receipts so each carries a landed `uid` — the precondition a
+    /// revocation needs (only a receipt on-chain can be withdrawn). Returns the jobs
+    /// oldest-first.
+    async fn settle_and_land(state: &Arc<AppState>, n: usize) -> Vec<JobSpec> {
+        let jobs = settle_n(state, n).await;
+        drain_attestations(state, &MockRelay::succeeding(), TEST_BATCH).await;
+        for job in &jobs {
+            assert!(stored_uid(state, &job.id).await.is_some(), "receipt landed before revoke");
+        }
+        jobs
+    }
+
+    /// FM1: `request_revocation` arms ONLY a LANDED receipt. A revoke of an absent job, an
+    /// owed-but-unrelayed (`uid` NULL) receipt, or an already-requested one is an
+    /// idempotent no-op (`requested: false`) that never arms a `revokeReceipt` which would
+    /// revert `NotIssued` on-chain, and never double-arms the drain.
+    #[tokio::test]
+    async fn revoke_arms_only_a_landed_receipt() {
+        let state = test_state_empty().await;
+
+        // Absent job → no-op.
+        let resp = post_receipt_revoke(state.clone(), Uuid::new_v4(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["requested"], false);
+
+        // Owed but not yet relayed (uid NULL) → no-op: can't revoke what hasn't landed.
+        let owed = seed_job();
+        settle_one(&state, &owed).await;
+        let resp = post_receipt_revoke(state.clone(), owed.id, None).await;
+        assert_eq!(body_json(resp).await["requested"], false);
+        assert_eq!(pending_revocations(&state).await, 0, "an owed receipt is not armed");
+
+        // Landed → armed.
+        drain_attestations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        let resp = post_receipt_revoke(state.clone(), owed.id, None).await;
+        assert_eq!(body_json(resp).await["requested"], true);
+        assert_eq!(pending_revocations(&state).await, 1);
+
+        // Second request for the same armed receipt → idempotent no-op, not double-armed.
+        let resp = post_receipt_revoke(state.clone(), owed.id, None).await;
+        assert_eq!(body_json(resp).await["requested"], false);
+        assert_eq!(pending_revocations(&state).await, 1);
+    }
+
+    /// FM: the revoke endpoint carries the same bearer gate as `POST /jobs` and the
+    /// redrive endpoints — with a token configured, a request without it is `401` and
+    /// nothing is armed; the correct token arms it.
+    #[tokio::test]
+    async fn revoke_endpoint_rejects_unauthenticated_and_accepts_the_token() {
+        let state = test_state_with_token(TEST_INGEST_TOKEN).await;
+        let jobs = settle_and_land(&state, 1).await;
+
+        let resp = post_receipt_revoke(state.clone(), jobs[0].id, None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = post_receipt_revoke(state.clone(), jobs[0].id, Some("Bearer wrong-token")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(pending_revocations(&state).await, 0, "an unauthenticated revoke arms nothing");
+
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_receipt_revoke(state.clone(), jobs[0].id, Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["requested"], true);
+        assert_eq!(pending_revocations(&state).await, 1);
+    }
+
+    /// FM: the happy path end-to-end — settle, land, arm, drain. The relayer calls
+    /// `revokeReceipt` once with the `bytes32` jobId, the row flips to revoked, and
+    /// `/stats` moves the count from `pending_revocations` to `revoked_attestations`;
+    /// `GET /jobs/{id}` then surfaces the fourth (revoked) attestation state.
+    #[tokio::test]
+    async fn drain_revokes_an_armed_receipt_end_to_end() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        assert!(post_receipt_revoke(state.clone(), job.id, None).await.status().is_success());
+        assert_eq!(pending_revocations(&state).await, 1);
+
+        let relay = MockRelay::succeeding();
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+
+        assert_eq!(
+            relay.revoked(),
+            vec![eas::job_id_hex(&job.id)],
+            "revokeReceipt called with the bytes32 jobId"
+        );
+        assert_eq!(revoked_receipts(&state).await, 1);
+        assert_eq!(pending_revocations(&state).await, 0, "the armed revocation drained");
+        assert_eq!(dead_lettered_revocations(&state).await, 0);
+
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", job.id)).await).await;
+        assert!(detail["attestation"]["uid"].is_string(), "the uid stays readable after revoke");
+        assert!(detail["attestation"]["revoked_at"].as_i64().is_some(), "revoked_at is stamped");
+    }
+
+    /// FM2: a re-driven revocation settles at most once — after it lands, a second drain
+    /// claims nothing (the row is revoked), so the relayer revokes exactly once.
+    #[tokio::test]
+    async fn a_landed_revocation_is_not_re_driven() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+
+        let relay = MockRelay::succeeding();
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+        drain_revocations(&state, &relay, TEST_BATCH).await; // second pass claims nothing
+        assert_eq!(relay.revoke_calls(), 1, "revoked exactly once, not re-driven");
+        assert_eq!(revoked_receipts(&state).await, 1);
+    }
+
+    /// FM2: an on-chain `AlreadyRevoked` (the attestation is already off-chain — a
+    /// crash-recovered re-drive hit the contract's fence) is an idempotent SUCCESS: the
+    /// row is marked revoked, not left pending or dead-lettered.
+    #[tokio::test]
+    async fn already_revoked_on_chain_marks_the_row_revoked() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+
+        drain_revocations(&state, &MockRelay::succeeding().with_revoke_already_revoked(), TEST_BATCH).await;
+        assert_eq!(revoked_receipts(&state).await, 1, "AlreadyRevoked is an idempotent success");
+        assert_eq!(pending_revocations(&state).await, 0);
+        assert_eq!(dead_lettered_revocations(&state).await, 0);
+    }
+
+    /// FM3: `NotAuthorized` is a GLOBAL signer misconfig — the drain halts loudly on the
+    /// first row and leaves every requested row pending (so it auto-resumes once the
+    /// signer is re-authorized), never quarantining the self-healing backlog one row at a
+    /// time.
+    #[tokio::test]
+    async fn drain_halts_on_not_authorized_without_dead_lettering() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 2).await;
+        for job in &jobs {
+            state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        }
+
+        let relay = MockRelay::succeeding().with_revoke_not_authorized();
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(relay.revoke_calls(), 1, "halted on the FIRST unauthorized row");
+        assert_eq!(pending_revocations(&state).await, 2, "both rows stay pending for auto-resume");
+        assert_eq!(dead_lettered_revocations(&state).await, 0, "a global misconfig is never dead-lettered");
+        assert_eq!(revoked_receipts(&state).await, 0);
+    }
+
+    /// FM: a per-row `Permanent` revoke fault (e.g. the contract reverts `NotIssued` for a
+    /// row believed landed) is DEAD-LETTERED + retained, not hot-looped or dropped, and a
+    /// retention sweep does NOT prune a job with an owed revocation even though its receipt
+    /// landed (`uid` set).
+    #[tokio::test]
+    async fn drain_dead_letters_a_permanent_revoke_and_retention_keeps_it() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+
+        drain_revocations(&state, &MockRelay::succeeding().with_revoke_permanent(), TEST_BATCH).await;
+        assert_eq!(dead_lettered_revocations(&state).await, 1);
+        assert_eq!(pending_revocations(&state).await, 0, "excluded from the drainable backlog");
+        assert_eq!(revoked_receipts(&state).await, 0);
+
+        let pruned = {
+            let mut store = state.store.lock().await;
+            store.prune_terminal_jobs(now_secs() + 10_000_000, 0, 100).unwrap()
+        };
+        assert_eq!(pruned, 0, "a stuck revocation is retained, not pruned out from under the operator");
+        assert_eq!(dead_lettered_revocations(&state).await, 1);
+    }
+
+    /// FM: a `Transient` revoke fault backs off — the row stays requested and lands on a
+    /// later tick, never dead-lettered.
+    #[tokio::test]
+    async fn drain_retries_a_transient_revoke_on_the_next_tick() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+
+        let relay = MockRelay::succeeding().with_revoke_transient(1);
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(pending_revocations(&state).await, 1, "still requested after a transient");
+        assert_eq!(dead_lettered_revocations(&state).await, 0, "a transient is never dead-lettered");
+
+        // Next tick: the transient budget is spent, the revoke lands.
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(revoked_receipts(&state).await, 1);
+        assert_eq!(pending_revocations(&state).await, 0);
+    }
+
+    /// FM: a per-row `Permanent` revoke dead-letters the poison HEAD and the drain
+    /// CONTINUES, so a healthy revocation behind it still lands the same tick.
+    #[tokio::test]
+    async fn drain_dead_letters_the_poison_revoke_and_revokes_the_rest() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 2).await;
+        let poison = &jobs[0]; // requested first → claimed first (the head)
+        let good = &jobs[1];
+        for job in [poison, good] {
+            state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        }
+
+        let relay = MockRelay::succeeding().with_revoke_permanent_job(eas::job_id_hex(&poison.id));
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+
+        assert_eq!(dead_lettered_revocations(&state).await, 1, "the poison head is quarantined");
+        assert_eq!(revoked_receipts(&state).await, 1, "the good revocation still landed");
+        assert_eq!(pending_revocations(&state).await, 0);
+        assert_eq!(relay.revoked(), vec![eas::job_id_hex(&good.id)]);
+    }
+
     /// FM1: re-drive re-arms ONLY a dead-lettered, not-yet-attested receipt. A
     /// dead-lettered row is re-armed (→ drainable again); an already-attested row
     /// (re-arming would resurrect a landed attestation), an unknown job, and a

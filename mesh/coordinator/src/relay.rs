@@ -229,6 +229,10 @@ struct MockInner {
     /// Always fail `revoke` with `AlreadyRevoked` (models a receipt already revoked
     /// on-chain — an idempotent success the drain marks and moves past).
     revoke_already_revoked: bool,
+    /// Specific `job_id`s whose `revoke` returns `Permanent` (the rest succeed) — one
+    /// poison revocation for the drain to dead-letter + isolate while the rest still
+    /// revoke. Empty on the production dev path.
+    revoke_permanent_jobs: Vec<String>,
     /// Total `revoke` calls (successful or not) — distinct from `calls`, so a test
     /// proves the revoke drain halted on the FIRST unauthorized row, not marched on.
     revoke_calls: usize,
@@ -259,6 +263,7 @@ impl MockRelay {
                 revoke_permanent: false,
                 revoke_not_authorized: false,
                 revoke_already_revoked: false,
+                revoke_permanent_jobs: Vec::new(),
                 revoke_calls: 0,
                 revoked: Vec::new(),
             }),
@@ -407,6 +412,14 @@ impl MockRelay {
         self
     }
 
+    /// Make this specific `job_id`'s `revoke` return `Permanent` (the rest succeed) —
+    /// one poison revocation for the drain to dead-letter + isolate.
+    #[cfg(test)]
+    pub fn with_revoke_permanent_job(mut self, job_id: String) -> Self {
+        self.inner.get_mut().unwrap().revoke_permanent_jobs.push(job_id);
+        self
+    }
+
     /// Total `revoke` calls so far.
     #[cfg(test)]
     pub fn revoke_calls(&self) -> usize {
@@ -500,7 +513,7 @@ impl Relay for MockRelay {
         if inner.revoke_not_authorized {
             return Err(RevokeError::NotAuthorized);
         }
-        if inner.revoke_permanent {
+        if inner.revoke_permanent || inner.revoke_permanent_jobs.contains(&job_id.to_string()) {
             return Err(RevokeError::Permanent("mock revoke permanent".into()));
         }
         if inner.revoke_already_revoked {
