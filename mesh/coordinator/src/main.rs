@@ -7066,6 +7066,339 @@ mod tests {
         assert_eq!(relay.revoked(), vec![eas::job_id_hex(&good.id)]);
     }
 
+    // -- POST /receipts/{id}/revoke-redrive + /receipts/revoke-redrive-all — operator
+    //    re-drive of a dead-lettered revocation --
+
+    /// `POST /receipts/{id}/revoke-redrive` with an optional `Authorization` header (body-less).
+    async fn post_receipt_revoke_redrive(
+        state: Arc<AppState>,
+        id: Uuid,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/receipts/{id}/revoke-redrive"));
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// `POST /receipts/revoke-redrive-all` with an optional `Authorization` header (body-less).
+    async fn post_receipts_revoke_redrive_all(state: Arc<AppState>, authorization: Option<&str>) -> axum::response::Response {
+        let mut builder = Request::builder().method("POST").uri("/receipts/revoke-redrive-all");
+        if let Some(auth) = authorization {
+            builder = builder.header("authorization", auth);
+        }
+        router(state).oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// Arm one landed receipt's revocation, then drain through a Permanent-reverting relay
+    /// so the revocation is dead-lettered — the precondition for a revocation re-drive test.
+    /// `job` must already be landed (via `settle_and_land`); asserts it is the only
+    /// revocation in flight (exactly one dead-lettered, none drainable).
+    async fn dead_letter_one_revocation(state: &Arc<AppState>, job: &JobSpec) {
+        state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        let poison = MockRelay::succeeding().with_revoke_permanent_job(eas::job_id_hex(&job.id));
+        drain_revocations(state, &poison, TEST_BATCH).await;
+        assert_eq!(dead_lettered_revocations(state).await, 1, "precondition: one dead-lettered revocation");
+        assert_eq!(pending_revocations(state).await, 0, "precondition: nothing drainable");
+    }
+
+    /// FM1 (anti-resurrection) + FM2 (pending no-op): re-drive re-arms ONLY a
+    /// dead-lettered, not-yet-revoked revocation. An already-REVOKED row (re-arming would
+    /// re-drive a settled correction into a second `revokeReceipt`), an unknown job, and a
+    /// still-pending row (already drainable) are all refused — the store returns false and
+    /// nothing changes.
+    #[tokio::test]
+    async fn revoke_redrive_rearms_only_a_dead_lettered_unrevoked_revocation() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 2).await;
+        let poison = &jobs[0];
+        let revoked = &jobs[1];
+
+        // `revoked`: arm + drain succeeding → revoked_at set (a settled correction).
+        state.store.lock().await.request_revocation(&revoked.id, now_secs()).unwrap();
+        drain_revocations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert_eq!(revoked_receipts(&state).await, 1, "precondition: one settled revocation");
+
+        // `poison`: arm + drain permanent → dead-lettered.
+        dead_letter_one_revocation(&state, poison).await;
+
+        {
+            let store = state.store.lock().await;
+            // Already-revoked: revoked_at set, so the `revoked_at IS NULL` guard refuses it —
+            // a settled correction is never re-driven into a second on-chain revoke.
+            assert!(!store.redrive_dead_lettered_revocation(&revoked.id).unwrap(), "a revoked row is not re-armed");
+            // Unknown job: nothing to re-arm.
+            assert!(!store.redrive_dead_lettered_revocation(&Uuid::new_v4()).unwrap(), "an unknown revocation is not re-armed");
+            // Dead-lettered: re-armed.
+            assert!(store.redrive_dead_lettered_revocation(&poison.id).unwrap(), "a dead-lettered revocation is re-armed");
+        }
+        assert_eq!(dead_lettered_revocations(&state).await, 0, "poison left the dead-letter set");
+        assert_eq!(pending_revocations(&state).await, 1, "poison re-entered the drainable backlog");
+
+        // Now-pending poison: a second re-drive is a no-op (already drainable).
+        assert!(
+            !state.store.lock().await.redrive_dead_lettered_revocation(&poison.id).unwrap(),
+            "a still-pending revocation is not re-armed"
+        );
+        assert_eq!(revoked_receipts(&state).await, 1, "the settled revocation is untouched throughout");
+    }
+
+    /// FM (over-reach): the bulk re-drive re-arms ONLY dead-lettered, unrevoked rows — never
+    /// a still-pending (already drainable) one and never a revoked (settled) one. With two
+    /// dead-lettered, one revoked, and one pending revocation present, it re-arms exactly the
+    /// two, leaves the pending row pending, and never resurrects the settled correction.
+    #[tokio::test]
+    async fn revoke_redrive_all_rearms_only_dead_lettered_unrevoked_revocations() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 4).await;
+        let (poison_a, poison_b, revoked, pending_rev) = (&jobs[0], &jobs[1], &jobs[2], &jobs[3]);
+
+        // Two dead-lettered.
+        for job in [poison_a, poison_b] {
+            state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        }
+        drain_revocations(&state, &MockRelay::succeeding().with_revoke_permanent(), TEST_BATCH).await;
+        assert_eq!(dead_lettered_revocations(&state).await, 2);
+
+        // One revoked (the poisons are skipped, stay quarantined).
+        state.store.lock().await.request_revocation(&revoked.id, now_secs()).unwrap();
+        drain_revocations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert_eq!(revoked_receipts(&state).await, 1);
+        assert_eq!(dead_lettered_revocations(&state).await, 2, "the poisons stay quarantined");
+
+        // One still-pending (armed, never drained).
+        state.store.lock().await.request_revocation(&pending_rev.id, now_secs()).unwrap();
+        assert_eq!(pending_revocations(&state).await, 1, "pending_rev is drainable");
+
+        // Bulk re-drive: only the two dead-lettered rows match.
+        let rearmed = state.store.lock().await.redrive_all_dead_lettered_revocations().unwrap();
+        assert_eq!(rearmed, 2, "exactly the two dead-lettered rows, not the pending or revoked one");
+        assert_eq!(dead_lettered_revocations(&state).await, 0, "both poisons re-armed");
+        assert_eq!(pending_revocations(&state).await, 3, "the two re-armed poisons joined the pending row");
+        assert_eq!(revoked_receipts(&state).await, 1, "the settled revocation is untouched");
+
+        // A succeeding drain lands the 3 pending revocations without re-driving the revoked one.
+        let relay = MockRelay::succeeding();
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(revoked_receipts(&state).await, 4, "the 3 re-armed/pending revocations landed");
+        assert!(
+            !relay.revoked().contains(&eas::job_id_hex(&revoked.id)),
+            "the already-revoked row is never re-driven"
+        );
+    }
+
+    /// FM (security): the revoke-redrive endpoint requires the same bearer token as
+    /// `POST /jobs`. A missing-header and a wrong-token call are both `401` and re-arm
+    /// NOTHING (the revocation stays dead-lettered); the correct token re-arms it
+    /// (`200 {"rearmed": true}`).
+    #[tokio::test]
+    async fn revoke_redrive_endpoint_rejects_unauthenticated_and_accepts_the_token() {
+        let state = test_state_with_token(TEST_INGEST_TOKEN).await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        let resp = post_receipt_revoke_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_revocations(&state).await, 1, "an unauthenticated re-drive re-arms nothing");
+        assert_eq!(pending_revocations(&state).await, 0);
+
+        let resp = post_receipt_revoke_redrive(state.clone(), job.id, Some("Bearer wrong-token")).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_revocations(&state).await, 1);
+
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_receipt_revoke_redrive(state.clone(), job.id, Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], true);
+        assert_eq!(dead_lettered_revocations(&state).await, 0, "the authenticated re-drive re-armed it");
+        assert_eq!(pending_revocations(&state).await, 1);
+    }
+
+    /// The revoke-redrive endpoint mirrors `POST /jobs`' unconfigured-open posture: with no
+    /// token it needs no auth. Also pins that the no-op path (the row no longer
+    /// dead-lettered) is a successful `200 {"rearmed": false}`, so an operator can replay it.
+    #[tokio::test]
+    async fn revoke_redrive_endpoint_open_and_idempotent_without_token() {
+        let state = test_state_empty().await; // no token configured
+        assert!(state.ingest_token.is_none());
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        // Open: re-drive with no auth re-arms the dead-lettered revocation.
+        let resp = post_receipt_revoke_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], true);
+        assert_eq!(pending_revocations(&state).await, 1);
+
+        // Idempotent no-op: a second re-drive (now pending, not dead-lettered) is 200 false.
+        let resp = post_receipt_revoke_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], false);
+    }
+
+    /// FM (security): the bulk revoke-redrive is a privileged mass-recovery action — a
+    /// missing, blank, or wrong bearer token is `401` and re-arms NOTHING; the correct token
+    /// re-arms the whole set (`200 {"rearmed": 2}`).
+    #[tokio::test]
+    async fn revoke_redrive_all_endpoint_rejects_unauthenticated_and_accepts_the_token() {
+        let state = test_state_with_token(TEST_INGEST_TOKEN).await;
+        let jobs = settle_and_land(&state, 2).await;
+        for job in &jobs {
+            state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        }
+        drain_revocations(&state, &MockRelay::succeeding().with_revoke_permanent(), TEST_BATCH).await;
+        assert_eq!(dead_lettered_revocations(&state).await, 2);
+
+        assert_eq!(post_receipts_revoke_redrive_all(state.clone(), None).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_receipts_revoke_redrive_all(state.clone(), Some("Bearer ")).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(post_receipts_revoke_redrive_all(state.clone(), Some("Bearer wrong-token")).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dead_lettered_revocations(&state).await, 2, "every unauthenticated bulk re-drive re-armed nothing");
+
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = post_receipts_revoke_redrive_all(state.clone(), Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], 2);
+        assert_eq!(dead_lettered_revocations(&state).await, 0, "the authenticated bulk re-drive re-armed both");
+        assert_eq!(pending_revocations(&state).await, 2);
+    }
+
+    /// FM2: a re-armed revocation lands EXACTLY ONCE on the next drain, and a repeat re-drive
+    /// after it has landed is a no-op — no double-revoke. The `revoked_at IS NULL` re-arm
+    /// guard plus the on-chain `AlreadyRevoked` fence keep a re-driven revocation to at most
+    /// one `revokeReceipt`.
+    #[tokio::test]
+    async fn revoke_redrive_then_drain_revokes_the_re_armed_revocation_exactly_once() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        // Operator re-drives after re-authorizing the signer.
+        assert!(state.store.lock().await.redrive_dead_lettered_revocation(&job.id).unwrap());
+        assert_eq!(pending_revocations(&state).await, 1, "re-armed back into the backlog");
+
+        // Next drain revokes it once.
+        let relay = MockRelay::succeeding();
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(relay.revoke_calls(), 1);
+        assert_eq!(revoked_receipts(&state).await, 1, "the re-armed revocation lands exactly once");
+        assert_eq!(pending_revocations(&state).await, 0);
+        assert_eq!(dead_lettered_revocations(&state).await, 0);
+
+        // A repeat re-drive once revoked is a no-op, and a further drain claims nothing.
+        assert!(
+            !state.store.lock().await.redrive_dead_lettered_revocation(&job.id).unwrap(),
+            "a revoked row can't be re-armed"
+        );
+        let relay2 = MockRelay::succeeding();
+        drain_revocations(&state, &relay2, TEST_BATCH).await;
+        assert_eq!(relay2.revoke_calls(), 0, "nothing left to claim — no second revoke");
+    }
+
+    /// FM3: if the cause is STILL unfixed, re-driving then re-draining simply re-dead-letters
+    /// the revocation — one more attempt per re-drive, never an infinite auto-retry. It stays
+    /// quarantined until the next EXPLICIT re-drive (a dead-lettered row is never auto-re-claimed).
+    #[tokio::test]
+    async fn revoke_redrive_re_dead_letters_on_a_repeat_permanent_error() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        // Re-drive, then drain while the cause is still unfixed (permanent again).
+        assert!(state.store.lock().await.redrive_dead_lettered_revocation(&job.id).unwrap());
+        let poison = MockRelay::succeeding().with_revoke_permanent_job(eas::job_id_hex(&job.id));
+        drain_revocations(&state, &poison, TEST_BATCH).await;
+        assert_eq!(poison.revoke_calls(), 1, "one more attempt — not a hot loop");
+        assert_eq!(dead_lettered_revocations(&state).await, 1, "re-dead-lettered, not dropped");
+        assert_eq!(pending_revocations(&state).await, 0);
+        assert_eq!(revoked_receipts(&state).await, 0, "still not revoked");
+
+        // NOT auto-re-driven: a succeeding drain claims nothing until the next explicit re-drive.
+        let healthy = MockRelay::succeeding();
+        drain_revocations(&state, &healthy, TEST_BATCH).await;
+        assert_eq!(healthy.revoke_calls(), 0, "a re-dead-lettered revocation is not auto-re-claimed");
+        assert_eq!(dead_lettered_revocations(&state).await, 1, "still quarantined");
+    }
+
+    /// FM3 (bulk): a bulk re-drive into a still-unfixed BROAD cause re-quarantines the whole
+    /// set in ONE bounded drain wave — one attempt per row, no hot loop — rather than looping.
+    #[tokio::test]
+    async fn revoke_redrive_all_re_dead_letters_into_a_still_unfixed_cause() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 2).await;
+        for job in &jobs {
+            state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        }
+        drain_revocations(&state, &MockRelay::succeeding().with_revoke_permanent(), TEST_BATCH).await;
+        assert_eq!(dead_lettered_revocations(&state).await, 2);
+
+        // Bulk re-drive while the broad cause is still unfixed.
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_revocations().unwrap(), 2);
+        assert_eq!(pending_revocations(&state).await, 2, "both re-armed back into the backlog");
+
+        // One bounded drain wave re-quarantines the whole set — one attempt per row.
+        let relay = MockRelay::succeeding().with_revoke_permanent();
+        drain_revocations(&state, &relay, TEST_BATCH).await;
+        assert_eq!(relay.revoke_calls(), 2, "one attempt per row — not a hot loop");
+        assert_eq!(dead_lettered_revocations(&state).await, 2, "re-dead-lettered, not dropped");
+        assert_eq!(pending_revocations(&state).await, 0);
+        assert_eq!(revoked_receipts(&state).await, 0);
+    }
+
+    /// FM3 (task): the retention gate keeps a RE-ARMED revocation. Re-arm clears only the
+    /// dead-letter stamp, leaving `revocation_requested_at` set and `revoked_at` NULL, so the
+    /// `revocation_requested_at IS NOT NULL AND revoked_at IS NULL` retention subquery still
+    /// treats it as owed — `prune_terminal_jobs` does NOT delete it mid-flight.
+    #[tokio::test]
+    async fn a_re_armed_revocation_is_retained_by_the_prune_gate() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        assert!(state.store.lock().await.redrive_dead_lettered_revocation(&job.id).unwrap());
+        assert_eq!(pending_revocations(&state).await, 1, "re-armed, owed again");
+
+        let pruned = {
+            let mut store = state.store.lock().await;
+            store.prune_terminal_jobs(now_secs() + 10_000_000, 0, 100).unwrap()
+        };
+        assert_eq!(pruned, 0, "a re-armed revocation is retained, not pruned mid-flight");
+        assert_eq!(pending_revocations(&state).await, 1, "still owed after the sweep");
+    }
+
+    /// FM (routing): the two new routes resolve to their own handlers, not shadowed by the
+    /// sibling `/receipts/{id}/revoke` (3-seg) or `/receipts/redrive-all` (2-seg). The
+    /// re-drive body carries `rearmed` (never `requested`, which would mean it hit the
+    /// `/revoke` handler), and the 2-seg bulk route reaches the bulk handler.
+    #[tokio::test]
+    async fn the_revoke_redrive_routes_are_not_shadowed() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        // /receipts/{id}/revoke-redrive → redrive_revocation (not the /{id}/revoke handler).
+        let resp = post_receipt_revoke_redrive(state.clone(), job.id, None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["rearmed"], true, "routed to the re-drive handler");
+        assert!(body.get("requested").is_none(), "not the /revoke handler");
+        assert_eq!(dead_lettered_revocations(&state).await, 0, "re-armed");
+
+        // Re-dead-letter, then hit the 2-seg bulk route → redrive_all_revocations.
+        drain_revocations(
+            &state,
+            &MockRelay::succeeding().with_revoke_permanent_job(eas::job_id_hex(&job.id)),
+            TEST_BATCH,
+        )
+        .await;
+        assert_eq!(dead_lettered_revocations(&state).await, 1);
+        let resp = post_receipts_revoke_redrive_all(state.clone(), None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rearmed"], 1, "the bulk handler re-armed the set");
+    }
+
     /// FM1: re-drive re-arms ONLY a dead-lettered, not-yet-attested receipt. A
     /// dead-lettered row is re-armed (→ drainable again); an already-attested row
     /// (re-arming would resurrect a landed attestation), an unknown job, and a
