@@ -369,6 +369,14 @@ def test_spec_rejects_oversized_inputs():
     big = {"blob": "x" * (MAX_INPUTS_BYTES + 1)}
     with pytest.raises(ValidationError):
         _spec(inputs=big)
+    # the inclusive boundary is accepted: inputs serializing to EXACTLY MAX_INPUTS_BYTES are
+    # coordinator-valid (validate.rs rejects with `>`, so `==` is in range) — the twin of the
+    # deadline/payout at-limit accepts above. Size the blob so the compact UTF-8 form lands on
+    # the cap, and assert that premise so the test can't silently go vacuous.
+    overhead = len(json.dumps({"blob": ""}, separators=(",", ":"), ensure_ascii=False).encode())
+    at_limit = {"blob": "x" * (MAX_INPUTS_BYTES - overhead)}
+    assert len(json.dumps(at_limit, separators=(",", ":"), ensure_ascii=False).encode()) == MAX_INPUTS_BYTES
+    assert _spec(inputs=at_limit).inputs == at_limit
 
 
 def test_spec_measures_inputs_in_utf8_bytes_like_serde():
