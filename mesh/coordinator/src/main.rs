@@ -62,7 +62,7 @@ mod validate;
 mod verify;
 
 use meter::{BatchSpendError, SpendError, Spender};
-use relay::{BatchRelayError, Relay, RelayError, ALREADY_ISSUED_UID};
+use relay::{BatchRelayError, Relay, RelayError, RevokeError, ALREADY_ISSUED_UID};
 use store::Store;
 
 #[derive(Parser)]
@@ -1925,6 +1925,11 @@ fn spawn_relayer<R: Relay + 'static>(
         loop {
             tick.tick().await;
             drain_attestations(&state, &relay, batch_size).await;
+            // Revocations ride the SAME relayer: revokeReceipt is a RenderReceipts call
+            // like issueReceipt, so it reuses the one Relay transport, interval, and
+            // signer — no separate task or knob. A tick issues owed receipts, then
+            // retracts any the operator has armed for revocation.
+            drain_revocations(&state, &relay, batch_size).await;
         }
     });
 }
@@ -2110,6 +2115,135 @@ async fn drain_singly<R: Relay>(
         }
     }
     true
+}
+
+/// Drain armed receipt revocations oldest-first through `relay`, retracting each
+/// on-chain via one `RenderReceipts.revokeReceipt(jobId)` call and marking the row
+/// revoked. Each step claims a `batch_size`-capped chunk of requested-but-unlanded
+/// revocations and revokes each SINGLY: `revokeReceipt` has no batch form (unlike
+/// `issueReceipts`), and a revocation is a cold correction path, not a per-block wave,
+/// so a single-submit drain — not a batch one — is the faithful shape.
+///
+/// Reactions mirror the issue drain on the OPPOSITE lifecycle direction (withdrawing a
+/// landed receipt, not issuing a pending one): `AlreadyRevoked` is an idempotent success
+/// (the receipt is already off-chain — a crash-recovered re-drive hit the contract's
+/// per-job fence — so mark it revoked and move on); `Transient` backs off to the next
+/// tick with the row still requested; `NotAuthorized` HALTS the drain loudly (the
+/// coordinator signer is deauthorized on RenderReceipts — a GLOBAL misconfig, so every
+/// revoke reverts — leaving every requested row pending so it auto-resumes once
+/// `setCoordinator` restores authorization, never quarantining the whole self-healing
+/// backlog one row at a time); a per-row `Permanent` DEAD-LETTERS that one revocation
+/// (quarantined + retained + surfaced at `/stats dead_lettered_revocations`) and
+/// CONTINUES, so one poison correction never blocks the rest.
+///
+/// The store lock is NEVER held across a revoke await: a chunk is claimed under the
+/// lock, the lock dropped for the on-chain call, and re-acquired only to mark — so
+/// settles and `/stats` never stall behind network latency, exactly like the issue drain.
+async fn drain_revocations<R: Relay>(state: &Arc<AppState>, relay: &R, batch_size: usize) {
+    loop {
+        let claimed = {
+            let store = state.store.lock().await;
+            store.claim_oldest_pending_revocation_batch(batch_size)
+        }; // lock dropped before the on-chain revoke below
+        let claimed = match claimed {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(?e, "relay: claim_oldest_pending_revocation_batch failed");
+                return;
+            }
+        };
+        if claimed.is_empty() {
+            return; // backlog drained
+        }
+        for (job_id, job_id_b32) in &claimed {
+            match relay.revoke(job_id_b32).await {
+                Ok(()) => {
+                    if !mark_revoked_row(state, job_id).await {
+                        return;
+                    }
+                }
+                Err(RevokeError::AlreadyRevoked) => {
+                    // Idempotent success: the attestation is already withdrawn on-chain
+                    // (a crash-recovered re-drive hit the contract's fence). Mark it and
+                    // move on rather than retrying forever — the revoke twin of the
+                    // issue drain's `AlreadyIssued` arm.
+                    tracing::info!(%job_id, "relay: receipt already revoked on-chain; marking revoked");
+                    if !mark_revoked_row(state, job_id).await {
+                        return;
+                    }
+                }
+                Err(RevokeError::NotAuthorized) => {
+                    // A global config fault, not a per-row one: the coordinator signer is
+                    // no longer in RenderReceipts.authorizedCoordinators, so EVERY revoke
+                    // reverts. Halt loudly and leave every requested row pending so the
+                    // drain auto-resumes once the owner calls setCoordinator. Mirrors the
+                    // issue drain's NotAuthorized arm.
+                    tracing::error!(%job_id, "relay: NotAuthorized — the coordinator signer is not authorized on RenderReceipts (owner must call setCoordinator); revocation draining paused");
+                    return;
+                }
+                Err(RevokeError::Transient(msg)) => {
+                    tracing::warn!(%job_id, %msg, "relay: transient revoke failure; retrying next tick");
+                    return; // back off; the row stays requested
+                }
+                Err(RevokeError::Permanent(msg)) => {
+                    // A per-row, non-retryable fault (e.g. the contract reverts NotIssued
+                    // for a row the coordinator believed landed — a state anomaly), NOT a
+                    // global misconfig. Quarantine THIS revocation and keep draining the
+                    // rest, so one poison correction never blocks the others. The row is
+                    // retained + surfaced at `/stats dead_lettered_revocations`.
+                    tracing::error!(%job_id, %msg, "relay: permanent revoke failure; dead-lettering this revocation and continuing");
+                    if !dead_letter_revocation(state, job_id).await {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mark one revocation landed under the lock. Returns `false` only on a store error
+/// (the caller stops the drain); a no-op re-mark (the row was already revoked by a
+/// recovered/duplicate drain) is logged and treated as success so the rest of the
+/// chunk keeps draining. The revoke twin of [`mark_relayed`].
+async fn mark_revoked_row(state: &Arc<AppState>, job_id: &uuid::Uuid) -> bool {
+    let marked = {
+        let store = state.store.lock().await;
+        store.mark_revoked(job_id, now_secs())
+    };
+    match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(%job_id, "relay: revocation already marked revoked");
+            true
+        }
+        Err(e) => {
+            tracing::error!(%job_id, ?e, "relay: mark_revoked failed");
+            false
+        }
+    }
+}
+
+/// Quarantine one revocation the relayer hit a non-retryable (`Permanent`) error on,
+/// under the lock. Returns `false` only on a store error (the caller stops the drain);
+/// a no-op mark (already revoked or already dead-lettered by a recovered/duplicate
+/// drain) is logged and treated as handled so the rest of the chunk keeps draining. The
+/// revoke twin of [`dead_letter_attestation`].
+async fn dead_letter_revocation(state: &Arc<AppState>, job_id: &uuid::Uuid) -> bool {
+    let marked = {
+        let store = state.store.lock().await;
+        store.mark_revocation_dead_lettered(job_id, now_secs())
+    };
+    match marked {
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(%job_id, "relay: revocation already revoked or dead-lettered; skipping");
+            true
+        }
+        Err(e) => {
+            tracing::error!(%job_id, ?e, "relay: mark_revocation_dead_lettered failed");
+            false
+        }
+    }
 }
 
 /// Spawn the debit relayer: every `interval_secs`, drain the pending-debit backlog
@@ -6198,7 +6332,7 @@ mod tests {
                 // One fewer uid than requested.
                 Ok(atts.iter().skip(1).map(|_| "0xshort".to_string()).collect())
             }
-            async fn revoke(&self, _job_id: &str) -> Result<(), relay::RevokeError> {
+            async fn revoke(&self, _job_id: &str) -> Result<(), RevokeError> {
                 Ok(())
             }
         }
