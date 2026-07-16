@@ -435,6 +435,23 @@ async def test_run_rejects_a_phantom_observed_triangle_figure(tmp_path):
     assert _route_back_target(verdict) == "optimization"
 
 
+async def test_run_accepts_a_budget_exact_resolved_world(tmp_path):
+    # The observed==budget boundary of the over-budget re-derivation. overBudget is strict
+    # (`observed > budget`) and the optimizer's own resolved boundary is observed <= budget, so a
+    # world landing EXACTLY on the budget is legitimately within. Every other budget test parks
+    # observed strictly under (602144/552144) or strictly over the budget, so an `observed >
+    # budget` -> `observed >= budget` slip would flip this exact boundary to over — reddening BOTH
+    # the metric-vs-body and body-vs-numbers arms — and false-reject a resolved world while the
+    # suite stays green; this pins the strict-greater floor. observed lands on the summed prior
+    # geometry so authored==observed==budget keeps the phantom + stale arms silent too.
+    budget = int(SUMMED_PRIOR)
+    body = _opt_body(budget=budget, observed=SUMMED_PRIOR, over_budget=False)
+    verdict = await validator.run(
+        _brief(), _opt_override(tmp_path, body=body, over_budget=0.0), layers_root=tmp_path
+    )
+    assert verdict.accepted, verdict.issues
+
+
 async def test_run_reports_a_malformed_optimization_body_not_raises(tmp_path):
     # FM4: a well-formed USD optimization layer (header + defaultPrim) whose budget body is
     # missing observedTriangles. The re-derivation must report MALFORMED with a clear
