@@ -2388,6 +2388,67 @@ impl Store {
         Ok(count as usize)
     }
 
+    /// Re-arm a dead-lettered revocation so the next relayer drain re-attempts the
+    /// `revokeReceipt`: clear `revocation_dead_lettered_at` back to NULL where the row is
+    /// quarantined (`revocation_dead_lettered_at IS NOT NULL`) and NOT yet landed
+    /// (`revoked_at IS NULL`); returns whether a row was re-armed. The revoke twin of
+    /// [`redrive_dead_lettered_attestation`](Self::redrive_dead_lettered_attestation), used
+    /// once the `Permanent` cause is fixed (the coordinator signer re-authorized via
+    /// `setCoordinator`, the disputed render re-confirmed invalid). A quarantined revocation
+    /// is never auto-re-claimed ([`claim_oldest_pending_revocation_batch`](Self::claim_oldest_pending_revocation_batch)
+    /// skips `revocation_dead_lettered_at IS NOT NULL`), so this is the only path back into
+    /// the drainable revocation backlog.
+    ///
+    /// The `revoked_at IS NULL` guard is the anti-resurrection fence: an ALREADY-revoked row
+    /// is never cleared back into the backlog, so a settled correction can't re-drive a
+    /// second `revokeReceipt` (idempotent on-chain via `AlreadyRevoked`, but wasted gas and a
+    /// misleading signal). A still-pending (not dead-lettered) revocation is already
+    /// drainable, so re-arming it is a meaningless no-op (returns false, touches nothing).
+    ///
+    /// Re-arming keeps the row's original `revocation_requested_at`, so it re-enters the
+    /// oldest-first drain ahead of newer revocations and, if the cause is STILL present, simply
+    /// re-dead-letters on the next `Permanent` error — one attempt per re-drive, never an
+    /// infinite auto-retry. A second re-drive once the row has landed (`revoked_at` set) is a
+    /// no-op, so an operator double-call can't re-revoke. Unlike the issue/debit re-drive there
+    /// is no `redrive_count` bump: no revocation dead-letter listing reads such a tally yet, so
+    /// the counter is deferred to that discovery follow-up rather than shipped as write-only state.
+    pub fn redrive_dead_lettered_revocation(&self, job_id: &uuid::Uuid) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET revocation_dead_lettered_at = NULL
+             WHERE job_id = ?1 AND revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL",
+            (job_id.to_string(),),
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Re-arm EVERY dead-lettered, not-yet-landed revocation in one statement; returns the
+    /// count re-armed. The bulk twin of
+    /// [`redrive_dead_lettered_revocation`](Self::redrive_dead_lettered_revocation), for the
+    /// recovery after a BROAD `Permanent` cause is fixed (the coordinator signer re-authorized
+    /// via `setCoordinator`) — instead of N single re-drives, the operator re-arms the lot.
+    ///
+    /// Identical `revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL` guard as the
+    /// single re-drive, just without the `job_id` filter, so the same safety boundary holds
+    /// set-wide: a still-pending revocation (already drainable) is untouched and an
+    /// already-revoked row (`revoked_at` set) is NEVER cleared — mass-clearing revoked marks
+    /// would re-drive settled corrections, fenced only by the on-chain `AlreadyRevoked` guard,
+    /// so this refuses them off-chain too (defense in depth). Re-armed rows keep their original
+    /// `revocation_requested_at`, so they re-enter the oldest-first drain ahead of newer ones.
+    ///
+    /// Idempotent + safe under a concurrent drain: each re-armed row gets exactly one more
+    /// attempt and, if the broad cause is NOT actually fixed, simply re-dead-letters on the next
+    /// error (one attempt per re-drive, never a hot loop). A second bulk call once the set has
+    /// landed re-arms nothing (every row now `revoked_at`-set). `0` is returned when there is
+    /// nothing to re-arm — a clean no-op, not an error.
+    pub fn redrive_all_dead_lettered_revocations(&self) -> Result<usize> {
+        let updated = self.conn.execute(
+            "UPDATE pending_attestations SET revocation_dead_lettered_at = NULL
+             WHERE revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL",
+            (),
+        )?;
+        Ok(updated)
+    }
+
     /// The on-chain attestation obligation for a job, for the `GET /jobs/{id}` read
     /// path. `Ok(Some((uid, submitted_at)))` iff a `pending_attestations` row exists —
     /// i.e. the job is a validated render that OWES an EAS receipt; the inner `uid`
