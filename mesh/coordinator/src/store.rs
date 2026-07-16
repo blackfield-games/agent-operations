@@ -2345,8 +2345,9 @@ impl Store {
     }
 
     /// Number of receipts whose on-chain attestation has been revoked (`revoked_at IS
-    /// NOT NULL`), surfaced at `/stats revoked_attestations` — the cumulative count of
-    /// corrections that have landed. 0 where nothing has been revoked.
+    /// NOT NULL`) and still retained, surfaced at `/stats revoked_attestations`. A revoked
+    /// receipt is terminal and prunes once aged (like any landed one), so this drops on a
+    /// retention sweep — it is not a monotonic total. 0 where nothing has been revoked.
     pub fn revoked_attestation_count(&self) -> Result<usize> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM pending_attestations WHERE revoked_at IS NOT NULL",

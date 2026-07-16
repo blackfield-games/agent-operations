@@ -763,9 +763,11 @@ struct Stats {
     /// mesh. Additive and optional.
     dead_lettered_attestations: usize,
     /// Receipts whose on-chain attestation has been REVOKED — a settled render later
-    /// found invalid, retracted via `RenderReceipts.revokeReceipt`. Cumulative: it counts
-    /// landed corrections, so it only rises. 0 on a mesh where nothing has been revoked.
-    /// Additive and optional. The revoke twin of the issue-side backlog metrics.
+    /// found invalid, retracted via `RenderReceipts.revokeReceipt`. Counts the revoked
+    /// rows still retained: a revoked receipt is terminal and, once aged past the
+    /// retention horizon, is pruned like any landed one, so this drops on prune (the same
+    /// as `pending_attestations`/`dead_lettered_attestations`), not a monotonic total.
+    /// 0 where nothing has been revoked. Additive and optional.
     revoked_attestations: usize,
     /// Receipts with a revocation an operator has armed (`POST /receipts/{id}/revoke`)
     /// that has not yet landed on-chain AND is still drainable — the revocation backlog
