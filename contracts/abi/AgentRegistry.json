@@ -490,5 +490,10 @@
     ],
     "name": "SafeERC20FailedOperation",
     "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroToken",
+    "type": "error"
   }
 ]

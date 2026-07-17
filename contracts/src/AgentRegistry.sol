@@ -71,8 +71,10 @@ contract AgentRegistry is Ownable2Step {
     error NotRegistered();
     error BondTooLow();
     error NotReputationWriter();
+    error ZeroToken();
 
     constructor(address token_, uint256 minBond_, address owner_) Ownable(owner_) {
+        if (token_ == address(0)) revert ZeroToken();
         TOKEN = IERC20(token_);
         minBond = minBond_;
     }

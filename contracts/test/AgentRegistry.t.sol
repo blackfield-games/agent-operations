@@ -57,6 +57,13 @@ contract AgentRegistryTest is Test {
         assertEq(r.minBond(), BOND);
     }
 
+    function test_constructor_revertsZeroToken() public {
+        // A zero token would deploy a registry whose every bond pull reverts opaquely at
+        // SafeERC20; fail loudly at construction instead (mirrors ArtifactTemplate).
+        vm.expectRevert(AgentRegistry.ZeroToken.selector);
+        new AgentRegistry(address(0), 0, owner);
+    }
+
     // --- registration (FM1: bound to the caller's key) ---
 
     function test_register_bindsToSenderAndPullsBond() public {
