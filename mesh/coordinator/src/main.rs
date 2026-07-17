@@ -3983,20 +3983,15 @@ async fn submit(
     // membership: a key that never registered (never proved key-possession via
     // `/register` or a ws `Hello`) must not mint credit + an on-chain EAS receipt by
     // signing a result alone. Checked after the canonical fold so the lookup keys on
-    // the same lowercase identity the registry stores. The same lock refreshes the
-    // earner's liveness for /stats; taken and dropped before the store lock so the
-    // two never overlap. Reject mirrors the bad-attestation branch (401, job left
-    // in_flight for the reaper) — a registered earner submitting for another is the
-    // documented residual this weaker-than-ws check does not close.
-    {
-        let now = now_secs();
-        match state.earners.lock().await.get_mut(&result.earner_address) {
-            Some(info) => info.last_seen = now,
-            None => {
-                tracing::warn!(?id, earner = %result.earner_address, "rejected: earner not registered");
-                return Err(StatusCode::UNAUTHORIZED);
-            }
-        }
+    // the same lowercase identity the registry stores. Taken and dropped before the
+    // store lock so the two never overlap. Reject mirrors the bad-attestation branch
+    // (401, job left in_flight for the reaper) — a registered earner submitting for
+    // another is the documented residual this weaker-than-ws check does not close.
+    // Membership ONLY: the liveness refresh deliberately does NOT ride this lock —
+    // see the accepted-path refresh after the settle.
+    if !state.earners.lock().await.contains_key(&result.earner_address) {
+        tracing::warn!(?id, earner = %result.earner_address, "rejected: earner not registered");
+        return Err(StatusCode::UNAUTHORIZED);
     }
     // Gate on lifecycle: a result is only valid for a job the earner actually
     // took (which marked it in_flight). Checked after signature verification so
@@ -4062,18 +4057,46 @@ async fn submit(
     // pending EAS receipt in the settle tx; the background relayer drains it to
     // RenderReceipts on-chain and stamps the real attestation uid.
     match store.record_completed(&result) {
-        Ok(true) => Ok("accepted"),
+        Ok(true) => {}
         // The in_flight gate above ran under this same lock, so a false here
         // means the job changed underneath us — a conflict, not a success.
         Ok(false) => {
             tracing::warn!(?id, "submit: job no longer in_flight at settle");
-            Err(StatusCode::CONFLICT)
+            return Err(StatusCode::CONFLICT);
         }
         Err(e) => {
             tracing::error!(?id, ?e, "submit: failed to persist result");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
+    // Liveness refresh is AUTHENTICATED by the settle itself, and so happens ONLY
+    // here — on the accepted path, never on a reject. `verify_signature` covers
+    // `signing_digest(job_id, output_hash)` with no nonce (unlike `hello_digest`), the
+    // signature ships inside the unauthenticated `GET /jobs/{id}` readback, and job
+    // ids are enumerable via `GET /jobs` — so a published result is replayable by
+    // anyone. Refreshing before the lifecycle gates let a third party keep a victim
+    // counted live in /stats, dispatch-eligible, unreapable as a job holder, and
+    // holding a `max_earners` slot (shedding real registrations with 503) while the
+    // real earner was offline, by replaying its own published result every
+    // `earner_ttl_secs` for a 409. Reaching THIS point cannot be replayed: it needs a
+    // signature over a job that is still in_flight under the dispatch_seq the caller
+    // echoed, and a result is published only once the job has completed. A rejected
+    // submit proves nothing about the claimed earner — the claim is precisely what is
+    // unauthenticated here — and costs an honest earner no liveness: its own
+    // token-authenticated `/jobs/next` polls refresh it, and a long render with no
+    // poll in flight ends in exactly this accepted settle.
+    //
+    // The store guard lives to end-of-scope, so this drop is load-bearing: it keeps
+    // the earners lock and the store lock from ever being held together, preserving
+    // the earners-then-store order /stats and /earners rely on. Best-effort by design
+    // — the earner can be evicted between the membership gate and here, and un-settling
+    // a durably-recorded job because its registration lapsed mid-submit would be worse
+    // than a stale last_seen.
+    drop(store);
+    if let Some(info) = state.earners.lock().await.get_mut(&result.earner_address) {
+        info.last_seen = now_secs();
+    }
+    Ok("accepted")
 }
 
 /// Websocket job dispatch (the v1 upgrade). Protocol, all JSON text frames:
