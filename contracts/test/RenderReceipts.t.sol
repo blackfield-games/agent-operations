@@ -1789,6 +1789,393 @@ contract RenderReceiptsTest is Test {
         assertEq(evilRegion.accruedFees(claimedRegion), RENDER_FEE_RATE * 1);
     }
 
+    // --- revokeReceipts (batch) ---
+    //
+    // The retraction twin of issueReceipts: revoke a whole wave in one tx. Mirrors the single
+    // revokeReceipt set at batch scale — same auth gate, same issued-and-not-revoked fence, same
+    // stored-earner decrements and EAS revoke — plus the batch invariants issueReceipts pins:
+    // MAX_BATCH bounds, whole-batch atomicity, and counters that net EXACTLY N single revokes.
+
+    /// @dev Issue `n` receipts singly for `who` (10 render-seconds, kind 0, zero region so no fee
+    ///      funding is needed) and return their jobIds — the live receipts the batch-revoke tests
+    ///      then retract.
+    function _issueMany(address who, uint256 n, string memory tag)
+        internal
+        returns (bytes32[] memory jobIds)
+    {
+        jobIds = new bytes32[](n);
+        vm.startPrank(coordinator);
+        for (uint256 i = 0; i < n; i++) {
+            jobIds[i] = keccak256(abi.encode(tag, i));
+            receipts.issueReceipt(who, jobIds[i], 10, 0, bytes32(0), bytes32(0));
+        }
+        vm.stopPrank();
+    }
+
+    function test_revokeReceipts_happyPath_flipsStateDecrementsAndRevokesAll() public {
+        _arm();
+        bytes32[] memory jobIds = _issueMany(earner, 3, "rb-happy");
+        assertEq(receipts.receiptCount(), 3);
+        assertEq(receipts.receiptsByEarner(earner), 3);
+
+        // ReceiptRevoked fires per element, on each job's OWN stored uid, in batch order.
+        for (uint256 i = 0; i < 3; i++) {
+            vm.expectEmit(true, true, true, true);
+            emit ReceiptRevoked(receipts.receiptUid(jobIds[i]), earner, jobIds[i]);
+        }
+        vm.prank(coordinator);
+        receipts.revokeReceipts(jobIds);
+
+        for (uint256 i = 0; i < 3; i++) {
+            assertTrue(receipts.receiptRevoked(jobIds[i]));
+            assertTrue(receipts.receiptIssued(jobIds[i])); // stays set — cannot be re-issued
+            assertTrue(eas.isRevoked(receipts.receiptUid(jobIds[i])));
+        }
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.receiptsByEarner(earner), 0);
+        assertEq(receipts.revokedCount(), 3);
+        assertEq(eas.revokeCalls(), 3);
+    }
+
+    function test_revokeReceipts_revertsNotAuthorized() public {
+        _arm();
+        bytes32[] memory jobIds = _issueMany(earner, 2, "rb-na");
+
+        vm.prank(stranger);
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        receipts.revokeReceipts(jobIds);
+
+        // The rejected revoke changed nothing.
+        assertEq(receipts.receiptCount(), 2);
+        assertEq(receipts.revokedCount(), 0);
+        assertEq(eas.revokeCalls(), 0);
+        assertFalse(receipts.receiptRevoked(jobIds[0]));
+    }
+
+    /// @dev The owner administers coordinators but is not itself one — batch revoke, like single,
+    ///      requires explicit self-authorization.
+    function test_revokeReceipts_ownerIsNotImplicitlyAuthorized() public {
+        _arm();
+        bytes32[] memory jobIds = _issueMany(earner, 1, "rb-owner");
+        vm.prank(owner);
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        receipts.revokeReceipts(jobIds);
+    }
+
+    /// @dev Auth is checked ONCE before the per-element fence, so an unauthorized caller gets
+    ///      NotAuthorized even for a never-issued batch — no per-element state-oracle leak and no
+    ///      gas spent walking the batch before the auth revert.
+    function test_revokeReceipts_unauthorizedRevertsBeforeNotIssued() public {
+        _arm();
+        bytes32[] memory batch = new bytes32[](1);
+        batch[0] = keccak256("rb-never-issued");
+        vm.prank(stranger);
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        receipts.revokeReceipts(batch);
+    }
+
+    function test_revokeReceipts_deauthorizedCoordinatorReverts() public {
+        _arm();
+        bytes32[] memory jobIds = _issueMany(earner, 2, "rb-deauth");
+        vm.prank(owner);
+        receipts.setCoordinator(coordinator, false);
+
+        vm.prank(coordinator);
+        vm.expectRevert(RenderReceipts.NotAuthorized.selector);
+        receipts.revokeReceipts(jobIds);
+
+        assertEq(receipts.receiptCount(), 2);
+        assertEq(receipts.revokedCount(), 0);
+    }
+
+    /// @dev An empty batch reverts rather than touching EAS or the counters for zero work
+    ///      (mirrors issueReceipts' EmptyBatch).
+    function test_revokeReceipts_emptyBatchReverts() public {
+        _arm();
+        bytes32[] memory batch = new bytes32[](0);
+        vm.prank(coordinator);
+        vm.expectRevert(RenderReceipts.EmptyBatch.selector);
+        receipts.revokeReceipts(batch);
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    /// @dev Gas-envelope seam (the SAME MAX_BATCH as issueReceipts): a batch of EXACTLY MAX_BATCH
+    ///      revokes — the cap is inclusive, so it never rejects a legitimate max-size retraction
+    ///      wave, and this drives the full O(n) fence/decrement/revoke loop at the boundary. Reads
+    ///      the cap off the contract so it tracks the constant in lock-step.
+    function test_revokeReceipts_atMaxBatchRevokes() public {
+        _arm();
+        uint256 max = receipts.MAX_BATCH();
+        bytes32[] memory jobIds = _issueMany(earner, max, "rb-max");
+        assertEq(receipts.receiptCount(), max);
+
+        vm.prank(coordinator);
+        receipts.revokeReceipts(jobIds);
+
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.revokedCount(), max);
+        assertEq(receipts.receiptsByEarner(earner), 0);
+        assertEq(eas.revokeCalls(), max);
+    }
+
+    /// @dev A batch of MAX_BATCH + 1 reverts BatchTooLarge BEFORE any revoke — the bound is a
+    ///      contract guarantee, not a trust assumption, even from an authorized-but-buggy
+    ///      coordinator. The elements ARE revocable, so this proves the size gate rejects at the
+    ///      boundary independent of element validity: nothing retracted, no counter moved.
+    function test_revokeReceipts_aboveMaxBatchReverts() public {
+        _arm();
+        uint256 over = receipts.MAX_BATCH() + 1;
+        bytes32[] memory jobIds = _issueMany(earner, over, "rb-over");
+        assertEq(receipts.receiptCount(), over);
+
+        vm.prank(coordinator);
+        vm.expectRevert(RenderReceipts.BatchTooLarge.selector);
+        receipts.revokeReceipts(jobIds);
+
+        assertEq(receipts.receiptCount(), over);
+        assertEq(receipts.revokedCount(), 0);
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    /// @dev Whole-batch atomicity (a never-issued element): one bad jobId — here between two good
+    ///      ones — reverts the ENTIRE call. The good elements stay LIVE, no counter moved, and
+    ///      phase 2 never runs so no uid is revoked. Proves an element AFTER a good one still rolls
+    ///      the good one's phase-1 effects back.
+    function test_revokeReceipts_notIssuedElementRevertsWholeBatch() public {
+        _arm();
+        bytes32[] memory issued = _issueMany(earner, 2, "rb-ni");
+        bytes32 neverIssued = keccak256("rb-ni-missing");
+
+        bytes32[] memory batch = new bytes32[](3);
+        batch[0] = issued[0];
+        batch[1] = neverIssued; // the bad element, after a good one
+        batch[2] = issued[1];
+
+        vm.prank(coordinator);
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.NotIssued.selector, neverIssued));
+        receipts.revokeReceipts(batch);
+
+        assertEq(receipts.receiptCount(), 2);
+        assertEq(receipts.revokedCount(), 0);
+        assertFalse(receipts.receiptRevoked(issued[0]));
+        assertFalse(receipts.receiptRevoked(issued[1]));
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    /// @dev Whole-batch atomicity (an already-revoked element): a job revoked by a prior single
+    ///      revokeReceipt reverts the batch that re-includes it (AlreadyRevoked). The other element
+    ///      stays live and the earlier single revoke's state is untouched — never a partial retract
+    ///      that desyncs the counters.
+    function test_revokeReceipts_doubleRevokeInBatchRevertsWholeBatch() public {
+        _arm();
+        bytes32[] memory issued = _issueMany(earner, 2, "rb-dr");
+        vm.prank(coordinator);
+        receipts.revokeReceipt(issued[1]); // already revoked before the batch
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.revokedCount(), 1);
+
+        bytes32[] memory batch = new bytes32[](2);
+        batch[0] = issued[0];
+        batch[1] = issued[1];
+
+        vm.prank(coordinator);
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.AlreadyRevoked.selector, issued[1]));
+        receipts.revokeReceipts(batch);
+
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.revokedCount(), 1);
+        assertFalse(receipts.receiptRevoked(issued[0]));
+        assertEq(eas.revokeCalls(), 1); // only the earlier single revoke
+    }
+
+    /// @dev A jobId repeated WITHIN one batch double-revokes unless the fence is checked per
+    ///      element: the second occurrence hits the receiptRevoked flag the first set (phase 1) and
+    ///      reverts AlreadyRevoked, rolling the whole batch back — no double-decrement, no uid
+    ///      revoked. The revoke twin of test_issueReceipts_intraBatchDuplicateReverts.
+    function test_revokeReceipts_intraBatchDuplicateReverts() public {
+        _arm();
+        bytes32[] memory issued = _issueMany(earner, 2, "rb-intra");
+        bytes32 dup = issued[0];
+
+        bytes32[] memory batch = new bytes32[](3);
+        batch[0] = dup;
+        batch[1] = issued[1];
+        batch[2] = dup; // repeats element 0 — hits the flag element 0 set
+
+        vm.prank(coordinator);
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.AlreadyRevoked.selector, dup));
+        receipts.revokeReceipts(batch);
+
+        assertEq(receipts.receiptCount(), 2);
+        assertEq(receipts.revokedCount(), 0);
+        assertFalse(receipts.receiptRevoked(issued[0]));
+        assertFalse(receipts.receiptRevoked(issued[1]));
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    /// @dev The equivalence proof (the counters net EXACTLY N single revokes): revoke three jobs
+    ///      as ONE batch on contract A vs as THREE single revokeReceipt calls on an
+    ///      identically-issued contract B, and assert receiptCount / revokedCount / per-earner
+    ///      counts are identical. Two earners so the per-earner PARTITION, not just the total, must
+    ///      match. Distinct per-contract jobIds so the shared MockEAS derives distinct uids.
+    function test_revokeReceipts_counterEqualsThreeSingleRevokes() public {
+        address earnerB = address(0xEA34);
+        RenderReceipts a = new RenderReceipts(address(eas), owner, address(region), RENDER_FEE_RATE);
+        RenderReceipts b = new RenderReceipts(address(eas), owner, address(region), RENDER_FEE_RATE);
+        vm.startPrank(owner);
+        a.registerSchema(address(registry));
+        a.setCoordinator(coordinator, true);
+        b.registerSchema(address(registry));
+        b.setCoordinator(coordinator, true);
+        vm.stopPrank();
+
+        bytes32[] memory ja = new bytes32[](3);
+        bytes32[] memory jb = new bytes32[](3);
+        vm.startPrank(coordinator);
+        for (uint256 i = 0; i < 3; i++) {
+            address who = i == 1 ? earnerB : earner; // {earner, earnerB, earner}
+            ja[i] = keccak256(abi.encode("eq-a", i));
+            jb[i] = keccak256(abi.encode("eq-b", i));
+            a.issueReceipt(who, ja[i], 10, 0, bytes32(0), bytes32(0));
+            b.issueReceipt(who, jb[i], 10, 0, bytes32(0), bytes32(0));
+        }
+        a.revokeReceipts(ja); // one batch
+        b.revokeReceipt(jb[0]); // three singles
+        b.revokeReceipt(jb[1]);
+        b.revokeReceipt(jb[2]);
+        vm.stopPrank();
+
+        assertEq(a.receiptCount(), b.receiptCount());
+        assertEq(a.revokedCount(), b.revokedCount());
+        assertEq(a.receiptsByEarner(earner), b.receiptsByEarner(earner));
+        assertEq(a.receiptsByEarner(earnerB), b.receiptsByEarner(earnerB));
+        // And the absolute end-state is what three revokes must net.
+        assertEq(a.receiptCount(), 0);
+        assertEq(a.revokedCount(), 3);
+        assertEq(a.receiptsByEarner(earner), 0);
+        assertEq(a.receiptsByEarner(earnerB), 0);
+    }
+
+    /// @dev A one-element batch is equivalent to a single revokeReceipt: same fence flip, same
+    ///      stored-earner decrement, same EAS revoke of the same uid with the canonical schema.
+    function test_revokeReceipts_singleElementMatchesRevokeReceipt() public {
+        _arm();
+        bytes32 jobId = keccak256("rb-equiv");
+        vm.prank(coordinator);
+        bytes32 uid = receipts.issueReceipt(earner, jobId, 1234, 3, keccak256("o"), bytes32(0));
+
+        bytes32[] memory batch = new bytes32[](1);
+        batch[0] = jobId;
+
+        vm.expectEmit(true, true, true, true);
+        emit ReceiptRevoked(uid, earner, jobId);
+        vm.prank(coordinator);
+        receipts.revokeReceipts(batch);
+
+        assertTrue(receipts.receiptRevoked(jobId));
+        assertEq(receipts.receiptCount(), 0);
+        assertEq(receipts.receiptsByEarner(earner), 0);
+        assertEq(receipts.revokedCount(), 1);
+        assertEq(eas.revokeCalls(), 1);
+        assertEq(eas.lastRevokedUid(), uid);
+        assertEq(eas.lastRevokeSchema(), receipts.schemaUid());
+        assertTrue(eas.isRevoked(uid));
+    }
+
+    /// @dev Each element decrements only ITS stored earner's slot (from issue time), never a
+    ///      caller-supplied one: a batch spanning two earners partitions the decrements correctly
+    ///      and leaves an un-batched receipt of the second earner live.
+    function test_revokeReceipts_decrementsStoredEarnersOnly() public {
+        _arm();
+        address earnerB = address(0xEA34);
+        bytes32 jobA = keccak256("rb-ea-a"); // earner
+        bytes32 jobB = keccak256("rb-ea-b"); // earnerB
+        bytes32 jobC = keccak256("rb-ea-c"); // earnerB, left LIVE
+        vm.startPrank(coordinator);
+        receipts.issueReceipt(earner, jobA, 10, 0, bytes32(0), bytes32(0));
+        receipts.issueReceipt(earnerB, jobB, 10, 0, bytes32(0), bytes32(0));
+        receipts.issueReceipt(earnerB, jobC, 10, 0, bytes32(0), bytes32(0));
+        vm.stopPrank();
+
+        bytes32[] memory batch = new bytes32[](2);
+        batch[0] = jobA;
+        batch[1] = jobB;
+        vm.prank(coordinator);
+        receipts.revokeReceipts(batch);
+
+        assertEq(receipts.receiptsByEarner(earner), 0); // its one receipt revoked
+        assertEq(receipts.receiptsByEarner(earnerB), 1); // one of two revoked, jobC still live
+        assertEq(receipts.receiptCount(), 1);
+        assertEq(receipts.revokedCount(), 2);
+        assertFalse(receipts.receiptRevoked(jobC));
+        assertEq(
+            receipts.receiptsByEarner(earner) + receipts.receiptsByEarner(earnerB), receipts.receiptCount()
+        );
+    }
+
+    /// @dev The batch twin of test_revokeReceipt_reentrantRevokeCannotDoubleDecrement — and the key
+    ///      CEI proof for the batch: phase 1 flags the WHOLE batch revoked BEFORE phase 2's first
+    ///      external EAS.revoke. The hostile EAS reenters revokeReceipt(jobB) during jobA's revoke
+    ///      (phase 2, element 0); jobB was already flagged in phase 1, so the reentry hits
+    ///      AlreadyRevoked — not a live receipt it could double-revoke. Counters net exactly one
+    ///      decrement per element. (Fails if the fence/decrement moved after the EAS call.)
+    function test_revokeReceipts_reentrantRevokeCannotDoubleDecrement() public {
+        ReentrantRevokeEAS reentrantEas = new ReentrantRevokeEAS();
+        RenderReceipts r = new RenderReceipts(address(reentrantEas), owner, address(region), RENDER_FEE_RATE);
+
+        bytes32 jobA = keccak256("rb-reentrant-a");
+        bytes32 jobB = keccak256("rb-reentrant-b");
+        reentrantEas.arm(r, jobB); // reenter a revoke of the OTHER batched job
+
+        vm.startPrank(owner);
+        r.registerSchema(address(registry));
+        r.setCoordinator(coordinator, true);
+        r.setCoordinator(address(reentrantEas), true); // reentry's msg.sender is the EAS
+        vm.stopPrank();
+
+        vm.startPrank(coordinator);
+        r.issueReceipt(earner, jobA, 10, 0, bytes32(0), bytes32(0));
+        r.issueReceipt(earner, jobB, 10, 0, bytes32(0), bytes32(0));
+        vm.stopPrank();
+        assertEq(r.receiptCount(), 2);
+
+        bytes32[] memory batch = new bytes32[](2);
+        batch[0] = jobA;
+        batch[1] = jobB;
+        vm.prank(coordinator);
+        r.revokeReceipts(batch);
+
+        // The reentrant revoke of jobB (already flagged in phase 1) hit AlreadyRevoked.
+        assertTrue(reentrantEas.reentered());
+        assertTrue(reentrantEas.reentryReverted());
+        assertEq(reentrantEas.reentryRevertSelector(), RenderReceipts.AlreadyRevoked.selector);
+
+        // Both outer elements reached EAS.revoke; each decremented exactly once.
+        assertEq(reentrantEas.revokeCalls(), 2);
+        assertTrue(r.receiptRevoked(jobA));
+        assertTrue(r.receiptRevoked(jobB));
+        assertEq(r.receiptCount(), 0);
+        assertEq(r.receiptsByEarner(earner), 0);
+        assertEq(r.revokedCount(), 2);
+    }
+
+    /// @dev A batch-revoked job's fence stays set (receiptIssued), so it can never be re-issued —
+    ///      no resurrection of a withdrawn attestation (the batch twin of
+    ///      test_revokeReceipt_revokedJobCannotBeReissued).
+    function test_revokeReceipts_revokedJobsCannotBeReissued() public {
+        _arm();
+        bytes32[] memory jobIds = _issueMany(earner, 2, "rb-noreissue");
+        vm.prank(coordinator);
+        receipts.revokeReceipts(jobIds);
+
+        vm.prank(coordinator);
+        vm.expectRevert(abi.encodeWithSelector(RenderReceipts.DuplicateReceipt.selector, jobIds[0]));
+        receipts.issueReceipt(earner, jobIds[0], 10, 0, bytes32(0), bytes32(0));
+
+        assertEq(receipts.receiptCount(), 0); // not resurrected
+        assertEq(receipts.revokedCount(), 2);
+    }
+
     // --- Ownable2Step ---
 
     function test_ownership_twoStepTransfer() public {
