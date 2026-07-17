@@ -315,18 +315,14 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     ///      pass — then the loop bumps the burn counters from the same arrays, so a revert
     ///      inside `_burnBatch` never advances a counter. Duplicate ids in one batch
     ///      accumulate correctly (each element adds to `burnedByTemplate[id]`).
-    /// @dev Every element must be non-zero, mirroring {burn}: ERC-1155 checks
-    ///      `fromBalance < value`, which a zero value passes even for a `templateId` `from`
-    ///      never held or that was never registered, so an unguarded zero element emits a
-    ///      phantom `Burned(from, id, 0)` while the counters stay put — invisible to the
-    ///      supply invariants (nothing moves) but real garbage to an indexer tallying
-    ///      artifacts destroyed per template. The check reverts the whole tx from inside the
-    ///      counter loop, unwinding `_burnBatch`'s burns with it, so atomicity is unchanged
-    ///      and no second pass over the batch is needed. Deliberately NO `EmptyBatch` or
-    ///      `MAX_BATCH` guard, unlike the coordinator-driven batch siblings: those bound a
-    ///      buggy or compromised caller acting on others' behalf, whereas this is the holder
-    ///      burning their own tokens on their own gas — a zero-length call emits nothing to
-    ///      spam, and capping salvage would be a UX cost with no trust rationale.
+    /// @dev The zero check mirrors {burn}'s and rides the counter loop rather than taking a
+    ///      pass of its own — reverting mid-loop unwinds `_burnBatch`'s burns with it. It is
+    ///      load-bearing because ERC-1155 checks `fromBalance < value`, which a zero value
+    ///      passes even for a `templateId` `from` never held, leaving a phantom
+    ///      `Burned(from, id, 0)` the supply invariants cannot see (no counter moves) but an
+    ///      indexer ingests. Deliberately no `EmptyBatch` or `MAX_BATCH` guard, unlike the
+    ///      coordinator-driven batch siblings: those bound a caller acting on others' behalf,
+    ///      whereas this holder burns their own tokens on their own gas.
     function burnBatch(address from, uint256[] calldata templateIds, uint256[] calldata amounts) external {
         if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
             revert ERC1155MissingApprovalForAll(msg.sender, from);
