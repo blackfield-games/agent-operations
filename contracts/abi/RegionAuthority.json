@@ -970,5 +970,10 @@
     "inputs": [],
     "name": "ZeroStake",
     "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroToken",
+    "type": "error"
   }
 ]

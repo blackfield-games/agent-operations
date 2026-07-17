@@ -71,6 +71,13 @@ contract RegionAuthorityTest is Test {
         new RegionAuthority(address(token), 0, owner);
     }
 
+    function test_constructor_revertsZeroToken() public {
+        // A zero token would deploy a region whose every stake/fee transfer reverts opaquely
+        // at SafeERC20; fail loudly at construction instead (mirrors ArtifactTemplate).
+        vm.expectRevert(RegionAuthority.ZeroToken.selector);
+        new RegionAuthority(address(0), STAKE, owner);
+    }
+
     // --- claim happy path ---
 
     function test_claim_mintsAndStakes() public {

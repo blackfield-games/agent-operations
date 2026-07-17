@@ -59,6 +59,7 @@ contract RegionAuthority is ERC721, Ownable2Step {
     error AlreadyClaimed();
     error NotHolder();
     error ZeroStake();
+    error ZeroToken();
     error ZeroAmount();
     error UnknownRegion();
     error NothingToClaim();
@@ -67,6 +68,7 @@ contract RegionAuthority is ERC721, Ownable2Step {
         ERC721("Blackfield Region", "BFLD-RGN")
         Ownable(owner_)
     {
+        if (token_ == address(0)) revert ZeroToken();
         if (stakeRequired_ == 0) revert ZeroStake();
         TOKEN = IERC20(token_);
         stakeRequired = stakeRequired_;
