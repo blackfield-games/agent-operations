@@ -7501,6 +7501,266 @@ mod tests {
         assert_eq!(body_json(resp).await["rearmed"], 1, "the bulk handler re-armed the set");
     }
 
+    // ---- dead-lettered revocation listing (GET /receipts/dead-lettered-revocations) ----
+
+    /// The `revocation_redrive_count` of a job's DEAD-LETTERED revocation, read back through
+    /// the listing (so it also proves the listing surfaces the count). `None` when the job
+    /// has no dead-lettered revocation. The revoke twin of [`receipt_redrive_count`].
+    async fn revocation_redrive_count(state: &Arc<AppState>, id: Uuid) -> Option<u32> {
+        state
+            .store
+            .lock()
+            .await
+            .list_dead_lettered_revocations(MAX_DEAD_LETTERED_LIST)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.0 == id)
+            .map(|r| r.5)
+    }
+
+    /// FM1: the listing returns ONLY dead-lettered, not-yet-landed revocations — a still-pending
+    /// revocation (drainable, `revocation_dead_lettered_at` NULL), an already-revoked correction
+    /// (`revoked_at` set), and a plain landed receipt with no revocation requested are all
+    /// excluded, so every listed revocation is genuinely re-armable by id. FM5: the two-segment
+    /// GET /receipts/dead-lettered-revocations route resolves here (not shadowed).
+    #[tokio::test]
+    async fn dead_lettered_revocation_listing_returns_only_dead_lettered_unrevoked() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 4).await;
+        let (deadletter, revoked, pending_rev, _plain) = (&jobs[0], &jobs[1], &jobs[2], &jobs[3]);
+
+        // dead-lettered: the one stuck revocation the operator needs to discover.
+        dead_letter_one_revocation(&state, deadletter).await;
+
+        // revoked: arm + a clean drain → revoked_at set (a landed correction, never listed).
+        state.store.lock().await.request_revocation(&revoked.id, now_secs()).unwrap();
+        drain_revocations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert_eq!(revoked_receipts(&state).await, 1, "precondition: one settled revocation");
+
+        // pending: armed but never drained → drainable, not dead-lettered.
+        state.store.lock().await.request_revocation(&pending_rev.id, now_secs()).unwrap();
+        assert_eq!(pending_revocations(&state).await, 1, "precondition: one drainable revocation");
+
+        // `_plain` (jobs[3]) is a landed receipt with no revocation requested at all.
+
+        let listing = body_json(get(state.clone(), "/receipts/dead-lettered-revocations").await).await;
+        let revocations = listing["revocations"].as_array().unwrap();
+        assert_eq!(revocations.len(), 1, "only the dead-lettered revocation is listed");
+        assert_eq!(
+            revocations[0]["job_id"], deadletter.id.to_string(),
+            "the dead-lettered one (not revoked/pending/plain)"
+        );
+        assert_eq!(listing["total"], 1);
+        assert_eq!(listing["truncated"], false);
+    }
+
+    /// FM4: each listed row carries the EXACT persisted fields (job_id, earner, render_seconds,
+    /// job_kind, revocation_dead_lettered_at, revocation_redrive_count), never re-derived — an
+    /// operator sees which earner's landed receipt is stuck being withdrawn, and since when.
+    #[tokio::test]
+    async fn dead_lettered_revocation_listing_carries_the_exact_persisted_fields() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0); // dev earner; render_seconds 1; Terrain (0)
+        dead_letter_one_revocation(&state, &job).await;
+
+        let listing = body_json(get(state.clone(), "/receipts/dead-lettered-revocations").await).await;
+        let r = &listing["revocations"][0];
+        assert_eq!(r["job_id"], job.id.to_string());
+        assert_eq!(r["earner"], dev_address(), "the settling earner, verbatim");
+        assert_eq!(r["render_seconds"], 1, "the revoked receipt's compute, exact");
+        assert_eq!(r["job_kind"], 0, "JobKind::Terrain numeric");
+        assert!(r["revocation_dead_lettered_at"].as_i64().unwrap() > 0, "the quarantine stamp is present");
+        assert_eq!(r["revocation_redrive_count"], 0, "a fresh dead-letter starts at 0");
+    }
+
+    /// FM2: the store listing is capped and oldest-first — a limit smaller than the dead-letter
+    /// backlog returns the OLDEST `limit` rows in insertion order, and the full count exceeds the
+    /// page (the `total > len` the endpoint reports as `truncated`), so a capped page is never
+    /// mistaken for the whole set.
+    #[tokio::test]
+    async fn list_dead_lettered_revocations_caps_and_orders_oldest_first() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 3).await;
+        for job in &jobs {
+            state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        }
+        // One drain dead-letters all three: every revoke is Permanent, dead-lettered per-row.
+        drain_revocations(&state, &MockRelay::succeeding().with_revoke_permanent(), TEST_BATCH).await;
+        assert_eq!(dead_lettered_revocations(&state).await, 3, "precondition: all three quarantined");
+
+        let store = state.store.lock().await;
+        // Capped: a limit of 2 over 3 dead-lettered returns the 2 OLDEST, in order.
+        let page = store.list_dead_lettered_revocations(2).unwrap();
+        assert_eq!(
+            page.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![jobs[0].id, jobs[1].id],
+            "oldest two, in order"
+        );
+        // total exceeds the page → the endpoint's `truncated` signal (total > len).
+        assert_eq!(store.dead_lettered_revocation_count().unwrap(), 3);
+        // Uncapped (limit >= total) returns all three, oldest-first.
+        let all = store.list_dead_lettered_revocations(10).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.0).collect::<Vec<_>>(),
+            jobs.iter().map(|j| j.id).collect::<Vec<_>>(),
+            "all three, oldest-first"
+        );
+    }
+
+    /// FM3: the listing exposes earner addresses + the render-fee scale, so it requires the same
+    /// bearer token as POST /jobs — a missing or wrong token is 401 and lists nothing; the correct
+    /// token returns the dead-lettered revocation.
+    #[tokio::test]
+    async fn dead_lettered_revocation_listing_requires_the_ingest_token() {
+        let state = test_state_with_token(TEST_INGEST_TOKEN).await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        assert_eq!(
+            get(state.clone(), "/receipts/dead-lettered-revocations").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "no Authorization header → 401"
+        );
+        assert_eq!(
+            get_auth(state.clone(), "/receipts/dead-lettered-revocations", Some("Bearer wrong-token"))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "wrong token → 401"
+        );
+
+        let auth = format!("Bearer {TEST_INGEST_TOKEN}");
+        let resp = get_auth(state.clone(), "/receipts/dead-lettered-revocations", Some(&auth)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let listing = body_json(resp).await;
+        assert_eq!(
+            listing["revocations"].as_array().unwrap().len(),
+            1,
+            "the authenticated listing shows the revocation"
+        );
+        assert_eq!(listing["revocations"][0]["job_id"], job.id.to_string());
+    }
+
+    /// FM4: `revocation_redrive_count` increments by exactly 1 per REAL re-arm (single AND bulk)
+    /// and never on a no-op — the dead-letter mark itself, an already-revoked row, and an unknown
+    /// id all leave it put. Read back through the listing, so it also pins that the listing
+    /// surfaces the bumped count.
+    #[tokio::test]
+    async fn revocation_redrive_count_increments_only_on_a_real_rearm() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 2).await;
+        let (poison, revoked) = (&jobs[0], &jobs[1]);
+
+        // revoked: a settled correction (revoked_at set) — a no-op re-drive target.
+        state.store.lock().await.request_revocation(&revoked.id, now_secs()).unwrap();
+        drain_revocations(&state, &MockRelay::succeeding(), TEST_BATCH).await;
+        assert_eq!(revoked_receipts(&state).await, 1);
+
+        // poison: dead-lettered.
+        dead_letter_one_revocation(&state, poison).await;
+        assert_eq!(revocation_redrive_count(&state, poison.id).await, Some(0), "the dead-letter mark does not bump");
+
+        // No-op re-drives bump nothing: a revoked row and an unknown id.
+        {
+            let store = state.store.lock().await;
+            assert!(!store.redrive_dead_lettered_revocation(&revoked.id).unwrap(), "revoked → no-op");
+            assert!(!store.redrive_dead_lettered_revocation(&Uuid::new_v4()).unwrap(), "unknown → no-op");
+        }
+        assert_eq!(revocation_redrive_count(&state, poison.id).await, Some(0), "no-op re-drives bump nothing");
+
+        // Real single re-drive then re-dead-letter (still failing): exactly 1.
+        assert!(state.store.lock().await.redrive_dead_lettered_revocation(&poison.id).unwrap());
+        drain_revocations(
+            &state,
+            &MockRelay::succeeding().with_revoke_permanent_job(eas::job_id_hex(&poison.id)),
+            TEST_BATCH,
+        )
+        .await;
+        assert_eq!(revocation_redrive_count(&state, poison.id).await, Some(1), "one real single re-arm → +1");
+
+        // Real bulk re-drive then re-dead-letter: exactly 2 (+1 per real re-arm, single or bulk).
+        assert_eq!(state.store.lock().await.redrive_all_dead_lettered_revocations().unwrap(), 1);
+        drain_revocations(
+            &state,
+            &MockRelay::succeeding().with_revoke_permanent_job(eas::job_id_hex(&poison.id)),
+            TEST_BATCH,
+        )
+        .await;
+        assert_eq!(revocation_redrive_count(&state, poison.id).await, Some(2), "the bulk re-arm also bumps → +1");
+    }
+
+    /// FM4 (migration): the `revocation_redrive_count` ADD COLUMN is idempotent and back-fills
+    /// existing rows to 0. A DB written by a PRE-count coordinator (the revocation lifecycle
+    /// columns exist, but not `revocation_redrive_count`) opens cleanly — the ALTER runs,
+    /// defaulting the existing dead-lettered revocation to 0 — and a second open re-runs the
+    /// now-duplicate ALTER without error or data loss.
+    #[test]
+    fn revocation_redrive_count_defaults_to_zero_on_a_pre_migration_db() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+        let receipt_id = Uuid::new_v4();
+        {
+            // Hand-build the pre-`revocation_redrive_count` schema: pending_attestations WITH the
+            // revocation lifecycle columns but WITHOUT revocation_redrive_count, holding one landed
+            // (uid set) receipt whose revocation is dead-lettered (requested + quarantined, not
+            // revoked). The column can only come from the ALTER migration.
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pending_attestations (
+                     job_id TEXT PRIMARY KEY NOT NULL,
+                     earner TEXT NOT NULL,
+                     job_id_b32 TEXT NOT NULL,
+                     render_seconds INTEGER NOT NULL,
+                     job_kind INTEGER NOT NULL,
+                     output_hash TEXT NOT NULL,
+                     region_id_b32 TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     uid TEXT,
+                     submitted_at INTEGER,
+                     dead_lettered_at INTEGER,
+                     redrive_count INTEGER NOT NULL DEFAULT 0,
+                     revocation_requested_at INTEGER,
+                     revoked_at INTEGER,
+                     revocation_dead_lettered_at INTEGER
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pending_attestations
+                 (job_id, earner, job_id_b32, render_seconds, job_kind, output_hash, region_id_b32,
+                  created_at, uid, revocation_requested_at, revocation_dead_lettered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                (
+                    receipt_id.to_string(),
+                    "0xearner",
+                    "b32",
+                    1i64,
+                    0i64,
+                    "hash",
+                    "region",
+                    100i64,
+                    "uid-abc",
+                    150i64,
+                    200i64,
+                ),
+            )
+            .unwrap();
+        }
+
+        // Open through the Store: the ADD COLUMN revocation_redrive_count migration runs and
+        // back-fills the existing revocation row to 0; the listing reads it.
+        let store = Store::open(&db_path).unwrap();
+        let revs = store.list_dead_lettered_revocations(10).unwrap();
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0].0, receipt_id);
+        assert_eq!(revs[0].5, 0, "an existing revocation row back-fills to revocation_redrive_count 0");
+        drop(store);
+
+        // Idempotent: a second open re-runs the now-duplicate ALTER without error, row intact.
+        let reopened = Store::open(&db_path).unwrap();
+        assert_eq!(reopened.list_dead_lettered_revocations(10).unwrap()[0].5, 0);
+    }
+
     /// FM1: re-drive re-arms ONLY a dead-lettered, not-yet-attested receipt. A
     /// dead-lettered row is re-armed (→ drainable again); an already-attested row
     /// (re-arming would resurrect a landed attestation), an unknown job, and a
