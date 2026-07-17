@@ -14,7 +14,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use futures_util::{SinkExt, StreamExt};
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
-use proto::{hello_digest, signing_digest, CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec};
+use proto::{
+    hello_digest, signing_digest, CoordinatorMsg, EarnerMsg, JobKind, JobResult, JobSpec,
+    REGISTER_CHALLENGE_HEADER,
+};
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use std::time::Duration;
@@ -633,16 +636,23 @@ where
 /// earner still polls and is dispatched work — it just won't have its liveness
 /// refreshed by polling, so it relies on the submit-path refresh.
 async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> Result<Option<String>> {
+    let nonce = fetch_register_challenge(client, args).await?;
     let supported = all_supported();
     let hello = EarnerMsg::Hello {
         earner_address: session.address.clone(),
         gpu_model: args.gpu_model.clone(),
         vram_gb: args.vram_gb,
-        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported, &[]),
+        signature_hex: session.sign_hello(&args.gpu_model, args.vram_gb, &supported, &nonce),
         supported,
     };
     let url = format!("{}/register", args.coordinator);
-    let resp = client.post(&url).json(&hello).send().await?.error_for_status()?;
+    let resp = client
+        .post(&url)
+        .header(REGISTER_CHALLENGE_HEADER, hex::encode(&nonce))
+        .json(&hello)
+        .send()
+        .await?
+        .error_for_status()?;
     let poll_token = resp
         .headers()
         .get("x-poll-token")
@@ -650,6 +660,24 @@ async fn register(client: &reqwest::Client, args: &Args, session: &Session) -> R
         .map(str::to_owned);
     tracing::info!(status = %resp.status(), have_poll_token = poll_token.is_some(), "registered with coordinator");
     Ok(poll_token)
+}
+
+/// Fetch a single-use registration challenge from the coordinator — the HTTP
+/// analogue of the WS opening `Challenge` frame. The earner folds this nonce into
+/// its signed `Hello` (via [`register`]) and echoes it back, so the coordinator can
+/// prove the registration is fresh and consume it. `Err` (so the caller treats the
+/// registration as failed) on transport error, a non-2xx, or a missing/undecodable
+/// nonce — failing closed rather than registering over an empty nonce the
+/// coordinator would reject.
+async fn fetch_register_challenge(client: &reqwest::Client, args: &Args) -> Result<Vec<u8>> {
+    let url = format!("{}/register/challenge", args.coordinator);
+    let resp = client.get(&url).send().await?.error_for_status()?;
+    let nonce_hex = resp
+        .headers()
+        .get(REGISTER_CHALLENGE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .context("register challenge response is missing the nonce header")?;
+    hex::decode(nonce_hex).context("register challenge nonce is not valid hex")
 }
 
 /// Whether a finished poll cycle should poll again immediately. A successful
@@ -1699,11 +1727,25 @@ mod tests {
 
     // ---- http register path: register over a wiremock coordinator ----
 
+    /// Mount `GET /register/challenge` returning a fixed nonce, so the register
+    /// round-trip has a challenge to sign over. The nonce value is arbitrary — the
+    /// mock coordinator does not verify the signature — but it must be valid hex.
+    async fn mount_challenge(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/register/challenge"))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header(REGISTER_CHALLENGE_HEADER, "0011223344556677"),
+            )
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn register_posts_hello_and_succeeds_on_2xx() {
         let server = MockServer::start().await;
         let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
 
+        mount_challenge(&server).await;
         Mock::given(method("POST"))
             .and(path("/register"))
             .respond_with(ResponseTemplate::new(200).insert_header("x-poll-token", "issued-tok-123"))
@@ -1720,12 +1762,18 @@ mod tests {
             "register captures the issued poll token from the x-poll-token response header"
         );
 
-        // The earner POSTed its Hello announcing address, GPU, and supported kinds.
+        // The earner POSTed its Hello (announcing address, GPU, supported kinds) and
+        // echoed the challenge it fetched.
         let requests = server.received_requests().await.unwrap();
         let reg = requests
             .iter()
             .find(|r| r.url.path() == "/register")
             .expect("earner POSTed a Hello to /register");
+        assert_eq!(
+            reg.headers.get(REGISTER_CHALLENGE_HEADER).map(|v| v.to_str().unwrap()),
+            Some("0011223344556677"),
+            "register echoes the fetched challenge"
+        );
         match serde_json::from_slice::<EarnerMsg>(&reg.body).unwrap() {
             EarnerMsg::Hello { earner_address, gpu_model, vram_gb, supported, .. } => {
                 assert_eq!(earner_address, session.address);
@@ -1742,9 +1790,10 @@ mod tests {
         let server = MockServer::start().await;
         let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
 
-        // A 5xx from the coordinator surfaces as Err (error_for_status). run_http
-        // treats a failed register as non-fatal: it logs and falls through to
-        // polling, so this Err must not be silently swallowed at the source.
+        // The challenge fetch succeeds; the register POST 5xxs. A 5xx surfaces as Err
+        // (error_for_status). run_http treats a failed register as non-fatal: it logs
+        // and falls through to polling, so this Err must not be silently swallowed.
+        mount_challenge(&server).await;
         Mock::given(method("POST"))
             .and(path("/register"))
             .respond_with(ResponseTemplate::new(500))
@@ -1757,6 +1806,37 @@ mod tests {
         assert!(
             register(&client, &args, &session).await.is_err(),
             "a non-2xx register response must surface as Err"
+        );
+    }
+
+    /// A failed challenge fetch fails the whole registration closed — the earner
+    /// never POSTs a Hello over an empty nonce the coordinator would reject.
+    #[tokio::test]
+    async fn register_errors_when_the_challenge_fetch_fails() {
+        let server = MockServer::start().await;
+        let session = Session::from_hex(DEV_SESSION_KEY).unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/register/challenge"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let args = args_for(&server);
+        let client = reqwest::Client::new();
+
+        assert!(
+            register(&client, &args, &session).await.is_err(),
+            "a failed challenge fetch must surface as Err"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.path() != "/register"),
+            "no Hello is POSTed when the challenge fetch fails"
         );
     }
 
