@@ -686,6 +686,35 @@ struct DeadLetteredReceiptListing {
     truncated: bool,
 }
 
+/// One dead-lettered receipt REVOCATION in the operator listing (`GET
+/// /receipts/dead-lettered-revocations`). `job_id` is the UUID an operator passes to `POST
+/// /receipts/{id}/revoke-redrive`; `earner`/`render_seconds`/`job_kind` identify the landed
+/// receipt whose `revokeReceipt` is stuck (the same fields the attestation listing carries);
+/// `revocation_dead_lettered_at` is the epoch-second stamp the correction was quarantined;
+/// `revocation_redrive_count` is how many times it has been re-armed, so a revocation that
+/// keeps re-dead-lettering into an unfixed cause is visible. The revoke twin of
+/// [`DeadLetteredReceipt`].
+#[derive(Debug, Serialize)]
+struct DeadLetteredRevocation {
+    job_id: Uuid,
+    earner: String,
+    render_seconds: u64,
+    job_kind: u16,
+    revocation_dead_lettered_at: i64,
+    revocation_redrive_count: u32,
+}
+
+/// Response for `GET /receipts/dead-lettered-revocations`: the dead-lettered revocations
+/// (oldest-first, capped at [`MAX_DEAD_LETTERED_LIST`]) plus the full `total` and a
+/// `truncated` flag, so a capped page is never mistaken for the whole set. The revoke twin
+/// of [`DeadLetteredReceiptListing`].
+#[derive(Debug, Serialize)]
+struct DeadLetteredRevocationListing {
+    revocations: Vec<DeadLetteredRevocation>,
+    total: usize,
+    truncated: bool,
+}
+
 /// Aggregate mesh stats. Backs the wedge requirement
 /// "Mesh GPUs joined count exposed at /stats".
 #[derive(Debug, Serialize)]
@@ -2571,6 +2600,10 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
         // distinct from the three-segment /{id}/revoke-redrive.
         .route("/receipts/{id}/revoke-redrive", post(redrive_revocation))
         .route("/receipts/revoke-redrive-all", post(redrive_all_revocations))
+        // Enumerate the quarantined revocations the by-id revoke-redrive targets (the revoke
+        // twin of /receipts/dead-lettered). A two-segment sibling, distinct from the
+        // three-segment /receipts/{id}/... routes above.
+        .route("/receipts/dead-lettered-revocations", get(dead_lettered_revocations))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -3320,6 +3353,75 @@ async fn dead_lettered_receipts(
         .collect::<Vec<_>>();
     let truncated = total > receipts.len();
     Ok(Json(DeadLetteredReceiptListing { receipts, total, truncated }))
+}
+
+/// `GET /receipts/dead-lettered-revocations` — the operator listing of every dead-lettered,
+/// not-yet-landed receipt revocation (oldest-first, capped at [`MAX_DEAD_LETTERED_LIST`]) plus
+/// the full `total` and a `truncated` flag, so a capped page is never mistaken for the whole
+/// set. The revoke twin of [`dead_lettered_receipts`] — it closes the
+/// `mesh-receipt-revocation-redrive` discovery deferral (no way to enumerate the stuck ids the
+/// by-id `revoke-redrive` needs; `/stats dead_lettered_revocations` surfaced only the count) and
+/// is the reader Design B deferred `revocation_redrive_count` until.
+///
+/// The listing exposes earner addresses + the render-fee scale of quarantined corrections (a
+/// privileged operational view), so it carries the SAME bearer-token gate as `POST /jobs` and
+/// the revoke-redrive endpoints: a missing/malformed/wrong/blank token is `401` before any store
+/// work; open when no token is configured (the dev posture). A listed row is always genuinely
+/// re-armable — the store filters to `revocation_dead_lettered_at IS NOT NULL AND revoked_at IS
+/// NULL`, so a still-pending (drainable) or already-revoked (landed) correction never appears.
+async fn dead_lettered_revocations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<DeadLetteredRevocationListing>, StatusCode> {
+    if let Some(expected) = state.ingest_token.as_deref() {
+        if !ingest_authorized(&headers, expected) {
+            tracing::warn!("rejected: GET /receipts/dead-lettered-revocations missing/invalid bearer ingest token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    let store = state.store.lock().await;
+    let rows = match store.list_dead_lettered_revocations(MAX_DEAD_LETTERED_LIST) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(?e, "dead_lettered_revocations: list query failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    // `total` is the dead-letter count (the same value `/stats dead_lettered_revocations` shows).
+    // It equals the count of LISTABLE rows because no revocation is ever both dead-lettered and
+    // revoked — `mark_revocation_dead_lettered` requires `revoked_at IS NULL` and
+    // `claim_oldest_pending_revocation_batch` skips dead-lettered rows, so the listing's extra
+    // `revoked_at IS NULL` filter never excludes a counted row. Thus `truncated` is exact today;
+    // if that state-machine invariant ever changes, count the listable predicate here instead.
+    let total = match store.dead_lettered_revocation_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(?e, "dead_lettered_revocations: count query failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let revocations = rows
+        .into_iter()
+        .map(
+            |(
+                job_id,
+                earner,
+                render_seconds,
+                job_kind,
+                revocation_dead_lettered_at,
+                revocation_redrive_count,
+            )| DeadLetteredRevocation {
+                job_id,
+                earner,
+                render_seconds,
+                job_kind,
+                revocation_dead_lettered_at,
+                revocation_redrive_count,
+            },
+        )
+        .collect::<Vec<_>>();
+    let truncated = total > revocations.len();
+    Ok(Json(DeadLetteredRevocationListing { revocations, total, truncated }))
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, StatusCode> {

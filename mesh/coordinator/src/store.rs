@@ -49,6 +49,13 @@ pub type DeadLetteredDebitRow = (uuid::Uuid, String, String, i64, u32);
 /// times it has been re-driven.
 pub type DeadLetteredAttestationRow = (uuid::Uuid, String, u64, u16, i64, u32);
 
+/// One row of [`Store::list_dead_lettered_revocations`]: `(job_id, earner,
+/// render_seconds, job_kind, revocation_dead_lettered_at, revocation_redrive_count)` — the
+/// operator-facing fields of a quarantined receipt REVOCATION (a landed receipt whose
+/// `revokeReceipt` `Permanent`-failed), `revocation_redrive_count` being how many times it
+/// has been re-armed. The revoke twin of [`DeadLetteredAttestationRow`].
+pub type DeadLetteredRevocationRow = (uuid::Uuid, String, u64, u16, i64, u32);
+
 /// The `(uid, submitted_at, revoked_at)` triple [`Store::attestation_readback`] returns
 /// for a job that owes a receipt: each element is `None` until the corresponding
 /// on-chain step lands (issue, then a later revoke), so the `GET /jobs/{id}` read tells
@@ -2460,6 +2467,51 @@ impl Store {
             (),
         )?;
         Ok(updated)
+    }
+
+    /// The dead-lettered, not-yet-landed receipt revocations for the operator listing
+    /// (`GET /receipts/dead-lettered-revocations`), oldest-first by insert order and capped at
+    /// `limit`. Returns `(job_id, earner, render_seconds, job_kind, revocation_dead_lettered_at,
+    /// revocation_redrive_count)` for each `Permanent`-quarantined `revokeReceipt`, so an operator
+    /// can enumerate WHICH corrections are stuck — and how many times each was re-armed into an
+    /// unfixed cause — before targeting them with `POST /receipts/{id}/revoke-redrive`. The revoke
+    /// twin of [`list_dead_lettered_attestations`](Self::list_dead_lettered_attestations).
+    ///
+    /// The `revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL` filter is the SAME
+    /// boundary the re-drive keys on, so the listing shows only what is actually re-drivable: a
+    /// still-drainable pending revocation (`revocation_dead_lettered_at` NULL), a landed correction
+    /// (`revoked_at` set), and a plain receipt with no revocation requested are all excluded. A
+    /// pure read — it does not reserve or mutate rows. `limit == 0` returns an empty batch.
+    pub fn list_dead_lettered_revocations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DeadLetteredRevocationRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT job_id, earner, render_seconds, job_kind, revocation_dead_lettered_at, revocation_redrive_count
+             FROM pending_attestations
+             WHERE revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL
+             ORDER BY created_at ASC, rowid ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, i64>(3)? as u16,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)? as u32,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (job_id, earner, render_seconds, job_kind, dead_lettered_at, redrive_count) = row?;
+            let uuid = uuid::Uuid::parse_str(&job_id).map_err(|e| {
+                anyhow::anyhow!("pending_attestations.job_id not a uuid {job_id:?}: {e}")
+            })?;
+            out.push((uuid, earner, render_seconds, job_kind, dead_lettered_at, redrive_count));
+        }
+        Ok(out)
     }
 
     /// The on-chain attestation obligation for a job, for the `GET /jobs/{id}` read
