@@ -1862,6 +1862,70 @@ def test_run_local_match_rejects_an_out_of_range_seed():
             run_local_match("/no/such/harness", [0, 1], policies, seed=bad)
 
 
+def test_run_local_match_forwards_max_ticks_and_omits_it_by_default(monkeypatch):
+    # max_ticks forwards --max-ticks <n> as a value-flag when set (the MatchConfig cap the SDK
+    # previously could not reach); omitted (None), no --max-ticks token appears so the argv is
+    # byte-identical to the base and the harness applies its 3600-tick default. Captured without a
+    # harness by stubbing the gateway before it spawns.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    mid = "00000000-0000-4000-8000-000000000000"
+
+    # Omitted (None): the argv is EXACTLY the base — no --max-ticks token anywhere.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, match_id=mid)
+    assert captured["argv"] == ["h", "--match-id", mid, "--seed", "0", "--seats", "2"]
+
+    # Set: --max-ticks lands in the base block (before any mode-gated flag) with 4 as its one next token.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, match_id=mid, max_ticks=4)
+    argv = captured["argv"]
+    assert argv[argv.index("--max-ticks") + 1] == "4"
+    assert argv == ["h", "--match-id", mid, "--seed", "0", "--seats", "2", "--max-ticks", "4"]
+
+
+def test_run_local_match_rejects_an_out_of_range_max_ticks():
+    # max_ticks forwards raw as --max-ticks <n>, which the harness parses as a u64 and panics on a
+    # negative / past-u64::MAX cap. Unlike seed it defaults to None (omit → harness 3600 default), so
+    # the fence guards only a set value: a negative or overflow raises before any spawn, while 0 stays a
+    # valid (caller-owned) cap. The bogus harness path proves the guard precedes spawn — a real spawn
+    # would raise a non-matching OSError, not this ValueError.
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    for bad in (-1, -3, 2**64, 2**80):
+        with pytest.raises(ValueError, match="max_ticks"):
+            run_local_match("/no/such/harness", [0, 1], policies, max_ticks=bad)
+
+
+def test_run_local_match_caps_match_length_at_max_ticks():
+    # The bound the loose 0 < final_tick < 3600 e2es structurally cannot pin: with max_ticks=4 the match
+    # is force-ended at the cap, so final_tick <= 4 (a baseline duel is not decisive by tick 4, so the cap,
+    # not a KO, ends it — the pre-forward SDK ran to ~decisive or the 3600 default). Required (fails, not
+    # skips) under CI/validate.sh; skips only on a plain local pytest without the toolchain.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    results = run_local_match(harness, [0, 1], policies, seed=7, max_ticks=4)
+
+    assert set(results) == {0, 1}
+    assert results[0] == results[1], "every seat sees the same canonical result"
+    assert 0 < results[0].final_tick <= 4
+
+
 def test_run_local_match_selects_a_named_arena_and_surfaces_its_geometry():
     # arena="reference" plays the match under the reference arena: each seat's Start frame
     # carries the central occluder + the two health pickups, read back via starts=. The
