@@ -2,6 +2,7 @@
 pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {RegionAuthority} from "../src/RegionAuthority.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
@@ -36,6 +37,7 @@ contract RegionAuthorityTest is Test {
     event StakeRequiredSet(uint256 amount);
     event FeesDeposited(uint256 indexed tokenId, address indexed from, uint256 amount);
     event FeesClaimed(uint256 indexed tokenId, address indexed holder, uint256 amount);
+    event FeesSettled(uint256 indexed tokenId, address indexed holder, uint256 amount);
     event Withdrawn(address indexed holder, uint256 amount);
 
     uint256 constant FEE = 30 ether;
@@ -486,6 +488,60 @@ contract RegionAuthorityTest is Test {
         region.withdraw();
         assertEq(token.balanceOf(alice), aliceBefore + STAKE + FEE);
         assertEq(token.balanceOf(address(region)), 0, "nothing stranded");
+    }
+
+    /// @dev A region transfer that settles accrued fees emits FeesSettled crediting the
+    ///      OUTGOING holder — the push-side log the withdrawable ledger previously created
+    ///      silently (its five sibling movements all log). Discriminating: without the
+    ///      emit in _update this reddens.
+    function test_transfer_emitsFeesSettledToOutgoingHolder() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        vm.expectEmit(true, true, false, true);
+        emit FeesSettled(TILE, alice, FEE);
+        vm.prank(alice);
+        region.transferFrom(alice, bob, TILE);
+    }
+
+    /// @dev Unstake burns the NFT, whose _update hook settles AND now logs the fees parked
+    ///      into the outgoing holder's withdrawable ledger — the recover path is observable.
+    function test_unstake_emitsFeesSettled() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        vm.expectEmit(true, true, false, true);
+        emit FeesSettled(TILE, alice, FEE);
+        vm.prank(alice);
+        region.unstake(TILE);
+    }
+
+    /// @dev A transfer with nothing accrued emits NO FeesSettled: the event lives inside
+    ///      the `accrued != 0` branch, so a zero-fee region sale stays log-free (no false
+    ///      credit signal, no gas on the common path). Mutation-proven — hoisting the emit
+    ///      out of the guard reddens this.
+    function test_transfer_zeroAccrued_emitsNoFeesSettled() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        // No depositFees — accruedFees[TILE] == 0, so the settlement branch is skipped.
+
+        vm.recordLogs();
+        vm.prank(alice);
+        region.transferFrom(alice, bob, TILE);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("FeesSettled(uint256,address,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(
+                logs[i].topics.length == 0 || logs[i].topics[0] != sig,
+                "FeesSettled must not fire when nothing accrued"
+            );
+        }
+        assertEq(region.withdrawable(alice), 0);
     }
 
     function test_depositFees_newHolderAccruesIndependentlyAfterTransfer() public {
