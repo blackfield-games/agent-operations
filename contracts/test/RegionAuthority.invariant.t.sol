@@ -202,6 +202,15 @@ contract RegionAuthorityInvariantTest is Test {
     function invariant_balanceReconcilesInternalAccounting() public view {
         assertEq(token.balanceOf(address(region)), handler.internalAccountingSum());
     }
+
+    /// @dev The protocol-wide aggregate tracks the live stakes exactly: `totalStaked`
+    ///      equals the independently-ghosted sum of every active region's stake across
+    ///      arbitrary claim/unstake/transfer interleaving (claim bumps it, unstake
+    ///      decrements the stored amount, a transfer leaves it — and the ghost — untouched).
+    ///      A miscounted increment/decrement or a transfer that moved the aggregate breaks this.
+    function invariant_totalStakedEqualsLiveStakes() public view {
+        assertEq(region.totalStaked(), handler.ghost_activeStakeSum());
+    }
 }
 
 contract RegionAuthorityFuzzTest is Test {

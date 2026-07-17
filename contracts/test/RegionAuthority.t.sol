@@ -198,6 +198,41 @@ contract RegionAuthorityTest is Test {
         assertEq(region.ownerOf(TILE), bob);
     }
 
+    /// @dev totalStaked is the protocol-wide aggregate: it starts at 0, accumulates each
+    ///      claim's amount across regions (never overwrites), stays put across a transfer
+    ///      (the stake stays locked under the new holder), and falls by exactly the
+    ///      unstaked region's STORED amount — so unstaking an over-staked region removes
+    ///      that region's real stake, not STAKE, and a claim→unstake round-trips it to 0.
+    function test_totalStaked_tracksClaimTransferAndUnstake() public {
+        assertEq(region.totalStaked(), 0, "starts at zero");
+
+        uint256 tile2 = uint256(keccak256("region:3,4,0"));
+        uint256 over = STAKE + 25 ether;
+
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        assertEq(region.totalStaked(), STAKE, "first claim adds its stake");
+
+        vm.prank(bob);
+        region.claim(tile2, over);
+        assertEq(region.totalStaked(), STAKE + over, "a second region accumulates, not overwrites");
+
+        // A transfer only moves the holder — the stake stays locked, so the aggregate holds.
+        vm.prank(alice);
+        region.transferFrom(alice, bob, TILE);
+        assertEq(region.totalStaked(), STAKE + over, "a transfer leaves totalStaked unchanged");
+
+        // Unstaking tile2 removes exactly its stored (over-)stake, not STAKE.
+        vm.prank(bob);
+        region.unstake(tile2);
+        assertEq(region.totalStaked(), STAKE, "unstake decrements the stored amount, not a fixed value");
+
+        // The surviving region round-trips the aggregate back to zero.
+        vm.prank(bob);
+        region.unstake(TILE);
+        assertEq(region.totalStaked(), 0, "claim -> unstake round-trips totalStaked to its prior value");
+    }
+
     // --- unstake revert paths ---
 
     function test_unstake_revertsNotHolder() public {
