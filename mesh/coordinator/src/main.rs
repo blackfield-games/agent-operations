@@ -15098,6 +15098,102 @@ mod tests {
         );
     }
 
+    /// FM3 (revoke arm): the revocation dead-letter age anchors on the OLDEST
+    /// `revocation_dead_lettered_at` (`MIN`), not the newest — the revoke twin of
+    /// `oldest_dead_lettered_age_is_min_not_newest`. Two quarantined revocations stamped
+    /// distinctly must yield the older stamp; a `MAX` would surface the newest and hide the
+    /// long-stuck row the metric exists to find.
+    #[tokio::test]
+    async fn oldest_dead_lettered_revocation_age_is_min_not_newest() {
+        let state = test_state_empty().await;
+        let jobs = settle_and_land(&state, 2).await;
+        let store = state.store.lock().await;
+        for job in &jobs {
+            assert!(store.request_revocation(&job.id, now_secs()).unwrap());
+        }
+        // Quarantine each with an explicit, distinct stamp (older = 1000, newer = 2000).
+        assert!(store.mark_revocation_dead_lettered(&jobs[0].id, 1000).unwrap());
+        assert!(store.mark_revocation_dead_lettered(&jobs[1].id, 2000).unwrap());
+        assert_eq!(
+            store.oldest_dead_lettered_revocation_at().unwrap(),
+            Some(1000),
+            "MIN stamp, not the newer 2000"
+        );
+    }
+
+    /// FM1: the age matches the LISTABLE set (`revoked_at IS NULL`), not every dead-lettered
+    /// row. A revocation quarantined and THEN landed on-chain — the idempotent `AlreadyRevoked`
+    /// arm stamps `revoked_at` without clearing the dead-letter stamp, so the row carries both —
+    /// is resolved and must drop out of the age, or a since-corrected receipt alarms forever.
+    /// With the only quarantined revocation settled, the age is `None`; dropping the `revoked_at
+    /// IS NULL` fence would report its stamp. The depth still counts the row, proving the fence
+    /// (not the row vanishing) is what excludes it.
+    #[tokio::test]
+    async fn oldest_dead_lettered_revocation_age_excludes_a_settled_row() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        let store = state.store.lock().await;
+        assert!(store.request_revocation(&job.id, now_secs()).unwrap());
+        assert!(store.mark_revocation_dead_lettered(&job.id, 1000).unwrap());
+        assert!(store.mark_revoked(&job.id, now_secs()).unwrap());
+        assert_eq!(
+            store.oldest_dead_lettered_revocation_at().unwrap(),
+            None,
+            "a since-revoked row is fenced out, not alarmed on forever"
+        );
+        assert_eq!(
+            store.dead_lettered_revocation_count().unwrap(),
+            1,
+            "the row still exists — the revoked_at fence, not deletion, excludes it from the age"
+        );
+    }
+
+    /// FM (revoke arm): `/stats` reports `null` for the revocation age on a clean mesh and a
+    /// small positive age once a revocation is dead-lettered through the real drain — the revoke
+    /// twin of `stats_reports_oldest_dead_lettered_age`, proving None → Some and that the field
+    /// is the AGE, not the `dead_lettered_revocations` depth.
+    #[tokio::test]
+    async fn stats_reports_oldest_dead_lettered_revocation_age() {
+        let state = test_state_empty().await;
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert!(json["oldest_dead_lettered_revocation_secs"].is_null(), "clean → null");
+        assert_eq!(json["dead_lettered_revocations"], 0);
+
+        let job = settle_and_land(&state, 1).await.remove(0);
+        dead_letter_one_revocation(&state, &job).await;
+
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        let age = json["oldest_dead_lettered_revocation_secs"]
+            .as_u64()
+            .expect("dead-lettered → numeric age");
+        assert!(age < 5, "freshly quarantined revocation age ~0, got {age}");
+        assert_eq!(json["dead_lettered_revocations"], 1);
+    }
+
+    /// FM2 (revoke arm): a `revocation_dead_lettered_at` ahead of `now` (clock skew) floors the
+    /// age at 0, never a negative value wrapped into a huge u64 — the revoke twin of
+    /// `stats_dead_lettered_age_floors_at_zero_on_future_stamp`.
+    #[tokio::test]
+    async fn stats_dead_lettered_revocation_age_floors_at_zero_on_future_stamp() {
+        let state = test_state_empty().await;
+        let job = settle_and_land(&state, 1).await.remove(0);
+        {
+            let store = state.store.lock().await;
+            assert!(store.request_revocation(&job.id, now_secs()).unwrap());
+            // A stamp far in the future (skew); the age must clamp to 0, not wrap.
+            assert!(store
+                .mark_revocation_dead_lettered(&job.id, now_secs() + 100_000)
+                .unwrap());
+        }
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert_eq!(
+            json["oldest_dead_lettered_revocation_secs"].as_u64().unwrap(),
+            0,
+            "a future stamp floors to 0, never a wrapped u64"
+        );
+    }
+
     #[tokio::test]
     async fn stats_reports_in_flight_progress_pct_avg() {
         // Build state with a truly-empty store (test_state_empty drains seeds via
