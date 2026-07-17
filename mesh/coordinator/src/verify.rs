@@ -117,15 +117,15 @@ pub fn verify_signature(
 /// signature can't be reattached to a different claimed address — a forger would
 /// have to recover its own (different) address.
 ///
-/// `nonce` binds freshness. On the WS path the coordinator passes the
-/// per-connection challenge it issued, so a Hello captured off the wire and
-/// replayed on a *new* connection — which receives a different challenge — fails
-/// recovery and never bootstraps a session under the victim's address. The HTTP
-/// `/register` path passes an empty nonce: its replay is a benign idempotent
-/// upsert of the victim's own data (no session, no reputation effect), so it is
-/// intentionally not challenge-gated. (Anti-replay landed in
-/// `mesh-signed-hello-nonce`; HTTP freshness would only matter if `/register`
-/// ever gained a session/reputation effect.)
+/// `nonce` binds freshness on both paths. On WS the coordinator passes the
+/// per-connection challenge it issued; on HTTP it passes the single-use challenge
+/// minted at `GET /register/challenge` and consumed in `register`. Either way a
+/// Hello captured off the wire and replayed fails recovery against a challenge it
+/// was not signed over (WS) or that has already been spent (HTTP), so it never
+/// registers under the victim's address. (HTTP freshness became load-bearing once
+/// `/register` began minting a poll token and refreshing liveness — a replay there
+/// rotated the victim's token and kept it phantom-live; the empty HTTP nonce this
+/// docstring once excused is closed by `mesh-register-hello-nonce-liveness-replay`.)
 pub fn verify_hello_signature(
     earner_address: &str,
     gpu_model: &str,

@@ -66,10 +66,11 @@ pub fn signing_digest(job_id: &Uuid, output_hash: &str) -> [u8; 32] {
 /// signed bytes (not merely sent alongside), so the signature and the freshness
 /// are inseparable: the coordinator reconstructs the digest with the nonce *it*
 /// chose and rejects a Hello whose signature was computed over any other nonce —
-/// defeating a captured-then-replayed Hello. The WS path passes the per-connection
-/// challenge; the HTTP path (whose replay is a benign idempotent upsert) passes an
-/// empty nonce. The `v2` tag retires the pre-nonce `v1` digest in lockstep so a
-/// stale `v1` signature can never validate. Both sides MUST build it identically.
+/// defeating a captured-then-replayed Hello. Both transports pass a
+/// coordinator-issued challenge: WS the per-connection nonce, HTTP the single-use
+/// nonce from `GET /register/challenge` (consumed on `POST /register`). The `v2`
+/// tag retires the pre-nonce `v1` digest in lockstep so a stale `v1` signature can
+/// never validate. Both sides MUST build it identically.
 pub fn hello_digest(
     earner_address: &str,
     gpu_model: &str,

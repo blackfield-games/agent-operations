@@ -2846,7 +2846,12 @@ async fn register_challenge(
 
 /// Earner → coordinator registration. Accepts an `EarnerMsg::Hello` and
 /// upserts the earner keyed by address. Other `EarnerMsg` variants are
-/// rejected here (job dispatch lives on its own routes for now). On success the
+/// rejected here (job dispatch lives on its own routes for now).
+///
+/// The Hello must be signed over a fresh single-use challenge minted at `GET
+/// /register/challenge` and echoed in [`proto::REGISTER_CHALLENGE_HEADER`]; it is
+/// consumed here (removed on lookup), so a captured registration cannot be
+/// replayed to refresh a victim's liveness or rotate its poll token. On success the
 /// response carries an [`POLL_TOKEN_HEADER`] the earner echoes as
 /// `Authorization: Bearer <token>` on `GET /jobs/next` to authenticate its
 /// liveness refresh — the body stays `"registered"` (out-of-band, so the body
@@ -2891,8 +2896,42 @@ async fn register(
         return Err(StatusCode::BAD_REQUEST);
     };
 
+    // Consume the single-use challenge this Hello must be signed over. HTTP is two
+    // requests (unlike WS, which holds its per-connection nonce in memory), so the
+    // coordinator issued this nonce at `GET /register/challenge` and looks it up
+    // here. Removed on lookup, so a captured Hello replayed against the same
+    // challenge finds it already spent — closing the empty-nonce replay that
+    // refreshed a victim's liveness and rotated its poll token out from under it.
+    let Some(challenge_hex) =
+        headers.get(proto::REGISTER_CHALLENGE_HEADER).and_then(|v| v.to_str().ok())
+    else {
+        tracing::warn!(address = %earner_address, "rejected registration: missing challenge");
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Some(nonce) = hex::decode(challenge_hex)
+        .ok()
+        .and_then(|b| <[u8; HELLO_NONCE_BYTES]>::try_from(b).ok())
+    else {
+        tracing::warn!(address = %earner_address, "rejected registration: malformed challenge");
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    {
+        let now = now_secs();
+        let mut store = state.register_challenges.lock().await;
+        match store.remove(&nonce) {
+            Some(issued) if now.saturating_sub(issued) <= REGISTER_CHALLENGE_TTL_SECS => {}
+            _ => {
+                tracing::warn!(
+                    address = %earner_address,
+                    "rejected registration: unknown or expired challenge"
+                );
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+
     if let Err(reason) =
-        validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &[], &signature_hex)
+        validate_hello(&earner_address, &gpu_model, vram_gb, &supported, &nonce, &signature_hex)
     {
         tracing::warn!(address = %earner_address, reason, "rejected malformed registration");
         return Err(StatusCode::BAD_REQUEST);
@@ -5175,8 +5214,11 @@ mod tests {
         }
     }
 
-    /// The HTTP-path `Hello` builder: signs over the empty-nonce digest (the HTTP
-    /// `/register` path is not challenge-gated — its replay is a benign upsert).
+    /// A `Hello` signed over the empty nonce — no longer a valid HTTP registration
+    /// (that now folds the issued challenge; see [`register_signed`]). Kept for the
+    /// reject-path fixtures (malformed address / field, forged signature) where the
+    /// registration fails before or regardless of the nonce, so the signature is
+    /// never reached and its nonce is immaterial.
     fn signed_hello(
         sk: &SigningKey,
         claimed: &str,
@@ -5299,6 +5341,68 @@ mod tests {
         (bytes, hex)
     }
 
+    /// POST a pre-built `Hello` `value` to `/register` from the loopback peer,
+    /// carrying `challenge_hex` in the challenge header. Used where the Hello is
+    /// intentionally not (re-)signed over the challenge — the structural-reject and
+    /// wrong-signature paths, which fail before or regardless of the nonce — and
+    /// where a test drives a specific challenge (replay, expiry, single-use).
+    async fn post_register_with(
+        state: Arc<AppState>,
+        value: &serde_json::Value,
+        challenge_hex: &str,
+    ) -> axum::response::Response {
+        router(state)
+            .layer(Extension(PeerAddr(test_peer())))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/register")
+                    .header("content-type", "application/json")
+                    .header(proto::REGISTER_CHALLENGE_HEADER, challenge_hex)
+                    .body(Body::from(serde_json::to_vec(value).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// POST `value` with a freshly-minted valid challenge — for reject paths that
+    /// must survive a *valid* challenge, so they reject on their own reason (a bad
+    /// address, a forged signature) rather than a missing one.
+    async fn post_register(state: Arc<AppState>, value: &serde_json::Value) -> axum::response::Response {
+        let (_, hex) = mint_challenge(state.clone()).await;
+        post_register_with(state, value, &hex).await
+    }
+
+    /// Full happy-path registration: mint a challenge, sign the Hello over it, POST.
+    /// Mirrors the earner's two-step HTTP flow. `claimed` may differ from `sk`'s
+    /// address for the claim/case-variant/forgery tests.
+    async fn register_signed(
+        state: Arc<AppState>,
+        sk: &SigningKey,
+        claimed: &str,
+        gpu_model: &str,
+        vram_gb: u32,
+        supported: Vec<JobKind>,
+    ) -> axum::response::Response {
+        let (nonce, hex) = mint_challenge(state.clone()).await;
+        let hello = signed_hello_with_nonce(sk, claimed, gpu_model, vram_gb, supported, &nonce);
+        post_register_with(state, &serde_json::to_value(hello).unwrap(), &hex).await
+    }
+
+    /// Happy-path registration for `label`'s self-signed earner with the default
+    /// GPU — the common case behind most tests that need a registered earner.
+    async fn register(
+        state: Arc<AppState>,
+        label: &str,
+        vram_gb: u32,
+        supported: Vec<JobKind>,
+    ) -> axum::response::Response {
+        let sk = test_signing_key(label);
+        let addr = address_from_signing_key(&sk);
+        register_signed(state, &sk, &addr, "RTX 4090", vram_gb, supported).await
+    }
+
     /// Each `GET /register/challenge` returns a distinct nonce — the freshness the
     /// single-use fence relies on — and parks it for consumption.
     #[tokio::test]
@@ -5336,13 +5440,7 @@ mod tests {
     #[tokio::test]
     async fn register_then_stats_reflects_earner() {
         let state = test_state_empty().await;
-        let msg = hello("a", 24, vec![JobKind::Terrain, JobKind::Foliage]);
-        let resp = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(&msg).unwrap(),
-        )
-        .await;
+        let resp = register(state.clone(), "a", 24, vec![JobKind::Terrain, JobKind::Foliage]).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let resp = get(state.clone(), "/stats").await;
@@ -5360,16 +5458,13 @@ mod tests {
     async fn register_upserts_and_sums_vram() {
         let state = test_state();
         // same label → same key → same address twice → upsert (count stays 1, vram updated)
-        let m1 = hello("abc", 24, vec![JobKind::Terrain]);
-        let m2 = hello("abc", 48, vec![JobKind::Terrain, JobKind::DiffusionTile]);
-        let m3 = hello("def", 16, vec![JobKind::NpcTick]);
-        for m in [&m1, &m2, &m3] {
-            let resp = post_json(
-                state.clone(),
-                "/register",
-                &serde_json::to_value(m).unwrap(),
-            )
-            .await;
+        let regs = [
+            ("abc", 24, vec![JobKind::Terrain]),
+            ("abc", 48, vec![JobKind::Terrain, JobKind::DiffusionTile]),
+            ("def", 16, vec![JobKind::NpcTick]),
+        ];
+        for (label, vram, kinds) in regs {
+            let resp = register(state.clone(), label, vram, kinds).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
@@ -5417,12 +5512,9 @@ mod tests {
             hello("good", 0, vec![JobKind::Terrain]),               // zero vram
         ];
         for m in &malformed {
-            let resp = post_json(
-                state.clone(),
-                "/register",
-                &serde_json::to_value(m).unwrap(),
-            )
-            .await;
+            // A valid challenge is minted first, so each rejects on its own
+            // structural reason rather than on a missing challenge.
+            let resp = post_register(state.clone(), &serde_json::to_value(m).unwrap()).await;
             assert_eq!(
                 resp.status(),
                 StatusCode::BAD_REQUEST,
@@ -5462,7 +5554,7 @@ mod tests {
             hello("depth", MAX_VRAM_GB + 1, vec![JobKind::Terrain]),   // vram over ceiling
         ];
         for m in &malformed {
-            let resp = post_json(state.clone(), "/register", &serde_json::to_value(m).unwrap()).await;
+            let resp = post_register(state.clone(), &serde_json::to_value(m).unwrap()).await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "expected 400 for {m:?}");
         }
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -5470,12 +5562,7 @@ mod tests {
         assert_eq!(json["total_vram_gb"], 0);
 
         // A normal earner — within every bound — still registers.
-        let ok = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("depth", 24, vec![JobKind::Terrain, JobKind::Foliage])).unwrap(),
-        )
-        .await;
+        let ok = register(state.clone(), "depth", 24, vec![JobKind::Terrain, JobKind::Foliage]).await;
         assert_eq!(ok.status(), StatusCode::OK);
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["gpus_joined"], 1);
@@ -5491,10 +5578,14 @@ mod tests {
     async fn register_accepts_boundary_gpu_len_and_vram() {
         let state = test_state_empty().await;
         let max_gpu = "x".repeat(MAX_GPU_MODEL_LEN);
-        let resp = post_json(
+        let sk = test_signing_key("boundary");
+        let resp = register_signed(
             state.clone(),
-            "/register",
-            &serde_json::to_value(hello_gpu("boundary", &max_gpu, MAX_VRAM_GB, vec![JobKind::Terrain])).unwrap(),
+            &sk,
+            &address_from_signing_key(&sk),
+            &max_gpu,
+            MAX_VRAM_GB,
+            vec![JobKind::Terrain],
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -5515,13 +5606,8 @@ mod tests {
         let lower = address_from_signing_key(&sk);
         let mixed = format!("0x{}", lower[2..].to_uppercase());
         assert_ne!(mixed, lower, "claim must differ in case from the recovered address");
-        let resp = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(signed_hello(&sk, &mixed, "RTX 4090", 24, vec![JobKind::Terrain]))
-                .unwrap(),
-        )
-        .await;
+        let resp =
+            register_signed(state.clone(), &sk, &mixed, "RTX 4090", 24, vec![JobKind::Terrain]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
@@ -5538,24 +5624,16 @@ mod tests {
     #[tokio::test]
     async fn malformed_re_register_does_not_evict_existing_earner() {
         let state = test_state_empty().await;
-        let ok = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("keep", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        let ok = register(state.clone(), "keep", 24, vec![JobKind::Terrain]).await;
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(
             body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
             1
         );
 
-        let bad = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("keep", 99, vec![])).unwrap(),
-        )
-        .await;
+        let bad =
+            post_register(state.clone(), &serde_json::to_value(hello("keep", 99, vec![])).unwrap())
+                .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 
         // The live entry is untouched: not evicted (count 1), not overwritten
@@ -5584,14 +5662,15 @@ mod tests {
         let state = test_state_empty().await;
         let victim = test_address("victim");
         // Attacker signs over the victim's claimed Hello with its own key.
-        let forged = signed_hello(
+        let resp = register_signed(
+            state.clone(),
             &test_signing_key("attacker"),
             &victim,
             "RTX 4090",
             24,
             vec![JobKind::Terrain],
-        );
-        let resp = post_json(state.clone(), "/register", &serde_json::to_value(&forged).unwrap()).await;
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "forged signature must 400");
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["gpus_joined"], 0, "a forged Hello must not enter the registry");
@@ -5612,22 +5691,18 @@ mod tests {
     async fn forged_re_register_does_not_evict_existing_earner() {
         let state = test_state_empty().await;
         let victim = test_address("victim");
-        let ok = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("victim", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        let ok = register(state.clone(), "victim", 24, vec![JobKind::Terrain]).await;
         assert_eq!(ok.status(), StatusCode::OK);
 
-        let forged = signed_hello(
+        let bad = register_signed(
+            state.clone(),
             &test_signing_key("attacker"),
             &victim,
             "RTX 4090",
             99,
             vec![JobKind::Terrain],
-        );
-        let bad = post_json(state.clone(), "/register", &serde_json::to_value(&forged).unwrap()).await;
+        )
+        .await;
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 
         let json = body_json(get(state.clone(), "/stats").await).await;
@@ -5680,12 +5755,7 @@ mod tests {
         enqueue(&state, &terrain).await; // newer, supported
 
         let addr = test_address("cap");
-        let reg = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        let reg = register(state.clone(), "cap", 24, vec![JobKind::Terrain]).await;
         assert_eq!(reg.status(), StatusCode::OK);
 
         let resp = get(state.clone(), &format!("/jobs/next?earner={addr}")).await;
@@ -5716,12 +5786,7 @@ mod tests {
         enqueue(&state, &diffusion).await;
 
         let addr = test_address("cap");
-        post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        register(state.clone(), "cap", 24, vec![JobKind::Terrain]).await;
 
         let resp = get(state.clone(), &format!("/jobs/next?earner={addr}")).await;
         let seq = resp
@@ -5750,14 +5815,7 @@ mod tests {
         let state = test_state_empty().await;
         enqueue(&state, &job_of(JobKind::Terrain)).await;
         let addr = test_address("cap");
-        let token = poll_token_of(
-            &post_json(
-                state.clone(),
-                "/register",
-                &serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap(),
-            )
-            .await,
-        );
+        let token = poll_token_of(&register(state.clone(), "cap", 24, vec![JobKind::Terrain]).await);
         state.earners.lock().await.get_mut(&addr).unwrap().last_seen = 0;
 
         let auth = format!("Bearer {token}");
@@ -5780,12 +5838,7 @@ mod tests {
         let state = test_state_empty().await;
         enqueue(&state, &job_of(JobKind::Terrain)).await;
         let victim = test_address("victim");
-        post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("victim", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        register(state.clone(), "victim", 24, vec![JobKind::Terrain]).await;
         state.earners.lock().await.get_mut(&victim).unwrap().last_seen = 0;
 
         // (a) No token at all → no refresh, but a job is still dispatched (attacker
@@ -5821,9 +5874,10 @@ mod tests {
     async fn next_job_reregistration_rotates_the_poll_token_without_stalling_dispatch() {
         let state = test_state_empty().await;
         let addr = test_address("cap");
-        let hello_msg = serde_json::to_value(hello("cap", 24, vec![JobKind::Terrain])).unwrap();
-        let token1 = poll_token_of(&post_json(state.clone(), "/register", &hello_msg).await);
-        let token2 = poll_token_of(&post_json(state.clone(), "/register", &hello_msg).await);
+        // Two honest registrations, each over its own fresh challenge (the same
+        // earner re-registering), so the rotation under test is the honest one.
+        let token1 = poll_token_of(&register(state.clone(), "cap", 24, vec![JobKind::Terrain]).await);
+        let token2 = poll_token_of(&register(state.clone(), "cap", 24, vec![JobKind::Terrain]).await);
         assert_ne!(token1, token2, "re-registration rotates the poll token");
 
         // A poll with the STALE token1: dispatch still works, liveness NOT refreshed.
@@ -5848,6 +5902,121 @@ mod tests {
         assert!(
             state.earners.lock().await.get(&addr).unwrap().last_seen > 0,
             "the current poll token refreshes liveness"
+        );
+    }
+
+    /// The core of the fix: a captured HTTP registration cannot be replayed. The
+    /// challenge it was signed over is single-use — consumed on the first register —
+    /// so resubmitting the exact same Hello + challenge is rejected, and crucially it
+    /// neither refreshes the victim's liveness NOR rotates its poll token out from
+    /// under it (the DoS half). Both halves are pinned: asserting only liveness would
+    /// miss the token rotation, which is the more damaging consequence.
+    #[tokio::test]
+    async fn register_replay_neither_refreshes_liveness_nor_rotates_token() {
+        let state = test_state_empty().await;
+        let addr = test_address("cap");
+        let sk = test_signing_key("cap");
+
+        // Honest registration, captured verbatim off the wire (nonce + signed Hello).
+        let (nonce, hex) = mint_challenge(state.clone()).await;
+        let hello = signed_hello_with_nonce(&sk, &addr, "RTX 4090", 24, vec![JobKind::Terrain], &nonce);
+        let captured = serde_json::to_value(&hello).unwrap();
+        let first = post_register_with(state.clone(), &captured, &hex).await;
+        assert_eq!(first.status(), StatusCode::OK, "the honest registration succeeds");
+        let token1 = poll_token_of(&first);
+
+        // Stale the victim's liveness so a spurious refresh would be observable.
+        state.earners.lock().await.get_mut(&addr).unwrap().last_seen = 0;
+
+        // Replay the captured Hello + challenge verbatim.
+        let replay = post_register_with(state.clone(), &captured, &hex).await;
+        assert_eq!(
+            replay.status(),
+            StatusCode::UNAUTHORIZED,
+            "a replay against the already-consumed challenge is rejected"
+        );
+
+        let earners = state.earners.lock().await;
+        let victim = earners.get(&addr).expect("the honest earner is still registered");
+        assert_eq!(victim.last_seen, 0, "a replay must NOT refresh the victim's liveness");
+        assert_eq!(victim.poll_token, token1, "a replay must NOT rotate the victim's poll token");
+    }
+
+    /// `/register` requires a challenge: a Hello with no challenge header is rejected
+    /// and inserts nothing (a legacy single-shot registration no longer registers).
+    #[tokio::test]
+    async fn register_without_challenge_header_is_rejected() {
+        let state = test_state_empty().await;
+        let hello = serde_json::to_value(hello("nochal", 24, vec![JobKind::Terrain])).unwrap();
+        let resp = post_json(state.clone(), "/register", &hello).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(get(state.clone(), "/stats").await).await["gpus_joined"],
+            0,
+            "a challenge-less registration inserts nothing"
+        );
+    }
+
+    /// A challenge the coordinator never issued is rejected, even carrying an
+    /// otherwise valid Hello signed over it — the nonce must come from the mint, not
+    /// be forged by the caller.
+    #[tokio::test]
+    async fn register_with_unissued_challenge_is_rejected() {
+        let state = test_state_empty().await;
+        let sk = test_signing_key("forge");
+        let nonce = [7u8; HELLO_NONCE_BYTES]; // never minted
+        let hello =
+            signed_hello_with_nonce(&sk, &address_from_signing_key(&sk), "RTX 4090", 24, vec![JobKind::Terrain], &nonce);
+        let resp =
+            post_register_with(state.clone(), &serde_json::to_value(hello).unwrap(), &hex::encode(nonce)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(get(state.clone(), "/stats").await).await["gpus_joined"], 0);
+    }
+
+    /// A minted challenge works exactly once: after a successful registration
+    /// consumes it, a second registration presenting the same challenge is rejected —
+    /// even for a different, honestly-signed earner.
+    #[tokio::test]
+    async fn register_challenge_is_single_use() {
+        let state = test_state_empty().await;
+        let (nonce, hex) = mint_challenge(state.clone()).await;
+
+        let sk1 = test_signing_key("first");
+        let h1 =
+            signed_hello_with_nonce(&sk1, &address_from_signing_key(&sk1), "RTX 4090", 24, vec![JobKind::Terrain], &nonce);
+        assert_eq!(
+            post_register_with(state.clone(), &serde_json::to_value(h1).unwrap(), &hex).await.status(),
+            StatusCode::OK
+        );
+
+        let sk2 = test_signing_key("second");
+        let h2 =
+            signed_hello_with_nonce(&sk2, &address_from_signing_key(&sk2), "RTX 4090", 24, vec![JobKind::Terrain], &nonce);
+        assert_eq!(
+            post_register_with(state.clone(), &serde_json::to_value(h2).unwrap(), &hex).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "the challenge is spent after the first registration"
+        );
+    }
+
+    /// A genuinely-issued challenge aged past its TTL is rejected — the window
+    /// between mint and use is bounded even before single-use consumption closes it.
+    #[tokio::test]
+    async fn register_with_expired_challenge_is_rejected() {
+        let state = test_state_empty().await;
+        let (nonce, hex) = mint_challenge(state.clone()).await;
+        // Age the parked challenge past its TTL.
+        {
+            let key: [u8; HELLO_NONCE_BYTES] = nonce.clone().try_into().unwrap();
+            let mut store = state.register_challenges.lock().await;
+            *store.get_mut(&key).unwrap() = now_secs() - REGISTER_CHALLENGE_TTL_SECS - 5;
+        }
+        let sk = test_signing_key("slow");
+        let hello =
+            signed_hello_with_nonce(&sk, &address_from_signing_key(&sk), "RTX 4090", 24, vec![JobKind::Terrain], &nonce);
+        assert_eq!(
+            post_register_with(state.clone(), &serde_json::to_value(hello).unwrap(), &hex).await.status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 
@@ -5974,10 +6143,15 @@ mod tests {
     /// to settle must register dev first, exactly as the live earner registers before
     /// it polls (`main.rs` HTTP poll loop).
     async fn register_dev_earner(state: &Arc<AppState>) {
-        let hello =
-            signed_hello(&dev_signing_key(), &dev_address(), "RTX 4090", 24, vec![JobKind::Terrain]);
-        let resp =
-            post_json(state.clone(), "/register", &serde_json::to_value(hello).unwrap()).await;
+        let resp = register_signed(
+            state.clone(),
+            &dev_signing_key(),
+            &dev_address(),
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK, "dev earner registers");
     }
 
@@ -6058,8 +6232,8 @@ mod tests {
         let upper = upper_case_variant(&canonical);
         assert_ne!(upper, canonical, "the variant differs only by case");
 
-        let hello = signed_hello(&sk, &upper, "RTX 4090", 24, vec![JobKind::Terrain]);
-        let resp = post_json(state.clone(), "/register", &serde_json::to_value(hello).unwrap()).await;
+        let resp =
+            register_signed(state.clone(), &sk, &upper, "RTX 4090", 24, vec![JobKind::Terrain]).await;
         assert_eq!(resp.status(), StatusCode::OK, "a case-variant claim still verifies");
 
         let earners = state.earners.lock().await;
@@ -6079,10 +6253,13 @@ mod tests {
         let upper = upper_case_variant(&canonical);
 
         // Register canonical, then stale its liveness so a hitting lookup is observable.
-        post_json(
+        register_signed(
             state.clone(),
-            "/register",
-            &serde_json::to_value(signed_hello(&dev_signing_key(), &canonical, "RTX 4090", 24, vec![JobKind::Terrain])).unwrap(),
+            &dev_signing_key(),
+            &canonical,
+            "RTX 4090",
+            24,
+            vec![JobKind::Terrain],
         )
         .await;
         state.earners.lock().await.get_mut(&canonical).unwrap().last_seen = 0;
@@ -6279,12 +6456,8 @@ mod tests {
         let canonical = address_from_signing_key(&sk);
         let upper = upper_case_variant(&canonical);
         let token = poll_token_of(
-            &post_json(
-                state.clone(),
-                "/register",
-                &serde_json::to_value(signed_hello(&sk, &canonical, "RTX 4090", 24, vec![JobKind::Terrain])).unwrap(),
-            )
-            .await,
+            &register_signed(state.clone(), &sk, &canonical, "RTX 4090", 24, vec![JobKind::Terrain])
+                .await,
         );
         state.earners.lock().await.get_mut(&canonical).unwrap().last_seen = 0;
 
@@ -11232,12 +11405,12 @@ mod tests {
     async fn registrations_shed_counts_only_the_rate_limit_shed() {
         let state = test_state_empty_with_registrations(2).await;
         // Two successful registers under the cap: success is not a shed.
-        assert_eq!(register_hello(&state, &hello("ra", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
-        assert_eq!(register_hello(&state, &hello("rb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "ra", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "rb", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(shed_counters(&state).await.0, 0, "a successful register is not a shed");
         // The 3rd from the same loopback source is over the cap → 429, the one event that counts.
         assert_eq!(
-            register_hello(&state, &hello("rc", 24, vec![JobKind::Terrain])).await,
+            register_hello(&state, "rc", 24, vec![JobKind::Terrain]).await,
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(shed_counters(&state).await.0, 1, "the rate-limit shed bumps registrations_shed");
@@ -11245,8 +11418,10 @@ mod tests {
         // A malformed register with tokens still available is a 400, NOT a shed — on a
         // fresh source the counter stays 0 even though the registration failed.
         let other = test_state_empty_with_registrations(5).await;
+        let malformed =
+            serde_json::to_value(hello_claiming("0xnope", 24, vec![JobKind::Terrain])).unwrap();
         assert_eq!(
-            register_hello(&other, &hello_claiming("0xnope", 24, vec![JobKind::Terrain])).await,
+            post_register(other.clone(), &malformed).await.status(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(shed_counters(&other).await.0, 0, "a validation 400 is not a rate-limit shed");
@@ -11374,21 +11549,21 @@ mod tests {
     #[tokio::test]
     async fn earners_shed_counts_only_the_registry_cap_shed() {
         let state = test_state_empty_with_earner_cap(2).await;
-        assert_eq!(register_hello(&state, &hello("ea", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
-        assert_eq!(register_hello(&state, &hello("eb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "ea", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "eb", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         let (reg0, _, earn0) = shed_counters(&state).await;
         assert_eq!(earn0, 0, "a successful register is not a shed");
         assert_eq!(reg0, 0, "no rate-limit shed");
         // A NEW earner at the cap (all live, nothing to evict) → 503 registry-cap shed.
         assert_eq!(
-            register_hello(&state, &hello("ec", 24, vec![JobKind::Terrain])).await,
+            register_hello(&state, "ec", 24, vec![JobKind::Terrain]).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
         let (reg1, _, earn1) = shed_counters(&state).await;
         assert_eq!(earn1, 1, "the registry-cap shed bumps earners_shed");
         assert_eq!(reg1, 0, "the registry-cap shed is NOT a rate-limit shed");
         // An in-place upsert of a KNOWN earner at the cap is admitted (200), not a shed.
-        assert_eq!(register_hello(&state, &hello("ea", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "ea", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(shed_counters(&state).await.2, 1, "an at-cap upsert of a known earner does not count");
     }
 
@@ -11399,7 +11574,7 @@ mod tests {
     #[tokio::test]
     async fn earners_shed_counts_a_ws_registry_cap_shed() {
         let state = test_state_empty_with_earner_cap(1).await;
-        assert_eq!(register_hello(&state, &hello("wsfull", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "wsfull", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(shed_counters(&state).await.2, 0, "the live earner filled the cap, no shed yet");
         let addr = serve_ephemeral(state.clone()).await;
         let (mut ws, _resp) =
@@ -11437,21 +11612,21 @@ mod tests {
     async fn earners_evicted_counts_only_an_http_registry_cap_eviction() {
         let state = test_state_empty_with_earner_cap(2).await;
         // Below the cap: a fresh register inserts into free room — not an eviction.
-        assert_eq!(register_hello(&state, &hello("ev_a", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "ev_a", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(evicted_counter(&state).await, 0, "a below-cap insert evicts nothing");
         // Fill the 2nd slot with a STALE entry (last_seen=0, far past the 60s TTL) so the
         // registry is full but has an evictable entry the cap policy can reclaim.
         state.earners.lock().await.insert("0xstale".into(), earner_info(0));
         // A NEW earner at the full cap reclaims the stale slot → eviction, the one bump.
-        assert_eq!(register_hello(&state, &hello("ev_b", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "ev_b", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(evicted_counter(&state).await, 1, "the evict-to-admit bumps earners_evicted");
         assert_eq!(shed_counters(&state).await.2, 0, "an eviction is not an all-live shed");
         // An in-place upsert of a KNOWN earner at the (now all-live) cap: admitted, no new slot.
-        assert_eq!(register_hello(&state, &hello("ev_a", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "ev_a", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(evicted_counter(&state).await, 1, "an upsert of a known earner evicts nothing");
         // A NEW earner at the now-all-live cap is shed (503), evicting nothing.
         assert_eq!(
-            register_hello(&state, &hello("ev_c", 24, vec![JobKind::Terrain])).await,
+            register_hello(&state, "ev_c", 24, vec![JobKind::Terrain]).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(evicted_counter(&state).await, 1, "the all-live reject evicts nothing");
@@ -12121,7 +12296,7 @@ mod tests {
         let state = test_state_empty_with_registrations(5).await;
         for label in ["ra", "rb", "rc"] {
             assert_eq!(
-                register_hello(&state, &hello(label, 24, vec![JobKind::Terrain])).await,
+                register_hello(&state, label, 24, vec![JobKind::Terrain]).await,
                 StatusCode::OK
             );
         }
@@ -12135,10 +12310,10 @@ mod tests {
     #[tokio::test]
     async fn register_over_rate_limit_returns_429() {
         let state = test_state_empty_with_registrations(2).await;
-        assert_eq!(register_hello(&state, &hello("ra", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
-        assert_eq!(register_hello(&state, &hello("rb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "ra", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "rb", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(
-            register_hello(&state, &hello("rc", 24, vec![JobKind::Terrain])).await,
+            register_hello(&state, "rc", 24, vec![JobKind::Terrain]).await,
             StatusCode::TOO_MANY_REQUESTS
         );
         // The shed registration admitted nothing — only the two under the limit count.
@@ -12152,11 +12327,15 @@ mod tests {
     #[tokio::test]
     async fn register_rate_limit_precedes_validation() {
         let state = test_state_empty_with_registrations(1).await;
-        assert_eq!(register_hello(&state, &hello("solo", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "solo", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         // Same source, over the limit, AND malformed (claims an address it can't sign
-        // for). Rate-limited first → 429, not the 400 a reached validation would give.
+        // for). The rate check precedes both the challenge and validation, so this is
+        // 429 — not the 400 a reached validation, nor the 401 a reached challenge,
+        // would give.
+        let malformed =
+            serde_json::to_value(hello_claiming("0xnope", 24, vec![JobKind::Terrain])).unwrap();
         assert_eq!(
-            register_hello(&state, &hello_claiming("0xnope", 24, vec![JobKind::Terrain])).await,
+            post_register(state.clone(), &malformed).await.status(),
             StatusCode::TOO_MANY_REQUESTS
         );
     }
@@ -12174,18 +12353,18 @@ mod tests {
 
         // Client X registers through the proxy — its own bucket, allowed.
         assert_eq!(
-            register_from(&state, peer, Some("203.0.113.10"), &hello("cx", 24, vec![JobKind::Terrain])).await,
+            register_from(&state, peer, Some("203.0.113.10"), "cx", 24, vec![JobKind::Terrain]).await,
             StatusCode::OK
         );
         // Client X again, over its cap of 1 → shed.
         assert_eq!(
-            register_from(&state, peer, Some("203.0.113.10"), &hello("cx2", 24, vec![JobKind::Terrain])).await,
+            register_from(&state, peer, Some("203.0.113.10"), "cx2", 24, vec![JobKind::Terrain]).await,
             StatusCode::TOO_MANY_REQUESTS
         );
         // Client Y, same proxy peer but a different XFF client → its own bucket,
         // unaffected by X having exhausted theirs.
         assert_eq!(
-            register_from(&state, peer, Some("203.0.113.20"), &hello("cy", 24, vec![JobKind::Terrain])).await,
+            register_from(&state, peer, Some("203.0.113.20"), "cy", 24, vec![JobKind::Terrain]).await,
             StatusCode::OK
         );
         // Exactly the two admitted clients joined; X's second attempt admitted nothing.
@@ -12204,44 +12383,63 @@ mod tests {
         let peer = SocketAddr::new(ip(7), 5000); // 10.0.0.7, a direct (untrusted) peer
 
         assert_eq!(
-            register_from(&state, peer, Some("203.0.113.10"), &hello("da", 24, vec![JobKind::Terrain])).await,
+            register_from(&state, peer, Some("203.0.113.10"), "da", 24, vec![JobKind::Terrain]).await,
             StatusCode::OK
         );
         // Different forged XFF, same peer → same bucket → shed at cap 1.
         assert_eq!(
-            register_from(&state, peer, Some("203.0.113.99"), &hello("db", 24, vec![JobKind::Terrain])).await,
+            register_from(&state, peer, Some("203.0.113.99"), "db", 24, vec![JobKind::Terrain]).await,
             StatusCode::TOO_MANY_REQUESTS
         );
         let stats = body_json(get(state, "/stats").await).await;
         assert_eq!(stats["gpus_joined"], 1);
     }
 
-    /// Register `msg` over HTTP `/register`, returning the status.
-    async fn register_hello(state: &Arc<AppState>, msg: &EarnerMsg) -> StatusCode {
-        post_json(state.clone(), "/register", &serde_json::to_value(msg).unwrap())
-            .await
-            .status()
+    /// Register `label`'s self-signed earner over HTTP `/register` (minting a
+    /// challenge first), returning the status.
+    async fn register_hello(
+        state: &Arc<AppState>,
+        label: &str,
+        vram: u32,
+        supported: Vec<JobKind>,
+    ) -> StatusCode {
+        register(state.clone(), label, vram, supported).await.status()
     }
 
-    /// Register `msg` over HTTP `/register` from a specific connection `peer`,
-    /// optionally carrying an `X-Forwarded-For` header — the two inputs
-    /// `resolve_source_ip` keys the per-source limiter on. Returns the status.
+    /// Register `label`'s self-signed earner over HTTP `/register` from a specific
+    /// connection `peer`, optionally carrying an `X-Forwarded-For` — the two inputs
+    /// `resolve_source_ip` keys the per-source limiter on. The challenge is minted
+    /// first (not rate-limited, so it doesn't perturb the bucket under test); the
+    /// POST is where the limiter fires. Returns the status.
     async fn register_from(
         state: &Arc<AppState>,
         peer: SocketAddr,
         xff: Option<&str>,
-        msg: &EarnerMsg,
+        label: &str,
+        vram: u32,
+        supported: Vec<JobKind>,
     ) -> StatusCode {
+        let (nonce, hex) = mint_challenge(state.clone()).await;
+        let sk = test_signing_key(label);
+        let hello = signed_hello_with_nonce(
+            &sk,
+            &address_from_signing_key(&sk),
+            "RTX 4090",
+            vram,
+            supported,
+            &nonce,
+        );
         let mut builder = Request::builder()
             .method("POST")
             .uri("/register")
-            .header("content-type", "application/json");
+            .header("content-type", "application/json")
+            .header(proto::REGISTER_CHALLENGE_HEADER, hex);
         if let Some(v) = xff {
             builder = builder.header("x-forwarded-for", v);
         }
         router(state.clone())
             .layer(Extension(PeerAddr(peer)))
-            .oneshot(builder.body(Body::from(serde_json::to_vec(msg).unwrap())).unwrap())
+            .oneshot(builder.body(Body::from(serde_json::to_vec(&hello).unwrap())).unwrap())
             .await
             .unwrap()
             .status()
@@ -12253,7 +12451,7 @@ mod tests {
     async fn register_below_cap_is_unchanged() {
         let state = test_state_empty_with_earner_cap(5).await;
         assert_eq!(
-            register_hello(&state, &hello("below", 24, vec![JobKind::Terrain])).await,
+            register_hello(&state, "below", 24, vec![JobKind::Terrain]).await,
             StatusCode::OK
         );
         let stats = body_json(get(state, "/stats").await).await;
@@ -12266,10 +12464,10 @@ mod tests {
     #[tokio::test]
     async fn register_at_cap_all_live_returns_503() {
         let state = test_state_empty_with_earner_cap(2).await;
-        assert_eq!(register_hello(&state, &hello("rega", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
-        assert_eq!(register_hello(&state, &hello("regb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "rega", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "regb", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         assert_eq!(
-            register_hello(&state, &hello("regc", 24, vec![JobKind::Terrain])).await,
+            register_hello(&state, "regc", 24, vec![JobKind::Terrain]).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(body_json(get(state.clone(), "/stats").await).await["gpus_joined"], 2);
@@ -12283,11 +12481,11 @@ mod tests {
     #[tokio::test]
     async fn register_at_cap_evicts_stalest_past_ttl() {
         let state = test_state_empty_with_earner_cap(2).await;
-        assert_eq!(register_hello(&state, &hello("rega", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
-        assert_eq!(register_hello(&state, &hello("regb", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "rega", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "regb", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         // Age "rega" past the 60s TTL so it becomes evictable.
         state.earners.lock().await.get_mut(&test_address("rega")).unwrap().last_seen = now_secs() - 10_000;
-        assert_eq!(register_hello(&state, &hello("regc", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "regc", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         let earners = state.earners.lock().await;
         assert_eq!(earners.len(), 2);
         assert!(!earners.contains_key(&test_address("rega")), "the stale earner was evicted");
@@ -12301,7 +12499,7 @@ mod tests {
     #[tokio::test]
     async fn ws_registration_enforces_earner_cap() {
         let state = test_state_empty_with_earner_cap(1).await;
-        assert_eq!(register_hello(&state, &hello("wsfull", 24, vec![JobKind::Terrain])).await, StatusCode::OK);
+        assert_eq!(register_hello(&state, "wsfull", 24, vec![JobKind::Terrain]).await, StatusCode::OK);
         let addr = serve_ephemeral(state.clone()).await;
         let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
@@ -16305,13 +16503,7 @@ mod tests {
         let state = test_state_empty().await;
         // Register via HTTP — freshly seen, so it counts.
         let addr = test_address("abc");
-        let msg = hello("abc", 24, vec![JobKind::Terrain]);
-        let resp = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(&msg).unwrap(),
-        )
-        .await;
+        let resp = register(state.clone(), "abc", 24, vec![JobKind::Terrain]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(get(state.clone(), "/stats").await).await;
         assert_eq!(json["gpus_joined"], 1);
@@ -17807,16 +17999,11 @@ mod tests {
         // Register two earners; then force one far into the past → stale (ttl=60).
         let live = test_address("live");
         let stale = test_address("stale");
-        for m in [
-            &hello("live", 24, vec![JobKind::Terrain, JobKind::Foliage]),
-            &hello("stale", 16, vec![JobKind::NpcTick]),
+        for (label, vram, kinds) in [
+            ("live", 24, vec![JobKind::Terrain, JobKind::Foliage]),
+            ("stale", 16, vec![JobKind::NpcTick]),
         ] {
-            let resp = post_json(
-                state.clone(),
-                "/register",
-                &serde_json::to_value(m).unwrap(),
-            )
-            .await;
+            let resp = register(state.clone(), label, vram, kinds).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
         {
@@ -17879,16 +18066,8 @@ mod tests {
         });
         let busy = test_address("busy");
         let idle = test_address("idle");
-        for m in [
-            &hello("busy", 24, vec![JobKind::Terrain]),
-            &hello("idle", 24, vec![JobKind::Terrain]),
-        ] {
-            let resp = post_json(
-                state.clone(),
-                "/register",
-                &serde_json::to_value(m).unwrap(),
-            )
-            .await;
+        for label in ["busy", "idle"] {
+            let resp = register(state.clone(), label, 24, vec![JobKind::Terrain]).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
         // busy completes 2 jobs, idle completes 1.
@@ -17951,12 +18130,7 @@ mod tests {
             earners_evicted: AtomicU64::new(0),
         });
         let pay = test_address("pay");
-        let resp = post_json(
-            state.clone(),
-            "/register",
-            &serde_json::to_value(hello("pay", 24, vec![JobKind::Terrain])).unwrap(),
-        )
-        .await;
+        let resp = register(state.clone(), "pay", 24, vec![JobKind::Terrain]).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Two DONE jobs credited to pay with known payouts (1.5e18 + 2.5e18).
