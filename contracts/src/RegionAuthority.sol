@@ -29,6 +29,12 @@ contract RegionAuthority is ERC721, Ownable2Step {
 
     mapping(uint256 tokenId => Stake) public stakes;
 
+    /// @notice Total $BLCKFLD locked as region stake across all live regions — the
+    ///         protocol-wide aggregate a HUD/indexer reads directly instead of summing
+    ///         every `stakes[tokenId].amount`. Bumped by `claim`, decremented by `unstake`;
+    ///         a transfer leaves it unchanged (the stake stays locked under the new holder).
+    uint256 public totalStaked;
+
     /// @notice Fees deposited against a region and not yet claimed by its current
     ///         holder. Settled to the outgoing holder's `withdrawable` on transfer.
     mapping(uint256 tokenId => uint256) public accruedFees;
@@ -75,6 +81,7 @@ contract RegionAuthority is ERC721, Ownable2Step {
         if (_ownerOf(tokenId) != address(0)) revert AlreadyClaimed();
         TOKEN.safeTransferFrom(msg.sender, address(this), amount);
         stakes[tokenId] = Stake({amount: amount, stakedAt: uint64(block.timestamp)});
+        totalStaked += amount;
         _safeMint(msg.sender, tokenId);
         emit Staked(msg.sender, tokenId, amount);
     }
@@ -82,6 +89,7 @@ contract RegionAuthority is ERC721, Ownable2Step {
     function unstake(uint256 tokenId) external {
         if (ownerOf(tokenId) != msg.sender) revert NotHolder();
         uint256 amount = stakes[tokenId].amount;
+        totalStaked -= amount;
         delete stakes[tokenId];
         // _burn fires the _update hook below, which settles any accrued fees into
         // this holder's `withdrawable` (claimable via `withdraw`) — so unstaking
