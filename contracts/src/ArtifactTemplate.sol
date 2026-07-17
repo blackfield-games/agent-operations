@@ -99,10 +99,24 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     ///         mints for that template, enforcing scarcity for high-rarity tiers.
     mapping(uint256 templateId => uint256) public templateMaxSupply;
 
+    /// @notice Cumulative ERC-1155 units burned across all templates — the destroy-side
+    ///         counterpart to `totalMinted`. Kept SEPARATE from the mint counters on
+    ///         purpose: a burn lowers circulating supply but never `mintedByTemplate`, so
+    ///         the supply cap keeps bounding cumulative MINTS and burning frees no cap
+    ///         headroom (a mint->burn->mint can never slip past a template's `maxSupply`).
+    uint256 public totalBurned;
+
+    /// @notice Cumulative units burned per template, the destroy-side counterpart to
+    ///         `mintedByTemplate`. A template's circulating supply is
+    ///         `mintedByTemplate[id] - burnedByTemplate[id]`; across all templates these
+    ///         sum to `totalBurned`.
+    mapping(uint256 templateId => uint256 amount) public burnedByTemplate;
+
     event TemplateRegistered(
         uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
     );
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
+    event Burned(address indexed from, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
     event MintFeeRateSet(uint256 rate);
     event RoyaltyRateSet(uint256 rate);
@@ -264,6 +278,30 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
 
         _mint(to, templateId, amount, data);
         emit Minted(to, templateId, amount);
+    }
+
+    /// @notice Destroy `amount` units of `templateId` held by `from`. A holder consumes
+    ///         or salvages their own artifact; an operator `from` approved via
+    ///         `setApprovalForAll` may burn on their behalf (the standard ERC-1155
+    ///         allowance). Deliberately NOT `minter`-gated: destruction is the holder's
+    ///         prerogative — the minter can create artifacts, never unilaterally destroy
+    ///         a player's. A zero amount is rejected (mirrors mint's `ZeroAmount`) so a
+    ///         no-op burn can't spam a `Burned` event.
+    /// @dev Bumps the SEPARATE burn counters, never the cumulative mint counters: the
+    ///      supply cap bounds `mintedByTemplate` (cumulative mints), so a burn frees no
+    ///      cap headroom and a mint->burn->mint can never exceed a template's `maxSupply`.
+    ///      Burning fires no ERC-1155 receiver hook (the destination is `address(0)`), so
+    ///      there is no reentrancy surface; `_burn` reverts `ERC1155InsufficientBalance`
+    ///      before any counter moves.
+    function burn(address from, uint256 templateId, uint256 amount) external {
+        if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
+            revert ERC1155MissingApprovalForAll(msg.sender, from);
+        }
+        if (amount == 0) revert ZeroAmount();
+        _burn(from, templateId, amount);
+        totalBurned += amount;
+        burnedByTemplate[templateId] += amount;
+        emit Burned(from, templateId, amount);
     }
 
     /// @dev Rarity-scaled per-mint charge in `rate` units, shared by the compute fee
