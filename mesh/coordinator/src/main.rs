@@ -866,6 +866,13 @@ struct Stats {
     /// the dead-lettered, not-yet-settled rows), or `null` when none are stuck — the debit
     /// twin of `oldest_dead_lettered_attestation_secs`. Additive and optional.
     oldest_dead_lettered_debit_secs: Option<u64>,
+    /// Age in seconds of the OLDEST quarantined revocation (`now -
+    /// MIN(revocation_dead_lettered_at)` over the dead-lettered, not-yet-landed rows), or `null`
+    /// when none are stuck — the revoke twin of `oldest_dead_lettered_attestation_secs`. A
+    /// dead-lettered revocation means a receipt the operator has declared FRAUDULENT is still
+    /// live on-chain, so this surfaces a single long-stuck correction the
+    /// `dead_lettered_revocations` depth alone would hide. Additive and optional.
+    oldest_dead_lettered_revocation_secs: Option<u64>,
     /// Cumulative registrations shed by the per-source rate limiter on either path
     /// (`429` on HTTP `/register`, socket close on the WS `Hello`) since boot — the
     /// registration-flood signal. Counts ONLY a rate-limit shed (`check_registration_rate`
@@ -3755,6 +3762,14 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+    let oldest_dead_lettered_revocation_secs = match store.oldest_dead_lettered_revocation_at() {
+        Ok(Some(ts)) => Some(now.saturating_sub(ts).max(0) as u64),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(?e, "stats: oldest_dead_lettered_revocation_at failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     // In-process shed counters — a plain Relaxed load (observability only, no store
     // lock). u64→usize is lossless on the 64-bit targets the coordinator runs on.
     let registrations_shed = state.registrations_shed.load(Ordering::Relaxed) as usize;
@@ -3789,6 +3804,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Status
         dead_lettered_debits,
         oldest_dead_lettered_attestation_secs,
         oldest_dead_lettered_debit_secs,
+        oldest_dead_lettered_revocation_secs,
         registrations_shed,
         jobs_shed,
         earners_shed,
