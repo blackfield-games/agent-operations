@@ -42,6 +42,11 @@ contract RegionAuthority is ERC721, Ownable2Step {
     event StakeRequiredSet(uint256 amount);
     event FeesDeposited(uint256 indexed tokenId, address indexed from, uint256 amount);
     event FeesClaimed(uint256 indexed tokenId, address indexed holder, uint256 amount);
+    /// @notice A region's accrued fees settled to its outgoing holder's `withdrawable`
+    ///         ledger on transfer/unstake — the push side of `_update`, logged so an
+    ///         indexer sees the credit created (and to which region/holder) without
+    ///         reconstructing it from `Transfer` + the deposit/claim history.
+    event FeesSettled(uint256 indexed tokenId, address indexed holder, uint256 amount);
     event Withdrawn(address indexed holder, uint256 amount);
 
     error StakeTooLow();
@@ -137,9 +142,11 @@ contract RegionAuthority is ERC721, Ownable2Step {
 
     /// @dev On every transfer and burn (not mint), settle the region's accrued fees
     ///      to the OUTGOING holder's pull ledger so a new holder cannot claim fees
-    ///      earned under the previous one. Pure internal bookkeeping — no external
-    ///      call here, so a hostile/paused fee token can never brick a transfer or
-    ///      unstake (the payout is deferred to the holder's own `withdraw`).
+    ///      earned under the previous one, emitting `FeesSettled` so the credit is
+    ///      observable on-chain. Still no external call here (an event is not a call),
+    ///      so a hostile/paused fee token can never brick a transfer or unstake (the
+    ///      payout is deferred to the holder's own `withdraw`). The event fires only
+    ///      when there are fees to move — a zero-accrued transfer stays log-free.
     function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
         address from = _ownerOf(tokenId);
         if (from != address(0)) {
@@ -147,6 +154,7 @@ contract RegionAuthority is ERC721, Ownable2Step {
             if (accrued != 0) {
                 accruedFees[tokenId] = 0;
                 withdrawable[from] += accrued;
+                emit FeesSettled(tokenId, from, accrued);
             }
         }
         return super._update(to, tokenId, auth);
