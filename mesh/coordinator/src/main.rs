@@ -3987,8 +3987,8 @@ async fn submit(
     // store lock so the two never overlap. Reject mirrors the bad-attestation branch
     // (401, job left in_flight for the reaper) — a registered earner submitting for
     // another is the documented residual this weaker-than-ws check does not close.
-    // Membership ONLY: the liveness refresh deliberately does NOT ride this lock —
-    // see the accepted-path refresh after the settle.
+    // Membership only — the liveness refresh must NOT ride this lock; it is gated on the
+    // settle below, and this gate clears long before a replay is ruled out.
     if !state.earners.lock().await.contains_key(&result.earner_address) {
         tracing::warn!(?id, earner = %result.earner_address, "rejected: earner not registered");
         return Err(StatusCode::UNAUTHORIZED);
@@ -4069,29 +4069,22 @@ async fn submit(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
-    // Liveness refresh is AUTHENTICATED by the settle itself, and so happens ONLY
-    // here — on the accepted path, never on a reject. `verify_signature` covers
+    // Liveness refresh is AUTHENTICATED by the settle, so it happens only here, never on
+    // a reject. A published result is replayable by anyone: `verify_signature` covers
     // `signing_digest(job_id, output_hash)` with no nonce (unlike `hello_digest`), the
-    // signature ships inside the unauthenticated `GET /jobs/{id}` readback, and job
-    // ids are enumerable via `GET /jobs` — so a published result is replayable by
-    // anyone. Refreshing before the lifecycle gates let a third party keep a victim
-    // counted live in /stats, dispatch-eligible, unreapable as a job holder, and
-    // holding a `max_earners` slot (shedding real registrations with 503) while the
-    // real earner was offline, by replaying its own published result every
-    // `earner_ttl_secs` for a 409. Reaching THIS point cannot be replayed: it needs a
-    // signature over a job that is still in_flight under the dispatch_seq the caller
-    // echoed, and a result is published only once the job has completed. A rejected
-    // submit proves nothing about the claimed earner — the claim is precisely what is
-    // unauthenticated here — and costs an honest earner no liveness: its own
-    // token-authenticated `/jobs/next` polls refresh it, and a long render with no
-    // poll in flight ends in exactly this accepted settle.
+    // signature ships in the unauthenticated `GET /jobs/{id}`, and `GET /jobs` enumerates
+    // the ids. Refreshing before the lifecycle gates therefore let a stranger replay a
+    // victim's own result every `earner_ttl_secs` — each a 409, each keeping the victim
+    // live in /stats, dispatch-eligible, unreapable as a job holder, and holding a
+    // `max_earners` slot. This point is out of replay's reach: it needs a signature over
+    // a job still in_flight under the echoed dispatch_seq, and results publish only at
+    // completion. Honest liveness is unaffected — a rejected submit proves nothing about
+    // the claimed earner (that claim is exactly what is unauthenticated here), and a real
+    // earner stays live via its token-authenticated polls and this settle.
     //
-    // The store guard lives to end-of-scope, so this drop is load-bearing: it keeps
-    // the earners lock and the store lock from ever being held together, preserving
-    // the earners-then-store order /stats and /earners rely on. Best-effort by design
-    // — the earner can be evicted between the membership gate and here, and un-settling
-    // a durably-recorded job because its registration lapsed mid-submit would be worse
-    // than a stale last_seen.
+    // `drop` is load-bearing, not tidiness: the guard lives to end-of-scope, and holding
+    // both locks inverts the earners-then-store order. Best-effort — an earner evicted
+    // mid-submit takes a stale last_seen over an un-settled job.
     drop(store);
     if let Some(info) = state.earners.lock().await.get_mut(&result.earner_address) {
         info.last_seen = now_secs();
