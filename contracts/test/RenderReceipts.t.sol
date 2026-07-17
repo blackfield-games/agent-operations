@@ -505,6 +505,13 @@ contract RenderReceiptsTest is Test {
         assertEq(address(receipts.feeToken()), address(token));
     }
 
+    function test_constructor_revertsZeroEas() public {
+        // A zero EAS would deploy a receipts book whose every issue/revoke reverts opaquely
+        // at the EAS call; fail loudly at construction instead (mirrors the feeToken guard).
+        vm.expectRevert(RenderReceipts.ZeroEas.selector);
+        new RenderReceipts(address(0), owner, address(region), RENDER_FEE_RATE);
+    }
+
     function test_constructor_revertsZeroRegionAuthority() public {
         vm.expectRevert(RenderReceipts.ZeroRegionAuthority.selector);
         new RenderReceipts(address(eas), owner, address(0), RENDER_FEE_RATE);

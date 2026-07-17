@@ -693,6 +693,11 @@
   },
   {
     "inputs": [],
+    "name": "ZeroEas",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "ZeroFeeRate",
     "type": "error"
   },

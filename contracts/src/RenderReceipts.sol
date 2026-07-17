@@ -162,6 +162,7 @@ contract RenderReceipts is Ownable2Step {
     error DuplicateReceipt(bytes32 jobId);
     error NotIssued(bytes32 jobId);
     error AlreadyRevoked(bytes32 jobId);
+    error ZeroEas();
     error ZeroRegionAuthority();
     error ZeroFeeRate();
     error ZeroFeeToken();
@@ -171,6 +172,7 @@ contract RenderReceipts is Ownable2Step {
     constructor(address eas_, address owner_, address regionAuthority_, uint256 renderFeeRate_)
         Ownable(owner_)
     {
+        if (eas_ == address(0)) revert ZeroEas();
         if (regionAuthority_ == address(0)) revert ZeroRegionAuthority();
         if (renderFeeRate_ == 0) revert ZeroFeeRate();
         EAS = IEAS(eas_);
