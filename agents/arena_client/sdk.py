@@ -549,6 +549,7 @@ def run_local_match(
     policies: dict[int, Policy],
     *,
     seed: int = 0,
+    max_ticks: int | None = None,
     match_id: str = "00000000-0000-4000-8000-000000000000",
     agent_ids: dict[int, str] | None = None,
     signing_keys: dict[int, bytes] | None = None,
@@ -1061,6 +1062,14 @@ def run_local_match(
         # than here — reject loudly, mirroring the sibling fences. Width is u64 (wider than the u32
         # twins); the common footgun is seed=hash(...), Python's hash() being signed and often negative.
         raise ValueError(f"seed is a determinism input in 0..=2**64-1 (0 = default); got {seed}")
+    if max_ticks is not None and not 0 <= max_ticks <= 2**64 - 1:
+        # The harness parses --max-ticks as a u64 (main.rs `.expect("max-ticks is a u64")`) and panics at
+        # startup on a negative / > u64::MAX cap, so a bad value aborts late (GatewayClosed / watchdog kill)
+        # rather than here — reject loudly, mirroring the seed fence. None omits the flag so the harness
+        # applies its 3600-tick default; unlike seed, 0 is a real cap the caller owns, not the default.
+        raise ValueError(
+            f"max_ticks is a match-length cap in 0..=2**64-1 (None = harness default 3600); got {max_ticks}"
+        )
     if not 0 <= vertical_hit_tolerance <= 2**31 - 1:
         # Core gates z-coupled hits on vertical_hit_tolerance > 0, so a negative reads as off (planar)
         # and a value past i32::MAX wraps the band negative (also off) — reject both loudly here,
@@ -1241,6 +1250,12 @@ def run_local_match(
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
+    if max_ticks is not None:
+        # Core MatchConfig bound, before the mode block: --max-ticks caps match length on the direct path
+        # (MatchConfig.max_ticks) and the --mode path alike (matchmaker_params carries it as a top-level
+        # MatchParams field, not via rules). None (omitted) adds no token so the harness applies its own
+        # 3600-tick default — byte-identical argv to the pre-flag SDK.
+        argv += ["--max-ticks", str(max_ticks)]
     if arena is not None:
         # Unconditional, before the mode block: --map drives both the direct and --mode
         # paths in the harness, so the arena loads however the roster is formed.
