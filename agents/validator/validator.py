@@ -506,33 +506,45 @@ def _intent_attributions(
     """
     out: list[tuple[str, str]] = []
 
+    # Deliberately UNGUARDED on a non-empty `required` (the lighting hoist at the Atmosphere
+    # check below, not a `if required:` branch): prop._required_block emits "" for an empty
+    # asset set, so an empty `required` demands exactly ZERO Required prims — a real
+    # expectation, not "nothing to check". The multiset comparison degenerates to it on its
+    # own (`dropped` iterates an empty required_counts, so it stays []; `extra` becomes every
+    # placed marker), which is why this needs no empty-case elif of its own. Gating the loop
+    # on `required` instead left the `extra` check dark exactly when the director seeded no
+    # must_have — or named only tokens with no MUST_HAVE_ASSET mapping — and a fabricated
+    # Required prim (real `references` arc, `triangles` honestly inflated to match) then
+    # cleared every other gate: the triangle gate prices whatever markers are in the body, so
+    # it reconciles; the count and fill gates never look at required assets. `required` is the
+    # MAPPED set (prop._required_assets skips vocabulary drift with a warning), so a director
+    # naming only unmappable tokens still lands here with prop having placed nothing.
     required = prop._required_assets(_director_intent(layers, layers_root, "must_have"))
-    if required:
-        prop_text = _layer_text(layers, "prop", layers_root)
-        if prop_text is not None:
-            required_counts = Counter(required)
-            placed = Counter(re.findall(r'requiredAsset\s*=\s*"([^"]+)"', prop_text))
-            dropped = sorted(a for a, n in required_counts.items() if placed[a] < n)
-            if dropped:
-                out.append((
-                    "prop",
-                    f"intent:must_have unmet: prop must place must-have asset(s) {dropped} "
-                    f"but its layer carries no Required prim referencing them",
-                ))
-            # The equality complement of `dropped`: the re-derived multiset is EXACT, so a marker
-            # over the must-have set (a duplicated hero, or an unrequested asset the director never
-            # demanded) is as much a desync as a dropped one — the must-have gate alone passes it
-            # (all demanded present) and the triangle gate prices whatever markers are in the body,
-            # so an honestly-inflated metric ships doubled/unrequested hero geometry accepted. Name
-            # prop, not the director, or the route-back misfires to the director loop.
-            extra = sorted(a for a, n in placed.items() if n > required_counts[a])
-            if extra:
-                out.append((
-                    "prop",
-                    f"intent:must_have over-placed: prop placed unrequested or duplicate "
-                    f"required asset(s) {extra} — its layer carries more Required prims than the "
-                    f"must-have set demands; re-run prop",
-                ))
+    prop_text = _layer_text(layers, "prop", layers_root)
+    if prop_text is not None:
+        required_counts = Counter(required)
+        placed = Counter(re.findall(r'requiredAsset\s*=\s*"([^"]+)"', prop_text))
+        dropped = sorted(a for a, n in required_counts.items() if placed[a] < n)
+        if dropped:
+            out.append((
+                "prop",
+                f"intent:must_have unmet: prop must place must-have asset(s) {dropped} "
+                f"but its layer carries no Required prim referencing them",
+            ))
+        # The equality complement of `dropped`: the re-derived multiset is EXACT, so a marker
+        # over the must-have set (a duplicated hero, or an unrequested asset the director never
+        # demanded) is as much a desync as a dropped one — the must-have gate alone passes it
+        # (all demanded present) and the triangle gate prices whatever markers are in the body,
+        # so an honestly-inflated metric ships doubled/unrequested hero geometry accepted. Name
+        # prop, not the director, or the route-back misfires to the director loop.
+        extra = sorted(a for a, n in placed.items() if n > required_counts[a])
+        if extra:
+            out.append((
+                "prop",
+                f"intent:must_have over-placed: prop placed unrequested or duplicate "
+                f"required asset(s) {extra} — its layer carries more Required prims than the "
+                f"must-have set demands; re-run prop",
+            ))
 
     if biome._caps_vegetation(_director_intent(layers, layers_root, "must_not")):
         biome_text = _layer_text(layers, "biome", layers_root)
