@@ -15121,13 +15121,14 @@ mod tests {
         );
     }
 
-    /// FM1: the age matches the LISTABLE set (`revoked_at IS NULL`), not every dead-lettered
-    /// row. A revocation quarantined and THEN landed on-chain — the idempotent `AlreadyRevoked`
-    /// arm stamps `revoked_at` without clearing the dead-letter stamp, so the row carries both —
-    /// is resolved and must drop out of the age, or a since-corrected receipt alarms forever.
-    /// With the only quarantined revocation settled, the age is `None`; dropping the `revoked_at
-    /// IS NULL` fence would report its stamp. The depth still counts the row, proving the fence
-    /// (not the row vanishing) is what excludes it.
+    /// FM1 (defense-in-depth): the age's predicate matches the listing's (`revoked_at IS
+    /// NULL`), so a row that is somehow both quarantined AND revoked drops out of the age rather
+    /// than alarming forever on a since-resolved receipt. The current drains never produce that
+    /// state — the revocation claim skips dead-lettered rows and a redrive clears the stamp
+    /// before the revoke can land — so this constructs it directly via the store. With the only
+    /// quarantined revocation settled the age is `None`; dropping the `revoked_at IS NULL` fence
+    /// would report its stamp. The depth still counts the row, proving the fence (not the row
+    /// vanishing) is what excludes it.
     #[tokio::test]
     async fn oldest_dead_lettered_revocation_age_excludes_a_settled_row() {
         let state = test_state_empty().await;
@@ -15148,10 +15149,13 @@ mod tests {
         );
     }
 
-    /// FM (revoke arm): `/stats` reports `null` for the revocation age on a clean mesh and a
-    /// small positive age once a revocation is dead-lettered through the real drain — the revoke
-    /// twin of `stats_reports_oldest_dead_lettered_age`, proving None → Some and that the field
-    /// is the AGE, not the `dead_lettered_revocations` depth.
+    /// FM (revoke arm): `/stats` reports `null` for the revocation age on a clean mesh AND while
+    /// a revocation is merely armed (pending, not yet quarantined), then a small positive age
+    /// once it dead-letters through the real drain — the revoke twin of
+    /// `stats_reports_oldest_dead_lettered_age`. Proves None → Some, that the field is the AGE
+    /// not the `dead_lettered_revocations` depth, and that it tracks the QUARANTINE, not the
+    /// request (a pending revocation has a null `revocation_dead_lettered_at`, so it must not
+    /// contribute an age).
     #[tokio::test]
     async fn stats_reports_oldest_dead_lettered_revocation_age() {
         let state = test_state_empty().await;
@@ -15161,6 +15165,15 @@ mod tests {
         assert_eq!(json["dead_lettered_revocations"], 0);
 
         let job = settle_and_land(&state, 1).await.remove(0);
+
+        // A merely-armed revocation (pending, not yet dead-lettered) has NO dead-letter age —
+        // the metric tracks the quarantine, not the request.
+        state.store.lock().await.request_revocation(&job.id, now_secs()).unwrap();
+        let json = body_json(get(state.clone(), "/stats").await).await;
+        assert!(json["oldest_dead_lettered_revocation_secs"].is_null(), "pending → still null");
+        assert_eq!(json["pending_revocations"], 1);
+        assert_eq!(json["dead_lettered_revocations"], 0);
+
         dead_letter_one_revocation(&state, &job).await;
 
         let json = body_json(get(state.clone(), "/stats").await).await;

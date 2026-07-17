@@ -1734,13 +1734,14 @@ impl Store {
     /// revocation (`MIN` over the listable dead-letter predicate), or `None` when none are
     /// stuck — the revoke twin of
     /// [`oldest_dead_lettered_attestation_at`](Self::oldest_dead_lettered_attestation_at).
-    /// Same predicate as the listing (`revocation_dead_lettered_at IS NOT NULL AND revoked_at
-    /// IS NULL`, [`list_dead_lettered_revocations`](Self::list_dead_lettered_revocations)), so a
-    /// revocation that has since landed on-chain (`revoked_at` set — a quarantined row the
-    /// idempotent `AlreadyRevoked` arm later marked revoked, since `mark_revoked` does not clear
-    /// the dead-letter stamp) never contributes; the age tracks only what is still owed, so it
-    /// cannot alarm forever on a resolved receipt. `MIN` over zero matching rows is SQL NULL →
-    /// `None`.
+    /// Same predicate as the listing
+    /// ([`list_dead_lettered_revocations`](Self::list_dead_lettered_revocations)), so the age's
+    /// membership matches it exactly. The `revoked_at IS NULL` fence is belt-and-suspenders: the
+    /// drains never produce a row that is both quarantined and revoked (the revocation claim
+    /// skips `revocation_dead_lettered_at IS NOT NULL` rows, and a redrive clears the stamp
+    /// before the revoke can land), but the fence guarantees a since-resolved receipt could
+    /// never keep the age alarming even if some future path stamped both. `MIN` over zero
+    /// matching rows is SQL NULL → `None`.
     pub fn oldest_dead_lettered_revocation_at(&self) -> Result<Option<i64>> {
         let oldest: Option<i64> = self.conn.query_row(
             "SELECT MIN(revocation_dead_lettered_at) FROM pending_attestations
