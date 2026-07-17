@@ -10371,6 +10371,71 @@ mod tests {
         assert!(detail["attestation"].is_null(), "drain leaves a no-receipt job absent");
     }
 
+    /// The metering twin of `job_detail_surfaces_the_three_attestation_states`:
+    /// `GET /jobs/{id}` reads the ComputeMeter debit back as owed → spent, `null` when
+    /// unmetered, and a dead-lettered-but-owed charge still as plain 'owed'
+    /// (`dead_lettered_at` deliberately not surfaced, mirroring the attestation readback).
+    #[tokio::test]
+    async fn job_detail_surfaces_the_debit_states() {
+        let state = test_state_empty_with_compute_rate(DRAIN_RATE).await;
+
+        // FM2 — unmetered: a buyerless settle owes an attestation but NO debit (nobody to
+        // charge), so `debit` is null — the twin of `attestation: null`, NOT a spurious
+        // zero-amount row.
+        let unmetered = seed_job();
+        settle_one(&state, &unmetered).await;
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", unmetered.id)).await).await;
+        assert!(detail["debit"].is_null(), "an unmetered job owes no charge");
+        assert!(detail["attestation"].is_object(), "but it still owes the attestation");
+
+        // FM1 owed — a metered settle records the charge; tx_hash/submitted_at stay null
+        // until the (operator-gated) spender lands it on Base.
+        let owed = seed_job();
+        settle_one_metered(&state, &owed).await;
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", owed.id)).await).await;
+        assert!(detail["debit"].is_object(), "an owed debit is present, not absent");
+        assert_eq!(
+            detail["debit"]["amount_wei"].as_str(),
+            Some("1000000000000"), // DRAIN_RATE (1e12 wei) * 1 render-second
+            "the owed charge is the metered amount"
+        );
+        assert!(detail["debit"]["tx_hash"].is_null(), "tx_hash null until spent on-chain");
+        assert!(detail["debit"]["submitted_at"].is_null(), "submitted_at null until spent");
+        // FM3 additive — the attestation twin is unchanged on the same response.
+        assert!(detail["attestation"].is_object(), "attestation still owed alongside the debit");
+        assert!(detail["attestation"]["uid"].is_null(), "attestation unchanged: uid still owed");
+
+        // FM1 spent — one drain pass lands the spend tx + submit time on-chain.
+        drain_debits_all(&state, &MockSpender::succeeding()).await;
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", owed.id)).await).await;
+        assert!(detail["debit"]["tx_hash"].is_string(), "tx_hash carries the spend tx once settled");
+        assert!(detail["debit"]["submitted_at"].is_i64(), "submitted_at carries the unix submit time");
+        assert_eq!(
+            detail["debit"]["amount_wei"].as_str(),
+            Some("1000000000000"),
+            "the amount is unchanged by the spend"
+        );
+
+        // FM3 — a dead-lettered-but-owed debit still reads as plain 'owed': the readback does
+        // NOT filter on dead_lettered_at (mirrors attestation_readback), so a quarantined
+        // charge is still surfaced as owed and carries no dead_lettered_at field.
+        let stuck = seed_job();
+        settle_one_metered(&state, &stuck).await;
+        assert!(state
+            .store
+            .lock()
+            .await
+            .mark_debit_dead_lettered(&stuck.id, 1_700_000_000)
+            .unwrap());
+        let detail = body_json(get(state.clone(), &format!("/jobs/{}", stuck.id)).await).await;
+        assert!(detail["debit"].is_object(), "a dead-lettered debit still reads as owed, not null");
+        assert!(detail["debit"]["tx_hash"].is_null(), "still owed — never spent");
+        assert!(
+            detail["debit"].get("dead_lettered_at").is_none(),
+            "dead_lettered_at is deliberately not surfaced"
+        );
+    }
+
     /// Boundary region coords (i32 extremes, layer u8::MAX) are accepted and
     /// round-trip intact. `RegionCoord::region_id` — which the dispatch and
     /// attestation paths later feed — is pure formatting with no arithmetic, so
