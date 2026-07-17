@@ -509,5 +509,10 @@
     "inputs": [],
     "name": "ZeroAddressBuyer",
     "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "ZeroToken",
+    "type": "error"
   }
 ]

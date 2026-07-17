@@ -32,6 +32,13 @@ contract ComputeMeterTest is Test {
         meter.setSpender(spender, true);
     }
 
+    function test_constructor_revertsZeroToken() public {
+        // A zero token would deploy a meter whose every deposit reverts opaquely at the
+        // SafeERC20 burn; fail loudly at construction instead (mirrors ArtifactTemplate).
+        vm.expectRevert(ComputeMeter.ZeroToken.selector);
+        new ComputeMeter(address(0), owner);
+    }
+
     function test_deposit_burnsAndCredits() public {
         vm.startPrank(buyer);
         token.approve(address(meter), 100 ether);

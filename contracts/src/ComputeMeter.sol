@@ -53,10 +53,12 @@ contract ComputeMeter is Ownable2Step {
     error InsufficientCredit();
     error AlreadySpent();
     error ZeroAddressBuyer();
+    error ZeroToken();
     error EmptyBatch();
     error BatchTooLarge();
 
     constructor(address token_, address owner_) Ownable(owner_) {
+        if (token_ == address(0)) revert ZeroToken();
         TOKEN = IERC20(token_);
     }
 
