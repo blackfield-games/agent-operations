@@ -5983,6 +5983,91 @@ mod tests {
         assert!(!by_earner.contains_key(&upper), "not the mixed case");
     }
 
+    /// The submit twin of [`next_job_unauthenticated_poll_does_not_refresh_liveness`]:
+    /// the liveness refresh must be authenticated by the settle, so a stranger cannot
+    /// forge one. Drives the real attack end to end rather than asserting the fence in
+    /// the abstract — including reading the victim's signature back out of the
+    /// UNAUTHENTICATED `GET /jobs/{id}`, which is what puts a replayable credential in a
+    /// stranger's hands: `verify_signature` covers `signing_digest(job_id, output_hash)`
+    /// with no nonce, so a published result stays valid forever. The refresh used to land
+    /// before the lifecycle gates, so this 409 arrived AFTER the victim had already been
+    /// marked live.
+    #[tokio::test]
+    async fn submit_replay_of_a_published_result_does_not_refresh_liveness() {
+        let state = test_state_empty().await;
+        let victim = dev_address();
+        register_dev_earner(&state).await;
+
+        // An honest render settles, publishing the victim's signature.
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap(); // in_flight, dispatch seq 1
+        let result = signed_result(job_id, "deadbeef");
+        let uri = format!("/jobs/{job_id}/submit");
+        let resp =
+            post_submit(state.clone(), &uri, &serde_json::to_value(&result).unwrap(), 1).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the honest settle is accepted");
+
+        // The real earner goes offline.
+        state.earners.lock().await.get_mut(&victim).unwrap().last_seen = 0;
+
+        // A stranger — no token, no registration — reads the signed result straight out
+        // of the open job detail and replays it verbatim.
+        let published = body_json(get(state.clone(), &format!("/jobs/{job_id}")).await).await
+            ["result"]
+            .clone();
+        assert_eq!(
+            published["signature_hex"],
+            serde_json::json!(result.signature_hex),
+            "the victim's signature is published on an unauthenticated read"
+        );
+        let resp = post_submit(state.clone(), &uri, &published, 1).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "the replay is refused — the job is no longer in_flight"
+        );
+        assert_eq!(
+            state.earners.lock().await.get(&victim).unwrap().last_seen,
+            0,
+            "a replayed submit must NOT refresh the victim's last_seen"
+        );
+    }
+
+    /// FM3, the complement: gating the refresh on the accepted path must not kill it.
+    /// The write exists precisely so a long render with no poll in flight stays live, and
+    /// that render ends in an accepted settle — a fence that refreshed on nothing would
+    /// make every mid-render earner reapable, so the reject half above is only half the
+    /// contract.
+    #[tokio::test]
+    async fn submit_accepted_settle_refreshes_liveness() {
+        let state = test_state_empty().await;
+        let victim = dev_address();
+        register_dev_earner(&state).await;
+        state.earners.lock().await.get_mut(&victim).unwrap().last_seen = 0;
+
+        let job = seed_job();
+        let job_id = job.id;
+        enqueue(&state, &job).await;
+        state.store.lock().await.take_next(|_| true).unwrap(); // in_flight, dispatch seq 1
+        let result = signed_result(job_id, "deadbeef");
+        let resp = post_submit(
+            state.clone(),
+            &format!("/jobs/{job_id}/submit"),
+            &serde_json::to_value(&result).unwrap(),
+            1,
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "the honest settle is accepted");
+        assert!(
+            state.earners.lock().await.get(&victim).unwrap().last_seen > 0,
+            "an accepted settle refreshes the earner's last_seen"
+        );
+    }
+
     /// The registered-earner gate: a VALID self-signed result from a key that never
     /// registered is refused 401 (mirroring the bad-attestation branch) and settles
     /// nothing — no credit, no results row, no pending EAS receipt — while the job
