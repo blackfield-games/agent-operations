@@ -307,13 +307,26 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     /// @notice Batch twin of {burn}: destroy `amounts[i]` units of `templateIds[i]` held
     ///         by `from` in one call — salvaging a mixed loadout without a tx per artifact.
     ///         Same holder-or-approved gate as {burn}, and atomic: a length mismatch
-    ///         reverts `ERC1155InvalidArrayLength` and any element that over-burns reverts
-    ///         the whole batch (`ERC1155InsufficientBalance`), so no partial burn commits.
+    ///         reverts `ERC1155InvalidArrayLength`, a zero element reverts `ZeroAmount`,
+    ///         and any element that over-burns reverts the whole batch
+    ///         (`ERC1155InsufficientBalance`), so no partial burn commits.
     /// @dev `_burnBatch` validates the lengths and balances and burns FIRST — a burn fires
     ///      no ERC-1155 receiver hook, so there is no reentrancy window before the counter
     ///      pass — then the loop bumps the burn counters from the same arrays, so a revert
     ///      inside `_burnBatch` never advances a counter. Duplicate ids in one batch
     ///      accumulate correctly (each element adds to `burnedByTemplate[id]`).
+    /// @dev Every element must be non-zero, mirroring {burn}: ERC-1155 checks
+    ///      `fromBalance < value`, which a zero value passes even for a `templateId` `from`
+    ///      never held or that was never registered, so an unguarded zero element emits a
+    ///      phantom `Burned(from, id, 0)` while the counters stay put — invisible to the
+    ///      supply invariants (nothing moves) but real garbage to an indexer tallying
+    ///      artifacts destroyed per template. The check reverts the whole tx from inside the
+    ///      counter loop, unwinding `_burnBatch`'s burns with it, so atomicity is unchanged
+    ///      and no second pass over the batch is needed. Deliberately NO `EmptyBatch` or
+    ///      `MAX_BATCH` guard, unlike the coordinator-driven batch siblings: those bound a
+    ///      buggy or compromised caller acting on others' behalf, whereas this is the holder
+    ///      burning their own tokens on their own gas — a zero-length call emits nothing to
+    ///      spam, and capping salvage would be a UX cost with no trust rationale.
     function burnBatch(address from, uint256[] calldata templateIds, uint256[] calldata amounts) external {
         if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
             revert ERC1155MissingApprovalForAll(msg.sender, from);
@@ -321,6 +334,7 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         _burnBatch(from, templateIds, amounts);
         uint256 burned;
         for (uint256 i = 0; i < templateIds.length; ++i) {
+            if (amounts[i] == 0) revert ZeroAmount();
             burnedByTemplate[templateIds[i]] += amounts[i];
             burned += amounts[i];
             emit Burned(from, templateIds[i], amounts[i]);
