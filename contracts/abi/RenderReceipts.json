@@ -366,6 +366,19 @@
     "type": "function"
   },
   {
+    "inputs": [
+      {
+        "internalType": "bytes32[]",
+        "name": "jobIds",
+        "type": "bytes32[]"
+      }
+    ],
+    "name": "revokeReceipts",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
     "inputs": [],
     "name": "revokedCount",
     "outputs": [

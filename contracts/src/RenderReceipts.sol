@@ -438,4 +438,74 @@ contract RenderReceipts is Ownable2Step {
             })
         );
     }
+
+    /// @notice Revoke a batch of previously-issued render receipts in ONE transaction, instead
+    ///         of N separate `revokeReceipt` calls — the retraction twin of `issueReceipts`.
+    ///         Used to invalidate a whole bad wave at once (a compromised or deauthorized earner
+    ///         whose entire output is fraudulent) without paying N base tx costs or racing N
+    ///         transactions. Every per-job effect of `revokeReceipt` applies PER ELEMENT: the
+    ///         issued-and-not-revoked fence, the live-counter decrements against the STORED
+    ///         earner, the `revokedCount` bump, and the EAS revoke of the persisted uid.
+    ///
+    ///         Authorization is identical to `revokeReceipt` — gated to the `authorizedCoordinators`
+    ///         set, checked ONCE before any state, so a deauthorized coordinator retracts nothing
+    ///         and leaks no gas past the auth revert. An empty batch reverts (`EmptyBatch`) and a
+    ///         batch above the SAME `MAX_BATCH` reverts (`BatchTooLarge`), so the O(n) fence/
+    ///         decrement/revoke loop can never approach the block gas limit.
+    ///
+    ///         Atomicity: ANY bad element — a jobId never issued, already revoked, or repeated
+    ///         within this batch (it hits the fence an earlier element set) — reverts the WHOLE
+    ///         call. Never a partial revoke that desyncs `receiptCount`/`revokedCount` or leaves
+    ///         some attestations live and some retracted with no atomic record of which.
+    ///
+    ///         CEI mirrors `revokeReceipt`: fence + decrement + emit EVERY element BEFORE any
+    ///         external `EAS.revoke`, so a hostile EAS reentering `revokeReceipt`/`revokeReceipts`
+    ///         for a batched job finds it already flagged and is rejected by `AlreadyRevoked` — it
+    ///         can neither double-decrement nor double-revoke. The single `EAS.revoke` is looped
+    ///         per element (no `IEAS` change), and the counters net EXACTLY the sum of N single
+    ///         revokes. Retracts the attestations only, never the region fee-share the matching
+    ///         issue routed — the same attestation-only posture `revokeReceipt` has.
+    function revokeReceipts(bytes32[] calldata jobIds) external {
+        if (!authorizedCoordinators[msg.sender]) revert NotAuthorized();
+
+        uint256 n = jobIds.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
+
+        // Phase 1 (checks + effects): fence each job, decrement the live counters against the
+        // stored earner, bump revokedCount, and cache the uid to revoke. The fence is per ELEMENT,
+        // so a jobId repeated within the batch hits the receiptRevoked flag the earlier element set
+        // and reverts (AlreadyRevoked) — an intra-batch duplicate can never double-decrement. The
+        // uid==0 guard mirrors revokeReceipt: unreachable outside a reentrant issue window, kept so
+        // the guarantee is self-contained. Each element's guards prove one un-revoked issue exists,
+        // so both decrements are >= 1 (checked arithmetic backstops any underflow regardless).
+        bytes32[] memory uids = new bytes32[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            bytes32 jobId = jobIds[i];
+            if (!receiptIssued[jobId]) revert NotIssued(jobId);
+            if (receiptRevoked[jobId]) revert AlreadyRevoked(jobId);
+            bytes32 uid = receiptUid[jobId];
+            if (uid == bytes32(0)) revert NotIssued(jobId);
+
+            receiptRevoked[jobId] = true;
+            address earner = _receiptEarner[jobId];
+            --receiptCount;
+            --receiptsByEarner[earner];
+            ++revokedCount;
+            uids[i] = uid;
+            emit ReceiptRevoked(uid, earner, jobId);
+        }
+
+        // Phase 2: revoke each stored uid LAST, after the whole batch is flagged revoked and the
+        // counters are fully decremented (checks-effects-interactions). By the time any EAS gets
+        // control every batched receipt is already retracted, so a reentrant revoke of ANY batched
+        // job hits AlreadyRevoked — the batch twin of revokeReceipt's single-call CEI.
+        for (uint256 i = 0; i < n; ++i) {
+            EAS.revoke(
+                IEAS.RevocationRequest({
+                    schema: schemaUid, data: IEAS.RevocationRequestData({uid: uids[i], value: 0})
+                })
+            );
+        }
+    }
 }
