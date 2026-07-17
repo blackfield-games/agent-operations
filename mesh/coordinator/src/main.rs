@@ -559,14 +559,36 @@ struct Attestation {
     revoked_at: Option<i64>,
 }
 
+/// The ComputeMeter debit state for a job on `GET /jobs/{id}` — the metering twin of
+/// [`Attestation`]. The `JobDetail.debit` field is non-`null` iff the job has a
+/// `pending_debits` row, i.e. a metered settle charged its validated compute (the same
+/// settle that owes the attestation above). `amount_wei` is the owed charge in decimal
+/// wei; `tx_hash` + `submitted_at` stay `null` until the (operator-gated) spender lands
+/// the `ComputeMeter.spendOnce` on Base, then carry the real spend tx hash + unix submit
+/// time. A client thus tells three states apart:
+/// `debit: null` (unmetered — no buyer / rate 0, so nothing is charged, the twin of
+/// `attestation: null`), `debit: { amount_wei, tx_hash: null, submitted_at: null }`
+/// (owed but not yet spent), and `debit: { amount_wei, tx_hash, submitted_at }` (spent
+/// on-chain). Deliberately carries no `dead_lettered_at`: a quarantined-but-owed charge
+/// still reads as plain 'owed' (see [`Store::debit_readback`](store::Store::debit_readback)).
+#[derive(Debug, Serialize)]
+struct Debit {
+    amount_wei: String,
+    tx_hash: Option<String>,
+    submitted_at: Option<i64>,
+}
+
 /// Full detail for `GET /jobs/{id}`: the job's `JobSpec`, its recorded `JobResult` once
-/// the job has completed (`null` until then), and its EAS [`Attestation`] state (`null`
-/// when the job owes no on-chain receipt; see [`Attestation`] for the three states).
+/// the job has completed (`null` until then), its EAS [`Attestation`] state (`null` when
+/// the job owes no on-chain receipt; see [`Attestation`] for the four states), and its
+/// ComputeMeter [`Debit`] state (`null` when the job owes no charge; see [`Debit`] for
+/// the three states) — the on-chain receipt and the compute charge read back side by side.
 #[derive(Debug, Serialize)]
 struct JobDetail {
     spec: JobSpec,
     result: Option<JobResult>,
     attestation: Option<Attestation>,
+    debit: Option<Debit>,
 }
 
 /// Query string for `GET /jobs`. `status`, when present, filters the listing to
@@ -3854,7 +3876,15 @@ async fn job_detail(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
-    Ok(Json(JobDetail { spec, result, attestation }))
+    let debit = match store.debit_readback(&id) {
+        Ok(Some((amount_wei, tx_hash, submitted_at))) => Some(Debit { amount_wei, tx_hash, submitted_at }),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!(?id, ?e, "job_detail: debit_readback failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    Ok(Json(JobDetail { spec, result, attestation, debit }))
 }
 
 /// Upper bound on rows returned by `GET /jobs`, to keep the payload bounded.

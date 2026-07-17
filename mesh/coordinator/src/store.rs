@@ -63,6 +63,14 @@ pub type DeadLetteredRevocationRow = (uuid::Uuid, String, u64, u16, i64, u32);
 /// clippy's type-complexity bound.
 pub type AttestationReadback = (Option<String>, Option<i64>, Option<i64>);
 
+/// The `(amount_wei, tx_hash, submitted_at)` triple [`Store::debit_readback`] returns
+/// for a job that owes a ComputeMeter charge. `amount_wei` is always present (a debit
+/// row exists only once a metered settle wrote it), while `tx_hash` + `submitted_at`
+/// stay `None` until the (operator-gated) spender lands the charge on Base, so the
+/// `GET /jobs/{id}` read tells owed from spent. Aliased to keep the readback signature
+/// within clippy's type-complexity bound. The metering twin of [`AttestationReadback`].
+pub type DebitReadback = (String, Option<String>, Option<i64>);
+
 /// Treat an `ALTER TABLE ... ADD COLUMN` that fails only because the column
 /// already exists as a success — that is the expected case for a DB created on
 /// a later boot. Any other error propagates unchanged.
@@ -2538,6 +2546,33 @@ impl Store {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
                     r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Read back the pending ComputeMeter debit for a job on `GET /jobs/{id}`: the owed
+    /// `amount_wei` plus the on-chain `tx_hash` + `submitted_at`, both `None` until the
+    /// (operator-gated) spender settles the charge. `None` (no row) when the job owes no
+    /// debit — unmetered (no buyer, rate 0, or zero render-seconds), the twin of
+    /// `attestation: null`. Deliberately does NOT surface `dead_lettered_at`: a
+    /// quarantined-but-owed charge still reads as plain 'owed', keeping this readback
+    /// outside the dead-letter family exactly like [`attestation_readback`](Self::attestation_readback).
+    /// The non-test read twin of the test-only [`pending_debit`](Self::pending_debit).
+    pub fn debit_readback(&self, job_id: &uuid::Uuid) -> Result<Option<DebitReadback>> {
+        let row = self.conn.query_row(
+            "SELECT amount_wei, tx_hash, submitted_at FROM pending_debits WHERE job_id = ?1",
+            [&job_id.to_string()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
                     r.get::<_, Option<i64>>(2)?,
                 ))
             },
