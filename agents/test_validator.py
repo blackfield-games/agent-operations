@@ -1414,6 +1414,41 @@ async def test_run_rejects_an_over_placed_required_asset_and_routes_to_prop(tmp_
     assert _route_back_target(verdict) == "prop"
 
 
+async def test_run_rejects_a_fabricated_required_asset_under_a_must_have_less_director(tmp_path):
+    # FM2 (false accept, the empty-must_have mirror of the over-placed case above): the director
+    # demands nothing, so prop._required_block emits no Required prim at all — a layer carrying one
+    # is stale or tampered. Nothing else catches it: the triangle gate prices whatever markers are
+    # in the body (so a metric inflated to match reconciles), and the count and fill gates never
+    # read required assets. The equality has to hold at zero, or a fabricated hero ships accepted.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(),
+        "prop": _prop_body(["comms_tower_01"]),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("over-placed" in i and "comms_tower_01" in i for i in verdict.issues)
+    assert "prop" in verdict.failing_specialists
+    assert not any("director" in i for i in verdict.issues)  # must not misroute to the director loop
+    assert _failing_specialist(verdict.issues) == "prop"
+    assert _route_back_target(verdict) == "prop"
+
+
+async def test_run_rejects_a_fabricated_required_asset_when_no_must_have_token_maps(tmp_path):
+    # The vocabulary-drift half of the same hole: the director DOES seed must_have, but no token
+    # maps, so prop._required_assets skips them all and prop places nothing — the required set is
+    # empty for a reason that is not "the director asked for nothing". The unmappable token is the
+    # accepted case (test_run_does_not_false_reject_an_unmappable_must_have_token) precisely
+    # because prop placed nothing for it; a hero appearing anyway is still a desync.
+    layers = _set_with(tmp_path, {
+        "director": _director_body(must_have="floating_citadel"),
+        "prop": _prop_body(["comms_tower_01"]),
+    })
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("over-placed" in i and "comms_tower_01" in i for i in verdict.issues)
+    assert _route_back_target(verdict) == "prop"
+
+
 async def test_run_rejects_an_uncapped_biome_under_a_capping_director(tmp_path):
     # FM2 (false accept, biome twin): the director's must_not carries the cap token but
     # biome emits no vegetationCapped marker — rejected and routed back to biome.
