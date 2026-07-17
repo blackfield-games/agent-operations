@@ -8,7 +8,7 @@ import {RegionAuthority} from "../src/RegionAuthority.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {IERC1155Receiver} from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {IERC20Errors, IERC1155Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 contract MockToken is ERC20 {
     constructor() ERC20("Mock", "MCK") {
@@ -42,6 +42,7 @@ contract ArtifactTemplateTest is Test {
         uint256 indexed templateId, address indexed author, uint16 rarity, bytes32 manifest
     );
     event Minted(address indexed to, uint256 indexed templateId, uint256 amount);
+    event Burned(address indexed from, uint256 indexed templateId, uint256 amount);
     event MinterSet(address indexed minter);
     event MintFeeRateSet(uint256 rate);
     event RoyaltyRateSet(uint256 rate);
@@ -964,6 +965,252 @@ contract ArtifactTemplateTest is Test {
         vm.prank(player);
         art.setMinter(stranger);
         assertEq(art.minter(), stranger);
+    }
+
+    // --- burn ---
+
+    /// @dev Register a rarity-0 (free-mint) template and mint `amount` to `player`, so a
+    ///      burn test starts from a known balance without funding the fee/royalty ledgers.
+    function _registerAndMint(uint256 amount, uint256 maxSupply) internal returns (uint256 id) {
+        vm.prank(minter);
+        id = art.registerTemplate(author, 0, keccak256("m"), maxSupply);
+        vm.prank(minter);
+        art.mint(player, id, amount, regionId, "");
+    }
+
+    function test_burn_holderDestroysOwnUnits() public {
+        uint256 id = _registerAndMint(5, 0);
+
+        vm.expectEmit(true, true, false, true);
+        emit Burned(player, id, 2);
+        vm.prank(player);
+        art.burn(player, id, 2);
+
+        assertEq(art.balanceOf(player, id), 3, "balance drops by the burned amount");
+        assertEq(art.burnedByTemplate(id), 2);
+        assertEq(art.totalBurned(), 2);
+        // The mint counters are monotonic — a burn never touches them.
+        assertEq(art.mintedByTemplate(id), 5, "burn must not lower mintedByTemplate");
+        assertEq(art.totalMinted(), 5, "burn must not lower totalMinted");
+    }
+
+    /// @dev FM2: an operator the holder approved via setApprovalForAll may burn on the
+    ///      holder's behalf — the standard ERC-1155 allowance the salvage/craft flow rides.
+    function test_burn_approvedOperatorBurnsOnBehalf() public {
+        uint256 id = _registerAndMint(5, 0);
+
+        vm.prank(player);
+        art.setApprovalForAll(stranger, true);
+
+        vm.expectEmit(true, true, false, true);
+        emit Burned(player, id, 4);
+        vm.prank(stranger);
+        art.burn(player, id, 4);
+
+        assertEq(art.balanceOf(player, id), 1);
+        assertEq(art.burnedByTemplate(id), 4);
+    }
+
+    /// @dev FM2: a caller who is neither the holder nor an approved operator cannot destroy
+    ///      the holder's artifacts — the burn reverts and leaves the balance + counters intact.
+    function test_burn_revertsUnauthorized() public {
+        uint256 id = _registerAndMint(5, 0);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC1155Errors.ERC1155MissingApprovalForAll.selector, stranger, player)
+        );
+        vm.prank(stranger);
+        art.burn(player, id, 1);
+
+        assertEq(art.balanceOf(player, id), 5, "an unauthorized burn changes nothing");
+        assertEq(art.totalBurned(), 0);
+    }
+
+    /// @dev FM2: revoking a prior approval closes the operator's burn power again.
+    function test_burn_revertsAfterApprovalRevoked() public {
+        uint256 id = _registerAndMint(5, 0);
+        vm.prank(player);
+        art.setApprovalForAll(stranger, true);
+        vm.prank(player);
+        art.setApprovalForAll(stranger, false);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC1155Errors.ERC1155MissingApprovalForAll.selector, stranger, player)
+        );
+        vm.prank(stranger);
+        art.burn(player, id, 1);
+    }
+
+    /// @dev FM2/FM3: burning more than the balance reverts with the ERC-1155 balance error
+    ///      before any counter moves — no partial burn, no counter drift.
+    function test_burn_revertsInsufficientBalance() public {
+        uint256 id = _registerAndMint(3, 0);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC1155Errors.ERC1155InsufficientBalance.selector, player, 3, 4, id)
+        );
+        vm.prank(player);
+        art.burn(player, id, 4);
+
+        assertEq(art.balanceOf(player, id), 3);
+        assertEq(art.burnedByTemplate(id), 0);
+        assertEq(art.totalBurned(), 0);
+    }
+
+    /// @dev A zero-amount burn is rejected (mirrors mint's ZeroAmount) so it can't spam a
+    ///      no-op Burned/TransferSingle event; nothing moves.
+    function test_burn_revertsZeroAmount() public {
+        uint256 id = _registerAndMint(5, 0);
+
+        vm.expectRevert(ArtifactTemplate.ZeroAmount.selector);
+        vm.prank(player);
+        art.burn(player, id, 0);
+
+        assertEq(art.balanceOf(player, id), 5);
+        assertEq(art.totalBurned(), 0);
+    }
+
+    /// @dev FM1 (the headline): burning does NOT free supply-cap headroom. The cap bounds
+    ///      cumulative MINTS (mintedByTemplate), not circulating supply, so a holder cannot
+    ///      mint to the cap, burn, and mint again past the intended scarcity.
+    function test_burn_doesNotFreeSupplyCap() public {
+        // Capped at 10, rarity 0 so the cap is exercised free of the fee/royalty.
+        uint256 id = _registerAndMint(10, 10); // exact-fill the cap
+        assertEq(art.mintedByTemplate(id), 10);
+
+        // Burn 4 — circulating supply is now 6, but mintedByTemplate stays 10.
+        vm.prank(player);
+        art.burn(player, id, 4);
+        assertEq(art.balanceOf(player, id), 6);
+        assertEq(art.mintedByTemplate(id), 10, "cumulative mints unchanged by a burn");
+        assertEq(art.burnedByTemplate(id), 4);
+
+        // A further mint of even ONE unit still reverts — the cap counts cumulative mints
+        // (10), not the 6 in circulation, so burning bought no headroom.
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 11, 10));
+        vm.prank(minter);
+        art.mint(player, id, 1, regionId, "");
+    }
+
+    /// @dev FM3: totalBurned tracks the sum of burnedByTemplate across templates.
+    function test_burn_totalBurnedSumsAcrossTemplates() public {
+        uint256 a = _registerAndMint(6, 0);
+        uint256 b = _registerAndMint(9, 0);
+
+        vm.startPrank(player);
+        art.burn(player, a, 2);
+        art.burn(player, b, 5);
+        art.burn(player, a, 1);
+        vm.stopPrank();
+
+        assertEq(art.burnedByTemplate(a), 3);
+        assertEq(art.burnedByTemplate(b), 5);
+        assertEq(art.totalBurned(), 8, "totalBurned == sum of per-template burns");
+        // Mint side is untouched by any burn.
+        assertEq(art.totalMinted(), 15);
+    }
+
+    // --- burnBatch ---
+
+    function test_burnBatch_destroysMultipleTemplates() public {
+        uint256 a = _registerAndMint(6, 0);
+        uint256 b = _registerAndMint(9, 0);
+
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        (ids[0], ids[1]) = (a, b);
+        (amounts[0], amounts[1]) = (2, 5);
+
+        // A Burned event per element, in order.
+        vm.expectEmit(true, true, false, true);
+        emit Burned(player, a, 2);
+        vm.expectEmit(true, true, false, true);
+        emit Burned(player, b, 5);
+        vm.prank(player);
+        art.burnBatch(player, ids, amounts);
+
+        assertEq(art.balanceOf(player, a), 4);
+        assertEq(art.balanceOf(player, b), 4);
+        assertEq(art.burnedByTemplate(a), 2);
+        assertEq(art.burnedByTemplate(b), 5);
+        assertEq(art.totalBurned(), 7);
+        assertEq(art.mintedByTemplate(a), 6, "burn leaves the mint counters alone");
+        assertEq(art.mintedByTemplate(b), 9);
+    }
+
+    /// @dev FM3: a batch is atomic — one element that over-burns reverts the WHOLE batch,
+    ///      so no earlier element's burn or counter bump commits.
+    function test_burnBatch_atomicOnOverBurn() public {
+        uint256 a = _registerAndMint(6, 0);
+        uint256 b = _registerAndMint(9, 0);
+
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        (ids[0], ids[1]) = (a, b);
+        (amounts[0], amounts[1]) = (2, 10); // b holds only 9
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC1155Errors.ERC1155InsufficientBalance.selector, player, 9, 10, b)
+        );
+        vm.prank(player);
+        art.burnBatch(player, ids, amounts);
+
+        // Nothing committed: the first element's 2 did NOT burn.
+        assertEq(art.balanceOf(player, a), 6);
+        assertEq(art.balanceOf(player, b), 9);
+        assertEq(art.burnedByTemplate(a), 0);
+        assertEq(art.totalBurned(), 0);
+    }
+
+    /// @dev A length mismatch between ids and amounts reverts before any burn.
+    function test_burnBatch_revertsLengthMismatch() public {
+        uint256 a = _registerAndMint(6, 0);
+
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](1);
+        (ids[0], ids[1]) = (a, a);
+        amounts[0] = 1;
+
+        vm.expectRevert(abi.encodeWithSelector(IERC1155Errors.ERC1155InvalidArrayLength.selector, 2, 1));
+        vm.prank(player);
+        art.burnBatch(player, ids, amounts);
+
+        assertEq(art.totalBurned(), 0);
+    }
+
+    function test_burnBatch_revertsUnauthorized() public {
+        uint256 a = _registerAndMint(6, 0);
+
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory amounts = new uint256[](1);
+        ids[0] = a;
+        amounts[0] = 1;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC1155Errors.ERC1155MissingApprovalForAll.selector, stranger, player)
+        );
+        vm.prank(stranger);
+        art.burnBatch(player, ids, amounts);
+
+        assertEq(art.balanceOf(player, a), 6);
+    }
+
+    /// @dev Duplicate ids in one batch accumulate into burnedByTemplate correctly (each
+    ///      element adds), so the per-template tally never under-counts a repeated id.
+    function test_burnBatch_duplicateIdsAccumulate() public {
+        uint256 a = _registerAndMint(6, 0);
+
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        (ids[0], ids[1]) = (a, a);
+        (amounts[0], amounts[1]) = (2, 3);
+
+        vm.prank(player);
+        art.burnBatch(player, ids, amounts);
+
+        assertEq(art.balanceOf(player, a), 1, "6 - (2 + 3)");
+        assertEq(art.burnedByTemplate(a), 5);
+        assertEq(art.totalBurned(), 5);
     }
 }
 
