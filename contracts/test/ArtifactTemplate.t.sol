@@ -1195,6 +1195,67 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.balanceOf(player, a), 6);
     }
 
+    /// @dev The batch mirror of test_burn_revertsZeroAmount: a zero element is rejected so it
+    ///      can't spam a no-op Burned event. ERC-1155's balance check is `fromBalance < value`,
+    ///      which 0 < 0 passes, so an UNREGISTERED id the holder has never touched sails through
+    ///      _burnBatch untouched — the counters never move (the supply invariants are blind to
+    ///      this by construction), leaving the event as the only trace an indexer would ingest.
+    function test_burnBatch_revertsZeroAmount() public {
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory amounts = new uint256[](1);
+        ids[0] = 999_999; // never registered, never held
+        amounts[0] = 0;
+
+        vm.expectRevert(ArtifactTemplate.ZeroAmount.selector);
+        vm.prank(player);
+        art.burnBatch(player, ids, amounts);
+
+        assertEq(art.burnedByTemplate(999_999), 0);
+        assertEq(art.totalBurned(), 0);
+    }
+
+    /// @dev Atomicity over the zero guard: the check sits in the counter loop that runs AFTER
+    ///      _burnBatch has already burned, so the revert must unwind the earlier elements too.
+    ///      A batch with one zero element burns NOTHING — never a partial salvage the caller
+    ///      believes settled in full.
+    function test_burnBatch_atomicOnZeroAmount() public {
+        uint256 a = _registerAndMint(6, 0);
+        uint256 b = _registerAndMint(9, 0);
+
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        (ids[0], ids[1]) = (a, b);
+        (amounts[0], amounts[1]) = (2, 0); // the first element is a legitimate burn
+
+        vm.expectRevert(ArtifactTemplate.ZeroAmount.selector);
+        vm.prank(player);
+        art.burnBatch(player, ids, amounts);
+
+        assertEq(art.balanceOf(player, a), 6, "the leading element's 2 did NOT burn");
+        assertEq(art.balanceOf(player, b), 9);
+        assertEq(art.burnedByTemplate(a), 0);
+        assertEq(art.totalBurned(), 0);
+    }
+
+    /// @dev The complement of the zero guard: an all-positive salvage still burns unchanged, so
+    ///      the guard rejects only the no-op element and never a holder's real mixed batch.
+    function test_burnBatch_allPositiveUnaffectedByZeroGuard() public {
+        uint256 a = _registerAndMint(6, 0);
+        uint256 b = _registerAndMint(9, 0);
+
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        (ids[0], ids[1]) = (a, b);
+        (amounts[0], amounts[1]) = (1, 9); // b burns to exactly zero balance
+
+        vm.prank(player);
+        art.burnBatch(player, ids, amounts);
+
+        assertEq(art.balanceOf(player, a), 5);
+        assertEq(art.balanceOf(player, b), 0, "burning the full holding is not a zero AMOUNT");
+        assertEq(art.totalBurned(), 10);
+    }
+
     /// @dev Duplicate ids in one batch accumulate into burnedByTemplate correctly (each
     ///      element adds), so the per-template tally never under-counts a repeated id.
     function test_burnBatch_duplicateIdsAccumulate() public {
