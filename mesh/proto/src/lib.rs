@@ -7,6 +7,13 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use uuid::Uuid;
 
+/// HTTP header carrying the single-use registration challenge on both legs of the
+/// `/register` handshake: the coordinator returns it on `GET /register/challenge`,
+/// and the earner echoes it on its `POST /register` (having folded the nonce into
+/// the signed [`hello_digest`]). Shared here so the two binaries key on one string
+/// and can never drift, exactly as they share the digest itself.
+pub const REGISTER_CHALLENGE_HEADER: &str = "x-register-challenge";
+
 /// Canonical message digest signed by the earner's session key and verified by
 /// the coordinator. Both sides MUST agree byte-for-byte, so the construction is
 /// fixed here and shared.

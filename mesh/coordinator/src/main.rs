@@ -368,6 +368,15 @@ struct AppState {
     /// rate-limit seam (`check_registration_rate`) refills + consumes under this lock
     /// on both registration paths; bounded at [`MAX_REGISTRATION_BUCKETS`].
     registration_buckets: Mutex<HashMap<IpAddr, RateBucket>>,
+    /// Outstanding single-use HTTP register challenges: nonce bytes → issued epoch
+    /// seconds. `GET /register/challenge` mints one; `POST /register` consumes it
+    /// (removed on use, so a captured `Hello` can register at most once) and folds
+    /// it into the verified [`proto::hello_digest`] — closing the capture-replay an
+    /// empty HTTP nonce left open, where a replayed registration refreshed a
+    /// victim's liveness and rotated its poll token out from under it. The WS path
+    /// does not touch this: it holds its per-connection challenge in memory. Bounded
+    /// at [`MAX_REGISTER_CHALLENGES`], swept by TTL on mint.
+    register_challenges: Mutex<HashMap<[u8; HELLO_NONCE_BYTES], i64>>,
     /// Per-source registrations allowed per [`REGISTRATION_WINDOW_SECS`]. Read by the
     /// registration rate-limit seam. Validated >= 1 in `with_store`. Mirrors
     /// `--max-registrations` / `COORDINATOR_MAX_REGISTRATIONS`.
@@ -512,6 +521,7 @@ impl AppState {
             max_queued_jobs: cfg.max_queued_jobs,
             max_earners: cfg.max_earners,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: cfg.max_registrations,
             trusted_proxies: cfg.trusted_proxies,
             registrations_shed: AtomicU64::new(0),
@@ -1837,6 +1847,26 @@ const DEFAULT_MAX_REGISTRATIONS: u32 = 4096;
 /// the map stays bounded. A const, not a knob: a backstop on a backstop.
 const MAX_REGISTRATION_BUCKETS: usize = 65_536;
 
+/// How long a minted register challenge stays usable. The honest earner GETs one
+/// and immediately POSTs its `Hello` (sub-second), so this is slack for a slow
+/// link, not a tuned value; an unconsumed challenge is swept on the next mint or
+/// rejected on presentation past it. Short by design — it bounds only the gap
+/// between issue and use, and the challenge is single-use, so consumption closes
+/// the window even before the TTL does.
+const REGISTER_CHALLENGE_TTL_SECS: i64 = 30;
+
+/// Cap on the outstanding-challenge map, so minting cannot be turned into the
+/// memory-DoS it defends against (mirrors [`MAX_REGISTRATION_BUCKETS`]). A mint at
+/// the cap first sweeps expired challenges — lossless, since an expired challenge
+/// would be rejected anyway — then, if still full, drops the oldest. Sized far
+/// above the handful of challenges an honest fleet holds unconsumed at once (each
+/// lives ~one round trip). A determined volumetric flood of mints can still churn
+/// the map, but memory stays bounded and honest challenges — consumed within a
+/// round trip of minting — are the newest entries, so eviction (oldest-first)
+/// reaches them last; sustained flooding is edge/OS territory, as for the
+/// per-source registration limiter.
+const MAX_REGISTER_CHALLENGES: usize = 65_536;
+
 /// Retention sweep: max terminal jobs deleted per batch. The store lock is held
 /// for just one bounded delete before the reaper releases it, so a large aged
 /// backlog cannot stall dispatch/settle behind a single long `DELETE` (FM2).
@@ -2597,6 +2627,7 @@ fn router_with_body_timeout(state: Arc<AppState>, body_read_timeout: Duration) -
     Router::new()
         .route("/health", get(health))
         .route("/register", post(register).layer(body_guard()))
+        .route("/register/challenge", get(register_challenge))
         .route("/stats", get(stats))
         .route("/earners", get(earners))
         // POST carries the body guards (a mutating, body-bearing route like
@@ -2761,6 +2792,56 @@ fn validate_hello(
         });
     }
     Ok(())
+}
+
+/// Mint a fresh single-use register challenge into `store`, bounding the map: at
+/// `max`, first sweep entries older than the TTL (they would be rejected anyway),
+/// then, if still full, drop the oldest so a new challenge always has room. Returns
+/// the nonce bytes, or `None` if the OS RNG is unavailable (mint fails closed
+/// rather than hand out a guessable challenge). The stored value is the issue time,
+/// against which [`register`] checks freshness on consumption.
+fn mint_register_challenge(
+    store: &mut HashMap<[u8; HELLO_NONCE_BYTES], i64>,
+    now: i64,
+    max: usize,
+) -> Option<[u8; HELLO_NONCE_BYTES]> {
+    let mut nonce = [0u8; HELLO_NONCE_BYTES];
+    getrandom::getrandom(&mut nonce).ok()?;
+    if store.len() >= max {
+        store.retain(|_, &mut issued| now.saturating_sub(issued) <= REGISTER_CHALLENGE_TTL_SECS);
+    }
+    if store.len() >= max {
+        if let Some(oldest) = store.iter().min_by_key(|(_, &issued)| issued).map(|(k, _)| *k) {
+            store.remove(&oldest);
+        }
+    }
+    store.insert(nonce, now);
+    Some(nonce)
+}
+
+/// `GET /register/challenge` — issue the single-use anti-replay nonce the HTTP
+/// registration handshake needs, returned in [`proto::REGISTER_CHALLENGE_HEADER`].
+/// The earner folds it into its `Hello` signature and echoes it on `POST
+/// /register`, where the coordinator consumes it. This is the HTTP rendering of the
+/// WS opening `Challenge` frame; unlike WS (a single connection that holds its
+/// nonce in memory), HTTP is two requests, so the nonce is parked in
+/// `register_challenges` between them.
+///
+/// Not per-source rate-limited: minting is cheap and the map is bounded + swept
+/// (see [`MAX_REGISTER_CHALLENGES`]), so the amplification risk — memory — is
+/// closed, and `POST /register` keeps its own per-source limiter. A valid challenge
+/// is required to register, and obtaining one that survives to consumption still
+/// funnels through that limiter, so the registration rate stays bounded.
+async fn register_challenge(
+    State(state): State<Arc<AppState>>,
+) -> Result<[(&'static str, String); 1], StatusCode> {
+    let now = now_secs();
+    let mut store = state.register_challenges.lock().await;
+    let Some(nonce) = mint_register_challenge(&mut store, now, MAX_REGISTER_CHALLENGES) else {
+        tracing::error!("register challenge: RNG failed; refusing to mint");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    Ok([(proto::REGISTER_CHALLENGE_HEADER, hex::encode(nonce))])
 }
 
 /// Earner → coordinator registration. Accepts an `EarnerMsg::Hello` and
@@ -5196,6 +5277,60 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .expect("register issues a poll token")
             .to_string()
+    }
+
+    /// GET a fresh register challenge, asserting the mint succeeds, and return its
+    /// (raw nonce bytes, hex) — the earner's first step, and the input every honest
+    /// `/register` test now signs its `Hello` over.
+    async fn mint_challenge(state: Arc<AppState>) -> (Vec<u8>, String) {
+        let resp = router(state)
+            .layer(Extension(PeerAddr(test_peer())))
+            .oneshot(Request::builder().uri("/register/challenge").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "challenge mint should succeed");
+        let hex = resp
+            .headers()
+            .get(proto::REGISTER_CHALLENGE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .expect("challenge mint returns the nonce header")
+            .to_string();
+        let bytes = hex::decode(&hex).expect("challenge nonce is hex");
+        (bytes, hex)
+    }
+
+    /// Each `GET /register/challenge` returns a distinct nonce — the freshness the
+    /// single-use fence relies on — and parks it for consumption.
+    #[tokio::test]
+    async fn register_challenge_mint_is_fresh_each_time() {
+        let state = test_state_empty().await;
+        let (_, a) = mint_challenge(state.clone()).await;
+        let (_, b) = mint_challenge(state.clone()).await;
+        assert_ne!(a, b, "each challenge mint is unique");
+        assert_eq!(
+            state.register_challenges.lock().await.len(),
+            2,
+            "both minted challenges are parked awaiting consumption"
+        );
+    }
+
+    /// The challenge map is bounded: minting at the cap first sweeps expired
+    /// entries, then evicts the oldest, so it can never grow without limit.
+    #[test]
+    fn mint_register_challenge_bounds_the_map() {
+        let mut store = HashMap::new();
+        assert!(mint_register_challenge(&mut store, 100, 2).is_some());
+        assert!(mint_register_challenge(&mut store, 100, 2).is_some());
+        assert_eq!(store.len(), 2);
+        // At the cap with both entries still within TTL: nothing to sweep, so the
+        // oldest is evicted and the map holds at the cap.
+        assert!(mint_register_challenge(&mut store, 100, 2).is_some());
+        assert_eq!(store.len(), 2, "at the cap with all live, minting evicts the oldest");
+        // Past the TTL: the expired entries are swept first, so the fresh mint lands
+        // with room and no eviction is needed.
+        let later = 100 + REGISTER_CHALLENGE_TTL_SECS + 1;
+        assert!(mint_register_challenge(&mut store, later, 2).is_some());
+        assert_eq!(store.len(), 1, "expired challenges are swept before eviction");
     }
 
     #[tokio::test]
@@ -14621,6 +14756,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -14766,6 +14902,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -16034,6 +16171,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -16962,6 +17100,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17023,6 +17162,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17089,6 +17229,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17118,6 +17259,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17220,6 +17362,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17338,6 +17481,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17394,6 +17538,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17463,6 +17608,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17526,6 +17672,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17580,6 +17727,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17647,6 +17795,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17720,6 +17869,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
@@ -17792,6 +17942,7 @@ mod tests {
             max_queued_jobs: DEFAULT_MAX_QUEUED_JOBS,
             max_earners: DEFAULT_MAX_EARNERS,
             registration_buckets: Mutex::new(HashMap::new()),
+            register_challenges: Mutex::new(HashMap::new()),
             max_registrations: DEFAULT_MAX_REGISTRATIONS,
             trusted_proxies: TrustedProxies::default(),
             registrations_shed: AtomicU64::new(0),
