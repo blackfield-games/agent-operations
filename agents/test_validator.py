@@ -3061,6 +3061,11 @@ def _prop_spec(triangles: float) -> LayerSpec:
     )
 
 
+# The must-have asset -> director token inverse, so a fixture placing a hero can seed the intent that
+# demands it without hardcoding a second copy of the vocabulary.
+_MUST_HAVE_TOKEN = {a: t for t, a in prop.MUST_HAVE_ASSET.items()}
+
+
 def _prop_expected(count: int, required: list[str]) -> float:
     return float(count * prop._asset_tris(_REGION_ASSET) + sum(prop._asset_tris(a) for a in required))
 
@@ -3131,14 +3136,21 @@ def _prop_metric_set(
     """A full well-formed set with prop declaring `placement_count` × the `fill_asset` fill + `required`
     heroes and metering `prop_tris`, the optimization body re-synced to the resulting summed geometry so
     the budget gate stays silent — only the prop self-consistency checks are exercised. `fill_asset`
-    defaults to the region-true pick (selection gate silent); pass a wrong/unknown asset to drive it."""
+    defaults to the region-true pick (selection gate silent); pass a wrong/unknown asset to drive it.
+    A non-empty `required` also seeds the director's intent:must_have with the tokens those assets came
+    from (reverse-mapped through prop's OWN table, so the fixture tracks a vocabulary change in
+    lock-step) — prop places a Required prim only for a demanded token, so a hero beside a must_have-less
+    director is a world the pipeline cannot emit and the intent gate rightly rejects it as over-placed."""
     summed = 262144.0 + 100000.0 + 144000.0 + prop_tris  # terrain + biome + npc + prop metrics
+    must_have = ",".join(_MUST_HAVE_TOKEN[a] for a in required)
     out: list[LayerSpec] = []
     for s in SPECIALISTS:
         if s == "prop":
             out.append(
                 _layer(root, "prop", body=_prop_body(required, placement_count=placement_count, fill_asset=fill_asset), metrics={"triangles": prop_tris})
             )
+        elif s == "director" and required:
+            out.append(_layer(root, "director", body=_director_body(must_have=must_have)))
         elif s == "optimization":
             body = _opt_body(authored=summed, observed=summed, over_budget=False)
             out.append(_layer(root, "optimization", body=body, metrics={"over_budget": 0.0}))
