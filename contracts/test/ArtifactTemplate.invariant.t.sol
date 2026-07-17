@@ -64,6 +64,9 @@ contract ArtifactTemplateHandler is Test {
     mapping(address => uint256) public ghost_registeredByAuthor;
     mapping(uint256 => uint256) public ghost_supply;
     mapping(uint256 => uint256) public ghost_maxSupply;
+    // Cumulative burned per template, the destroy-side mirror of ghost_supply. Circulating
+    // supply of a template is ghost_supply(id) - ghost_burned(id); burns never touch supply.
+    mapping(uint256 => uint256) public ghost_burned;
 
     constructor(ArtifactTemplate art_, address[] memory actors_) {
         art = art_;
@@ -107,6 +110,21 @@ contract ArtifactTemplateHandler is Test {
         // is arbitrary here — the NoopRegionAuthority sinks the royalty leg.
         art.mint(to, id, amount, 1, "");
         ghost_supply[id] += amount;
+    }
+
+    /// @dev Burn some of an actor's own holdings, pranked as that actor so the call passes
+    ///      the holder-or-approved gate. Interleaved freely with mint by the fuzzer, so the
+    ///      accounting + cap invariants are proven to hold under any mint/burn ordering.
+    function burn(uint256 idSeed, uint256 fromSeed, uint256 amount) external {
+        if (ids.length == 0) return;
+        uint256 id = ids[idSeed % ids.length];
+        address from = actors[fromSeed % actors.length];
+        uint256 bal = art.balanceOf(from, id);
+        if (bal == 0) return; // nothing to burn — skip rather than revert-discard the call
+        amount = bound(amount, 1, bal);
+        vm.prank(from);
+        art.burn(from, id, amount);
+        ghost_burned[id] += amount;
     }
 
     // -----------------------------------------------------------------------
@@ -161,8 +179,9 @@ contract ArtifactTemplateInvariantTest is Test {
         assertEq(art.nextTemplateId(), handler.ghost_registered());
     }
 
-    /// @dev Sum of balanceOf(actor, id) over all actors equals the total minted for
-    ///      that id (no transfers or burns occur during the run, so accounting is exact).
+    /// @dev Sum of balanceOf(actor, id) over all actors equals a template's CIRCULATING
+    ///      supply — cumulative minted minus cumulative burned (no transfers occur, so
+    ///      every unit is held by an actor or was burned).
     function invariant_supplyEqualsSummedBalances() public view {
         uint256 len = handler.idsLength();
         for (uint256 i = 0; i < len; i++) {
@@ -172,7 +191,7 @@ contract ArtifactTemplateInvariantTest is Test {
             for (uint256 j = 0; j < actorsLen; j++) {
                 sum += art.balanceOf(handler.actorAt(j), id);
             }
-            assertEq(sum, handler.ghost_supply(id));
+            assertEq(sum, handler.ghost_supply(id) - handler.ghost_burned(id));
         }
     }
 
@@ -199,9 +218,35 @@ contract ArtifactTemplateInvariantTest is Test {
         assertEq(art.totalMinted(), summed);
     }
 
+    /// @dev Per-template burned units match the burn ghost, and across templates they sum
+    ///      to totalBurned — the destroy-side mirror of invariant_mintAccountingMatches.
+    function invariant_burnAccountingMatches() public view {
+        uint256 len = handler.idsLength();
+        uint256 summed = 0;
+        for (uint256 i = 0; i < len; i++) {
+            uint256 id = handler.ids(i);
+            assertEq(art.burnedByTemplate(id), handler.ghost_burned(id));
+            summed += art.burnedByTemplate(id);
+        }
+        assertEq(art.totalBurned(), summed);
+    }
+
+    /// @dev Burned units of a template can never exceed its cumulative minted — you cannot
+    ///      destroy more than was ever created (a corollary of the supply invariant, pinned
+    ///      directly so a counter-swap regression is caught at the accounting layer too).
+    function invariant_burnedNeverExceedsMinted() public view {
+        uint256 len = handler.idsLength();
+        for (uint256 i = 0; i < len; i++) {
+            uint256 id = handler.ids(i);
+            assertLe(art.burnedByTemplate(id), art.mintedByTemplate(id));
+        }
+    }
+
     /// @dev A capped template's minted supply NEVER exceeds its cap (the scarcity
-    ///      guarantee), and the on-chain cap matches what was registered. Uncapped
-    ///      templates (cap == 0) are unconstrained and skipped.
+    ///      guarantee), and the on-chain cap matches what was registered. With burns now
+    ///      interleaved by the fuzzer this also proves burn buys no cap headroom: the cap
+    ///      bounds cumulative mints, so freeing circulating balance can never let a later
+    ///      mint slip past it. Uncapped templates (cap == 0) are unconstrained and skipped.
     function invariant_mintedNeverExceedsCap() public view {
         uint256 len = handler.idsLength();
         for (uint256 i = 0; i < len; i++) {
