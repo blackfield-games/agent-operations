@@ -1649,6 +1649,11 @@
   },
   {
     "inputs": [],
+    "name": "ZeroEas",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "ZeroRegistry",
     "type": "error"
   },

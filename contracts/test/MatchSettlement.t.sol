@@ -13,6 +13,14 @@ contract MockToken is ERC20 {
     }
 }
 
+/// @dev A registry whose TOKEN() is the zero address, to reach MatchSettlement's derived-token
+///      guard without deploying a real AgentRegistry (which now rejects a zero token itself).
+contract ZeroTokenRegistry {
+    function TOKEN() external pure returns (address) {
+        return address(0);
+    }
+}
+
 /// @dev Records the last attest so a test can decode its payload, and derives a
 ///      deterministic uid from (schema, recipient, data) — distinct per settled result.
 contract MockEAS is IEAS {
@@ -225,6 +233,13 @@ contract MatchSettlementTest is Test {
         assertEq(address(settlement.token()), address(registry.TOKEN()));
     }
 
+    function test_constructor_revertsZeroEas() public {
+        // A zero EAS would deploy a settlement whose every attest/revoke reverts opaquely at
+        // the EAS call; fail loudly at construction instead (mirrors the token guard).
+        vm.expectRevert(MatchSettlement.ZeroEas.selector);
+        new MatchSettlement(address(0), address(registry), owner, REP_DELTA);
+    }
+
     function test_constructor_revertsZeroRegistry() public {
         vm.expectRevert(MatchSettlement.ZeroRegistry.selector);
         new MatchSettlement(address(eas), address(0), owner, REP_DELTA);
@@ -241,7 +256,7 @@ contract MatchSettlementTest is Test {
     }
 
     function test_constructor_revertsZeroToken() public {
-        AgentRegistry zeroTokenRegistry = new AgentRegistry(address(0), 0, owner);
+        ZeroTokenRegistry zeroTokenRegistry = new ZeroTokenRegistry();
         vm.expectRevert(MatchSettlement.ZeroToken.selector);
         new MatchSettlement(address(eas), address(zeroTokenRegistry), owner, REP_DELTA);
     }

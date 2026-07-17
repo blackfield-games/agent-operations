@@ -356,6 +356,7 @@ contract MatchSettlement is Ownable2Step {
     error SchemaNotSet();
     error NotAttested(bytes32 matchId);
     error AttestationAlreadyRevoked(bytes32 matchId);
+    error ZeroEas();
     error ZeroRegistry();
     error ZeroToken();
     error ZeroReputationDelta();
@@ -385,6 +386,7 @@ contract MatchSettlement is Ownable2Step {
     error PayoutMismatch(uint256 paid, uint256 pot);
 
     constructor(address eas_, address registry_, address owner_, uint256 reputationDelta_) Ownable(owner_) {
+        if (eas_ == address(0)) revert ZeroEas();
         if (registry_ == address(0)) revert ZeroRegistry();
         if (reputationDelta_ == 0) revert ZeroReputationDelta();
         if (reputationDelta_ > uint256(type(int256).max)) revert ReputationDeltaTooLarge();
