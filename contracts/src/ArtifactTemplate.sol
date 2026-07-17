@@ -304,6 +304,30 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         emit Burned(from, templateId, amount);
     }
 
+    /// @notice Batch twin of {burn}: destroy `amounts[i]` units of `templateIds[i]` held
+    ///         by `from` in one call — salvaging a mixed loadout without a tx per artifact.
+    ///         Same holder-or-approved gate as {burn}, and atomic: a length mismatch
+    ///         reverts `ERC1155InvalidArrayLength` and any element that over-burns reverts
+    ///         the whole batch (`ERC1155InsufficientBalance`), so no partial burn commits.
+    /// @dev `_burnBatch` validates the lengths and balances and burns FIRST — a burn fires
+    ///      no ERC-1155 receiver hook, so there is no reentrancy window before the counter
+    ///      pass — then the loop bumps the burn counters from the same arrays, so a revert
+    ///      inside `_burnBatch` never advances a counter. Duplicate ids in one batch
+    ///      accumulate correctly (each element adds to `burnedByTemplate[id]`).
+    function burnBatch(address from, uint256[] calldata templateIds, uint256[] calldata amounts) external {
+        if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
+            revert ERC1155MissingApprovalForAll(msg.sender, from);
+        }
+        _burnBatch(from, templateIds, amounts);
+        uint256 burned;
+        for (uint256 i = 0; i < templateIds.length; ++i) {
+            burnedByTemplate[templateIds[i]] += amounts[i];
+            burned += amounts[i];
+            emit Burned(from, templateIds[i], amounts[i]);
+        }
+        totalBurned += burned;
+    }
+
     /// @dev Rarity-scaled per-mint charge in `rate` units, shared by the compute fee
     ///      (`mintFeeRate`, burned credit) and the region royalty (`royaltyRate`, real
     ///      $BLCKFLD): ceil(rate * amount * rarity / MAX_RARITY). Rounds UP so any
