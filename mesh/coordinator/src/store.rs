@@ -449,6 +449,15 @@ impl Store {
             "ALTER TABLE pending_attestations ADD COLUMN revocation_dead_lettered_at INTEGER",
             [],
         ))?;
+        // Migrate pre-existing DBs (created before per-revocation re-drive tracking).
+        // NOT NULL DEFAULT 0 back-fills every existing row to 0 — none has been
+        // re-driven yet. The revoke twin of the `redrive_count` migration above; the
+        // dead-lettered-revocation listing is its first reader (Design B deferred this
+        // column until that reader existed). Swallow only the duplicate-column error.
+        ignore_duplicate_column(conn.execute(
+            "ALTER TABLE pending_attestations ADD COLUMN revocation_redrive_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        ))?;
         // Migrate pre-existing DBs (created before the debit relayer's `submitted_at`
         // / `tx_hash` columns). NULL on every existing row means "still pending",
         // which is correct: nothing had been spent on-chain yet. Mirrors the
@@ -2409,12 +2418,14 @@ impl Store {
     /// oldest-first drain ahead of newer revocations and, if the cause is STILL present, simply
     /// re-dead-letters on the next `Permanent` error — one attempt per re-drive, never an
     /// infinite auto-retry. A second re-drive once the row has landed (`revoked_at` set) is a
-    /// no-op, so an operator double-call can't re-revoke. Unlike the issue/debit re-drive there
-    /// is no `redrive_count` bump: no revocation dead-letter listing reads such a tally yet, so
-    /// the counter is deferred to that discovery follow-up rather than shipped as write-only state.
+    /// no-op, so an operator double-call can't re-revoke. Bumps `revocation_redrive_count` (the
+    /// revoke twin of `redrive_count`) so the dead-lettered-revocation listing can surface a
+    /// revocation that keeps re-dead-lettering into an unfixed cause — that listing is the reader
+    /// Design B deferred the counter until, so it is no longer write-only state.
     pub fn redrive_dead_lettered_revocation(&self, job_id: &uuid::Uuid) -> Result<bool> {
         let updated = self.conn.execute(
-            "UPDATE pending_attestations SET revocation_dead_lettered_at = NULL
+            "UPDATE pending_attestations
+             SET revocation_dead_lettered_at = NULL, revocation_redrive_count = revocation_redrive_count + 1
              WHERE job_id = ?1 AND revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL",
             (job_id.to_string(),),
         )?;
@@ -2439,10 +2450,12 @@ impl Store {
     /// attempt and, if the broad cause is NOT actually fixed, simply re-dead-letters on the next
     /// error (one attempt per re-drive, never a hot loop). A second bulk call once the set has
     /// landed re-arms nothing (every row now `revoked_at`-set). `0` is returned when there is
-    /// nothing to re-arm — a clean no-op, not an error.
+    /// nothing to re-arm — a clean no-op, not an error. Bumps `revocation_redrive_count` on each
+    /// re-armed row, same as the single re-drive, so the listing shows a repeatedly-stuck revocation.
     pub fn redrive_all_dead_lettered_revocations(&self) -> Result<usize> {
         let updated = self.conn.execute(
-            "UPDATE pending_attestations SET revocation_dead_lettered_at = NULL
+            "UPDATE pending_attestations
+             SET revocation_dead_lettered_at = NULL, revocation_redrive_count = revocation_redrive_count + 1
              WHERE revocation_dead_lettered_at IS NOT NULL AND revoked_at IS NULL",
             (),
         )?;
