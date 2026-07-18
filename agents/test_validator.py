@@ -15,6 +15,8 @@ Run from the agents/ dir:
 
 from pathlib import Path
 
+import pytest
+
 from biome import biome
 from common.types import LayerSpec, RegionCoord, WorldBrief
 from director import director
@@ -2421,6 +2423,90 @@ def test_director_beats_consistency_flags_a_stale_line_and_skips_an_absent_one(t
     stale = issues(other)  # present + wrong: one issue naming director + the helper
     assert len(stale) == 1
     assert "director" in stale[0] and "_region_beats" in stale[0]
+
+
+# ---- lighting palette lock: the DECISIONS.md Sky/Sun rig beats must never recolor or dim ----
+#
+# The palette SIBLING of the fog gate above: that gate defends the one beats-driven property
+# lighting emits, these defend the locked overcast-dome + inferno-rim rig it also emits. A
+# tampered color/intensity/angle (or a stripped Sky/Sun prim) otherwise passes every gate and
+# ships the broken lighting into a DIFFUSION_TILE render job, though an equivalent fog tamper is
+# caught. The gate re-derives the expected rig from lighting.LOCKED_SKY/LOCKED_SUN (single source).
+
+# Each locked opinion tampered independently in an otherwise region-true world (all other
+# specialists valid, no director intent so no fog/intent gate co-fires) — so the palette gate is
+# the SOLE violation and lighting the sole route-back target. Stripping the gate reddens exactly
+# these; a correct palette (below) stays accepted.
+_TAMPERED_PALETTES = {
+    "sun_color_cold_blue": lighting.PALETTE_BLOCK.replace("(1.0, 0.62, 0.32)", "(0.20, 0.35, 0.95)"),
+    "sun_intensity_zeroed": lighting.PALETTE_BLOCK.replace(
+        "float inputs:intensity = 1.2", "float inputs:intensity = 0.0"
+    ),
+    "sun_angle_wrong": lighting.PALETTE_BLOCK.replace(
+        "float inputs:angle = 0.53", "float inputs:angle = 1.20"
+    ),
+    "sky_color_wrong": lighting.PALETTE_BLOCK.replace("(0.55, 0.58, 0.62)", "(0.90, 0.10, 0.10)"),
+    "sky_intensity_wrong": lighting.PALETTE_BLOCK.replace(
+        "float inputs:intensity = 0.4", "float inputs:intensity = 5.0"
+    ),
+    "sun_prim_omitted": lighting.LOCKED_SKY,  # Sky only — the Sun rig stripped entirely
+    "sky_prim_omitted": lighting.LOCKED_SUN,  # Sun only — the Sky dome stripped entirely
+}
+
+
+@pytest.mark.parametrize("tamper", sorted(_TAMPERED_PALETTES))
+async def test_run_rejects_a_tampered_palette_and_routes_to_lighting(tmp_path, tamper):
+    palette = _TAMPERED_PALETTES[tamper]
+    assert palette != lighting.PALETTE_BLOCK  # premise: the tamper actually changed the rig
+    layers = _set_with(tmp_path, {"lighting": _lighting_body(palette=palette)})
+    verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
+    assert not verdict.accepted
+    assert any("materials/style lock" in i and "lighting" in i for i in verdict.issues)
+    # keyed off the palette lock, never "director" — so the text-scan fallback agrees with the
+    # structured attribution and route-back targets lighting (the sole offender here).
+    assert not any("director" in i for i in verdict.issues)
+    assert verdict.failing_specialists == ["lighting"]
+    assert _failing_specialist(verdict.issues) == "lighting"
+    assert _route_back_target(verdict) == "lighting"
+
+
+async def test_run_accepts_the_locked_palette_with_and_without_fog(tmp_path):
+    # FM1 (no false reject) + independence: the intact locked rig validates whether or not the
+    # beats-driven Atmosphere is present — proving the palette gate never cross-fires on the fog the
+    # sibling gate owns. Without-fog uses a beats-less director (the fog gate's own silent case);
+    # with-fog pairs a beats-declaring director with the matching Atmosphere so a real fog volume
+    # sits beside the palette. Each root is fresh so neither render's file bleeds into the other.
+    recognized = lighting._recognized_beats(_REGION_BEATS_LINE)
+    assert recognized  # premise: the region's beats really drive an Atmosphere
+    cases = {
+        "no_fog": {"director": _director_body(), "lighting": _lighting_body(driven_by=None)},
+        "with_fog": {
+            "director": _director_body(beats=_REGION_BEATS_LINE),
+            "lighting": _lighting_body(driven_by=recognized),
+        },
+    }
+    for name, bodies in cases.items():
+        root = tmp_path / name
+        verdict = await validator.run(_brief(), _set_with(root, bodies), layers_root=root)
+        assert verdict.accepted, (name, verdict.issues)
+        assert not any("materials/style lock" in i for i in verdict.issues)
+
+
+def test_lighting_palette_consistency_flags_a_tamper_and_skips_an_absent_layer(tmp_path):
+    # Unit-level (mirrors the beats gate's direct-call pin): an intact palette yields [], a tampered
+    # one yields exactly the two-prim gate's mismatch(es) named lighting, and an ABSENT lighting
+    # layer degrades to [] (the missing-layer gate already rejects it — no double-report, FM3). Each
+    # case gets a fresh root so a written layer never lingers into the absent case.
+    intact = _set_with(tmp_path / "intact", {"lighting": _lighting_body()})
+    assert validator._lighting_palette_consistency(intact, tmp_path / "intact") == []
+
+    root = tmp_path / "tampered"
+    tampered = _set_with(root, {"lighting": _lighting_body(palette=lighting.LOCKED_SUN)})
+    issues = validator._lighting_palette_consistency(tampered, root)
+    assert len(issues) == 1 and "lighting" in issues[0] and "Sky" in issues[0]
+
+    missing = _set_with_missing(tmp_path / "missing", {}, missing="lighting")
+    assert validator._lighting_palette_consistency(missing, tmp_path / "missing") == []
 
 
 # ---- terrain triangle self-consistency: the metric must match the declared heightfield ----
