@@ -337,6 +337,17 @@ async def run(
         issues.append(message)
         failing.add(specialist)
 
+    # Lighting palette lock — the SIBLING of the beats/Atmosphere fog gate inside
+    # _intent_attributions. That gate re-derives the one beats-driven property lighting emits,
+    # but the DECISIONS.md-locked Sky/Sun rig lighting ALSO emits had no gate: a tampered
+    # color/intensity/angle slipped into a render job while an equivalent fog tamper was
+    # caught. Re-derive the locked rig from lighting's own constants and reject a mismatch,
+    # naming lighting so route-back re-runs it. Wellformed-only (a missing/malformed lighting
+    # is already rejected + attributed above); silent + byte-identical accept when intact.
+    for message in _lighting_palette_consistency(wellformed, layers_root):
+        issues.append(message)
+        failing.add("lighting")
+
     # Director intent:factions re-derivation — the PRODUCER twin of the four count/grid brief-re-derivation
     # gates and of the npc factions/selection CONSUMERS above. Those consumers re-derive npc's PICK off the
     # director's roster, so a STALE director roster that npc faithfully mirrored is invisible to them (the
@@ -732,6 +743,40 @@ def _intent_attributions(
                     f"interior_volumes (the frontier rule); re-run {layer.specialist}",
                 ))
     return out
+
+
+def _lighting_palette_consistency(layers: list[LayerSpec], layers_root: Path) -> list[str]:
+    """Why the lighting layer's DECISIONS.md-locked Sky/Sun rig is altered or missing, or []
+    when the palette is intact — the palette SIBLING of the beats→Atmosphere fog gate
+    (:637-702). Within the same lighting layer that gate defends the ONE beats-driven
+    property (the fog's ``drivenBy``/``density``) while its locked overcast-dome +
+    inferno-rim palette went UNCHECKED: a tampered Sun color (→ cold blue), a zeroed
+    intensity, a wrong angle, or a stripped Sky/Sun prim passed every gate and shipped the
+    broken rig into a ``DIFFUSION_TILE`` render job, though an equivalent fog tamper is
+    caught. This closes that asymmetry.
+
+    Re-derives the expected rig from lighting's OWN constants (``lighting.LOCKED_SKY`` /
+    ``LOCKED_SUN`` — the single source ``lighting.run`` emits verbatim, as the fog gate reads
+    ``lighting._fog_density``), so a future palette change tracks in lock-step and this gate
+    never carries a third hand-copy to drift. A pure VERIFY gate like the interiors gate
+    (:704-733): a correct world contains both locked blocks byte-for-byte and stays
+    byte-identical accepted; a well-formed lighting layer whose Sky or Sun block deviates in
+    any color/intensity/angle opinion — or omits the prim — yields a mismatch NAMED lighting
+    (the route-back target), keyed off the palette lock, never the word ``director`` (which
+    the text-scan fallback routes pipeline-earlier). Reads the layer through ``_layer_text``
+    so a file that vanished after the well-formedness check degrades to a skip (FM3); silent
+    when lighting is absent/malformed (already rejected + attributed upstream, no
+    double-report). Independent of the fog gate — it never inspects the beats-driven
+    Atmosphere, so the two lighting gates can't cross-fire."""
+    text = _layer_text(layers, "lighting", layers_root)
+    if text is None:
+        return []
+    return [
+        f"materials/style lock violated: lighting's DECISIONS.md-locked {name} rig is altered "
+        f"or missing (a tampered color/intensity/angle); re-run lighting"
+        for name, block in (("Sky", lighting.LOCKED_SKY), ("Sun", lighting.LOCKED_SUN))
+        if block not in text
+    ]
 
 
 def _director_factions_consistency(
