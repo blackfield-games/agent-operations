@@ -31,6 +31,7 @@ contract AgentRegistryTest is Test {
     );
     event ReputationWriterSet(address indexed writer, bool authorized);
     event MinBondSet(uint256 minBond);
+    event HandleChanged(address indexed agent, bytes32 handle);
 
     function setUp() public {
         token = new MockToken();
@@ -217,6 +218,113 @@ contract AgentRegistryTest is Test {
         assertTrue(attacker.reentryReverted(), "reentry blocked by CEI");
         assertEq(evil.balanceOf(address(attacker)), BOND, "recovered exactly its own bond");
         assertEq(evil.balanceOf(address(r)), BOND, "honest agent's bond intact");
+    }
+
+    // --- setHandle (rename an active identity's label in place, touching nothing else) ---
+
+    function test_setHandle_renamesInPlaceAndEmits() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+
+        bytes32 renamed = bytes32("alice-v2");
+        vm.expectEmit(true, false, false, true);
+        emit HandleChanged(alice, renamed);
+        vm.prank(alice);
+        registry.setHandle(renamed);
+
+        (,,,,, bytes32 handle) = registry.agents(alice);
+        assertEq(handle, renamed, "the handle was renamed in place");
+        assertTrue(registry.isRegistered(alice), "still an active identity");
+    }
+
+    /// @dev A rename touches ONLY the handle. An identity's standing, bond, match
+    ///      count, active flag, and registration timestamp are all untouched — even
+    ///      as time passes — so a rename is not a path to reset a bad reputation or
+    ///      re-bond, and moves nothing the match service authenticates on.
+    function test_setHandle_touchesNoOtherField() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(owner);
+        registry.recordMatchResult(alice, -30 ether); // give it standing + a match
+
+        (
+            bool registeredBefore,
+            uint64 registeredAtBefore,
+            uint64 matchesBefore,
+            uint256 bondBefore,
+            int256 repBefore,
+        ) = registry.agents(alice);
+
+        vm.warp(block.timestamp + 1 days); // time moves; registeredAt must NOT
+        vm.prank(alice);
+        registry.setHandle(bytes32("alice-v2"));
+
+        (
+            bool registeredAfter,
+            uint64 registeredAtAfter,
+            uint64 matchesAfter,
+            uint256 bondAfter,
+            int256 repAfter,
+            bytes32 handleAfter
+        ) = registry.agents(alice);
+        assertEq(registeredAfter, registeredBefore, "active flag unchanged");
+        assertEq(registeredAtAfter, registeredAtBefore, "registeredAt unchanged by a rename");
+        assertEq(matchesAfter, matchesBefore, "match count unchanged");
+        assertEq(bondAfter, bondBefore, "the bond is neither re-pulled nor refunded");
+        assertEq(repAfter, repBefore, "a rename cannot reset a standing");
+        assertEq(handleAfter, bytes32("alice-v2"), "only the handle moved");
+        assertEq(token.balanceOf(address(registry)), BOND, "no token moved");
+    }
+
+    /// @dev Self-sovereign: no address parameter, so a rename only ever hits
+    ///      msg.sender's own record — alice renaming never touches bob's identity.
+    function test_setHandle_isPerSenderOnly() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(bob);
+        registry.register(bytes32("bob-bot"), BOND);
+
+        vm.prank(alice);
+        registry.setHandle(bytes32("alice-v2"));
+
+        (,,,,, bytes32 aliceHandle) = registry.agents(alice);
+        (,,,,, bytes32 bobHandle) = registry.agents(bob);
+        assertEq(aliceHandle, bytes32("alice-v2"));
+        assertEq(bobHandle, bytes32("bob-bot"), "another identity's handle is untouched");
+    }
+
+    function test_setHandle_revertsForNeverRegistered() public {
+        vm.expectRevert(AgentRegistry.NotRegistered.selector);
+        vm.prank(alice);
+        registry.setHandle(bytes32("ghost"));
+    }
+
+    /// @dev A deregistered (inactive) identity cannot rename — it must re-register
+    ///      (which sets a fresh handle) to go active again. Mirrors deregister's gate,
+    ///      and the persisted handle is left intact by the rejected call.
+    function test_setHandle_revertsForDeregisteredIdentity() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(alice);
+        registry.deregister();
+
+        vm.expectRevert(AgentRegistry.NotRegistered.selector);
+        vm.prank(alice);
+        registry.setHandle(bytes32("alice-v2"));
+
+        (,,,,, bytes32 handle) = registry.agents(alice);
+        assertEq(handle, HANDLE, "the persisted handle is unchanged by the rejected rename");
+    }
+
+    /// @dev The zero handle is a valid label (register accepts it too), so a rename
+    ///      may clear the display label without reverting.
+    function test_setHandle_acceptsZeroHandle() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(alice);
+        registry.setHandle(bytes32(0));
+        (,,,,, bytes32 handle) = registry.agents(alice);
+        assertEq(handle, bytes32(0), "the label was cleared");
     }
 
     // --- reputation (FM2: only an authorized writer may move it) ---
