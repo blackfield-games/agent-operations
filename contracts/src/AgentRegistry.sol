@@ -66,6 +66,7 @@ contract AgentRegistry is Ownable2Step {
     );
     event ReputationWriterSet(address indexed writer, bool authorized);
     event MinBondSet(uint256 minBond);
+    event HandleChanged(address indexed agent, bytes32 handle);
 
     error AlreadyRegistered();
     error NotRegistered();
@@ -112,6 +113,24 @@ contract AgentRegistry is Ownable2Step {
         a.bond = 0;
         if (refund > 0) TOKEN.safeTransfer(msg.sender, refund);
         emit Deregistered(msg.sender, refund);
+    }
+
+    /// @notice Rename the caller's display `handle` in place. A convenience for an
+    ///         active identity that mistyped its label or wants to rebrand without
+    ///         `deregister`/`register` — which would refund the bond, drop the
+    ///         active flag, and reset `registeredAt`. Self-sovereign like `register`:
+    ///         there is no address parameter, so it only ever renames `msg.sender`'s
+    ///         own identity, and it is gated to a currently-registered caller (the
+    ///         same gate as `deregister`). The handle is a non-authoritative, non-
+    ///         unique display label the match service never authenticates on, so a
+    ///         rename moves nothing it reads — it touches ONLY `handle`, leaving
+    ///         reputation, bond, match count, and the registration timestamps intact
+    ///         (a rename is not a path to reset a standing or re-bond).
+    function setHandle(bytes32 handle) external {
+        Agent storage a = agents[msg.sender];
+        if (!a.registered) revert NotRegistered();
+        a.handle = handle;
+        emit HandleChanged(msg.sender, handle);
     }
 
     /// @notice Apply a ranked match's reputation delta to `agent` and count the
