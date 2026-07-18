@@ -7909,7 +7909,7 @@ pub fn parity_vectors() -> ParityVectors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena_proto::{ActionButtons, MatchConfig, SeatInfo};
+    use arena_proto::{ActionButtons, EntityKind, MatchConfig, SeatInfo};
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
     /// First SplitMix64 output for seed 1, verified against the reference
@@ -8851,6 +8851,165 @@ mod tests {
         // Score is offense-credited: seat 1 has dealt no damage, so it still reads 0
         // even after taking the hit (it is not symmetric with damage TAKEN).
         assert_eq!(m.observe(1).own.score, 0, "taking damage does not raise the victim's score");
+    }
+
+    #[test]
+    fn broadcast_surfaces_in_flight_projectiles_as_neutral_entities() {
+        // A projectile-mode fire puts a traveling shot on the whole-stage feed — a caster
+        // renders in-flight shots, closing the inverted-coverage gap (observe already surfaces
+        // them). The BroadcastEntity mirrors the live projectile (id, position, travel facing),
+        // is the neutral team with a flat `z`, and carries no health bar/score (a shot is not a
+        // scoring body); its id sits in the projectile space so it sorts after every pawn.
+        let mut m = projectile_close_match(1);
+        let aim = m.observe(0).own.facing;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, aim, true))]);
+        assert_eq!(m.projectiles.len(), 1, "the fire spawned one in-flight shot");
+        let proj = &m.projectiles[0];
+
+        let b = m.broadcast();
+        let shots: Vec<_> = b.entities.iter().filter(|e| e.kind == EntityKind::Projectile).collect();
+        assert_eq!(shots.len(), 1, "the shot is on the spectator feed");
+        let s = shots[0];
+        assert_eq!(s.entity_id, proj.id, "broadcast mirrors the live projectile id");
+        assert!(s.entity_id >= PROJECTILE_ID_BASE, "in the projectile id space");
+        assert_eq!(s.position, proj.pos, "and its position");
+        assert_eq!(s.facing, proj.facing, "and its travel facing");
+        assert_eq!(s.team, 0, "a projectile is the neutral team");
+        assert_eq!(s.z, 0, "reported flat, exactly as observe reports a shot");
+        assert_eq!((s.health, s.max_health, s.score), (0, 0, 0), "no health bar or score");
+        assert!(s.alive, "an in-flight shot is on stage");
+        // The pawns sort first (seat ids ≤ 255), the shot last (its id ≥ 2^16).
+        assert_eq!(b.entities.first().unwrap().kind, EntityKind::Player);
+        assert_eq!(b.entities.last().unwrap().kind, EntityKind::Projectile);
+
+        // A pure-hitscan match spawns no projectile, so its feed stays pawns-only.
+        let mut hit = close_match(1);
+        let hit_aim = hit.observe(0).own.facing;
+        step_with(&mut hit, &[(0, intent(Vec2::ZERO, hit_aim, true))]);
+        assert!(
+            hit.broadcast().entities.iter().all(|e| e.kind == EntityKind::Player),
+            "a hitscan match's feed carries only pawns",
+        );
+    }
+
+    #[test]
+    fn broadcast_surfaces_active_pickups_and_omits_a_collected_one() {
+        // An active world pickup is on the whole-stage feed as a neutral Pickup entity
+        // (mirroring observe's Pickup VisibleEntity, position-only); a collected/dormant one is
+        // off stage and omitted, so its absence tracks its real state — the active-only rule
+        // observe follows, not a stale marker. Its effect kind/amount/timer never reach the wire.
+        let rules = Rules {
+            pickup_radius: 1000,
+            pickup_respawn_cooldown: 10,
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let pickups = vec![PickupSpawn { kind: PickupKind::Health, position: Vec2::ZERO, amount: 25 }];
+        let mut m =
+            Match::new_with_pickups(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), pickups, 1);
+        m.pawns[0].pos = Vec2::ZERO; // standing on the Health pad
+        m.pawns[0].health = 50; // wounded, so the pad is genuinely collected on the idle tick
+
+        let b0 = m.broadcast();
+        let pk: Vec<_> = b0.entities.iter().filter(|e| e.kind == EntityKind::Pickup).collect();
+        assert_eq!(pk.len(), 1, "the active pickup is on the feed");
+        let p = pk[0];
+        assert_eq!(p.entity_id, m.pickups[0].id, "broadcast mirrors the pickup id");
+        assert!(p.entity_id >= PICKUP_ID_BASE, "in the pickup id space");
+        assert_eq!(p.position, m.pickups[0].pos);
+        assert_eq!(p.team, 0, "a pickup is the neutral team");
+        assert_eq!(p.facing, 0, "a pickup carries no facing");
+        assert_eq!((p.health, p.max_health, p.score), (0, 0, 0), "position-only, no pawn fields");
+        assert!(p.alive, "an active pickup is on stage");
+
+        // The wounded pawn idles on the pad: it heals, the pad goes dormant and drops off the
+        // feed until it respawns — a collected pickup is absent, never a stale on-stage marker.
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, EAST, false))]);
+        assert!(!m.pickups[0].active, "the pad was collected");
+        assert!(
+            m.broadcast().entities.iter().all(|e| e.kind != EntityKind::Pickup),
+            "a collected pickup leaves the feed",
+        );
+    }
+
+    #[test]
+    fn broadcast_orders_pawns_projectiles_and_pickups_canonically() {
+        // The whole-stage frame stays canonical ascending-`entity_id` across all three kinds:
+        // pawns (ids ≤ 255) below projectiles (≥ 2^16) below pickups (≥ 2^24), the total order
+        // the disjoint id spaces guarantee — so a consumer reads a stable, non-interleaved frame.
+        let rules = Rules {
+            weapon_mode: WeaponMode::Projectile,
+            spawn_radius: 2 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        // The pickup sits in a far corner so no pawn collects it (it stays active).
+        let pickups =
+            vec![PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x: 12 * POSITION_SCALE, y: 12 * POSITION_SCALE }, amount: 8 }];
+        let mut m =
+            Match::new_with_pickups(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), pickups, 1);
+        let aim = m.observe(0).own.facing;
+        step_with(&mut m, &[(0, intent(Vec2::ZERO, aim, true))]);
+
+        let b = m.broadcast();
+        assert!(b.entities.iter().any(|e| e.kind == EntityKind::Player), "pawns present");
+        assert!(b.entities.iter().any(|e| e.kind == EntityKind::Projectile), "a shot present");
+        assert!(b.entities.iter().any(|e| e.kind == EntityKind::Pickup), "a pickup present");
+
+        let ids: Vec<u32> = b.entities.iter().map(|e| e.entity_id).collect();
+        let mut ascending = ids.clone();
+        ascending.sort_unstable();
+        assert_eq!(ids, ascending, "entities are ascending by entity_id");
+        // The id spaces group the kinds: the last pawn precedes the first projectile, which
+        // precedes the first pickup — pawns, then shots, then pickups.
+        let kinds: Vec<EntityKind> = b.entities.iter().map(|e| e.kind).collect();
+        let last_pawn = kinds.iter().rposition(|k| *k == EntityKind::Player).unwrap();
+        let first_proj = kinds.iter().position(|k| *k == EntityKind::Projectile).unwrap();
+        let first_pickup = kinds.iter().position(|k| *k == EntityKind::Pickup).unwrap();
+        assert!(last_pawn < first_proj && first_proj < first_pickup, "pawns < projectiles < pickups");
+    }
+
+    #[test]
+    fn broadcast_projection_never_enters_the_replay_hash() {
+        // FM2: broadcast() is a spectator VIEW, never an input to build_replay /
+        // canonical_encoding — so surfacing projectiles+pickups on the feed cannot move
+        // replay_hash (a move would break determinism / parity goldens). Two identical
+        // projectile+pickup matches stepped in lock-step: one polled via broadcast() every tick
+        // (exercising the new projection), one never polled. Their replay digests stay identical.
+        let make = || {
+            let rules = Rules {
+                weapon_mode: WeaponMode::Projectile,
+                spawn_radius: 2 * POSITION_SCALE,
+                spawn_jitter: 0,
+                ..Default::default()
+            };
+            let pickups =
+                vec![PickupSpawn { kind: PickupKind::Ammo, position: Vec2 { x: 12 * POSITION_SCALE, y: 0 }, amount: 8 }];
+            Match::new_with_pickups(MID.parse().unwrap(), config(2), rules, two_seats(), Vec::new(), pickups, 9)
+        };
+        let mut polled = make();
+        let mut quiet = make();
+        let aim = polled.observe(0).own.facing;
+        let (mut saw_proj, mut saw_pickup) = (false, false);
+        for tick in 0..8u32 {
+            if polled.phase() != MatchPhase::Live {
+                break;
+            }
+            let fire = tick == 0; // one shot, so a projectile is live for the early ticks
+            step_with(&mut polled, &[(0, intent(Vec2::ZERO, aim, fire))]);
+            step_with(&mut quiet, &[(0, intent(Vec2::ZERO, aim, fire))]);
+            let b = polled.broadcast();
+            saw_proj |= b.entities.iter().any(|e| e.kind == EntityKind::Projectile);
+            saw_pickup |= b.entities.iter().any(|e| e.kind == EntityKind::Pickup);
+        }
+        assert!(saw_proj, "the polled match really put a shot on the feed");
+        assert!(saw_pickup, "the polled match really put a pickup on the feed");
+        assert_eq!(
+            polled.build_replay().digest(),
+            quiet.build_replay().digest(),
+            "polling broadcast() must never perturb the replay digest",
+        );
     }
 
     #[test]
