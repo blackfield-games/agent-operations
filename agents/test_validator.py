@@ -110,6 +110,11 @@ def _layer(
         ob = metrics.get("over_budget", 0.0)
         over = isinstance(ob, (int, float)) and not isinstance(ob, bool) and ob > 0
         body = _opt_body(budget=500_000 if over else optimization.TRIANGLE_BUDGET)
+    if specialist == "lighting" and body is VALID_BODY:
+        # Default lighting to its real locked palette (like optimization above) so the
+        # palette-lock gate stays silent for every set-builder; pass an explicit body to
+        # model a simplified/tampered lighting layer.
+        body = _lighting_body()
     if body is not None:
         full = root / rel
         full.parent.mkdir(parents=True, exist_ok=True)
@@ -856,16 +861,6 @@ def Xform "World" {
     def Xform "Hub" {}
 }
 """
-# Defines /World, overrides /World/Hub — legitimate over-on-def when paired with a
-# layer that defines Hub.
-OVERRIDES_HUB = """#usda 1.0
-(
-    defaultPrim = "World"
-)
-over "World" {
-    over "Hub" {}
-}
-"""
 # Defines /World, then dangles an override over /Ghost that nothing defines.
 DANGLES_GHOST = """#usda 1.0
 (
@@ -1136,8 +1131,10 @@ def test_composition_check_runs_without_pxr(tmp_path):
 
 async def test_run_accepts_a_legitimate_over_on_def(tmp_path):
     # terrain defines /World/Hub, lighting only overrides it — legal layering, not
-    # a conflict; the world is accepted.
-    layers = _set_with(tmp_path, {"terrain": HUB_AS_MESH, "lighting": OVERRIDES_HUB})
+    # a conflict; the world is accepted. The lighting layer carries its real locked
+    # palette (so the palette-lock gate stays silent), then overrides /World/Hub.
+    lighting_over = _lighting_body() + 'over "World"\n{\n    over "Hub" {}\n}\n'
+    layers = _set_with(tmp_path, {"terrain": HUB_AS_MESH, "lighting": lighting_over})
     verdict = await validator.run(_brief(), layers, layers_root=tmp_path)
     assert verdict.accepted, verdict.issues
 
@@ -1206,7 +1203,7 @@ async def test_run_attributes_missing_layer_and_metric_to_their_specialists(tmp_
         _layer(tmp_path, "terrain"),
         # biome omitted → missing layer
         _layer(tmp_path, "prop"),
-        _layer(tmp_path, "lighting"),
+        _layer(tmp_path, "lighting"),  # defaults to the real locked palette (palette gate silent)
         _layer(tmp_path, "npc"),
         _layer(tmp_path, "optimization", metrics={}),  # drop the required over_budget
     ]
@@ -1260,13 +1257,21 @@ def _director_body(
     return "\n".join(lines) + "\n"
 
 
-def _lighting_body(driven_by: list[str] | None = None, density: float | None = None) -> str:
+def _lighting_body(
+    driven_by: list[str] | None = None, density: float | None = None, palette: str | None = None
+) -> str:
     """A lighting layer mirroring lighting.run: the locked overcast+inferno-rim palette,
     plus a `def Volume "Atmosphere"` whose `drivenBy` lists `driven_by` iff it is given
     (None ⇒ the pre-beats palette with no Atmosphere — the back-compat floor the gate must
     accept when no beat is recognized). `inputs:density` defaults to the consistent
     lighting._fog_density(driven_by) lighting.run emits; pass `density` to author a
-    drivenBy-correct-but-density-wrong layer (the density-self-consistency reject fixture)."""
+    drivenBy-correct-but-density-wrong layer (the density-self-consistency reject fixture).
+
+    `palette` defaults to lighting.PALETTE_BLOCK — the real DECISIONS.md-locked Sky/Sun rig
+    lighting.run emits — so the layer clears the palette-lock gate; pass a tampered block
+    (a recolored/dimmed/stripped Sky or Sun) to author a palette-lock reject fixture."""
+    if palette is None:
+        palette = lighting.PALETTE_BLOCK
     atmosphere = ""
     if driven_by is not None:
         fog = lighting._fog_density(driven_by) if density is None else density
@@ -1279,7 +1284,7 @@ def _lighting_body(driven_by: list[str] | None = None, density: float | None = N
     return (
         '#usda 1.0\n(\n    defaultPrim = "Lighting"\n)\n\n'
         'def Xform "Lighting"\n{\n'
-        '    def DomeLight "Sky"\n    {\n        custom string mood = "overcast"\n    }'
+        f"{palette}"
         f"{atmosphere}\n}}\n"
     )
 
