@@ -661,6 +661,15 @@ contract MatchSettlement is Ownable2Step {
     ///         write (CEI: the `Settled` fence + `replayHash` commit precede the registry
     ///         interactions), so a malformed field settles nothing and leaves the `matchId`
     ///         free for a corrected result.
+    ///
+    ///         There is deliberately NO fixed-field settle: a field match in a fixed-only
+    ///         deployment (`maxRatingDelta == 0`) reverts rather than spreading the 1v1
+    ///         `reputationDelta` across placements. Unlike the trivial 1v1 `+d/-d`, a zero-sum
+    ///         placement→delta curve for N seats is an economic-policy choice with no canonical
+    ///         form (how steeply reward decays by rank, how the middle nets to zero), so it
+    ///         stays deferred until an operator confirms a curve rather than being invented
+    ///         here. Field ranked is therefore an opt-in of the variable path, where the
+    ///         attester supplies each seat's delta directly under the `maxRatingDelta` ceiling.
     function settleField(
         bytes32 matchId,
         address[] calldata agents,
