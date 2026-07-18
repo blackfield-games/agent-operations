@@ -1369,7 +1369,7 @@ pub fn replay_to_feed(record: &MatchRecord, feed: &SpectatorFeed) -> Result<usiz
 mod tests {
     use super::*;
     use arena_proto::MatchPhase;
-    use arena_proto::{ActionButtons, PickupKind, PickupSpawn, SeatOutcome};
+    use arena_proto::{ActionButtons, EntityKind, PickupKind, PickupSpawn, SeatOutcome};
     use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
     #[test]
@@ -3471,5 +3471,71 @@ mod tests {
         assert!(!record.replay.pickups.is_empty(), "the record carries the pickup");
         let replayed = replay_frames(&record).expect("a valid pickup record replays");
         assert_eq!(live, replayed, "the spectator feed must reproduce the live match's pickup heals");
+    }
+
+    #[test]
+    fn the_spectator_feed_carries_projectiles_and_active_pickups_end_to_end() {
+        // FM4: the SpectatorFeed's live path (`broadcast()` per tick) AND its replay path
+        // (`replay_frames`) must both convey the whole-stage entities — an in-flight shot and an
+        // active world pickup. Every OTHER feed test uses a hitscan, itemless match, so the feed
+        // could silently drop both kinds and stay green; this is the one that catches it.
+        let rules = Rules {
+            weapon_mode: arena_core::WeaponMode::Projectile,
+            spawn_radius: 5 * POSITION_SCALE,
+            spawn_jitter: 0,
+            ..Default::default()
+        };
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "p0".into() },
+            SeatInfo { seat: 1, team: 1, controller: "p1".into() },
+        ];
+        // A pickup off in a corner that neither idle pawn ever reaches, so it stays ACTIVE on
+        // every frame (a Pickup entity, not a heal effect swallowed into a pawn's health bar).
+        let pickups = vec![PickupSpawn {
+            kind: PickupKind::Ammo,
+            position: Vec2 { x: 20 * POSITION_SCALE, y: 20 * POSITION_SCALE },
+            amount: 8,
+        }];
+        let config = MatchConfig {
+            tick_hz: 30,
+            max_ticks: 12,
+            bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+            seats: 2,
+        };
+        let mut m = Match::new_with_pickups(Uuid::new_v4(), config, rules, seats, Vec::new(), pickups, 1);
+
+        // Seat 0 fires ONE shot on tick 0 (its spawn facing already points at the enemy) then
+        // idles; the shot is live on the feed while it flies. Neither pawn moves, so the corner
+        // pickup is never collected.
+        let aim = m.observe(0).own.facing;
+        let mut live = vec![m.broadcast()];
+        let mut tick = 0u32;
+        while m.phase() == MatchPhase::Live {
+            let fire = tick == 0;
+            let intents = BTreeMap::from([(
+                0u8,
+                ActionIntent {
+                    move_dir: Vec2::ZERO,
+                    aim,
+                    buttons: ActionButtons { fire, jump: false, ability: false, reload: false },
+                },
+            )]);
+            m.step(&intents);
+            live.push(m.broadcast());
+            tick += 1;
+        }
+
+        let has_projectile = |b: &Broadcast| b.entities.iter().any(|e| e.kind == EntityKind::Projectile);
+        let has_pickup = |b: &Broadcast| b.entities.iter().any(|e| e.kind == EntityKind::Pickup);
+        assert!(live.iter().any(has_projectile), "an in-flight shot reached the live feed");
+        assert!(live.iter().all(has_pickup), "the active pickup is on every live frame");
+
+        // The replay path must reproduce the SAME frames — the record round-trips the shot and
+        // the pickup, not just the pawns.
+        let record = m.to_record().unwrap();
+        let replayed = replay_frames(&record).expect("a valid projectile+pickup record replays");
+        assert_eq!(live, replayed, "the replay feed reproduces the live whole-stage frames");
+        assert!(replayed.iter().any(has_projectile), "the replay feed carries the shot too");
+        assert!(replayed.iter().all(has_pickup), "and the active pickup on every replayed frame");
     }
 }
