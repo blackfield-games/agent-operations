@@ -32,6 +32,9 @@ contract MockEAS is IEAS {
     uint256 public revokeCalls;
     bytes32 public lastRevokedUid;
     bytes32 public lastRevokedSchema;
+    /// @dev Records the schema EACH uid was revoked under, so a batch revoke can be checked
+    ///      per element (the last-revoked pair only sees the final element of a batch).
+    mapping(bytes32 uid => bytes32 schema) public revokedSchemaOf;
 
     function attest(IEAS.AttestationRequest calldata request) external payable returns (bytes32) {
         attestCalls++;
@@ -46,6 +49,7 @@ contract MockEAS is IEAS {
         revokeCalls++;
         lastRevokedUid = request.data.uid;
         lastRevokedSchema = request.schema;
+        revokedSchemaOf[request.data.uid] = request.schema;
     }
 }
 
@@ -3252,6 +3256,288 @@ contract MatchSettlementTest is Test {
         settlement.settleField(MATCH, ag, ds, HASH);
         assertEq(settlement.liveAttestationCount(), 2, "settleField adds the fourth call site's one");
         assertEq(settlement.revokedAttestationCount(), 0, "no revokes on the field paths");
+    }
+
+    // --- revokeAttestations: the batch retraction twin of RenderReceipts.revokeReceipts ---
+
+    /// @dev The headline: a whole disputed wave is retracted in ONE call. Three settled matches of
+    ///      DIFFERENT shapes (a decisive 1v1, a draw, a field wager) revoke atomically — every
+    ///      element flagged, one EAS.revoke each, the live count falls by exactly the batch size and
+    ///      the revoked count rises by it. The settlements stay FINAL: no funds move, no reputation.
+    function test_revokeAttestations_retractsAWholeWaveAtomically() public {
+        _enableVariable(RATING_CAP);
+
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH); // decisive 1v1
+
+        bytes32 m2 = bytes32("wave-draw");
+        _open(m2, STAKE);
+        _fundBoth(m2);
+        vm.prank(attester);
+        settlement.settleDraw(m2, HASH); // draw
+
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH); // field wager
+
+        assertEq(settlement.liveAttestationCount(), 3, "three live attestations before the sweep");
+        uint256 aliceBal = token.balanceOf(alice);
+        int256 aliceRep = registry.reputationOf(alice);
+        uint256 escrow = token.balanceOf(address(settlement));
+
+        bytes32[] memory ids = new bytes32[](3);
+        ids[0] = MATCH;
+        ids[1] = m2;
+        ids[2] = FIELD;
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+
+        assertEq(eas.revokeCalls(), 3, "one EAS.revoke per element, no more");
+        assertTrue(settlement.matchAttestationRevoked(MATCH), "1v1 flagged");
+        assertTrue(settlement.matchAttestationRevoked(m2), "draw flagged");
+        assertTrue(settlement.matchAttestationRevoked(FIELD), "field flagged");
+        assertEq(settlement.liveAttestationCount(), 0, "live count fell by exactly the batch size");
+        assertEq(settlement.revokedAttestationCount(), 3, "revoked count rose by exactly the batch size");
+
+        assertEq(token.balanceOf(alice), aliceBal, "no funds clawed back");
+        assertEq(registry.reputationOf(alice), aliceRep, "no reputation reversed");
+        assertEq(token.balanceOf(address(settlement)), escrow, "escrow untouched");
+    }
+
+    /// @dev The crux divergence from revokeReceipts (one global schema): each match revokes under
+    ///      its OWN matchAttestationSchema. A mixed batch of a 1v1 (1v1 schema) and a field wager
+    ///      (field schema) must hand EAS each attestation's own schema — a single shared schema
+    ///      would revert the mismatched element on a real EAS.
+    function test_revokeAttestations_revokesEachUnderItsOwnSchema() public {
+        _enableVariable(RATING_CAP);
+
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+        bytes32 uid1v1 = settlement.matchAttestationUid(MATCH);
+
+        _openFundField3(STAKE);
+        uint256[] memory ps = _payouts3(150 ether, 90 ether, 60 ether);
+        int256[] memory ds = _deltas(20 ether, 0, -20 ether);
+        vm.prank(attester);
+        settlement.settleFieldWager(FIELD, ps, ds, HASH);
+        bytes32 uidField = settlement.matchAttestationUid(FIELD);
+
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = MATCH;
+        ids[1] = FIELD;
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+
+        assertEq(eas.revokeCalls(), 2);
+        assertEq(eas.revokedSchemaOf(uid1v1), settlement.schemaUid(), "the 1v1 revoked under the 1v1 schema");
+        assertEq(
+            eas.revokedSchemaOf(uidField),
+            settlement.fieldSchemaUid(),
+            "the field wager revoked under the field schema"
+        );
+    }
+
+    /// @dev A batch emits MatchAttestationRevoked for EVERY element (an indexer following the
+    ///      single-revoke event sees each batched retraction too).
+    function test_revokeAttestations_emitsPerElement() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+        bytes32 uid1 = settlement.matchAttestationUid(MATCH);
+
+        bytes32 m2 = bytes32("emit-2");
+        _open(m2, STAKE);
+        _fundBoth(m2);
+        vm.prank(attester);
+        settlement.settleDraw(m2, HASH);
+        bytes32 uid2 = settlement.matchAttestationUid(m2);
+
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = MATCH;
+        ids[1] = m2;
+        vm.expectEmit(true, true, false, false);
+        emit MatchAttestationRevoked(MATCH, uid1);
+        vm.expectEmit(true, true, false, false);
+        emit MatchAttestationRevoked(m2, uid2);
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+    }
+
+    /// @dev Atomicity: an already-revoked element reverts the WHOLE batch — no partial revoke that
+    ///      leaves the other element flagged and desyncs the counters.
+    function test_revokeAttestations_revertsAtomicallyOnAlreadyRevokedElement() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        bytes32 m2 = bytes32("atomic-2");
+        _open(m2, STAKE);
+        _fundBoth(m2);
+        vm.prank(attester);
+        settlement.settleDraw(m2, HASH);
+
+        vm.prank(attester);
+        settlement.revokeAttestation(m2); // revoke one singly first
+        uint256 liveBefore = settlement.liveAttestationCount();
+        uint256 revokedBefore = settlement.revokedAttestationCount();
+        uint256 easBefore = eas.revokeCalls();
+
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = MATCH;
+        ids[1] = m2; // already revoked
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.AttestationAlreadyRevoked.selector, m2));
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+
+        assertFalse(settlement.matchAttestationRevoked(MATCH), "the good element was NOT partially revoked");
+        assertEq(settlement.liveAttestationCount(), liveBefore, "live count untouched by the reverted batch");
+        assertEq(settlement.revokedAttestationCount(), revokedBefore, "revoked count untouched");
+        assertEq(eas.revokeCalls(), easBefore, "no EAS.revoke from the reverted batch");
+    }
+
+    /// @dev A never-attested element (uid == 0) reverts the whole batch NotAttested — the good
+    ///      element is not partially revoked.
+    function test_revokeAttestations_revertsOnNeverAttestedElement() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        bytes32 ghost = bytes32("never-settled");
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = MATCH;
+        ids[1] = ghost;
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.NotAttested.selector, ghost));
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+
+        assertFalse(settlement.matchAttestationRevoked(MATCH), "no partial revoke of the settled element");
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    /// @dev An intra-batch duplicate [X, X] reverts: the second occurrence hits the
+    ///      matchAttestationRevoked flag the first set, so a duplicate can never double-decrement.
+    function test_revokeAttestations_revertsOnIntraBatchDuplicate() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = MATCH;
+        ids[1] = MATCH;
+        vm.expectRevert(abi.encodeWithSelector(MatchSettlement.AttestationAlreadyRevoked.selector, MATCH));
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+
+        assertFalse(settlement.matchAttestationRevoked(MATCH), "duplicate batch reverted, nothing revoked");
+        assertEq(settlement.liveAttestationCount(), 1, "no decrement from the reverted duplicate batch");
+    }
+
+    function test_revokeAttestations_revertsForNonAttester() public {
+        _open(MATCH, STAKE);
+        _fundBoth(MATCH);
+        vm.prank(attester);
+        settlement.settle(MATCH, alice, HASH);
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = MATCH;
+        vm.expectRevert(MatchSettlement.NotAttester.selector);
+        vm.prank(bob); // a registered agent, but not an attester
+        settlement.revokeAttestations(ids);
+        assertFalse(settlement.matchAttestationRevoked(MATCH));
+        assertEq(eas.revokeCalls(), 0);
+    }
+
+    function test_revokeAttestations_revertsOnEmptyBatch() public {
+        bytes32[] memory ids = new bytes32[](0);
+        vm.expectRevert(MatchSettlement.EmptyBatch.selector);
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+    }
+
+    /// @dev A batch AT exactly MAX_BATCH (64) succeeds and retracts the full set (draws keep the
+    ///      seat balances flat across 64 matches).
+    function test_revokeAttestations_boundsAtMaxBatch() public {
+        uint256 n = settlement.MAX_BATCH();
+        bytes32[] memory ids = new bytes32[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            bytes32 id = bytes32(uint256(0xB00) + i);
+            _open(id, STAKE);
+            _fundBoth(id);
+            vm.prank(attester);
+            settlement.settleDraw(id, HASH);
+            ids[i] = id;
+        }
+        assertEq(settlement.liveAttestationCount(), n, "64 live attestations before the sweep");
+
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+        assertEq(eas.revokeCalls(), n, "one EAS.revoke per element at the cap");
+        assertEq(settlement.liveAttestationCount(), 0, "the full max batch retracted");
+        assertEq(settlement.revokedAttestationCount(), n);
+    }
+
+    /// @dev A batch ABOVE MAX_BATCH reverts BatchTooLarge before touching any state.
+    function test_revokeAttestations_revertsAboveMaxBatch() public {
+        bytes32[] memory ids = new bytes32[](settlement.MAX_BATCH() + 1);
+        vm.expectRevert(MatchSettlement.BatchTooLarge.selector);
+        vm.prank(attester);
+        settlement.revokeAttestations(ids);
+    }
+
+    /// @dev CEI under batching: a hostile EAS re-entering revokeAttestation for a batched match
+    ///      during Phase 2 finds it already flagged (Phase 1 flags ALL elements first) and reverts
+    ///      AttestationAlreadyRevoked — no double-decrement, no double-revoke across the batch.
+    function test_revokeAttestations_reentrantEasCannotDoubleRevoke() public {
+        ReentrantRevokeEAS reEas = new ReentrantRevokeEAS();
+        MatchSettlement s = new MatchSettlement(address(reEas), address(registry), owner, REP_DELTA);
+        _wireFresh(s, true);
+        vm.prank(owner);
+        s.setAttester(address(reEas), true); // grant so the reentry tests the fence, not the attester gate
+
+        bytes32 m2 = bytes32("reentrant-2");
+        _openFundSettle1v1(s, MATCH);
+        _openFundSettle1v1(s, m2);
+
+        reEas.arm(s, MATCH); // re-enter revokeAttestation(MATCH) during the batch's Phase 2
+        bytes32[] memory ids = new bytes32[](2);
+        ids[0] = MATCH;
+        ids[1] = m2;
+        vm.prank(attester);
+        s.revokeAttestations(ids);
+
+        assertEq(reEas.revokeCalls(), 2, "two batch elements, no reentrant third EAS.revoke");
+        assertTrue(reEas.reentered(), "the mock attempted the reentry");
+        assertTrue(reEas.reentryReverted(), "the reentrant revokeAttestation reverted");
+        assertEq(
+            reEas.reentryRevertSelector(),
+            MatchSettlement.AttestationAlreadyRevoked.selector,
+            "reentry blocked by the AlreadyRevoked fence set in Phase 1"
+        );
+        assertTrue(s.matchAttestationRevoked(MATCH), "both retracted exactly once");
+        assertTrue(s.matchAttestationRevoked(m2));
+        assertEq(s.liveAttestationCount(), 0);
+        assertEq(s.revokedAttestationCount(), 2);
+    }
+
+    function _openFundSettle1v1(MatchSettlement s, bytes32 id) internal {
+        vm.prank(attester);
+        s.openMatch(id, alice, bob, STAKE);
+        vm.prank(alice);
+        s.fund(id);
+        vm.prank(bob);
+        s.fund(id);
+        vm.prank(attester);
+        s.settle(id, alice, HASH);
     }
 
     /// @dev FM1: the attest is the LAST interaction, after the Settled fence and the payout.
