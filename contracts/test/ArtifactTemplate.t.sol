@@ -1481,6 +1481,31 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.balanceOf(player, t), 0);
     }
 
+    /// @dev The batch loop's per-element CEI pinned DIRECTLY, not merely inferred from the
+    ///      shared `_mintOne` plus the single-mint `test_mint_capHoldsUnderReentrancy`. Outer
+    ///      `mintBatch([{t,3},{t,3}])` on cap 8: element 0 commits 3, then its `_mint` receiver
+    ///      hook reenters `mint(t,3)` — which reads the committed 3 and commits 6 — and returns;
+    ///      element 1 then reads the LIVE 6 and reverts (6+3=9 > 8 → `SupplyExceeded`), unwinding
+    ///      the whole batch. Proves the loop reads live counters ACROSS a reentrancy that itself
+    ///      moved the count — not a per-batch entry snapshot — so a reentrant minter cannot use
+    ///      the batch path to slip past a cap the single path holds. The batch twin of
+    ///      `test_mintBatch_capHoldsAcrossBatchDuplicates` (which has no reentry).
+    function test_mintBatch_capHoldsUnderReentrancy() public {
+        ReentrantMinter rm = new ReentrantMinter(art);
+        vm.prank(owner);
+        art.setMinter(address(rm));
+        uint256 id = rm.registerCapped(author, 0, 8); // rarity 0 = free mint, no royalty
+
+        // element 1's SupplyExceeded(id, 9, 8) propagates raw — the hook already returned
+        // during element 0, so nothing wraps it.
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, id, 9, 8));
+        rm.fireBatch(3, 3, 3, regionId);
+
+        assertEq(art.mintedByTemplate(id), 0, "whole batch rolled back, cap never breached");
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.balanceOf(address(rm), id), 0);
+    }
+
     /// @dev Gas-envelope seam: a batch of EXACTLY MAX_BATCH mints — the cap is inclusive so it
     ///      never rejects a legitimate max-size loadout, and this drives the full O(n)
     ///      cap/fee/royalty/mint loop at the boundary with real (rarity>0) per-element work.
@@ -1721,6 +1746,22 @@ contract ReentrantMinter is IERC1155Receiver {
         reentryAmount = reentryAmount_;
         regionId = regionId_;
         art.mint(address(this), templateId, outerAmount, regionId_, "");
+    }
+
+    /// @dev Outer call is a two-element `mintBatch` of `templateId`; the receiver hook still
+    ///      reenters a single `mint(reentryAmount)` once, so a test can drive a reentrancy that
+    ///      lands BETWEEN batch elements (during element 0's `_mint`) and prove element 1 reads
+    ///      the reentrant-moved count.
+    function fireBatch(uint256 a0, uint256 a1, uint256 reentryAmount_, uint256 regionId_) external {
+        reentryAmount = reentryAmount_;
+        regionId = regionId_;
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (templateId, templateId);
+        (amounts[0], amounts[1]) = (a0, a1);
+        (regions[0], regions[1]) = (regionId_, regionId_);
+        art.mintBatch(address(this), ids, amounts, regions, "");
     }
 
     function onERC1155Received(address, address, uint256, uint256, bytes calldata) external returns (bytes4) {
