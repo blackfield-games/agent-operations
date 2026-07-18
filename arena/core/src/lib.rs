@@ -9018,6 +9018,62 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_surfaces_the_starting_countdown_then_zero_at_live() {
+        // The spectator twin of observe_surfaces_the_starting_countdown: a broadcast taken
+        // during Starting stamps phase == Starting and the live countdown a caster overlay
+        // renders ("starts in N"), decrementing each step, and reads exactly 0 on the first
+        // Live frame. The whole-stage feed shows the same clock the per-seat view does.
+        let mut m = countdown_match(3);
+        let opening = m.broadcast();
+        assert_eq!(opening.phase, MatchPhase::Starting, "the feed opens in Starting under a countdown");
+        assert_eq!(opening.starting_remaining, 3, "carrying the full countdown");
+
+        for left in [2u32, 1] {
+            m.step(&BTreeMap::new());
+            let b = m.broadcast();
+            assert_eq!(b.phase, MatchPhase::Starting);
+            assert_eq!(b.starting_remaining, left, "the feed clock tracks the live counter");
+        }
+
+        m.step(&BTreeMap::new()); // the 3rd step drives the counter to 0 and flips to Live
+        let live = m.broadcast();
+        assert_eq!(live.phase, MatchPhase::Live);
+        assert_eq!(live.starting_remaining, 0, "exactly 0 on the first Live frame");
+    }
+
+    #[test]
+    fn broadcast_reports_zero_starting_remaining_without_a_countdown() {
+        // A match that opens directly in Live (the default) shows 0 on the feed from tick 0
+        // — no phantom countdown for a match built before the field existed, the twin of
+        // observe_reports_zero_starting_remaining_without_a_countdown.
+        let m = new_match(1);
+        assert_eq!(m.phase(), MatchPhase::Live);
+        assert_eq!(m.broadcast().starting_remaining, 0);
+    }
+
+    #[test]
+    fn polling_broadcast_through_the_countdown_never_perturbs_the_replay_hash() {
+        // starting_remaining is a view field, so a spectator polling the feed through the
+        // pre-live countdown (where it is non-zero) must not move the replay digest. Two
+        // identical countdown matches stepped in lock-step from Starting into Live: one
+        // polled via broadcast() every tick, one never polled — their digests stay identical.
+        let mut polled = countdown_match(3);
+        let mut quiet = countdown_match(3);
+        let mut saw_countdown = false;
+        for _ in 0..6 {
+            saw_countdown |= polled.broadcast().starting_remaining > 0;
+            polled.step(&BTreeMap::new());
+            quiet.step(&BTreeMap::new());
+        }
+        assert!(saw_countdown, "the polled match really exercised a non-zero countdown on the feed");
+        assert_eq!(
+            polled.build_replay().digest(),
+            quiet.build_replay().digest(),
+            "polling broadcast() through the countdown must never perturb the replay digest",
+        );
+    }
+
+    #[test]
     fn spawns_are_seed_deterministic_and_mirrored() {
         let a = new_match(7);
         let b = new_match(7);
