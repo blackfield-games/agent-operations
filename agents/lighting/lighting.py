@@ -40,6 +40,28 @@ BEAT_FOG_DENSITY: dict[str, float] = {
 # the director's intent.
 FOG_DENSITY_MAX = 0.6
 
+# The DECISIONS.md-locked rig: an overcast Sky dome + an inferno-orange Sun rim — the
+# scorched-modern palette beats must never recolor or dim. These blocks are the SINGLE
+# SOURCE of the lock: `run` emits them verbatim into every lighting layer, and the
+# validator's palette gate re-derives the expected rig from them (as its fog gate reads
+# `_fog_density`), so a change here moves both the emitter and the gate in lock-step —
+# no hand-copied second opinion to drift. Beats append only the Atmosphere volume after
+# the Sun; they never touch these color/intensity/angle opinions.
+LOCKED_SKY = """    def DomeLight "Sky"
+    {
+        float inputs:intensity = 0.4
+        color3f inputs:color = (0.55, 0.58, 0.62)
+        custom string mood = "overcast"
+    }"""
+LOCKED_SUN = """    def DistantLight "Sun"
+    {
+        float inputs:intensity = 1.2
+        color3f inputs:color = (1.0, 0.62, 0.32)
+        float inputs:angle = 0.53
+        custom string mood = "inferno_rim"
+    }"""
+PALETTE_BLOCK = f"{LOCKED_SKY}\n{LOCKED_SUN}"
+
 
 def _beats_from_director(prior: list[LayerSpec]) -> str:
     """The director's free-form ``intent:beats`` mood line for this region, read off the
@@ -114,19 +136,7 @@ async def run(brief: WorldBrief, prior: list[LayerSpec]) -> LayerSpec | None:
 
 def Xform "Lighting"
 {{
-    def DomeLight "Sky"
-    {{
-        float inputs:intensity = 0.4
-        color3f inputs:color = (0.55, 0.58, 0.62)
-        custom string mood = "overcast"
-    }}
-    def DistantLight "Sun"
-    {{
-        float inputs:intensity = 1.2
-        color3f inputs:color = (1.0, 0.62, 0.32)
-        float inputs:angle = 0.53
-        custom string mood = "inferno_rim"
-    }}{fog_block}
+{PALETTE_BLOCK}{fog_block}
 }}
 """
     )
