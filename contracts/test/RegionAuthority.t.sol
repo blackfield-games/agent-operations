@@ -431,6 +431,181 @@ contract RegionAuthorityTest is Test {
         region.claimFees(TILE);
     }
 
+    // --- claimFeesBatch (sweep a portfolio of regions in one tx, strict-atomic) ---
+
+    /// @dev The headline: a holder sweeps three regions' fees in ONE call — a
+    ///      `FeesClaimed` per region and a SINGLE aggregated transfer of the sum, with
+    ///      every `accruedFees` zeroed and the stakes left locked.
+    function test_claimFeesBatch_sweepsManyRegionsInOneTransfer() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        uint256 t3 = uint256(keccak256("region:5,6,0"));
+        vm.startPrank(alice);
+        region.claim(TILE, STAKE);
+        region.claim(t2, STAKE);
+        region.claim(t3, STAKE);
+        vm.stopPrank();
+        vm.startPrank(bob);
+        region.depositFees(TILE, FEE);
+        region.depositFees(t2, 50 ether);
+        region.depositFees(t3, 20 ether);
+        vm.stopPrank();
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.expectEmit(true, true, false, true);
+        emit FeesClaimed(TILE, alice, FEE);
+        vm.expectEmit(true, true, false, true);
+        emit FeesClaimed(t2, alice, 50 ether);
+        vm.expectEmit(true, true, false, true);
+        emit FeesClaimed(t3, alice, 20 ether);
+
+        uint256[] memory ids = new uint256[](3);
+        ids[0] = TILE;
+        ids[1] = t2;
+        ids[2] = t3;
+        vm.prank(alice);
+        region.claimFeesBatch(ids);
+
+        uint256 sum = FEE + 50 ether + 20 ether;
+        assertEq(token.balanceOf(alice), aliceBefore + sum, "one aggregated transfer of the summed fees");
+        assertEq(region.accruedFees(TILE), 0);
+        assertEq(region.accruedFees(t2), 0);
+        assertEq(region.accruedFees(t3), 0);
+        assertEq(token.balanceOf(address(region)), 3 * STAKE, "only fees left; the three stakes stay locked");
+    }
+
+    /// @dev Strict-atomic: a zero-fee element reverts the WHOLE batch (mirrors the
+    ///      single's `NothingToClaim`) — the funded region is NOT partially swept.
+    function test_claimFeesBatch_revertsAtomicallyOnZeroFeeElement() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        vm.startPrank(alice);
+        region.claim(TILE, STAKE);
+        region.claim(t2, STAKE); // t2 has no accrued fees
+        vm.stopPrank();
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = t2;
+        vm.expectRevert(RegionAuthority.NothingToClaim.selector);
+        vm.prank(alice);
+        region.claimFeesBatch(ids);
+
+        assertEq(region.accruedFees(TILE), FEE, "the funded region was NOT partially swept");
+        assertEq(token.balanceOf(alice), aliceBefore, "no transfer from the reverted batch");
+    }
+
+    /// @dev A batch is not a licence to sweep another holder's region: an element the
+    ///      caller does not own reverts `NotHolder`, and that region stays untouched —
+    ///      fees are never pooled to `msg.sender` across differently-owned regions.
+    function test_claimFeesBatch_revertsOnNonHeldElement() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.claim(t2, STAKE);
+        vm.startPrank(bob);
+        region.depositFees(TILE, FEE);
+        region.depositFees(t2, FEE);
+        vm.stopPrank();
+
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = t2; // bob's region
+        vm.expectRevert(RegionAuthority.NotHolder.selector);
+        vm.prank(alice);
+        region.claimFeesBatch(ids);
+
+        assertEq(region.accruedFees(TILE), FEE, "alice's region not swept by the reverted batch");
+        assertEq(region.accruedFees(t2), FEE, "bob's region untouched, no cross-holder sweep");
+    }
+
+    /// @dev An intra-batch duplicate `[X, X]` reverts: the second occurrence reads the
+    ///      balance the first zeroed (`NothingToClaim`), so a duplicate can never
+    ///      double-claim, and the reverted batch leaves the region fully accrued.
+    function test_claimFeesBatch_revertsOnIntraBatchDuplicate() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.depositFees(TILE, FEE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = TILE;
+        vm.expectRevert(RegionAuthority.NothingToClaim.selector);
+        vm.prank(alice);
+        region.claimFeesBatch(ids);
+
+        assertEq(region.accruedFees(TILE), FEE, "no partial claim from the reverted duplicate batch");
+        assertEq(token.balanceOf(alice), aliceBefore, "nothing transferred");
+    }
+
+    function test_claimFeesBatch_revertsOnEmptyBatch() public {
+        uint256[] memory ids = new uint256[](0);
+        vm.expectRevert(RegionAuthority.EmptyBatch.selector);
+        vm.prank(alice);
+        region.claimFeesBatch(ids);
+    }
+
+    /// @dev A batch AT exactly MAX_BATCH (64) succeeds and sweeps the full portfolio.
+    function test_claimFeesBatch_boundsAtMaxBatch() public {
+        uint256 n = region.MAX_BATCH();
+        uint256[] memory ids = new uint256[](n);
+        vm.startPrank(alice);
+        for (uint256 i = 0; i < n; i++) {
+            uint256 id = uint256(keccak256(abi.encode("maxbatch", i)));
+            region.claim(id, STAKE);
+            ids[i] = id;
+        }
+        vm.stopPrank();
+        vm.startPrank(bob);
+        for (uint256 i = 0; i < n; i++) {
+            region.depositFees(ids[i], FEE);
+        }
+        vm.stopPrank();
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.prank(alice);
+        region.claimFeesBatch(ids);
+        assertEq(token.balanceOf(alice), aliceBefore + n * FEE, "the full max batch swept");
+        assertEq(region.accruedFees(ids[0]), 0);
+        assertEq(region.accruedFees(ids[n - 1]), 0);
+    }
+
+    /// @dev A batch ABOVE MAX_BATCH reverts BatchTooLarge before touching any state.
+    function test_claimFeesBatch_revertsAboveMaxBatch() public {
+        uint256[] memory ids = new uint256[](region.MAX_BATCH() + 1);
+        vm.expectRevert(RegionAuthority.BatchTooLarge.selector);
+        vm.prank(alice);
+        region.claimFeesBatch(ids);
+    }
+
+    /// @dev CEI under batching: a hostile token reentering `claimFees` on the aggregated
+    ///      fee payout finds the region's `accruedFees` already zeroed (Phase 1 zeroes
+    ///      before the Phase 2 transfer) and reverts — no double-claim draining the pool.
+    function test_claimFeesBatch_reentrantClaimerCannotDoubleClaim() public {
+        HookToken evil = new HookToken();
+        RegionAuthority r = new RegionAuthority(address(evil), STAKE, owner);
+        ReentrantClaimer attacker = new ReentrantClaimer(r, evil);
+
+        evil.transfer(address(attacker), STAKE);
+        attacker.claim(TILE, STAKE); // attacker holds TILE; pool holds its STAKE
+        evil.approve(address(r), type(uint256).max);
+        r.depositFees(TILE, FEE); // accrue FEE; pool now holds STAKE + FEE
+
+        uint256 poolBefore = evil.balanceOf(address(r));
+        evil.arm(); // fire the reentry on the fee payout
+        attacker.claimFeesBatch();
+
+        assertTrue(attacker.reentered(), "reentry fired");
+        assertTrue(attacker.reentryReverted(), "reentry blocked by CEI (accrued zeroed pre-transfer)");
+        assertEq(evil.balanceOf(address(attacker)), FEE, "recovered exactly its own fee, not double");
+        assertEq(evil.balanceOf(address(r)), poolBefore - FEE, "only the one fee left; the stake is intact");
+        assertEq(r.accruedFees(TILE), 0);
+    }
+
     /// @dev The fairness property: a region sale must not hand the buyer the fees the
     ///      seller earned. On transfer the accrued balance settles to the OUTGOING
     ///      holder's pull ledger; the new holder inherits nothing.
@@ -824,6 +999,12 @@ contract ReentrantClaimer {
 
     function claimFees() external {
         region.claimFees(tokenId);
+    }
+
+    function claimFeesBatch() external {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = tokenId;
+        region.claimFeesBatch(ids);
     }
 
     function onPayout() external {
