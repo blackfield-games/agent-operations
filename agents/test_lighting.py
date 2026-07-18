@@ -17,22 +17,6 @@ from lighting import lighting
 from terrain import terrain
 from validator import validator
 
-# The DECISIONS.md-locked palette blocks — beats must never recolor or dim these.
-LOCKED_SKY = """    def DomeLight "Sky"
-    {
-        float inputs:intensity = 0.4
-        color3f inputs:color = (0.55, 0.58, 0.62)
-        custom string mood = "overcast"
-    }"""
-LOCKED_SUN = """    def DistantLight "Sun"
-    {
-        float inputs:intensity = 1.2
-        color3f inputs:color = (1.0, 0.62, 0.32)
-        float inputs:angle = 0.53
-        custom string mood = "inferno_rim"
-    }"""
-
-
 def _density_from_usd(text: str) -> float:
     m = re.search(r"inputs:density\s*=\s*([\d.]+)", text)
     assert m, "emitted lighting USD has no Atmosphere density"
@@ -57,17 +41,44 @@ async def test_director_beats_drive_atmospheric_fog(tmp_path, monkeypatch):
     assert layer.summary.endswith(f"fog {lighting._fog_density(recognized):.2f}")
 
 
+def test_locked_palette_matches_decisions_md():
+    # The single authoritative pin of the DECISIONS.md-locked values: lighting.run and the
+    # validator's palette gate both re-derive from these constants, so a fat-finger to a
+    # color/intensity/angle would pass every relationship test — this asserts the bytes
+    # themselves. The one place the literal values live in a test (replacing the old
+    # hand-copied LOCKED_SKY/LOCKED_SUN that shadowed the inline producer literals).
+    assert lighting.LOCKED_SKY == (
+        '    def DomeLight "Sky"\n'
+        "    {\n"
+        "        float inputs:intensity = 0.4\n"
+        "        color3f inputs:color = (0.55, 0.58, 0.62)\n"
+        '        custom string mood = "overcast"\n'
+        "    }"
+    )
+    assert lighting.LOCKED_SUN == (
+        '    def DistantLight "Sun"\n'
+        "    {\n"
+        "        float inputs:intensity = 1.2\n"
+        "        color3f inputs:color = (1.0, 0.62, 0.32)\n"
+        "        float inputs:angle = 0.53\n"
+        '        custom string mood = "inferno_rim"\n'
+        "    }"
+    )
+    assert lighting.PALETTE_BLOCK == f"{lighting.LOCKED_SKY}\n{lighting.LOCKED_SUN}"
+
+
 @pytest.mark.asyncio
 async def test_locked_palette_unchanged_only_fog_added(tmp_path, monkeypatch):
     # FM1 (palette lock): beats add ONLY the Atmosphere volume — the overcast dome and
     # inferno-rim sun (color, intensity, angle) are byte-identical with and without beats.
-    # The DECISIONS.md color lock holds while the atmosphere reads the director's intent.
+    # The DECISIONS.md color lock holds while the atmosphere reads the director's intent. The
+    # locked blocks are re-derived from lighting's OWN constants (single source), not a copy.
     monkeypatch.chdir(tmp_path)
     brief = WorldBrief(biome="forest", region=RegionCoord(x=3, y=7))
     dl = await director.run(brief, [])
     with_beats = (tmp_path / "layers" / (await lighting.run(brief, [dl])).path).read_text()
     no_beats = (tmp_path / "layers" / (await lighting.run(brief, [])).path).read_text()
-    for block in (LOCKED_SKY, LOCKED_SUN):
+    for block in (lighting.LOCKED_SKY, lighting.LOCKED_SUN):
         assert block in with_beats, "beats changed the locked palette"
         assert block in no_beats
     assert 'def Volume "Atmosphere"' in with_beats
