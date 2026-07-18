@@ -1579,22 +1579,26 @@ impl Match {
         }
     }
 
-    /// Project the whole-battlefield SPECTATOR view — every pawn's public on-stage
-    /// state — as an [`arena_proto::Broadcast`]. This is the caster-camera feed a
-    /// non-participant watches, the deliberate counterpart to
+    /// Project the whole-battlefield SPECTATOR view — every pawn plus the world
+    /// entities on stage — as an [`arena_proto::Broadcast`]. This is the caster-camera
+    /// feed a non-participant watches, the deliberate counterpart to
     /// [`observe`](Match::observe):
     ///
     /// - `observe` is one seat's PARITY-BOUNDED slice — its own full state plus only
-    ///   the enemies it can perceive — and is the gameplay security boundary. This
-    ///   method does not touch it: adding `broadcast` changes nothing an agent sees,
-    ///   because the Gateway still answers a participant's connection only with
-    ///   `observe`.
+    ///   the enemies, shots, and pickups it can perceive — and is the gameplay
+    ///   security boundary. This method does not touch it: adding `broadcast` changes
+    ///   nothing an agent sees, because the Gateway still answers a participant's
+    ///   connection only with `observe`.
     /// - `broadcast` is omniscient over PUBLIC state only: it reports EVERY pawn
-    ///   (alive or dead, in or out of anyone's perception) because a spectator sees
-    ///   the whole stage, but it carries only what is on screen — position, team,
-    ///   facing, the health bar, and the scoreboard `score`. It deliberately omits
-    ///   the private HUD internals (`ammo`, `cooldown`) the parity bound also hides,
-    ///   so the feed is not a tactical x-ray.
+    ///   (alive or dead, in or out of anyone's perception) AND every in-flight
+    ///   projectile and active pickup, because a spectator sees the whole stage — the
+    ///   same three [`EntityKind`](arena_proto::EntityKind)s `observe` perceives, but
+    ///   unbounded by any one seat's cone. It carries only what is on screen —
+    ///   position, team, facing, and (for a pawn) the health bar and scoreboard
+    ///   `score`; a projectile/pickup is the neutral team with those pawn-only fields
+    ///   zeroed. It deliberately omits the private HUD internals (`ammo`, `cooldown`,
+    ///   `shield`) the parity bound also hides, so the feed is not a tactical x-ray,
+    ///   and a pickup's effect sub-kind/amount/respawn never reach the wire.
     ///
     /// SECURITY: `observe` and `broadcast` are two separate methods on the same
     /// `Match`; the parity bound holds only as long as a *participant's* gameplay
@@ -1623,6 +1627,46 @@ impl Match {
                 alive: p.alive,
             })
             .collect();
+        // Every in-flight projectile, as the neutral team with its travel `facing` — the
+        // rest of the whole stage a caster renders, mirroring the `Projectile`
+        // `VisibleEntity` `observe` projects (a pure-hitscan match has none). It is not a
+        // scoring body, so it carries no health bar or scoreboard: `health`/`max_health`/
+        // `score` are zeroed and `alive` marks only that it is on stage. `z` is flattened
+        // to `0` exactly as `observe` reports it, so the two views agree on a shot's shape.
+        entities.extend(self.projectiles.iter().map(|proj| arena_proto::BroadcastEntity {
+            entity_id: proj.id,
+            kind: arena_proto::EntityKind::Projectile,
+            team: 0,
+            position: proj.pos,
+            z: 0,
+            facing: proj.facing,
+            health: 0,
+            max_health: 0,
+            score: 0,
+            alive: true,
+        }));
+        // Every ACTIVE world pickup, neutral team and no facing — mirroring the `Pickup`
+        // `VisibleEntity` `observe` projects. A dormant (collected, not-yet-respawned)
+        // pickup is off stage and emits none, so its absence tracks its real state, the
+        // same way `observe` omits it; its effect sub-kind, amount, and respawn timer
+        // never reach the wire (a spectator learns no more than the rendered stage shows).
+        entities.extend(self.pickups.iter().filter(|pk| pk.active).map(|pk| {
+            arena_proto::BroadcastEntity {
+                entity_id: pk.id,
+                kind: arena_proto::EntityKind::Pickup,
+                team: 0,
+                position: pk.pos,
+                z: 0,
+                facing: 0,
+                health: 0,
+                max_health: 0,
+                score: 0,
+                alive: true,
+            }
+        }));
+        // Pawns (seat ids ≤ 255) sort below projectiles (from 2^16) below pickups (from
+        // 2^24), so the frame stays canonical ascending-`entity_id` order across all three
+        // kinds — the disjoint id spaces make the single sort total and stable.
         entities.sort_by_key(|e| e.entity_id);
         arena_proto::Broadcast {
             protocol_version: PROTOCOL_VERSION,
