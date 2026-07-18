@@ -70,6 +70,15 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     ///         template above it would over/under-charge the $BLCKFLD mint fee.
     uint16 public constant MAX_RARITY = 10_000;
 
+    /// @notice Largest `mintBatch` size. Bounds the O(n) fee/royalty/mint loop so a
+    ///         single batch's gas stays a contract guarantee, never a trust assumption
+    ///         even from a buggy or compromised minter — the same envelope
+    ///         `RenderReceipts.MAX_BATCH`/`ComputeMeter.DEBIT_BATCH_SIZE_MAX` use for the
+    ///         other coordinator-driven batches. Only `mintBatch` (minter acting on a
+    ///         recipient's behalf) is bounded; `burnBatch` is not, because a holder burns
+    ///         their own tokens on their own gas.
+    uint256 public constant MAX_BATCH = 64;
+
     struct Template {
         address author;
         uint16 rarity; // 0-10000 basis points, drives mint cost
@@ -136,6 +145,9 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     error ZeroRoyaltyToken();
     error ZeroMinter();
     error SupplyExceeded(uint256 templateId, uint256 wouldMint, uint256 maxSupply);
+    error EmptyBatch();
+    error BatchTooLarge();
+    error ArrayLengthMismatch();
 
     constructor(
         address owner_,
@@ -232,6 +244,54 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
     {
         if (msg.sender != minter) revert NotMinter();
         if (to == address(0)) revert ZeroRecipient();
+        _mintOne(to, templateId, amount, regionId, data);
+    }
+
+    /// @notice Batch twin of {mint}: mint `amounts[i]` units of `templateIds[i]` into region
+    ///         `regionIds[i]` for a single recipient in one call — granting a mixed
+    ///         multi-template loadout (a starter pack / loot bundle) without a transaction
+    ///         per artifact. The create-side counterpart to {burnBatch}. Every per-element
+    ///         effect of {mint} applies UNCHANGED through the shared `_mintOne`: the
+    ///         supply-cap check, the compute fee, the region royalty route, the ERC-1155
+    ///         mint, and the `Minted` event — so the batch can never drift from the single
+    ///         mint's charge, and the counters net EXACTLY the sum of N single mints.
+    /// @dev Minter-gated once (like {mint}), for a SINGLE recipient (like {burnBatch}'s
+    ///      single `from`). Bounded by `MAX_BATCH` with `EmptyBatch`/`BatchTooLarge` — unlike
+    ///      {burnBatch}, because a minter acts on a recipient's behalf (see `MAX_BATCH`). The
+    ///      three per-element arrays must be equal length (`ArrayLengthMismatch`); `regionIds`
+    ///      is length-checked here because, unlike an OZ `_mintBatch`, it is not one of the
+    ///      ERC-1155 arrays. Whole-batch atomic and CEI-safe per element: each `_mintOne`
+    ///      commits its supply counters before its own external calls, so a reentrant
+    ///      minter/receiver-hook sees the cap enforced, a templateId repeated within one batch
+    ///      accumulates against the committed count, and ANY element's revert (unknown
+    ///      template, cap exceeded, insufficient fee credit, unknown region, zero amount)
+    ///      rolls the WHOLE batch back — never a partially-granted loadout.
+    function mintBatch(
+        address to,
+        uint256[] calldata templateIds,
+        uint256[] calldata amounts,
+        uint256[] calldata regionIds,
+        bytes calldata data
+    ) external {
+        if (msg.sender != minter) revert NotMinter();
+        if (to == address(0)) revert ZeroRecipient();
+        uint256 n = templateIds.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
+        if (amounts.length != n || regionIds.length != n) revert ArrayLengthMismatch();
+
+        for (uint256 i = 0; i < n; ++i) {
+            _mintOne(to, templateIds[i], amounts[i], regionIds[i], data);
+        }
+    }
+
+    /// @dev The per-element mint engine shared by {mint} and {mintBatch} — the single source
+    ///      of truth for a mint's charge, so a batch can never drift from a single. The caller
+    ///      has already checked minter auth and a non-zero recipient (both per-CALL, checked
+    ///      once); everything below is per-element.
+    function _mintOne(address to, uint256 templateId, uint256 amount, uint256 regionId, bytes calldata data)
+        private
+    {
         if (amount == 0) revert ZeroAmount();
         Template storage t = templates[templateId];
         if (t.author == address(0)) revert UnknownTemplate();
@@ -253,7 +313,8 @@ contract ArtifactTemplate is ERC1155, Ownable2Step {
         // which can reenter (a misbehaving meter/token; a minter that is also the
         // recipient via the ERC-1155 receiver hook). A reentrant call therefore sees
         // counters that already include this mint, so the supply cap holds and the
-        // royalty is never double-routed.
+        // royalty is never double-routed. In a batch this holds PER element, so a
+        // templateId repeated across elements accumulates against the committed count.
         totalMinted += amount;
         mintedByTemplate[templateId] = wouldMint;
 
