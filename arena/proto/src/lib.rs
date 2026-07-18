@@ -381,13 +381,27 @@ pub struct BroadcastEntity {
 /// seat's private observation, which would either leak one seat's hidden state to
 /// every viewer or, conversely, withhold the whole-map view a broadcast needs. It
 /// carries no `deadline_micros`, no `own`, and no per-seat `visible`: a spectator is
-/// not a participant, cannot act, and has no tick to answer.
+/// not a participant, cannot act, and has no tick to answer. It DOES carry
+/// [`starting_remaining`](Broadcast::starting_remaining) — the pre-match countdown is
+/// the public clock a stream viewer sees on screen, not a private per-seat quantity, so
+/// unlike `deadline_micros` it is a spectator-facing field, not an omission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Broadcast {
     pub protocol_version: u32,
     pub match_id: MatchId,
     pub tick: u64,
     pub phase: MatchPhase,
+    /// Ticks left in the [`Starting`](MatchPhase::Starting) countdown before the match
+    /// opens to [`Live`](MatchPhase::Live): the live counter while `phase` is `Starting`,
+    /// and `0` in every other phase. A caster overlay reads this to render the pre-match
+    /// countdown clock ("starts in `starting_remaining` ticks") — the spectator
+    /// counterpart to the same field on [`Observation`], which the participant view uses
+    /// to time its first move. Like there, it is a VIEW field: NOT part of
+    /// `canonical_encoding` or the replay digest, so surfacing it moves no `replay_hash`.
+    /// `#[serde(default)]` so a frame encoded before the field existed decodes to `0`,
+    /// which is exactly its value once `Live` — the back-compat default matches reality.
+    #[serde(default)]
+    pub starting_remaining: u32,
     /// Every on-stage entity's public state — pawns, in-flight projectiles, and active
     /// pickups — ascending by `entity_id` (canonical).
     pub entities: Vec<BroadcastEntity>,
@@ -2507,6 +2521,7 @@ mod tests {
             match_id: FIXED_MATCH.parse().unwrap(),
             tick: 64,
             phase: MatchPhase::Live,
+            starting_remaining: 0,
             entities: vec![BroadcastEntity {
                 entity_id: 0,
                 kind: EntityKind::Player,

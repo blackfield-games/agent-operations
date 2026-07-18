@@ -3057,6 +3057,7 @@ mod tests {
             match_id: FIXED_ID.parse().unwrap(),
             tick,
             phase: MatchPhase::Live,
+            starting_remaining: 0,
             entities: Vec::new(),
         }
     }

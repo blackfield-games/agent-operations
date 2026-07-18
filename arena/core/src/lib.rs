@@ -1673,6 +1673,11 @@ impl Match {
             match_id: self.match_id,
             tick: self.tick,
             phase: self.phase,
+            // The live pre-match countdown, mirroring the same field `observe` reports:
+            // `Starting` streams the ticks-to-GO a caster overlay renders, and it is `0`
+            // once the match is `Live` (the counter is spent). A view field like the rest
+            // of `broadcast`, never fed to `canonical_encoding`, so `replay_hash` is untouched.
+            starting_remaining: self.starting_remaining,
             entities,
         }
     }
