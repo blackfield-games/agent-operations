@@ -22,6 +22,10 @@ contract RegionAuthority is ERC721, Ownable2Step {
     IERC20 public immutable TOKEN;
     uint256 public stakeRequired;
 
+    /// @notice Upper bound on a `claimFeesBatch` roster, bounding the loop's gas.
+    ///         Mirrors `MatchSettlement`/`RenderReceipts.MAX_BATCH` (a distinct bound).
+    uint256 public constant MAX_BATCH = 64;
+
     struct Stake {
         uint256 amount;
         uint64 stakedAt;
@@ -63,6 +67,8 @@ contract RegionAuthority is ERC721, Ownable2Step {
     error ZeroAmount();
     error UnknownRegion();
     error NothingToClaim();
+    error EmptyBatch();
+    error BatchTooLarge();
 
     constructor(address token_, uint256 stakeRequired_, address owner_)
         ERC721("Blackfield Region", "BFLD-RGN")
@@ -132,6 +138,36 @@ contract RegionAuthority is ERC721, Ownable2Step {
         accruedFees[tokenId] = 0;
         TOKEN.safeTransfer(msg.sender, amount);
         emit FeesClaimed(tokenId, msg.sender, amount);
+    }
+
+    /// @notice Claim the accrued fees of MULTIPLE regions the caller holds in ONE tx,
+    ///         instead of N separate `claimFees` calls — the batch twin for a holder
+    ///         managing a portfolio of regions. Strict-atomic and per-element identical
+    ///         to `claimFees`: every `tokenId` must be held by the caller (`NotHolder`)
+    ///         with non-zero accrued fees (`NothingToClaim`), so a non-held or zero-fee
+    ///         element — including a `tokenId` REPEATED in the batch (its second
+    ///         occurrence reads the balance the first already zeroed) — reverts the
+    ///         WHOLE call; a batch never partially sweeps. CEI mirrors the single: every
+    ///         region's `accruedFees` is zeroed BEFORE the one aggregated transfer, so a
+    ///         reentrant token recipient finds nothing left to claim across the batch.
+    ///         Pass only regions that have accrued fees (readable via `accruedFees`); a
+    ///         `FeesClaimed` fires per region and the payout is one transfer of the sum.
+    function claimFeesBatch(uint256[] calldata tokenIds) external {
+        uint256 n = tokenIds.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
+
+        uint256 total = 0;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = tokenIds[i];
+            if (ownerOf(tokenId) != msg.sender) revert NotHolder();
+            uint256 amount = accruedFees[tokenId];
+            if (amount == 0) revert NothingToClaim();
+            accruedFees[tokenId] = 0;
+            total += amount;
+            emit FeesClaimed(tokenId, msg.sender, amount);
+        }
+        TOKEN.safeTransfer(msg.sender, total);
     }
 
     /// @notice Withdraw fees settled to the caller from a region transfer/burn (the

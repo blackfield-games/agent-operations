@@ -22,6 +22,19 @@
   },
   {
     "inputs": [],
+    "name": "MAX_BATCH",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
     "name": "TOKEN",
     "outputs": [
       {
@@ -123,6 +136,19 @@
       }
     ],
     "name": "claimFees",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint256[]",
+        "name": "tokenIds",
+        "type": "uint256[]"
+      }
+    ],
+    "name": "claimFeesBatch",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -806,6 +832,11 @@
     "type": "error"
   },
   {
+    "inputs": [],
+    "name": "BatchTooLarge",
+    "type": "error"
+  },
+  {
     "inputs": [
       {
         "internalType": "address",
@@ -906,6 +937,11 @@
       }
     ],
     "name": "ERC721NonexistentToken",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "EmptyBatch",
     "type": "error"
   },
   {
