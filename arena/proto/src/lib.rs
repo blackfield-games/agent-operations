@@ -332,20 +332,24 @@ pub struct Observation {
     pub visible: Vec<VisibleEntity>,
 }
 
-/// One entity in a [`Broadcast`] — the PUBLIC, on-stage state of a single pawn as
-/// a non-participant spectator sees it.
+/// One entity in a [`Broadcast`] — the PUBLIC, on-stage state of a single entity (a
+/// pawn, an in-flight projectile, or an active pickup) as a non-participant spectator
+/// sees it. The `kind` discriminates the three; a projectile/pickup is the neutral
+/// team with the pawn-only `health`/`max_health`/`score` zeroed.
 ///
 /// This is the spectator counterpart to [`VisibleEntity`], and the difference is
 /// deliberate. A `VisibleEntity` is parity-bounded — only what one seat can perceive
 /// this tick — and carries no health or score. A `BroadcastEntity` is the
-/// caster-camera view: it is reported for EVERY pawn (a spectator watching the
-/// rendered match sees the whole battlefield), and it carries the health bar and
-/// scoreboard a broadcast shows — `health`/`max_health`/`score`/`alive`. But it
-/// stops at what is *on screen*: there is deliberately NO `ammo` or `cooldown`
-/// field, so the feed is not a tactical x-ray of every player's private HUD. That
-/// exclusion is the broadcast's security line — a spectator must learn no more than
-/// a viewer of the stream would — and is pinned by a wire-shape test; widening it
-/// with a private field is a regression.
+/// caster-camera view: it is reported for EVERY pawn (alive or dead) AND every
+/// in-flight projectile and active pickup, because a spectator watching the rendered
+/// match sees the whole battlefield unbounded by any one seat's cone, and for a pawn
+/// it carries the health bar and scoreboard a broadcast shows —
+/// `health`/`max_health`/`score`/`alive`. But it stops at what is *on screen*: there
+/// is deliberately NO `ammo` or `cooldown` field, so the feed is not a tactical x-ray
+/// of every player's private HUD, and a pickup's effect sub-kind/amount/respawn never
+/// reach the wire. That exclusion is the broadcast's security line — a spectator must
+/// learn no more than a viewer of the stream would — and is pinned by a wire-shape
+/// test; widening it with a private field is a regression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastEntity {
     pub entity_id: u32,
@@ -369,21 +373,23 @@ pub struct BroadcastEntity {
 ///
 /// Where an [`Observation`] is one seat's parity-bounded, player-perspective slice
 /// (its own state plus only what it perceives), a `Broadcast` is the
-/// omniscient-over-PUBLIC-state view a spectator/caster gets: every pawn's on-stage
-/// state ([`BroadcastEntity`]), in ascending `entity_id` order so the frame is
-/// canonical. It is intentionally a SEPARATE type from `Observation` — a spectator
-/// feed must never be wired from a seat's private observation, which would either
-/// leak one seat's hidden state to every viewer or, conversely, withhold the
-/// whole-map view a broadcast needs. It carries no `deadline_micros`, no `own`, and
-/// no per-seat `visible`: a spectator is not a participant, cannot act, and has no
-/// tick to answer.
+/// omniscient-over-PUBLIC-state view a spectator/caster gets: every pawn plus every
+/// in-flight projectile and active pickup as a [`BroadcastEntity`], in ascending
+/// `entity_id` order so the frame is canonical (the disjoint pawn/projectile/pickup id
+/// spaces make that one order total across the three kinds). It is intentionally a
+/// SEPARATE type from `Observation` — a spectator feed must never be wired from a
+/// seat's private observation, which would either leak one seat's hidden state to
+/// every viewer or, conversely, withhold the whole-map view a broadcast needs. It
+/// carries no `deadline_micros`, no `own`, and no per-seat `visible`: a spectator is
+/// not a participant, cannot act, and has no tick to answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Broadcast {
     pub protocol_version: u32,
     pub match_id: MatchId,
     pub tick: u64,
     pub phase: MatchPhase,
-    /// Every pawn's public on-stage state, ascending by `entity_id` (canonical).
+    /// Every on-stage entity's public state — pawns, in-flight projectiles, and active
+    /// pickups — ascending by `entity_id` (canonical).
     pub entities: Vec<BroadcastEntity>,
 }
 
