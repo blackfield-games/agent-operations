@@ -1273,6 +1273,423 @@ contract ArtifactTemplateTest is Test {
         assertEq(art.burnedByTemplate(a), 5);
         assertEq(art.totalBurned(), 5);
     }
+
+    // --- mintBatch (create-side batch twin of burnBatch) ---
+
+    /// @dev Register a template without minting, so a mintBatch test controls the mint.
+    function _register(uint16 rarity, uint256 maxSupply) internal returns (uint256 id) {
+        vm.prank(minter);
+        id = art.registerTemplate(author, rarity, keccak256("mb"), maxSupply);
+    }
+
+    /// @dev Stake+claim a second region so a batch can route royalties into more than one.
+    function _claimRegion(uint256 rid, address holder) internal {
+        token.transfer(holder, STAKE);
+        vm.startPrank(holder);
+        token.approve(address(region), STAKE);
+        region.claim(rid, STAKE);
+        vm.stopPrank();
+    }
+
+    /// @dev Happy path: a mixed loadout of three distinct templates minted to one recipient in
+    ///      one call — a Minted per element in order, per-template balances + counters, and the
+    ///      region royalty routed for the batch.
+    function test_mintBatch_happyPath() public {
+        uint256 t1 = _register(5000, 0);
+        uint256 t2 = _register(3000, 0);
+        uint256 t3 = _register(8000, 0);
+
+        uint256[] memory ids = new uint256[](3);
+        uint256[] memory amounts = new uint256[](3);
+        uint256[] memory regions = new uint256[](3);
+        (ids[0], ids[1], ids[2]) = (t1, t2, t3);
+        (amounts[0], amounts[1], amounts[2]) = (2, 5, 1);
+        (regions[0], regions[1], regions[2]) = (regionId, regionId, regionId);
+
+        vm.expectEmit(true, true, false, true);
+        emit Minted(player, t1, 2);
+        vm.expectEmit(true, true, false, true);
+        emit Minted(player, t2, 5);
+        vm.expectEmit(true, true, false, true);
+        emit Minted(player, t3, 1);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.balanceOf(player, t1), 2);
+        assertEq(art.balanceOf(player, t2), 5);
+        assertEq(art.balanceOf(player, t3), 1);
+        assertEq(art.mintedByTemplate(t1), 2);
+        assertEq(art.mintedByTemplate(t2), 5);
+        assertEq(art.mintedByTemplate(t3), 1);
+        assertEq(art.totalMinted(), 8);
+        assertGt(region.accruedFees(regionId), 0, "royalty routed for the batch");
+    }
+
+    /// @dev A one-element batch is equivalent to a single mint: same fee debit, same royalty
+    ///      route, same Minted, same counters.
+    function test_mintBatch_singleElementMatchesMint() public {
+        uint256 t = _register(5000, 0);
+        uint256 creditBefore = meter.credit(player);
+        uint256 accruedBefore = region.accruedFees(regionId);
+
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory amounts = new uint256[](1);
+        uint256[] memory regions = new uint256[](1);
+        (ids[0], amounts[0], regions[0]) = (t, 4, regionId);
+
+        vm.expectEmit(true, true, false, true);
+        emit Minted(player, t, 4);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.balanceOf(player, t), 4);
+        assertEq(art.mintedByTemplate(t), 4);
+        assertEq(art.totalMinted(), 4);
+        assertLt(meter.credit(player), creditBefore, "fee debited");
+        assertGt(region.accruedFees(regionId), accruedBefore, "royalty routed");
+    }
+
+    /// @dev A fresh ArtifactTemplate wired to the shared meter+region, minter set, and with
+    ///      `player` approved to pull its royalty — for the two-contract equivalence tests.
+    function _freshWiredArt() internal returns (ArtifactTemplate x) {
+        x = new ArtifactTemplate(owner, BASE_URI, address(meter), FEE_RATE, address(region), ROYALTY_RATE);
+        vm.startPrank(owner);
+        x.setMinter(minter);
+        meter.setSpender(address(x), true);
+        vm.stopPrank();
+        vm.prank(player);
+        token.approve(address(x), type(uint256).max);
+    }
+
+    /// @dev The equivalence proof (counters): three templates minted as ONE batch on contract A
+    ///      vs as three single mints on an identically-wired contract B leaves totalMinted /
+    ///      mintedByTemplate / balances IDENTICAL. Both entry points share _mintOne, so this pins
+    ///      that the batch adds nothing but the loop. The royalty-routing partition is the twin
+    ///      test below. Mirrors revokeReceipts' counter-equals-three-single-revokes.
+    function test_mintBatch_counterEqualsThreeSingleMints() public {
+        ArtifactTemplate a = _freshWiredArt();
+        ArtifactTemplate b = _freshWiredArt();
+
+        uint256[] memory ids = new uint256[](3);
+        uint256[] memory amounts = new uint256[](3);
+        uint256[] memory regions = new uint256[](3);
+        vm.startPrank(minter);
+        for (uint256 i = 0; i < 3; i++) {
+            uint16 rarity = uint16(2000 + i * 1500); // 2000, 3500, 5000
+            a.registerTemplate(author, rarity, keccak256("m"), 0);
+            b.registerTemplate(author, rarity, keccak256("m"), 0);
+            ids[i] = i + 1; // both fresh contracts start nextTemplateId at 0
+            amounts[i] = 2 + i; // 2, 3, 4
+            regions[i] = regionId;
+        }
+        a.mintBatch(player, ids, amounts, regions, ""); // one batch
+        b.mint(player, ids[0], amounts[0], regions[0], ""); // three singles
+        b.mint(player, ids[1], amounts[1], regions[1], "");
+        b.mint(player, ids[2], amounts[2], regions[2], "");
+        vm.stopPrank();
+
+        assertEq(a.totalMinted(), b.totalMinted());
+        assertEq(a.totalMinted(), 9); // 2 + 3 + 4
+        for (uint256 i = 0; i < 3; i++) {
+            assertEq(a.mintedByTemplate(ids[i]), b.mintedByTemplate(ids[i]), "per-template mint count");
+            assertEq(a.balanceOf(player, ids[i]), b.balanceOf(player, ids[i]), "per-template balance");
+        }
+    }
+
+    /// @dev The equivalence proof (royalty partition): a batch spanning TWO regions routes the
+    ///      SAME per-region royalty a matching set of single mints does — so the batch never
+    ///      mis-attributes or drops a region's share. Deltas are measured in scoped blocks to
+    ///      keep the stack shallow.
+    function test_mintBatch_royaltyPartitionEqualsSingles() public {
+        uint256 regionB = uint256(keccak256("region-B"));
+        _claimRegion(regionB, address(0x0EE2));
+        ArtifactTemplate a = _freshWiredArt();
+        ArtifactTemplate b = _freshWiredArt();
+
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        vm.startPrank(minter);
+        a.registerTemplate(author, 5000, keccak256("m"), 0);
+        b.registerTemplate(author, 5000, keccak256("m"), 0);
+        a.registerTemplate(author, 3000, keccak256("m"), 0);
+        b.registerTemplate(author, 3000, keccak256("m"), 0);
+        (ids[0], ids[1]) = (1, 2);
+        (amounts[0], amounts[1]) = (3, 4);
+        (regions[0], regions[1]) = (regionId, regionB); // two distinct regions
+
+        uint256 batchA;
+        uint256 batchB;
+        {
+            uint256 preA = region.accruedFees(regionId);
+            uint256 preB = region.accruedFees(regionB);
+            a.mintBatch(player, ids, amounts, regions, "");
+            batchA = region.accruedFees(regionId) - preA;
+            batchB = region.accruedFees(regionB) - preB;
+        }
+        {
+            uint256 preA = region.accruedFees(regionId);
+            uint256 preB = region.accruedFees(regionB);
+            b.mint(player, ids[0], amounts[0], regions[0], "");
+            b.mint(player, ids[1], amounts[1], regions[1], "");
+            assertEq(region.accruedFees(regionId) - preA, batchA, "region A royalty: batch == singles");
+            assertEq(region.accruedFees(regionB) - preB, batchB, "region B royalty: batch == singles");
+        }
+        vm.stopPrank();
+        assertGt(batchB, 0, "the second region is actually exercised");
+    }
+
+    /// @dev Duplicate ids within a batch accumulate into mintedByTemplate/balance correctly
+    ///      (each element adds against the committed count) — the mint twin of
+    ///      test_burnBatch_duplicateIdsAccumulate.
+    function test_mintBatch_duplicateIdsAccumulate() public {
+        uint256 t = _register(0, 0);
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (t, t);
+        (amounts[0], amounts[1]) = (2, 3);
+        (regions[0], regions[1]) = (regionId, regionId);
+
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.balanceOf(player, t), 5, "2 + 3");
+        assertEq(art.mintedByTemplate(t), 5);
+        assertEq(art.totalMinted(), 5);
+    }
+
+    /// @dev A capped template repeated within ONE batch is bounded by its LIVE count — each
+    ///      element's cap check reads mintedByTemplate fresh, so element 1 sees element 0's mint.
+    ///      cap 5, [{t,3},{t,3}] -> element 1's wouldMint = 3+3 = 6 > 5 -> SupplyExceeded, whole
+    ///      batch reverts. A batch that pre-checked every cap against the entry-count (a plausible
+    ///      "optimization") would let the duplicates collectively breach the cap.
+    function test_mintBatch_capHoldsAcrossBatchDuplicates() public {
+        uint256 t = _register(0, 5); // cap 5, rarity 0 so the cap is the only gate
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (t, t);
+        (amounts[0], amounts[1]) = (3, 3);
+        (regions[0], regions[1]) = (regionId, regionId);
+
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, t, 6, 5));
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.mintedByTemplate(t), 0, "whole batch rolled back, cap never breached");
+        assertEq(art.balanceOf(player, t), 0);
+    }
+
+    /// @dev Gas-envelope seam: a batch of EXACTLY MAX_BATCH mints — the cap is inclusive so it
+    ///      never rejects a legitimate max-size loadout, and this drives the full O(n)
+    ///      cap/fee/royalty/mint loop at the boundary with real (rarity>0) per-element work.
+    ///      Reads the cap off the contract so the test tracks the constant in lock-step.
+    function test_mintBatch_atMaxBatchMints() public {
+        uint256 n = art.MAX_BATCH();
+        uint256[] memory ids = new uint256[](n);
+        uint256[] memory amounts = new uint256[](n);
+        uint256[] memory regions = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ids[i] = _register(100, 0); // 1% rarity -> a small real fee + royalty per element
+            amounts[i] = 1;
+            regions[i] = regionId;
+        }
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.totalMinted(), n);
+        assertEq(art.balanceOf(player, ids[0]), 1);
+        assertEq(art.balanceOf(player, ids[n - 1]), 1);
+        assertGt(region.accruedFees(regionId), 0);
+    }
+
+    /// @dev A batch of MAX_BATCH + 1 reverts BatchTooLarge BEFORE any mint — the bound is a
+    ///      contract guarantee even from a buggy minter. The elements ARE mintable, so this
+    ///      proves the size gate rejects at the boundary independent of element validity.
+    function test_mintBatch_aboveMaxBatchReverts() public {
+        uint256 id = _register(0, 0);
+        uint256 n = art.MAX_BATCH() + 1;
+        uint256[] memory ids = new uint256[](n);
+        uint256[] memory amounts = new uint256[](n);
+        uint256[] memory regions = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            (ids[i], amounts[i], regions[i]) = (id, 1, regionId);
+        }
+        vm.expectRevert(ArtifactTemplate.BatchTooLarge.selector);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+        assertEq(art.totalMinted(), 0, "nothing minted over the cap");
+    }
+
+    /// @dev An empty batch reverts rather than doing zero work.
+    function test_mintBatch_revertsEmptyBatch() public {
+        uint256[] memory ids = new uint256[](0);
+        uint256[] memory amounts = new uint256[](0);
+        uint256[] memory regions = new uint256[](0);
+        vm.expectRevert(ArtifactTemplate.EmptyBatch.selector);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+    }
+
+    /// @dev Auth is checked before the size/length guards, so a non-minter gets NotMinter even
+    ///      for an empty batch — no leak of the batch-shape checks before the auth revert.
+    function test_mintBatch_unauthorizedRevertsBeforeEmptyBatch() public {
+        uint256[] memory ids = new uint256[](0);
+        uint256[] memory amounts = new uint256[](0);
+        uint256[] memory regions = new uint256[](0);
+        vm.expectRevert(ArtifactTemplate.NotMinter.selector);
+        vm.prank(stranger);
+        art.mintBatch(player, ids, amounts, regions, "");
+    }
+
+    function test_mintBatch_revertsNotMinter() public {
+        uint256 t = _register(0, 0);
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory amounts = new uint256[](1);
+        uint256[] memory regions = new uint256[](1);
+        (ids[0], amounts[0], regions[0]) = (t, 1, regionId);
+
+        vm.expectRevert(ArtifactTemplate.NotMinter.selector);
+        vm.prank(stranger);
+        art.mintBatch(player, ids, amounts, regions, "");
+        assertEq(art.totalMinted(), 0);
+    }
+
+    function test_mintBatch_revertsZeroRecipient() public {
+        uint256 t = _register(0, 0);
+        uint256[] memory ids = new uint256[](1);
+        uint256[] memory amounts = new uint256[](1);
+        uint256[] memory regions = new uint256[](1);
+        (ids[0], amounts[0], regions[0]) = (t, 1, regionId);
+
+        vm.expectRevert(ArtifactTemplate.ZeroRecipient.selector);
+        vm.prank(minter);
+        art.mintBatch(address(0), ids, amounts, regions, "");
+    }
+
+    /// @dev amounts shorter than templateIds reverts ArrayLengthMismatch before any mint.
+    function test_mintBatch_revertsAmountsLengthMismatch() public {
+        uint256 t = _register(0, 0);
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](1);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (t, t);
+        amounts[0] = 1;
+        (regions[0], regions[1]) = (regionId, regionId);
+
+        vm.expectRevert(ArtifactTemplate.ArrayLengthMismatch.selector);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+        assertEq(art.totalMinted(), 0);
+    }
+
+    /// @dev regionIds shorter than templateIds reverts ArrayLengthMismatch — the third array is
+    ///      length-checked here because, unlike an OZ _mintBatch, it is not an ERC-1155 array.
+    function test_mintBatch_revertsRegionIdsLengthMismatch() public {
+        uint256 t = _register(0, 0);
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](1);
+        (ids[0], ids[1]) = (t, t);
+        (amounts[0], amounts[1]) = (1, 1);
+        regions[0] = regionId;
+
+        vm.expectRevert(ArtifactTemplate.ArrayLengthMismatch.selector);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+        assertEq(art.totalMinted(), 0);
+    }
+
+    /// @dev Whole-batch atomicity (an unknown template mid-batch): reverts UnknownTemplate and
+    ///      rolls the leading element's mint AND fee back — never a partial loadout.
+    function test_mintBatch_atomicOnUnknownTemplate() public {
+        uint256 t1 = _register(5000, 0);
+        uint256 missing = 999_999; // never registered
+
+        uint256 creditBefore = meter.credit(player);
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (t1, missing);
+        (amounts[0], amounts[1]) = (2, 1);
+        (regions[0], regions[1]) = (regionId, regionId);
+
+        vm.expectRevert(ArtifactTemplate.UnknownTemplate.selector);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.balanceOf(player, t1), 0, "leading mint rolled back");
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.mintedByTemplate(t1), 0);
+        assertEq(meter.credit(player), creditBefore, "no fee charged on the reverted batch");
+    }
+
+    /// @dev Whole-batch atomicity (a zero amount mid-batch): reverts ZeroAmount, the leading
+    ///      element's mint rolled back — the mint twin of test_burnBatch_atomicOnZeroAmount.
+    function test_mintBatch_atomicOnZeroAmount() public {
+        uint256 t1 = _register(5000, 0);
+        uint256 t2 = _register(5000, 0);
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (t1, t2);
+        (amounts[0], amounts[1]) = (2, 0); // element 1 is a no-op amount
+        (regions[0], regions[1]) = (regionId, regionId);
+
+        vm.expectRevert(ArtifactTemplate.ZeroAmount.selector);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.balanceOf(player, t1), 0, "leading mint rolled back");
+        assertEq(art.totalMinted(), 0);
+    }
+
+    /// @dev Whole-batch atomicity (a supply-cap breach mid-batch): reverts SupplyExceeded, the
+    ///      leading element rolled back.
+    function test_mintBatch_atomicOnSupplyCap() public {
+        uint256 t1 = _register(5000, 0);
+        uint256 tCap = _register(5000, 3); // cap 3
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (t1, tCap);
+        (amounts[0], amounts[1]) = (2, 4); // 4 > cap 3
+        (regions[0], regions[1]) = (regionId, regionId);
+
+        vm.expectRevert(abi.encodeWithSelector(ArtifactTemplate.SupplyExceeded.selector, tCap, 4, 3));
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.balanceOf(player, t1), 0);
+        assertEq(art.totalMinted(), 0);
+    }
+
+    /// @dev Whole-batch atomicity over the royalty external call: a mid-batch element naming an
+    ///      unclaimed region reverts inside depositFees, rolling the ENTIRE batch back — the
+    ///      leading element's fee debit AND mint are unwound too.
+    function test_mintBatch_atomicOnUnknownRegion() public {
+        uint256 t1 = _register(5000, 0);
+        uint256 t2 = _register(5000, 0);
+        uint256 unknownRegion = uint256(keccak256("never-claimed"));
+
+        uint256 creditBefore = meter.credit(player);
+        uint256[] memory ids = new uint256[](2);
+        uint256[] memory amounts = new uint256[](2);
+        uint256[] memory regions = new uint256[](2);
+        (ids[0], ids[1]) = (t1, t2);
+        (amounts[0], amounts[1]) = (2, 3);
+        (regions[0], regions[1]) = (regionId, unknownRegion); // element 1's region is unclaimed
+
+        vm.expectRevert(RegionAuthority.UnknownRegion.selector);
+        vm.prank(minter);
+        art.mintBatch(player, ids, amounts, regions, "");
+
+        assertEq(art.balanceOf(player, t1), 0, "leading mint rolled back");
+        assertEq(art.totalMinted(), 0);
+        assertEq(art.mintedByTemplate(t1), 0);
+        assertEq(meter.credit(player), creditBefore, "leading fee debit rolled back");
+    }
 }
 
 /// @notice Minter + mint recipient that reenters mint() once from its ERC-1155
