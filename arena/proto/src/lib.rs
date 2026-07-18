@@ -1935,12 +1935,14 @@ mod tests {
         // FM1: a Broadcast is a SEPARATE type from Observation — no seat, no `own`,
         // no per-seat `visible`, no deadline. Pin the top-level key set so the
         // spectator frame can never be silently reshaped into — or sourced from — a
-        // seat's parity-bounded observation.
+        // seat's parity-bounded observation. It DOES carry `starting_remaining`: the
+        // pre-match countdown is the public on-screen clock, not a per-seat quantity —
+        // the line the spectator wire draws is public-vs-private, not participant-vs-not.
         let b = sample_broadcast();
         let json = serde_json::to_value(&b).unwrap();
         assert_eq!(
             object_keys(&json),
-            ["entities", "match_id", "phase", "protocol_version", "tick"],
+            ["entities", "match_id", "phase", "protocol_version", "starting_remaining", "tick"],
             "Broadcast gained or lost a top-level field"
         );
         for forbidden in ["seat", "own", "visible", "deadline_micros"] {
@@ -1949,6 +1951,10 @@ mod tests {
                 "Broadcast must not carry seat-observation field `{forbidden}`"
             );
         }
+        // The crux distinction: the public countdown is carried, the participant-only
+        // per-tick deadline is not. A spectator watches a clock; it has no tick to answer.
+        assert!(json.get("starting_remaining").is_some(), "Broadcast must carry the public countdown");
+        assert!(json.get("deadline_micros").is_none(), "Broadcast must not carry the participant deadline");
     }
 
     #[test]
@@ -1958,6 +1964,7 @@ mod tests {
             "match_id": FIXED_MATCH,
             "tick": 64,
             "phase": "live",
+            "starting_remaining": 0,
             "entities": [{
                 "entity_id": 0, "kind": "player", "team": 1,
                 "position": { "x": -1000, "y": 500 }, "z": 0,
@@ -1965,7 +1972,28 @@ mod tests {
             }]
         });
         let parsed: Broadcast = serde_json::from_value(canonical.clone()).unwrap();
+        assert_eq!(parsed.starting_remaining, 0, "a Live broadcast is done counting down");
         assert_eq!(serde_json::to_value(&parsed).unwrap(), canonical, "Broadcast wire shape drifted");
+
+        // A Starting-phase broadcast round-trips its live countdown byte-for-byte — the
+        // caster overlay's "starts in 90" clock, the spectator twin of the Observation case.
+        let mut starting = canonical.clone();
+        {
+            let o = starting.as_object_mut().unwrap();
+            o["phase"] = "starting".into();
+            o["starting_remaining"] = serde_json::json!(90);
+        }
+        let parsed_starting: Broadcast = serde_json::from_value(starting.clone()).unwrap();
+        assert_eq!(parsed_starting.phase, MatchPhase::Starting);
+        assert_eq!(parsed_starting.starting_remaining, 90);
+        assert_eq!(serde_json::to_value(&parsed_starting).unwrap(), starting, "Starting broadcast wire shape drifted");
+
+        // A frame written before the field existed (key omitted) decodes to 0 via
+        // serde(default) — a pre-countdown feed reads as already-Live.
+        let mut legacy = canonical.clone();
+        legacy.as_object_mut().unwrap().remove("starting_remaining");
+        let parsed_legacy: Broadcast = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed_legacy.starting_remaining, 0, "an omitted starting_remaining defaults to 0");
     }
 
     #[test]
