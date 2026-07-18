@@ -226,6 +226,13 @@ contract MatchSettlement is Ownable2Step {
     ///         rather than a trust assumption.
     uint256 public constant MAX_FIELD = 64;
 
+    /// @notice Upper bound on `revokeAttestations`' batch size — the retraction twin of
+    ///         `RenderReceipts.MAX_BATCH`, making the O(n) fence/decrement/revoke loop's gas
+    ///         envelope a contract guarantee rather than a trust assumption. It equals
+    ///         `MAX_FIELD` (64) but is a DISTINCT bound (a revoke-batch size, not a field
+    ///         roster size), so the two never have to move together.
+    uint256 public constant MAX_BATCH = 64;
+
     /// @notice Lower/upper bounds and the construction default for `settleWindow`. The
     ///         floor is generous (a match plays in seconds and an attester settles in
     ///         one tx, so an hour is ~60× headroom) so a still-in-progress match can
@@ -382,6 +389,8 @@ contract MatchSettlement is Ownable2Step {
     error FieldTooLarge();
     error LengthMismatch();
     error DuplicateAgent(address agent);
+    error EmptyBatch();
+    error BatchTooLarge();
     error NonZeroSum(int256 sum);
     error PayoutMismatch(uint256 paid, uint256 pot);
 
@@ -1061,6 +1070,75 @@ contract MatchSettlement is Ownable2Step {
                 data: IEAS.RevocationRequestData({uid: uid, value: 0})
             })
         );
+    }
+
+    /// @notice Retract a BATCH of settled matches' EAS attestations in ONE transaction,
+    ///         instead of N separate `revokeAttestation` calls — the batch twin of
+    ///         `RenderReceipts.revokeReceipts`. Invalidates a whole disputed wave at once (a
+    ///         compromised or deauthorized attester whose run of settled results is contested)
+    ///         without paying N base tx costs or racing N transactions. Every per-match effect
+    ///         of `revokeAttestation` applies PER ELEMENT: the attested-and-not-revoked fence,
+    ///         the `liveAttestationCount` decrement / `revokedAttestationCount` bump, and the
+    ///         `EAS.revoke` of the persisted uid under THAT match's own schema.
+    ///
+    ///         Attester-gated, checked ONCE before any state, so a deauthorized attester
+    ///         retracts nothing and reveals no attestation state past the revert. An empty
+    ///         batch reverts (`EmptyBatch`) and a batch above `MAX_BATCH` reverts
+    ///         (`BatchTooLarge`), bounding the loop's gas.
+    ///
+    ///         Atomicity: ANY bad element — a match never attested (`uid == 0`), already
+    ///         revoked, or repeated within this batch (it hits the fence an earlier element
+    ///         set) — reverts the WHOLE call. Never a partial revoke that desyncs
+    ///         `liveAttestationCount`/`revokedAttestationCount` or leaves some attestations
+    ///         live and some retracted with no atomic record of which.
+    ///
+    ///         CEI mirrors `revokeAttestation`: fence + decrement + emit EVERY element BEFORE
+    ///         any external `EAS.revoke`, so a hostile EAS reentering
+    ///         `revokeAttestation`/`revokeAttestations` for a batched match finds it already
+    ///         flagged (`AttestationAlreadyRevoked`) and can neither double-decrement nor
+    ///         double-revoke. Unlike `RenderReceipts.revokeReceipts` (one global schema), each
+    ///         match's uid is revoked under its OWN `matchAttestationSchema`, so a mixed batch
+    ///         of 1v1 and field matches revokes each under the schema it was attested with (EAS
+    ///         reverts a schema mismatch). Attestation-only, same as `revokeAttestation`: it
+    ///         never reverses the final escrow payout or the reputation write.
+    function revokeAttestations(bytes32[] calldata matchIds) external onlyAttester {
+        uint256 n = matchIds.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
+
+        // Phase 1 (checks + effects): fence each match, decrement the live counter, bump
+        // revokedAttestationCount, and cache both the uid AND its schema to revoke. The fence
+        // is per ELEMENT, so a matchId repeated within the batch hits the matchAttestationRevoked
+        // flag an earlier element set and reverts (AttestationAlreadyRevoked) — an intra-batch
+        // duplicate can never double-decrement. Each element's guards prove one un-revoked
+        // attestation exists, so the decrement is >= 1 (checked arithmetic backstops underflow).
+        bytes32[] memory uids = new bytes32[](n);
+        bytes32[] memory schemas = new bytes32[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            bytes32 matchId = matchIds[i];
+            bytes32 uid = matchAttestationUid[matchId];
+            if (uid == bytes32(0)) revert NotAttested(matchId);
+            if (matchAttestationRevoked[matchId]) revert AttestationAlreadyRevoked(matchId);
+
+            matchAttestationRevoked[matchId] = true;
+            --liveAttestationCount;
+            ++revokedAttestationCount;
+            uids[i] = uid;
+            schemas[i] = matchAttestationSchema[matchId];
+            emit MatchAttestationRevoked(matchId, uid);
+        }
+
+        // Phase 2: revoke each stored uid LAST, after the whole batch is flagged and the
+        // counters are fully moved (checks-effects-interactions). By the time any EAS gets
+        // control every batched attestation is already retracted, so a reentrant revoke of ANY
+        // batched match hits AttestationAlreadyRevoked — the batch twin of the single-call CEI.
+        for (uint256 i = 0; i < n; ++i) {
+            EAS.revoke(
+                IEAS.RevocationRequest({
+                    schema: schemas[i], data: IEAS.RevocationRequestData({uid: uids[i], value: 0})
+                })
+            );
+        }
     }
 
     /// @dev Shared void-and-refund mechanics for `cancelMatch` and `refundExpired`: flip
