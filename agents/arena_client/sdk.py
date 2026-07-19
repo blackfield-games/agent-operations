@@ -498,6 +498,14 @@ class SubprocessGateway:
             if not line:
                 raise GatewayClosed("harness closed the stream")
             env = json.loads(line)
+            if env.get("channel") == "spectator":
+                # A --spectate/--replay whole-battlefield broadcast, interleaved on the
+                # same stdout as the per-seat frames. A participant transport is not its
+                # consumer (the spectator client reads this channel): drop it rather than
+                # crash on the absent "seat" key or buffer a stream this side never drains.
+                continue
+            if "seat" not in env:
+                raise ProtocolError(f"gateway envelope has neither a seat nor a known channel: {env!r}")
             self._queues[env["seat"]].append(env["frame"])
         return self._queues[seat].popleft()
 
