@@ -851,6 +851,141 @@ pub fn frame_parity_vectors() -> FrameParityVectors {
     }
 }
 
+/// One canonical spectator wire FRAME: the exact serde-JSON a real [`SpectatorMsg`]
+/// value serializes to. The spectator sibling of [`FrameCase`], minus its `direction` —
+/// the spectator protocol is one-directional (server→spectator only), so every frame
+/// flows one way and no direction tag is needed. The `frame` comes from
+/// `serde_json::to_value` of a live message, so it IS the reference wire shape in data
+/// form; the committed golden (`tests/spectator_parity.json`) cannot silently drift from
+/// the types it pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpectatorCase {
+    pub label: String,
+    /// `true` when a decode→re-encode reproduces `frame` byte-for-byte. `false` ONLY for
+    /// the back-compat frame that OMITS `Broadcast.starting_remaining`: decoding fills the
+    /// `serde(default)` `0`, so re-encoding adds the field back and cannot reproduce the
+    /// omitted input.
+    pub exact_reencode: bool,
+    pub frame: serde_json::Value,
+}
+
+/// The versioned, canonical cross-implementer SPECTATOR wire-FRAME parity set: one
+/// representative of EACH [`SpectatorMsg`] variant — a populated `Frame(Broadcast)`, the
+/// back-compat `Frame` that omits `starting_remaining`, and the terminal
+/// `End(MatchResult)`. Every `frame` is `serde_json::to_value` of a real message value
+/// (the omit case then drops the optional key), so the set is the reference wire in data
+/// form. The spectator sibling of [`FrameParityVectors`]; the Rust drift-gate
+/// (`tests/spectator_parity.rs`) and the Python SDK (`agents/test_arena_client.py`) load
+/// the SAME golden, so a spectator-wire drift on either side breaks loud. Pure integer +
+/// UUID + fixed strings, so it is byte-stable on every platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpectatorParityVectors {
+    pub domain: String,
+    pub protocol_version: u32,
+    pub match_id: String,
+    pub frames: Vec<SpectatorCase>,
+}
+
+/// Domain tag for [`spectator_parity_vectors`]. Bump only on a deliberate spectator
+/// wire-frame convention change (a renamed tag, a re-flattened variant, a new required
+/// field) — the signal both implementers re-pin against.
+const SPECTATOR_PARITY_DOMAIN: &str = "blackfield/arena/spectator-parity/v1";
+
+/// The canonical cross-implementer SPECTATOR wire-FRAME parity vectors: one
+/// representative of every [`SpectatorMsg`] variant, each emitted straight from a real
+/// message value, so the set is the reference wire in data form. The Rust drift-gate
+/// (`tests/spectator_parity.rs`) and the Python SDK conformance test
+/// (`agents/test_arena_client.py`) load the SAME committed golden, so a spectator
+/// wire-shape drift on EITHER side breaks loud against one source of truth — the
+/// cross-implementer pin a Python caster/grader needs to decode the whole-battlefield
+/// broadcast. The [`frame_parity_vectors`] analogue for the spectator layer.
+///
+/// Plan-gate (recorded): ONE representative per variant, NOT an exhaustive field-value
+/// matrix — the same discipline as [`frame_parity_vectors`]. This golden pins each
+/// variant's wire SHAPE (the internal `type` tag, the newtype flattening of `frame`/`end`,
+/// and the `starting_remaining` back-compat default); the `BroadcastEntity` no-private-HUD
+/// field set is pinned by the in-crate wire-shape test.
+pub fn spectator_parity_vectors() -> SpectatorParityVectors {
+    let mid: MatchId = PARITY_MATCH_ID.parse().expect("PARITY_MATCH_ID is a valid UUID");
+    // A populated Starting-phase broadcast: `starting_remaining` NON-default (the pre-match
+    // countdown clock a stream overlay shows), and a BroadcastEntity for a pawn (carrying the
+    // health bar + score a broadcast renders) plus an in-flight projectile — ascending by
+    // entity_id, the canonical order. Like frame_parity's observe_starting, the phase/entity
+    // mix pins SHAPE, not a simulated match state.
+    let broadcast = Broadcast {
+        protocol_version: PROTOCOL_VERSION,
+        match_id: mid,
+        tick: 0,
+        phase: MatchPhase::Starting,
+        starting_remaining: 90,
+        entities: vec![
+            BroadcastEntity {
+                entity_id: 7,
+                kind: EntityKind::Player,
+                team: 2,
+                position: Vec2 { x: 1000, y: -2000 },
+                z: 0,
+                facing: 0x4000,
+                health: 80,
+                max_health: 100,
+                score: 12,
+                alive: true,
+            },
+            BroadcastEntity {
+                entity_id: 1000,
+                kind: EntityKind::Projectile,
+                team: 0,
+                position: Vec2 { x: 1200, y: -1800 },
+                z: 0,
+                facing: 0x4000,
+                health: 0,
+                max_health: 0,
+                score: 0,
+                alive: true,
+            },
+        ],
+    };
+    let result = MatchResult {
+        protocol_version: PROTOCOL_VERSION,
+        match_id: mid,
+        final_tick: 2,
+        outcomes: vec![
+            SeatOutcome { seat: 0, team: 1, placement: 1, score: 3, alive_at_end: true, forfeited: false },
+            SeatOutcome { seat: 1, team: 2, placement: 2, score: 1, alive_at_end: false, forfeited: true },
+        ],
+        replay_hash: PARITY_REPLAY_HASH.to_string(),
+    };
+
+    let sv = |m: &SpectatorMsg| serde_json::to_value(m).expect("SpectatorMsg serializes to a value");
+    let case =
+        |label: &str, exact_reencode, frame| SpectatorCase { label: label.to_string(), exact_reencode, frame };
+
+    let mut frames = vec![
+        case("frame_populated", true, sv(&SpectatorMsg::Frame(broadcast.clone()))),
+        case("end", true, sv(&SpectatorMsg::End(result))),
+    ];
+
+    // Back-compat omit frame: a Live broadcast serialized, then `starting_remaining` dropped
+    // — a frame from before the field existed (or an older caster) is pinned. serde(default)
+    // fills `0` on decode, which is exactly its value once Live, so re-encoding adds
+    // `starting_remaining: 0` back (exact_reencode false). The spectator twin of
+    // start_legacy_omits_optional_fields.
+    let live = Broadcast { tick: 128, phase: MatchPhase::Live, starting_remaining: 0, ..broadcast };
+    let mut frame_legacy = sv(&SpectatorMsg::Frame(live));
+    {
+        let o = frame_legacy.as_object_mut().expect("frame is a json object");
+        o.remove("starting_remaining");
+    }
+    frames.push(case("frame_legacy_omits_starting_remaining", false, frame_legacy));
+
+    SpectatorParityVectors {
+        domain: SPECTATOR_PARITY_DOMAIN.to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        match_id: PARITY_MATCH_ID.to_string(),
+        frames,
+    }
+}
+
 /// One agent action, bound to the tick it answers.
 ///
 /// `tick` is the [`Observation`] tick this action responds to, so the server can
