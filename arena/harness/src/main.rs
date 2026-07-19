@@ -35,7 +35,7 @@ use arena_core::{
 };
 use arena_match::{
     replay_to_spectator, JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker,
-    RegistrySnapshot, SignatureVerifier, SnapshotError,
+    RegistrySnapshot, SignatureVerifier, SnapshotError, Spectator, SpectatorFeed,
 };
 use arena_proto::{
     check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
@@ -96,6 +96,16 @@ struct Args {
     /// `{ "seat", "frame" }` line), terminating with a single [`SpectatorMsg::End`]. `None` (no
     /// `--replay`) runs a live match exactly as before — byte-identical.
     replay: Option<PathBuf>,
+    /// Live-cast the running match: fan `Match::broadcast()` each simulated tick out as a
+    /// [`SpectatorMsg`] on the same `{ "channel": "spectator", "frame": … }` envelope as
+    /// `--replay`, ALONGSIDE the per-seat Observe frames, so a caster watches live. Publishing
+    /// rides a bounded, lossy [`SpectatorFeed`](arena_match::SpectatorFeed) ring (drop-oldest),
+    /// so a slow consumer never stalls the tick loop and the [`MatchResult`] is byte-identical
+    /// to a no-spectate run. The cast frames match `--replay`'s replay of the same match
+    /// (public-only [`Broadcast`], never a seat's private HUD), plus a live-only frame per
+    /// pre-live Starting tick (a record's replay burns the countdown silently). `false` (the
+    /// default) casts nothing — byte-identical to the pre-flag harness.
+    spectate: bool,
     /// On-chain-registered agent addresses eligible for a ranked seat, each supplied by a
     /// repeated `--registered <addr>[:<reputation>]` — the arena-side view of
     /// `AgentRegistry.isRegistered` + `reputationOf` the matchmaker gates ranked
@@ -739,6 +749,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut ladder_file: Option<PathBuf> = None;
     let mut emit_replay: Option<PathBuf> = None;
     let mut replay: Option<PathBuf> = None;
+    let mut spectate = false;
     let mut registered: Vec<(String, i128)> = Vec::new();
     let mut min_reputation: Option<i128> = None;
     let mut arena: &'static str = "";
@@ -835,6 +846,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
             "--emit-replay" => emit_replay = Some(it.next().expect("--emit-replay needs a value").into()),
             "--replay" => replay = Some(it.next().expect("--replay needs a value").into()),
+            "--spectate" => spectate = true,
             "--registered" => {
                 let raw = it.next().expect("--registered needs an agent address");
                 let raw = raw.trim();
@@ -1022,6 +1034,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         ladder_file,
         emit_replay,
         replay,
+        spectate,
         registered,
         min_reputation,
         arena,
@@ -1428,12 +1441,18 @@ const DEV_MOCK_K: i32 = 32;
 ///   never stall the countdown.
 /// - A no-countdown match opens `Live`, so the loop never runs — byte-identical to the
 ///   pre-countdown pump (no Starting frame is emitted at all).
-fn pump_starting(m: &mut Match, n: u8, out: &mut impl Write) {
+fn pump_starting(m: &mut Match, n: u8, out: &mut impl Write, cast: Option<&SpectatorCast>) {
     while m.phase() == MatchPhase::Starting {
         for seat in 0..n {
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
         }
         out.flush().expect("flush starting observations");
+        // A live cast streams the spawned arena through the countdown too (FM4); a replay of the
+        // record cannot (the countdown is invisible to the scored stream — burned silently before
+        // the opening Live frame), so this Starting broadcast is live-cast-only.
+        if let Some(c) = cast {
+            c.frame(m, out);
+        }
         m.step(&BTreeMap::new());
     }
 }
@@ -1448,11 +1467,12 @@ fn pump_to_end(
     n: u8,
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
+    cast: Option<&SpectatorCast>,
 ) -> MatchResult {
     // Pre-live countdown: stream the Starting phase to the agents, then enter the Live loop
     // (which opens at tick 0). With no countdown (the default) the match opens Live and this
     // is a no-op — byte-identical to the pre-countdown pump.
-    pump_starting(m, n, out);
+    pump_starting(m, n, out, cast);
     // The seats still in the match. A Leave drops its seat here, so the sim forfeits it
     // (absent from `intents`) every later tick AND the read loop stops expecting its line —
     // without this a departed-then-silent agent hangs the blocking read forever (or a stray
@@ -1465,6 +1485,10 @@ fn pump_to_end(
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
         }
         out.flush().expect("flush observations");
+        // Cast this Live tick's public broadcast (S_0..S_{k-1}); the terminal S_k rides `finish`.
+        if let Some(c) = cast {
+            c.frame(m, out);
+        }
 
         let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
         // One line per still-active seat. A Leave consumes its sender's slot for this tick
@@ -1504,19 +1528,25 @@ fn pump_to_end(
         m.step(&intents);
     }
 
-    finish(m, n, out)
+    finish(m, n, out, cast)
 }
 
 /// Broadcast the terminal [`MatchResult`] to every seat and return it — the shared
 /// match-end emit both the blocking ([`pump_to_end`]) and deadline-enforced
 /// ([`pump_to_end_deadlined`]) live loops close on, so the two paths end a match
 /// byte-identically.
-fn finish(m: &Match, n: u8, out: &mut impl Write) -> MatchResult {
+fn finish(m: &Match, n: u8, out: &mut impl Write, cast: Option<&SpectatorCast>) -> MatchResult {
     let result = m.result().expect("an ended match has a result").clone();
     for seat in 0..n {
         emit(out, seat, &GatewayMsg::End(result.clone()));
     }
     out.flush().expect("flush results");
+    // Close the live cast with the terminal Ended-state broadcast (S_k — the frame
+    // `replay_frames` ends on) then the `SpectatorMsg::End`, so a no-countdown live cast is
+    // byte-identical to `replay_frames(record)` + End (FM3).
+    if let Some(c) = cast {
+        c.end(m, &result, out);
+    }
     result
 }
 
@@ -1676,8 +1706,9 @@ fn pump_to_end_deadlined(
     rx: &Receiver<String>,
     out: &mut impl Write,
     deadline: Duration,
+    cast: Option<&SpectatorCast>,
 ) -> MatchResult {
-    pump_starting(m, n, out);
+    pump_starting(m, n, out, cast);
     let mut active: BTreeSet<SeatId> = (0..n).collect();
     // Per-seat consecutive deadline misses, kept across ticks so a persistent silence escalates
     // to elimination (see read_tick_deadlined). A seat that answers clears its entry; a match
@@ -1688,6 +1719,10 @@ fn pump_to_end_deadlined(
             emit(out, seat, &GatewayMsg::Observe(m.observe(seat)));
         }
         out.flush().expect("flush observations");
+        // Cast this Live tick's public broadcast (S_0..S_{k-1}); the terminal S_k rides `finish`.
+        if let Some(c) = cast {
+            c.frame(m, out);
+        }
         let active_before: BTreeSet<SeatId> = active.clone();
         let intents = read_tick_deadlined(m, &mut active, rx, deadline, &mut misses);
         // Each seat that departed `active` inside the read — a Leave, a threshold-crossing silent
@@ -1699,7 +1734,7 @@ fn pump_to_end_deadlined(
         }
         m.step(&intents);
     }
-    finish(m, n, out)
+    finish(m, n, out, cast)
 }
 
 /// Feed each stdin line to `tx` until EOF, a read error, or the receiver drops (the match
@@ -1727,10 +1762,16 @@ fn feed_stdin_lines(tx: &mpsc::Sender<String>) {
 /// the channel, then pump. The reader is DETACHED, never joined — a thread blocked on a
 /// silent-but-open stdin would otherwise hang match teardown; when this returns the
 /// receiver drops, and the reader exits on its next send (or dies with the process).
-fn pump_to_end_enforced(m: &mut Match, n: u8, out: &mut impl Write, deadline: Duration) -> MatchResult {
+fn pump_to_end_enforced(
+    m: &mut Match,
+    n: u8,
+    out: &mut impl Write,
+    deadline: Duration,
+    cast: Option<&SpectatorCast>,
+) -> MatchResult {
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || feed_stdin_lines(&tx));
-    pump_to_end_deadlined(m, n, &rx, out, deadline)
+    pump_to_end_deadlined(m, n, &rx, out, deadline, cast)
 }
 
 /// Drive the live match through whichever read discipline the flags select, returning the
@@ -1745,12 +1786,13 @@ fn drive_pump(
     deadline: Option<Duration>,
     mut lines: impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
+    cast: Option<&SpectatorCast>,
 ) -> MatchResult {
     match deadline {
-        None => pump_to_end(m, n, &mut lines, out),
+        None => pump_to_end(m, n, &mut lines, out, cast),
         Some(d) => {
             drop(lines);
-            pump_to_end_enforced(m, n, out, d)
+            pump_to_end_enforced(m, n, out, d, cast)
         }
     }
 }
@@ -1971,6 +2013,66 @@ fn emit_spectator(out: &mut impl Write, msg: &SpectatorMsg) {
     let envelope = serde_json::json!({ "channel": "spectator", "frame": frame });
     writeln!(out, "{}", serde_json::to_string(&envelope).expect("serialize envelope"))
         .expect("write spectator frame");
+}
+
+/// Each `--spectate` sink's ring size — frames buffered before the oldest is dropped. The
+/// harness's own sink is drained every tick so it never fills; the bound only matters for a
+/// slow REMOTE consumer subscribed to the same feed, which sheds overflow rather than stalling.
+const SPECTATE_RING: usize = 256;
+/// Concurrent live-spectator admission cap (bounds memory against unbounded subscribers).
+const SPECTATE_MAX: usize = 64;
+
+/// The `--spectate` live cast: a bounded, lossy [`SpectatorFeed`] plus the harness's own
+/// always-drained [`Spectator`] sink. Each simulated tick the driver [`frame`](Self::frame)s
+/// `Match::broadcast()` into the feed and immediately drains the sink to stdout as a
+/// `{ "channel": "spectator", … }` [`SpectatorMsg`], alongside the per-seat Observe stream.
+///
+/// Publishing is NON-BLOCKING (the feed drops a full ring's oldest message), so neither a slow
+/// remote subscriber nor the sink can backpressure the tick loop — the [`MatchResult`] is
+/// byte-identical to a no-spectate run (FM1). The cast is the same public [`Broadcast`] a
+/// `--replay` replay of this match produces (never a seat's private HUD — FM2), so a live
+/// watcher and an after-the-fact watcher see the same frames (FM3).
+struct SpectatorCast {
+    feed: SpectatorFeed,
+    /// The harness's local consumer, drained to stdout after every publish.
+    sink: Spectator,
+}
+
+impl SpectatorCast {
+    fn new() -> Self {
+        Self::with_limits(SPECTATE_RING, SPECTATE_MAX)
+    }
+
+    fn with_limits(ring: usize, max: usize) -> Self {
+        let feed = SpectatorFeed::new(ring, max);
+        let sink = feed.subscribe().expect("the first subscribe is always admitted");
+        Self { feed, sink }
+    }
+
+    /// Publish this tick's public broadcast, then flush the sink to stdout. Draining right
+    /// after the single publish keeps the always-read sink at ≤1 buffered, so it never sheds
+    /// its own frames regardless of the ring bound.
+    fn frame(&self, m: &Match, out: &mut impl Write) {
+        self.feed.publish_frame(m.broadcast());
+        self.drain(out);
+    }
+
+    /// Close the cast: publish the terminal-state broadcast (the Ended frame `replay_frames`
+    /// ends on) and then the [`SpectatorMsg::End`] carrying the result, draining after each so
+    /// the sink never drops the terminal frame under a tight ring.
+    fn end(&self, m: &Match, result: &MatchResult, out: &mut impl Write) {
+        self.feed.publish_frame(m.broadcast());
+        self.drain(out);
+        self.feed.publish_end(result.clone());
+        self.drain(out);
+    }
+
+    fn drain(&self, out: &mut impl Write) {
+        while let Some(msg) = self.sink.recv() {
+            emit_spectator(out, &msg);
+        }
+        out.flush().expect("flush spectator cast");
+    }
 }
 
 /// Verify `record` and cast it as a [`SpectatorMsg`] stream onto `out`: every projected
@@ -2319,6 +2421,10 @@ fn main() {
     // the live Base submitter is operator-gated.
     let settler = args.settle_dev_mock.then(MockSettler::default);
 
+    // --spectate: the live cast, shared by both the direct and matchmade drive paths. `None`
+    // (the default) keeps every pump byte-identical to the pre-flag harness.
+    let spectator = args.spectate.then(SpectatorCast::new);
+
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let stdout = io::stdout();
@@ -2330,7 +2436,7 @@ fn main() {
     if let Some(mode) = args.mode {
         let (mm, mut m) = handshake_matchmade(&args, mode, n, &settler, &mut lines, &mut out);
         let deadline = enforced_deadline(&args, &m);
-        let result = drive_pump(&mut m, n, deadline, lines, &mut out);
+        let result = drive_pump(&mut m, n, deadline, lines, &mut out, spectator.as_ref());
         // Settle the ladder while the roster is still alive (it maps seat→controller for
         // the rating readout); `settle_finished` then consumes the match.
         settle_ranked_ladder(&mm, &result, m.seats());
@@ -2437,7 +2543,7 @@ fn main() {
     }
 
     let deadline = enforced_deadline(&args, &m);
-    let result = drive_pump(&mut m, n, deadline, lines, &mut out);
+    let result = drive_pump(&mut m, n, deadline, lines, &mut out, spectator.as_ref());
     emit_replay_record(args.emit_replay.as_deref(), &m);
     settle_finished(&settler, &result, m, &recovered);
 }
@@ -3190,6 +3296,7 @@ mod tests {
             ladder_file: None,
             emit_replay: None,
             replay: None,
+            spectate: false,
             registered: Vec::new(),
             min_reputation: None,
             arena: "",
@@ -3287,6 +3394,7 @@ mod tests {
             ladder_file: None,
             emit_replay: None,
             replay: None,
+            spectate: false,
             registered: Vec::new(),
             min_reputation: None,
             arena,
@@ -3986,7 +4094,7 @@ mod tests {
         let before = [m.observe(0).own.position, m.observe(1).own.position];
 
         let mut out: Vec<u8> = Vec::new();
-        pump_starting(&mut m, 2, &mut out);
+        pump_starting(&mut m, 2, &mut out, None);
 
         // The countdown elapsed to Live at tick 0, no pawn moved pre-live (a Starting step runs
         // the pure countdown with empty intents).
@@ -4022,7 +4130,7 @@ mod tests {
         assert_eq!(m.phase(), MatchPhase::Live, "no countdown opens directly in Live");
 
         let mut out: Vec<u8> = Vec::new();
-        pump_starting(&mut m, 2, &mut out);
+        pump_starting(&mut m, 2, &mut out, None);
 
         assert!(out.is_empty(), "a no-countdown match emits no Starting observation");
         assert_eq!(m.phase(), MatchPhase::Live, "the match stays Live");
@@ -5894,7 +6002,7 @@ mod tests {
         let script: Vec<String> =
             (0..4).flat_map(|t| [act_line(0, mid, t), act_line(1, mid, t)]).collect();
         let mut out: Vec<u8> = Vec::new();
-        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out, None);
 
         assert_eq!(m.phase(), MatchPhase::Ended);
         assert_eq!(result.outcomes.len(), 2);
@@ -5921,7 +6029,7 @@ mod tests {
             act_line(0, mid, 3),
         ];
         let mut out: Vec<u8> = Vec::new();
-        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out, None);
 
         assert_eq!(m.phase(), MatchPhase::Ended, "the leaver's elimination ends the 1v1");
         assert_eq!(result.final_tick, 2, "it ends at the leave tick, not the max_ticks cap");
@@ -5960,7 +6068,7 @@ mod tests {
             act_line(2, mid, 3),
         ];
         let mut out: Vec<u8> = Vec::new();
-        pump_to_end(&mut m, 3, &mut pump_input(&script), &mut out);
+        pump_to_end(&mut m, 3, &mut pump_input(&script), &mut out, None);
 
         assert_eq!(m.phase(), MatchPhase::Ended);
         let replay = m.into_replay();
@@ -5985,7 +6093,7 @@ mod tests {
         let mut m = build_direct_match(&direct_args(2, "", 0), 2);
         let script = [leave_line(0), leave_line(1)];
         let mut out: Vec<u8> = Vec::new();
-        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out);
+        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out, None);
 
         assert_eq!(m.phase(), MatchPhase::Ended, "both departed: the match ends at once, not at the cap");
         assert_eq!(result.final_tick, 1, "both forfeit at tick 0, so the match ends there");
@@ -6093,7 +6201,7 @@ mod tests {
         drop(tx); // the agent stream is closed before a single action
 
         let mut out: Vec<u8> = Vec::new();
-        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(50));
+        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(50), None);
         assert_eq!(
             m.phase(),
             MatchPhase::Ended,
@@ -6155,7 +6263,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let start = Instant::now();
-        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(50));
+        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(50), None);
         assert_eq!(m.phase(), MatchPhase::Ended, "the leaver's elimination ends the enforced pump");
         assert_eq!(result.final_tick, 1, "the 1v1 ends at the tick-0 forfeit, not the max_ticks cap");
         let replay = m.into_replay();
@@ -6263,7 +6371,7 @@ mod tests {
         let mut m = build_direct_match(&direct_args(2, "", 0), 2);
         let (_tx, rx) = mpsc::channel::<String>(); // held open (no EOF) but never fed
         let mut out: Vec<u8> = Vec::new();
-        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(5));
+        let result = pump_to_end_deadlined(&mut m, 2, &rx, &mut out, Duration::from_millis(5), None);
 
         assert_eq!(m.phase(), MatchPhase::Ended, "persistent silence ends the match, it does not idle to the cap");
         assert_eq!(
