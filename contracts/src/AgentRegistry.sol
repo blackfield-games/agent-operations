@@ -67,6 +67,7 @@ contract AgentRegistry is Ownable2Step {
     event ReputationWriterSet(address indexed writer, bool authorized);
     event MinBondSet(uint256 minBond);
     event HandleChanged(address indexed agent, bytes32 handle);
+    event BondIncreased(address indexed agent, uint256 additional, uint256 newBond);
 
     error AlreadyRegistered();
     error NotRegistered();
@@ -131,6 +132,30 @@ contract AgentRegistry is Ownable2Step {
         if (!a.registered) revert NotRegistered();
         a.handle = handle;
         emit HandleChanged(msg.sender, handle);
+    }
+
+    /// @notice Raise the caller's own bond in place by `additional` $BLCKFLD. A
+    ///         convenience for an active identity that wants more anti-Sybil weight —
+    ///         e.g. to meet a `minBond` the owner raised after it registered, which
+    ///         grandfathers existing identities and otherwise leaves an under-bonded
+    ///         one no path to comply short of `deregister`/`register` (refunding then
+    ///         re-pulling the whole bond, dropping the active flag, and resetting
+    ///         `registeredAt`). Self-sovereign like `register`: no address parameter,
+    ///         so it only ever tops up `msg.sender`'s own identity, and it is gated to
+    ///         a currently-registered caller (`deregister`'s gate) — a ghost or
+    ///         deregistered record cannot be bonded. Increase-only by design: there is
+    ///         no in-place decrease, which would be a partial bond withdrawal that
+    ///         keeps the identity active (a full withdrawal already costs deactivation
+    ///         via `deregister`). CEI like `register`: the bond is raised before the
+    ///         token pull. Touches ONLY the bond — `registeredAt`, standing, match
+    ///         count, handle, and the active flag are untouched, so a re-bond is not a
+    ///         re-register and never resets the identity's age or standing.
+    function increaseBond(uint256 additional) external {
+        Agent storage a = agents[msg.sender];
+        if (!a.registered) revert NotRegistered();
+        a.bond += additional;
+        if (additional > 0) TOKEN.safeTransferFrom(msg.sender, address(this), additional);
+        emit BondIncreased(msg.sender, additional, a.bond);
     }
 
     /// @notice Apply a ranked match's reputation delta to `agent` and count the
