@@ -22,8 +22,8 @@ contract RegionAuthority is ERC721, Ownable2Step {
     IERC20 public immutable TOKEN;
     uint256 public stakeRequired;
 
-    /// @notice Upper bound on a `claimFeesBatch` roster, bounding the loop's gas.
-    ///         Mirrors `MatchSettlement`/`RenderReceipts.MAX_BATCH` (a distinct bound).
+    /// @notice Upper bound on a `claimFeesBatch`/`unstakeBatch` roster, bounding the
+    ///         loop's gas. Mirrors `MatchSettlement`/`RenderReceipts.MAX_BATCH` (a distinct bound).
     uint256 public constant MAX_BATCH = 64;
 
     struct Stake {
@@ -105,6 +105,39 @@ contract RegionAuthority is ERC721, Ownable2Step {
         _burn(tokenId);
         TOKEN.safeTransfer(msg.sender, amount);
         emit Unstaked(msg.sender, tokenId, amount);
+    }
+
+    /// @notice Exit MULTIPLE regions the caller holds in ONE tx — the batch twin of
+    ///         `unstake` for a holder leaving a portfolio, instead of N separate calls.
+    ///         Strict-atomic and per-element identical to `unstake`: every `tokenId`
+    ///         must be held by the caller (`NotHolder`; a nonexistent or already-burned
+    ///         id reverts in `ownerOf`), so a non-held element — including a `tokenId`
+    ///         REPEATED in the batch, whose second occurrence finds the first already
+    ///         burned — reverts the WHOLE call; a batch never partially exits. Each
+    ///         element burns its region, whose `_update` hook settles that region's
+    ///         accrued fees into the holder's `withdrawable` (claimable via `withdraw`),
+    ///         so a batch exit strands no earned fees. CEI mirrors the single: every
+    ///         stake is deleted and every NFT burned in Phase 1, BEFORE the one
+    ///         aggregated refund transfer in Phase 2, so a reentrant token recipient
+    ///         finds every region already burned. `totalStaked` and the refund net
+    ///         exactly the summed stakes, and an `Unstaked` fires per region.
+    function unstakeBatch(uint256[] calldata tokenIds) external {
+        uint256 n = tokenIds.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
+
+        uint256 total = 0;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 tokenId = tokenIds[i];
+            if (ownerOf(tokenId) != msg.sender) revert NotHolder();
+            uint256 amount = stakes[tokenId].amount;
+            totalStaked -= amount;
+            delete stakes[tokenId];
+            total += amount;
+            _burn(tokenId);
+            emit Unstaked(msg.sender, tokenId, amount);
+        }
+        TOKEN.safeTransfer(msg.sender, total);
     }
 
     /// @notice Deposit `amount` $BLCKFLD as fees earned by a region's holder. Pulls
