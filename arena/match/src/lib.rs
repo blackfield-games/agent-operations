@@ -1365,6 +1365,28 @@ pub fn replay_to_feed(record: &MatchRecord, feed: &SpectatorFeed) -> Result<usiz
     Ok(published)
 }
 
+/// Re-run a finished [`MatchRecord`] into the exact [`SpectatorMsg`] stream a spectator
+/// watching the replay receives — one [`SpectatorMsg::Frame`] per [`replay_frames`] frame,
+/// in the same order, then a single terminal [`SpectatorMsg::End`] carrying the verified
+/// [`MatchResult`]. The materialized (non-feed) counterpart to [`replay_to_feed`]: the same
+/// verified [`replay_into`] spine, collected into a `Vec` for a caller that serializes the
+/// cast itself — the harness `--replay` mode writing each envelope to stdout — rather than
+/// fanning it to live [`Spectator`]s.
+///
+/// VERIFIES first (via [`replay_into`]), so a truncated, tampered, or over-budget record is
+/// a typed [`ReplayError`] with NO message produced — casting an untrusted artifact can
+/// never be turned into a CPU/memory DoS or stream a partial frame before the bound rejects
+/// it. The terminal `End` carries the [`MatchResult`] the re-run proved (which a verified
+/// record guarantees matches its committed `result`), never a re-derivation, so the cast and
+/// the settlement path can never disagree on the outcome. On success the stream is exactly
+/// `replay_frames(record)?.len() + 1` messages.
+pub fn replay_to_spectator(record: &MatchRecord) -> Result<Vec<SpectatorMsg>, ReplayError> {
+    let mut msgs = Vec::new();
+    let result = replay_into(record, |frame| msgs.push(SpectatorMsg::Frame(frame)))?;
+    msgs.push(SpectatorMsg::End(result));
+    Ok(msgs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
