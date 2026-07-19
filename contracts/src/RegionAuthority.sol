@@ -22,8 +22,8 @@ contract RegionAuthority is ERC721, Ownable2Step {
     IERC20 public immutable TOKEN;
     uint256 public stakeRequired;
 
-    /// @notice Upper bound on a `claimFeesBatch`/`unstakeBatch` roster, bounding the
-    ///         loop's gas. Mirrors `MatchSettlement`/`RenderReceipts.MAX_BATCH` (a distinct bound).
+    /// @notice Upper bound on a `claimBatch`/`claimFeesBatch`/`unstakeBatch` roster,
+    ///         bounding the loop's gas. Mirrors `MatchSettlement`/`RenderReceipts.MAX_BATCH` (a distinct bound).
     uint256 public constant MAX_BATCH = 64;
 
     struct Stake {
@@ -69,6 +69,7 @@ contract RegionAuthority is ERC721, Ownable2Step {
     error NothingToClaim();
     error EmptyBatch();
     error BatchTooLarge();
+    error ArrayLengthMismatch();
 
     constructor(address token_, uint256 stakeRequired_, address owner_)
         ERC721("Blackfield Region", "BFLD-RGN")
@@ -81,9 +82,38 @@ contract RegionAuthority is ERC721, Ownable2Step {
     }
 
     function claim(uint256 tokenId, uint256 amount) external {
-        // A region authority — which earns a fee share — must lock a positive
-        // stake. This holds independent of stakeRequired (which is also kept
-        // positive), so no tokenId is ever minted against a zero stake.
+        _claimOne(tokenId, amount);
+    }
+
+    /// @notice Claim (mint + stake) MULTIPLE regions in ONE tx — the create twin of
+    ///         `unstakeBatch` for a staker acquiring a portfolio, instead of N separate
+    ///         `claim` calls. Strict-atomic and per-element identical to `claim` (both
+    ///         run the shared `_claimOne`): the `tokenIds`/`amounts` arrays must be equal
+    ///         length (`ArrayLengthMismatch`), and any element that fails a `claim` guard
+    ///         — a zero or too-low stake, or a `tokenId` already claimed (including one
+    ///         REPEATED in the batch, whose second occurrence finds the first already
+    ///         minted) — reverts the WHOLE call; a batch never partially mints. Each
+    ///         element pulls its own stake and `_safeMint`s in `claim`'s proven order, so
+    ///         `totalStaked` and the pulled tokens net exactly the summed stakes and a
+    ///         `Staked` fires per region.
+    function claimBatch(uint256[] calldata tokenIds, uint256[] calldata amounts) external {
+        uint256 n = tokenIds.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_BATCH) revert BatchTooLarge();
+        if (amounts.length != n) revert ArrayLengthMismatch();
+
+        for (uint256 i = 0; i < n; i++) {
+            _claimOne(tokenIds[i], amounts[i]);
+        }
+    }
+
+    /// @dev The single-region claim shared by `claim` and `claimBatch`. A region
+    ///      authority — which earns a fee share — must lock a positive stake; this holds
+    ///      independent of `stakeRequired` (also kept positive), so no tokenId is ever
+    ///      minted against a zero stake. Safe-recipient + CEI: the stake is pulled and
+    ///      recorded before `_safeMint`, whose ERC721 receiver hook is the only external
+    ///      call, and a fresh (unclaimed) tokenId is required (`AlreadyClaimed`).
+    function _claimOne(uint256 tokenId, uint256 amount) internal {
         if (amount == 0) revert ZeroStake();
         if (amount < stakeRequired) revert StakeTooLow();
         if (_ownerOf(tokenId) != address(0)) revert AlreadyClaimed();
