@@ -474,6 +474,55 @@ contract AgentRegistryTest is Test {
         assertFalse(registry.isRegistered(alice));
     }
 
+    function test_wasRegistered_falseForNeverRegistered() public view {
+        // registeredAt == 0 for an address that never registered — the sentinel that
+        // makes recordMatchResult reject a never-seen agent (FM2).
+        assertFalse(registry.wasRegistered(alice));
+    }
+
+    function test_wasRegistered_trueForActive() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        assertTrue(registry.wasRegistered(alice));
+    }
+
+    /// @dev The defining branch: wasRegistered survives deregistration where
+    ///      isRegistered does not — the two diverge exactly here. deregister leaves
+    ///      registeredAt set, so a bad standing cannot be laundered by leaving before
+    ///      settle. A refactor that zeroed registeredAt on deregister passes every
+    ///      isRegistered test but reddens this one.
+    function test_wasRegistered_persistsAfterDeregister() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(alice);
+        registry.deregister();
+
+        assertTrue(registry.wasRegistered(alice), "ever-registered survives deregister");
+        assertFalse(registry.isRegistered(alice), "but the active flag is cleared");
+    }
+
+    /// @dev wasRegistered is the exact predicate recordMatchResult gates on
+    ///      (registeredAt != 0), proven load-bearing across the divergence: a
+    ///      deregistered-but-ever-registered identity reads true and is still
+    ///      scorable, while a never-registered address reads false and reverts
+    ///      NotRegistered.
+    function test_wasRegistered_predictsRecordMatchResultScorability() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(alice);
+        registry.deregister();
+
+        assertTrue(registry.wasRegistered(alice));
+        vm.prank(owner);
+        registry.recordMatchResult(alice, -25 ether);
+        assertEq(registry.reputationOf(alice), -25 ether, "the deregistered identity was still scored");
+
+        assertFalse(registry.wasRegistered(bob));
+        vm.expectRevert(AgentRegistry.NotRegistered.selector);
+        vm.prank(owner);
+        registry.recordMatchResult(bob, 5 ether);
+    }
+
     function test_reputationOf_zeroForUnknownAddress() public view {
         assertEq(registry.reputationOf(address(0xDEAD)), 0);
     }
