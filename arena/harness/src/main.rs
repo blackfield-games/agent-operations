@@ -2522,6 +2522,95 @@ mod tests {
         assert_eq!(hex::encode(committed), result.replay_hash, "matches the published result hash");
     }
 
+    // ---- --emit-replay: the finished match's MatchRecord as a fetchable artifact ----
+
+    /// A really-simulated 2-seat match driven to its terminal state (empty intents, a short
+    /// tick cap) — the same construction as `committed_digest_equals_the_core_replay_digest`,
+    /// so `to_record` sees a genuine ended match, not a fixture.
+    fn ended_match() -> (Match, MatchResult) {
+        let config = MatchConfig {
+            tick_hz: 30,
+            max_ticks: 2,
+            bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+            seats: 2,
+        };
+        let mut m = Match::new(id(), config, Rules::default(), roster(2), Vec::new(), 0);
+        while m.phase() == MatchPhase::Live {
+            m.step(&BTreeMap::new());
+        }
+        let result = m.result().expect("ended").clone();
+        (m, result)
+    }
+
+    fn replay_test_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("arena-replay-test-{}-{tag}.json", std::process::id()))
+    }
+
+    #[test]
+    fn emit_replay_writes_a_verifiable_record_matching_the_published_hash() {
+        // The emitted artifact must (a) carry the exact digest the match published in its
+        // MatchResult (so the on-chain-committed hash points at THIS record) and (b)
+        // re-verify from the record ALONE, reproducing the same result — the whole point of
+        // a fetchable replay a settlement grader or spectator re-runs.
+        let (m, result) = ended_match();
+        let path = replay_test_path("verifiable");
+        let _ = std::fs::remove_file(&path);
+        emit_replay_record(Some(&path), &m);
+
+        let bytes = std::fs::read(&path).expect("the emitted record is on disk and readable");
+        let record: MatchRecord = serde_json::from_slice(&bytes).expect("round-trips through JSON");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            hex::encode(record.replay.digest()),
+            result.replay_hash,
+            "the emitted record's digest is the published replay_hash",
+        );
+        assert_eq!(record.verify(), Ok(result), "the record re-runs to its own result");
+    }
+
+    #[test]
+    fn emit_replay_none_writes_nothing() {
+        // The flag is opt-in: without --emit-replay the harness touches no file — the no-op
+        // path that keeps a bare run byte-identical to the pre-flag harness.
+        let (m, _result) = ended_match();
+        let path = replay_test_path("none");
+        let _ = std::fs::remove_file(&path);
+        emit_replay_record(None, &m);
+        assert!(!path.exists(), "no path ⇒ no artifact written");
+    }
+
+    #[test]
+    fn a_tampered_emitted_record_is_a_typed_reject_not_a_panic() {
+        // A consumer that fetches the artifact must be safe against a doctored one:
+        // overwriting the committed hash makes verify reject with the typed HashMismatch
+        // (the outcomes still reproduce, but the commitment now lies), NEVER a panic.
+        let (m, _result) = ended_match();
+        let path = replay_test_path("tampered");
+        let _ = std::fs::remove_file(&path);
+        emit_replay_record(Some(&path), &m);
+        let bytes = std::fs::read(&path).expect("readable");
+        let _ = std::fs::remove_file(&path);
+
+        let mut record: MatchRecord = serde_json::from_slice(&bytes).unwrap();
+        record.result.replay_hash = "ff".repeat(32); // a digest the clean re-run can't reproduce
+        assert!(
+            matches!(record.verify(), Err(arena_core::ReplayError::HashMismatch { .. })),
+            "a tampered commitment is a clean typed rejection, never a panic",
+        );
+    }
+
+    #[test]
+    fn parse_args_reads_the_emit_replay_path() {
+        // The flag plumbs a value path into Args; its absence stays None (the no-op default).
+        let with = parse_args_from(
+            ["--emit-replay", "/tmp/rec.json", "--seats", "2"].into_iter().map(String::from),
+        );
+        assert_eq!(with.emit_replay, Some(PathBuf::from("/tmp/rec.json")));
+        let without = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(without.emit_replay, None);
+    }
+
     fn ranked(rating_a: i32, rating_b: i32, k: i32) -> RankedContext {
         RankedContext { rating_a, rating_b, k }
     }
