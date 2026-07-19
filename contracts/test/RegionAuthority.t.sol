@@ -606,6 +606,178 @@ contract RegionAuthorityTest is Test {
         assertEq(r.accruedFees(TILE), 0);
     }
 
+    // --- claimBatch (acquire a portfolio of regions in one tx, strict-atomic) ---
+
+    /// @dev The headline: a staker mints three regions with DISTINCT stakes in ONE call —
+    ///      a `Staked` per region, `totalStaked` and the single pull netting exactly the
+    ///      summed stakes, every NFT minted to the caller with its own recorded stake.
+    function test_claimBatch_mintsManyAndPullsSummedStakes() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        uint256 t3 = uint256(keccak256("region:5,6,0"));
+        uint256 a1 = STAKE;
+        uint256 a2 = STAKE + 50 ether;
+        uint256 a3 = 2 * STAKE;
+        uint256 sum = a1 + a2 + a3;
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.expectEmit(true, true, false, true);
+        emit Staked(alice, TILE, a1);
+        vm.expectEmit(true, true, false, true);
+        emit Staked(alice, t2, a2);
+        vm.expectEmit(true, true, false, true);
+        emit Staked(alice, t3, a3);
+
+        uint256[] memory ids = new uint256[](3);
+        ids[0] = TILE;
+        ids[1] = t2;
+        ids[2] = t3;
+        uint256[] memory amts = new uint256[](3);
+        amts[0] = a1;
+        amts[1] = a2;
+        amts[2] = a3;
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+
+        assertEq(region.ownerOf(TILE), alice);
+        assertEq(region.ownerOf(t2), alice);
+        assertEq(region.ownerOf(t3), alice);
+        assertEq(region.balanceOf(alice), 3, "all three minted to the caller");
+        assertEq(region.totalStaked(), sum, "totalStaked netted the summed stakes");
+        assertEq(token.balanceOf(address(region)), sum, "contract pulled exactly the summed stakes");
+        assertEq(token.balanceOf(alice), aliceBefore - sum, "caller paid exactly the summed stakes");
+        (uint256 amt2, uint64 stakedAt2) = region.stakes(t2);
+        assertEq(amt2, a2, "each region recorded its own stake");
+        assertEq(stakedAt2, uint64(block.timestamp));
+    }
+
+    /// @dev FM1 strict-atomic: an already-claimed element reverts AlreadyClaimed and the
+    ///      WHOLE batch rolls back — the fresh element is NOT minted and no token is pulled.
+    function test_claimBatch_revertsOnAlreadyClaimedElement() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        vm.prank(bob);
+        region.claim(t2, STAKE); // t2 already held by bob
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE; // fresh
+        ids[1] = t2; // already claimed
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = STAKE;
+        amts[1] = STAKE;
+        vm.expectRevert(RegionAuthority.AlreadyClaimed.selector);
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+
+        assertFalse(region.regionExists(TILE), "the fresh element was NOT minted by the reverted batch");
+        assertEq(region.totalStaked(), STAKE, "only bob's prior stake remains");
+        assertEq(token.balanceOf(alice), aliceBefore, "no token pulled from the reverted batch");
+    }
+
+    /// @dev FM1: an intra-batch duplicate `[X, X]` reverts — the first occurrence mints X,
+    ///      so the second finds it already claimed (AlreadyClaimed) and the whole batch rolls
+    ///      back (one stake can never mint two regions or double-pull).
+    function test_claimBatch_revertsOnIntraBatchDuplicate() public {
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = TILE;
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = STAKE;
+        amts[1] = STAKE;
+        vm.expectRevert(RegionAuthority.AlreadyClaimed.selector);
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+
+        assertFalse(region.regionExists(TILE), "nothing minted by the reverted duplicate batch");
+        assertEq(region.totalStaked(), 0);
+        assertEq(token.balanceOf(alice), aliceBefore, "no token pulled");
+    }
+
+    /// @dev FM1: a too-low stake element reverts StakeTooLow atomically (mirrors claim's
+    ///      per-element guard through the shared _claimOne) — no region in the batch mints.
+    function test_claimBatch_revertsOnTooLowStakeElement() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = t2;
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = STAKE;
+        amts[1] = STAKE - 1; // below the floor
+        vm.expectRevert(RegionAuthority.StakeTooLow.selector);
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+
+        assertFalse(region.regionExists(TILE), "the valid element did not mint");
+        assertEq(region.totalStaked(), 0);
+    }
+
+    /// @dev FM1: the two parallel arrays must be equal length — a mismatch reverts
+    ///      ArrayLengthMismatch (an amount could otherwise be silently dropped or read OOB).
+    function test_claimBatch_revertsOnLengthMismatch() public {
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = uint256(keccak256("region:3,4,0"));
+        uint256[] memory amts = new uint256[](1);
+        amts[0] = STAKE;
+        vm.expectRevert(RegionAuthority.ArrayLengthMismatch.selector);
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+    }
+
+    /// @dev FM3 safe-recipient: claimBatch mints via `_safeMint`, so a batch claimed by a
+    ///      contract that cannot receive ERC721 reverts the whole call (a mutation to
+    ///      `_mint` would silently strand the NFTs). Proves the batch keeps claim's guard.
+    function test_claimBatch_revertsForNonReceiver() public {
+        NonReceiverClaimer bad = new NonReceiverClaimer(region, token);
+        assertTrue(token.transfer(address(bad), STAKE));
+
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = TILE;
+        uint256[] memory amts = new uint256[](1);
+        amts[0] = STAKE;
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721InvalidReceiver.selector, address(bad)));
+        bad.claimBatch(ids, amts);
+
+        assertFalse(region.regionExists(TILE), "nothing minted to a non-receiver");
+        assertEq(token.balanceOf(address(region)), 0, "the reverted mint rolled back its pull");
+    }
+
+    function test_claimBatch_revertsOnEmptyBatch() public {
+        uint256[] memory ids = new uint256[](0);
+        uint256[] memory amts = new uint256[](0);
+        vm.expectRevert(RegionAuthority.EmptyBatch.selector);
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+    }
+
+    /// @dev A batch AT exactly MAX_BATCH (64) succeeds and mints the full portfolio.
+    function test_claimBatch_boundsAtMaxBatch() public {
+        uint256 n = region.MAX_BATCH();
+        uint256[] memory ids = new uint256[](n);
+        uint256[] memory amts = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            ids[i] = uint256(keccak256(abi.encode("claimbatch", i)));
+            amts[i] = STAKE;
+        }
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+        assertEq(region.balanceOf(alice), n, "the full max batch minted");
+        assertEq(region.totalStaked(), n * STAKE);
+        assertEq(token.balanceOf(alice), aliceBefore - n * STAKE, "pulled the full summed stake");
+    }
+
+    /// @dev A batch ABOVE MAX_BATCH reverts BatchTooLarge before touching any state.
+    function test_claimBatch_revertsAboveMaxBatch() public {
+        uint256 n = region.MAX_BATCH() + 1;
+        uint256[] memory ids = new uint256[](n);
+        uint256[] memory amts = new uint256[](n);
+        vm.expectRevert(RegionAuthority.BatchTooLarge.selector);
+        vm.prank(alice);
+        region.claimBatch(ids, amts);
+    }
+
     // --- unstakeBatch (exit a portfolio of regions in one tx, strict-atomic) ---
 
     /// @dev The headline: a holder exits three regions in ONE call — an `Unstaked` per
@@ -1261,5 +1433,21 @@ contract ReentrantWithdrawer is IPayoutReceiver {
 
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
         return this.onERC721Received.selector;
+    }
+}
+
+/// @notice Claims a batch but does NOT implement onERC721Received, so `_safeMint` to it
+///         reverts — proving claimBatch keeps claim's safe-recipient guard (a `_mint`
+///         mutation would silently strand the NFTs here).
+contract NonReceiverClaimer {
+    RegionAuthority region;
+
+    constructor(RegionAuthority region_, ERC20 token_) {
+        region = region_;
+        token_.approve(address(region_), type(uint256).max);
+    }
+
+    function claimBatch(uint256[] calldata ids, uint256[] calldata amounts) external {
+        region.claimBatch(ids, amounts);
     }
 }
