@@ -31,16 +31,16 @@ use std::time::{Duration, Instant};
 
 use arena_core::{
     arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, Match,
-    MatchRecord, Rules, SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
+    MatchRecord, ReplayError, Rules, SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
 };
 use arena_match::{
-    JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker, RegistrySnapshot,
-    SignatureVerifier, SnapshotError,
+    replay_to_spectator, JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker,
+    RegistrySnapshot, SignatureVerifier, SnapshotError,
 };
 use arena_proto::{
     check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
-    MatchConfig, MatchMode, MatchPhase, MatchResult, ReplayRecord, SeatId, SeatInfo, Vec2,
-    POSITION_SCALE, PROTOCOL_VERSION,
+    MatchConfig, MatchMode, MatchPhase, MatchResult, ReplayRecord, SeatId, SeatInfo, SpectatorMsg,
+    Vec2, POSITION_SCALE, PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -86,6 +86,16 @@ struct Args {
     /// writes nothing — byte-identical to the pre-flag harness; the record rides a side file,
     /// never the per-seat stdout frame stream, so the match output is unperturbed.
     emit_replay: Option<PathBuf>,
+    /// Cast a finished match's [`MatchRecord`] (an `--emit-replay` artifact) at this path as a
+    /// read-only [`SpectatorMsg`] stream to stdout, then exit — the "watch a finished A2A/Mixed
+    /// match from the artifact alone" mode, the consumer `--emit-replay` was built for. A wholly
+    /// separate path: it seats no agents and reads no stdin, verifies the record
+    /// ([`replay_to_spectator`], which rejects a truncated/tampered/over-budget record as a typed
+    /// error and casts NOTHING), and emits each projected [`Broadcast`] on a distinct
+    /// `{ "channel": "spectator", "frame": <SpectatorMsg> }` envelope (never the per-seat
+    /// `{ "seat", "frame" }` line), terminating with a single [`SpectatorMsg::End`]. `None` (no
+    /// `--replay`) runs a live match exactly as before — byte-identical.
+    replay: Option<PathBuf>,
     /// On-chain-registered agent addresses eligible for a ranked seat, each supplied by a
     /// repeated `--registered <addr>[:<reputation>]` — the arena-side view of
     /// `AgentRegistry.isRegistered` + `reputationOf` the matchmaker gates ranked
@@ -728,6 +738,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut human_seats: Vec<SeatId> = Vec::new();
     let mut ladder_file: Option<PathBuf> = None;
     let mut emit_replay: Option<PathBuf> = None;
+    let mut replay: Option<PathBuf> = None;
     let mut registered: Vec<(String, i128)> = Vec::new();
     let mut min_reputation: Option<i128> = None;
     let mut arena: &'static str = "";
@@ -823,6 +834,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             }
             "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
             "--emit-replay" => emit_replay = Some(it.next().expect("--emit-replay needs a value").into()),
+            "--replay" => replay = Some(it.next().expect("--replay needs a value").into()),
             "--registered" => {
                 let raw = it.next().expect("--registered needs an agent address");
                 let raw = raw.trim();
@@ -1009,6 +1021,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         human_seats,
         ladder_file,
         emit_replay,
+        replay,
         registered,
         min_reputation,
         arena,
@@ -1940,6 +1953,64 @@ fn write_replay_record(path: &Path, record: &MatchRecord) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Load a [`MatchRecord`] JSON artifact (an `--emit-replay` file) for the `--replay` cast.
+/// Only read/parse errors surface here as a message; the DoS-bounded verification happens
+/// later, in [`replay_to_spectator`].
+fn load_record(path: &Path) -> Result<MatchRecord, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("cannot parse {} as a MatchRecord: {e}", path.display()))
+}
+
+/// Serialize one [`SpectatorMsg`] onto its own stdout channel: a
+/// `{ "channel": "spectator", "frame": <msg> }` envelope, distinct from the per-seat
+/// `{ "seat", "frame" }` [`emit`] line so a `--replay` cast is unambiguous and never
+/// mistaken for a seat's Gateway stream.
+fn emit_spectator(out: &mut impl Write, msg: &SpectatorMsg) {
+    let frame = serde_json::to_value(msg).expect("serialize spectator message");
+    let envelope = serde_json::json!({ "channel": "spectator", "frame": frame });
+    writeln!(out, "{}", serde_json::to_string(&envelope).expect("serialize envelope"))
+        .expect("write spectator frame");
+}
+
+/// Verify `record` and cast it as a [`SpectatorMsg`] stream onto `out`: every projected
+/// [`Broadcast`] as a [`SpectatorMsg::Frame`], then a single terminal [`SpectatorMsg::End`].
+/// Returns the number of frames cast (the terminal End is not counted).
+///
+/// Verification is FIRST ([`replay_to_spectator`]): a truncated, tampered, or over-budget
+/// record returns the typed [`ReplayError`] having written NOTHING (the whole stream is
+/// materialized before the first `emit_spectator`), so casting an untrusted artifact can
+/// never stream a partial frame or be turned into a CPU/memory DoS.
+fn cast_to(out: &mut impl Write, record: &MatchRecord) -> Result<usize, ReplayError> {
+    let msgs = replay_to_spectator(record)?;
+    let frames = msgs.iter().filter(|m| matches!(m, SpectatorMsg::Frame(_))).count();
+    for msg in &msgs {
+        emit_spectator(out, msg);
+    }
+    Ok(frames)
+}
+
+/// The `--replay <path>` mode: load, verify, and cast a finished match's record as a
+/// read-only spectator stream, then return. A read/parse failure or a rejected record is
+/// loud and fatal (nothing valid to cast, `exit(1)`); a clean cast flushes and reports the
+/// frame count to stderr, leaving stdout the pure spectator stream.
+fn replay_cast(path: &Path, out: &mut impl Write) {
+    let record = load_record(path).unwrap_or_else(|e| {
+        eprintln!("[replay] {e}");
+        std::process::exit(1);
+    });
+    match cast_to(out, &record) {
+        Ok(frames) => {
+            out.flush().expect("flush spectator stream");
+            eprintln!("[replay] cast {frames} frame(s) from {}", path.display());
+        }
+        Err(e) => {
+            eprintln!("[replay] {} failed verification, cast nothing: {e:?}", path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Refuse to start a run whose `--ladder-file` can't be trusted: a corrupt or
 /// stale-schema ladder is reported and the process exits non-zero, NEVER silently reset
 /// to `DEFAULT_RATING` (which would erase real standings under a transient read glitch
@@ -2224,6 +2295,15 @@ fn build_direct_match(args: &Args, n: u8) -> Match {
 
 fn main() {
     let args = parse_args();
+    // --replay cast: a wholly separate read-only mode — load a finished MatchRecord and
+    // stream it as spectator frames to stdout, seating no agents and reading no stdin. A
+    // live run (no --replay) is untouched below and stays byte-identical.
+    if let Some(path) = args.replay.as_deref() {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        replay_cast(path, &mut out);
+        return;
+    }
     // Warn (never refuse) if a reputation floor can't gate anything — an operator config
     // slip the empty---registered guard doesn't cover. stderr only, so stdout stays the
     // byte-identical protocol stream.
@@ -3038,6 +3118,7 @@ mod tests {
             human_seats,
             ladder_file: None,
             emit_replay: None,
+            replay: None,
             registered: Vec::new(),
             min_reputation: None,
             arena: "",
@@ -3134,6 +3215,7 @@ mod tests {
             human_seats: vec![],
             ladder_file: None,
             emit_replay: None,
+            replay: None,
             registered: Vec::new(),
             min_reputation: None,
             arena,
