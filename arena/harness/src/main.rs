@@ -2691,6 +2691,77 @@ mod tests {
         assert_eq!(without.emit_replay, None);
     }
 
+    #[test]
+    fn parse_args_reads_the_replay_path() {
+        // The cast mode's path plumbs into Args; its absence stays None (a live run).
+        let with =
+            parse_args_from(["--replay", "/tmp/rec.json", "--seats", "2"].into_iter().map(String::from));
+        assert_eq!(with.replay, Some(PathBuf::from("/tmp/rec.json")));
+        let without = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(without.replay, None);
+    }
+
+    #[test]
+    fn replay_cast_emits_only_spectator_frames() {
+        // FM4 (channel isolation): a --replay cast rides its OWN `{ "channel": "spectator" }`
+        // envelope — every line is a SpectatorMsg (Frames then one terminal End), NONE is a
+        // per-seat `{ "seat", "frame" }` Gateway line (no Welcome/Observe/Start, no `seat`).
+        // So a caster reads the cast unambiguously and a consumer can never confuse it with a
+        // seat's private stream.
+        let (_m, result) = ended_match();
+        let record = _m.to_record().expect("a finished match yields a record");
+        let mut buf: Vec<u8> = Vec::new();
+        let frames = cast_to(&mut buf, &record).expect("a valid record casts");
+
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), frames + 1, "one line per Frame plus the terminal End");
+
+        let mut ends = 0;
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                v.get("channel").and_then(|c| c.as_str()),
+                Some("spectator"),
+                "every cast line rides the dedicated spectator channel",
+            );
+            assert!(v.get("seat").is_none(), "a cast line carries no per-seat `seat` — it is not a Gateway frame");
+            let frame = v.get("frame").expect("every envelope wraps a frame").clone();
+            let ty = frame.get("type").and_then(|t| t.as_str());
+            assert!(
+                !matches!(ty, Some("welcome" | "observe" | "start" | "challenge" | "reject")),
+                "a cast frame must never be a per-seat Gateway message, got type={ty:?}",
+            );
+            match serde_json::from_value::<SpectatorMsg>(frame).expect("the frame is a SpectatorMsg") {
+                SpectatorMsg::Frame(_) => {}
+                SpectatorMsg::End(r) => {
+                    ends += 1;
+                    assert_eq!(r, record.result, "the terminal End carries the match's committed result");
+                    assert_eq!(r, result, "…the same result the live match produced");
+                }
+            }
+        }
+        assert_eq!(ends, 1, "exactly one terminal End");
+        let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last["frame"]["type"], "end", "the stream terminates with the End");
+    }
+
+    #[test]
+    fn cast_to_rejects_a_tampered_record_and_writes_nothing() {
+        // FM1 (DoS bound) at the harness boundary: cast_to verifies FIRST, so a record whose
+        // committed result no longer matches the re-run is a typed reject that writes NOTHING —
+        // no partial spectator frame ever reaches stdout before the rejection.
+        let (m, _result) = ended_match();
+        let mut record = m.to_record().expect("a finished match yields a record");
+        record.result.final_tick += 1;
+        let mut buf: Vec<u8> = Vec::new();
+        assert!(
+            matches!(cast_to(&mut buf, &record), Err(ReplayError::ResultMismatch)),
+            "a tampered record is a clean typed reject, never a panic",
+        );
+        assert!(buf.is_empty(), "a rejected record casts nothing — no partial frame reaches the writer");
+    }
+
     fn ranked(rating_a: i32, rating_b: i32, k: i32) -> RankedContext {
         RankedContext { rating_a, rating_b, k }
     }
