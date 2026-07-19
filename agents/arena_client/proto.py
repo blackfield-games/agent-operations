@@ -302,6 +302,69 @@ def decode_gateway(frame: dict) -> GatewayMsg:
             raise ProtocolError(f"unknown gateway frame type {tag!r}")
 
 
+class BroadcastEntity(_Wire):
+    """One on-stage entity in a spectator Broadcast — the caster-camera view, mirroring
+    `arena_proto::BroadcastEntity`. The whole-battlefield counterpart to `VisibleEntity`:
+    it carries the health bar + scoreboard a broadcast renders (`health`/`max_health`/
+    `score`/`alive`) and DROPS `in_line_of_sight` (a spectator sees the whole map, not one
+    seat's cone). It deliberately carries NO `ammo`/`cooldown` — a spectator learns no more
+    than a viewer of the stream, the broadcast's security line — which `extra=forbid` pins."""
+
+    entity_id: U32
+    kind: EntityKindName
+    team: U16
+    position: Vec2
+    z: I32
+    facing: U16
+    health: U16
+    max_health: U16
+    score: I32
+    alive: bool
+
+
+class Broadcast(_Wire):
+    """A spectator's whole-battlefield snapshot at one tick, mirroring `arena_proto::Broadcast`
+    — every pawn, in-flight projectile, and active pickup as a `BroadcastEntity`, ascending by
+    `entity_id`. The caster view, NOT any seat's `Observation`: no `own`, no `deadline_micros`,
+    no per-seat `visible`. It DOES carry `starting_remaining` (the public pre-match countdown a
+    stream overlay shows)."""
+
+    protocol_version: U32
+    match_id: MatchIdStr
+    tick: U64
+    phase: Phase
+    # The public pre-match countdown clock (the live counter during Starting, 0 once
+    # Live/Ended). serde(default)=0 on the Rust side, so a frame written before the field
+    # existed decodes to 0 — the spectator twin of Observation.starting_remaining.
+    starting_remaining: U32 = 0
+    entities: list[BroadcastEntity]
+
+
+SpectatorMsg = Broadcast | MatchResult
+
+
+def decode_spectator(frame: dict) -> SpectatorMsg:
+    """Decode one server→spectator frame. The spectator protocol is one-directional — a
+    caster/grader only RECEIVES a stream of `frame`s and a terminal `end`, never sends.
+    Envelopes are internally tagged on `type` (`snake_case`); the two newtype variants —
+    `frame` / `end` — carry the `Broadcast` / `MatchResult` fields flattened next to `type`,
+    exactly as the Rust `SpectatorMsg` serializes them. This reconstruction is machine-pinned
+    against the shared `arena/proto/tests/spectator_parity.json` golden (emitted by
+    `arena_proto::spectator_parity_vectors()` and diffed by the Rust drift-gate) — see
+    `test_arena_client.py`."""
+    if not isinstance(frame, dict) or "type" not in frame:
+        raise ProtocolError(f"frame is not a tagged spectator message: {frame!r}")
+    tag = frame["type"]
+    body = {k: v for k, v in frame.items() if k != "type"}
+    match tag:
+        case "frame":
+            return Broadcast.model_validate(body)
+        case "end":
+            return MatchResult.model_validate(body)
+        case _:
+            raise ProtocolError(f"unknown spectator frame type {tag!r}")
+
+
 _JOIN_DOMAIN = b"blackfield/arena/join/v1"
 
 
