@@ -2463,7 +2463,7 @@ fn main() {
     // the default arena while the operator believes the file loaded.
     if map_file_conflicts_with_mode(&args) {
         eprintln!(
-            "--map-file loads a custom arena into the direct path and cannot combine with --mode (the matchmade path's arena is a compile-time key — see arena-match-map-override); drop one"
+            "--map-file loads a custom arena into the direct path and cannot combine with --mode (the matchmade path resolves its arena from a fixed builtin key); drop one"
         );
         std::process::exit(1);
     }
