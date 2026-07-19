@@ -1686,6 +1686,53 @@ def test_gateway_ladder_fails_loud_on_a_drifted_emission_but_skips_a_foreign_mat
     assert emit(foreign).ladder("m") == {}
 
 
+def _stdout_gateway(*lines: str):
+    # A portable stand-in for the harness: write the given stdout lines and exit, so recv
+    # reads them line by line — no cargo, no real match. The stderr `emit` helper's twin
+    # for the stdout frame stream.
+    from arena_client.sdk import SubprocessGateway
+
+    text = "".join(lines)
+    return SubprocessGateway([sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", text])
+
+
+def test_gateway_recv_tolerates_the_interleaved_spectator_channel():
+    # FM1 (crash) + FM4 (seat order): a --spectate/--replay harness interleaves spectator
+    # envelopes { "channel": "spectator", "frame": ... } — NO "seat" key — on the SAME
+    # stdout as the per-seat frames. recv dispatches on env["seat"], so a spectator line
+    # used to raise KeyError and kill the transport mid-match. A participant transport must
+    # DROP the spectator channel (it belongs to the spectator client, not a seat) and still
+    # deliver every seat frame in order, even with a broadcast wedged between two of them.
+    seat0_a = json.dumps({"seat": 0, "frame": {"type": "observe", "tick": 0}}) + "\n"
+    spectator = json.dumps({"channel": "spectator", "frame": {"type": "frame", "tick": 0}}) + "\n"
+    seat0_b = json.dumps({"seat": 0, "frame": {"type": "observe", "tick": 1}}) + "\n"
+
+    gw = _stdout_gateway(seat0_a, spectator, seat0_b)
+    try:
+        assert gw.recv(0) == {"type": "observe", "tick": 0}
+        assert gw.recv(0) == {"type": "observe", "tick": 1}
+        # FM2 (no unbounded buffer): the dropped spectator line routed to no queue — only
+        # seat 0 was ever created, so a spectated match never accumulates a sink this side
+        # never drains.
+        assert set(gw._queues) == {0}, "the spectator channel is dropped, never buffered"
+    finally:
+        gw.close()
+
+
+def test_gateway_recv_rejects_an_envelope_with_neither_seat_nor_channel():
+    # FM3 (malformed swallowed): a line that is neither a per-seat { "seat" } frame nor the
+    # known spectator channel is drift — a typed ProtocolError, never a raw KeyError (the
+    # old crash) and never a silent skip (which would mask a real envelope-format change as
+    # a benign spectator line).
+    unknown = json.dumps({"frame": {"type": "observe"}}) + "\n"  # no seat, no channel
+    gw = _stdout_gateway(unknown)
+    try:
+        with pytest.raises(proto.ProtocolError, match="neither a seat"):
+            gw.recv(0)
+    finally:
+        gw.close()
+
+
 def test_run_matchmade_ladder_file_accumulates_a_seat_rating_across_two_runs(tmp_path):
     # The headline: a --ladder-file makes the ranked ladder DURABLE across SDK calls. Run a
     # ranked match twice sharing one file; run 2 seeds from run 1's written ladder, so each
