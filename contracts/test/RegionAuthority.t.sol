@@ -606,6 +606,201 @@ contract RegionAuthorityTest is Test {
         assertEq(r.accruedFees(TILE), 0);
     }
 
+    // --- unstakeBatch (exit a portfolio of regions in one tx, strict-atomic) ---
+
+    /// @dev The headline: a holder exits three regions in ONE call — an `Unstaked` per
+    ///      region and a SINGLE aggregated refund of the summed stakes, every NFT burned
+    ///      and `totalStaked` netted to zero.
+    function test_unstakeBatch_exitsManyRegionsInOneTransfer() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        uint256 t3 = uint256(keccak256("region:5,6,0"));
+        vm.startPrank(alice);
+        region.claim(TILE, STAKE);
+        region.claim(t2, STAKE);
+        region.claim(t3, STAKE);
+        vm.stopPrank();
+        assertEq(region.totalStaked(), 3 * STAKE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.expectEmit(true, true, false, true);
+        emit Unstaked(alice, TILE, STAKE);
+        vm.expectEmit(true, true, false, true);
+        emit Unstaked(alice, t2, STAKE);
+        vm.expectEmit(true, true, false, true);
+        emit Unstaked(alice, t3, STAKE);
+
+        uint256[] memory ids = new uint256[](3);
+        ids[0] = TILE;
+        ids[1] = t2;
+        ids[2] = t3;
+        vm.prank(alice);
+        region.unstakeBatch(ids);
+
+        assertEq(
+            token.balanceOf(alice), aliceBefore + 3 * STAKE, "one aggregated refund of the summed stakes"
+        );
+        assertEq(token.balanceOf(address(region)), 0, "pool emptied");
+        assertEq(region.totalStaked(), 0, "totalStaked netted the whole batch");
+        assertEq(region.balanceOf(alice), 0, "all three NFTs burned");
+        (uint256 amt,) = region.stakes(TILE);
+        assertEq(amt, 0, "stake record deleted");
+    }
+
+    /// @dev FM2: every element's accrued fees settle to `withdrawable` exactly once on
+    ///      burn (a batched exit strands no earned fees), and the books reconcile — after
+    ///      the batch the only balance left is the settled fees (Σ stake = 0, Σ accrued = 0).
+    function test_unstakeBatch_settlesAccruedFeesForEveryElement() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        uint256 t3 = uint256(keccak256("region:5,6,0"));
+        vm.startPrank(alice);
+        region.claim(TILE, STAKE);
+        region.claim(t2, STAKE);
+        region.claim(t3, STAKE);
+        vm.stopPrank();
+        vm.startPrank(bob);
+        region.depositFees(TILE, FEE);
+        region.depositFees(t2, 50 ether);
+        region.depositFees(t3, 20 ether);
+        vm.stopPrank();
+
+        uint256 accruedSum = FEE + 50 ether + 20 ether;
+        uint256 aliceBefore = token.balanceOf(alice);
+
+        uint256[] memory ids = new uint256[](3);
+        ids[0] = TILE;
+        ids[1] = t2;
+        ids[2] = t3;
+        vm.prank(alice);
+        region.unstakeBatch(ids);
+
+        assertEq(token.balanceOf(alice), aliceBefore + 3 * STAKE, "stakes refunded immediately");
+        assertEq(region.accruedFees(TILE), 0);
+        assertEq(region.accruedFees(t2), 0);
+        assertEq(region.accruedFees(t3), 0);
+        assertEq(region.withdrawable(alice), accruedSum, "every element's accrued fees settled exactly once");
+        assertEq(
+            token.balanceOf(address(region)), accruedSum, "balance reconciles: only the settled fees remain"
+        );
+
+        vm.prank(alice);
+        region.withdraw();
+        assertEq(
+            token.balanceOf(alice), aliceBefore + 3 * STAKE + accruedSum, "fees recovered, nothing stranded"
+        );
+        assertEq(token.balanceOf(address(region)), 0);
+    }
+
+    /// @dev FM1 strict-atomic: an element the caller does not hold reverts NotHolder and
+    ///      the WHOLE batch rolls back — nothing burned, no partial refund, no cross-holder
+    ///      exit of another owner's region.
+    function test_unstakeBatch_revertsOnNonHeldElement() public {
+        uint256 t2 = uint256(keccak256("region:3,4,0"));
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+        vm.prank(bob);
+        region.claim(t2, STAKE); // bob's region
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = t2; // not held by alice
+        vm.expectRevert(RegionAuthority.NotHolder.selector);
+        vm.prank(alice);
+        region.unstakeBatch(ids);
+
+        assertEq(region.ownerOf(TILE), alice, "alice's region not burned by the reverted batch");
+        assertEq(region.ownerOf(t2), bob, "bob's region untouched, no cross-holder exit");
+        assertEq(region.totalStaked(), 2 * STAKE, "totalStaked unchanged");
+        assertEq(token.balanceOf(alice), aliceBefore, "no refund from the reverted batch");
+    }
+
+    /// @dev FM1: an intra-batch duplicate `[X, X]` reverts — the first occurrence burns X,
+    ///      so the second's `ownerOf` reverts ERC721NonexistentToken, and the whole batch
+    ///      rolls back (no double refund of one stake).
+    function test_unstakeBatch_revertsOnIntraBatchDuplicate() public {
+        vm.prank(alice);
+        region.claim(TILE, STAKE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = TILE;
+        ids[1] = TILE;
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, TILE));
+        vm.prank(alice);
+        region.unstakeBatch(ids);
+
+        assertEq(region.ownerOf(TILE), alice, "the reverted duplicate batch burned nothing");
+        assertEq(region.totalStaked(), STAKE, "totalStaked unchanged");
+        assertEq(token.balanceOf(alice), aliceBefore, "no refund");
+    }
+
+    function test_unstakeBatch_revertsOnEmptyBatch() public {
+        uint256[] memory ids = new uint256[](0);
+        vm.expectRevert(RegionAuthority.EmptyBatch.selector);
+        vm.prank(alice);
+        region.unstakeBatch(ids);
+    }
+
+    /// @dev A batch AT exactly MAX_BATCH (64) succeeds and exits the full portfolio.
+    function test_unstakeBatch_boundsAtMaxBatch() public {
+        uint256 n = region.MAX_BATCH();
+        uint256[] memory ids = new uint256[](n);
+        vm.startPrank(alice);
+        for (uint256 i = 0; i < n; i++) {
+            uint256 id = uint256(keccak256(abi.encode("unstakebatch", i)));
+            region.claim(id, STAKE);
+            ids[i] = id;
+        }
+        vm.stopPrank();
+        assertEq(region.totalStaked(), n * STAKE);
+
+        uint256 aliceBefore = token.balanceOf(alice);
+        vm.prank(alice);
+        region.unstakeBatch(ids);
+        assertEq(token.balanceOf(alice), aliceBefore + n * STAKE, "the full max batch exited");
+        assertEq(region.totalStaked(), 0);
+        assertEq(region.balanceOf(alice), 0, "every NFT burned");
+    }
+
+    /// @dev A batch ABOVE MAX_BATCH reverts BatchTooLarge before touching any state.
+    function test_unstakeBatch_revertsAboveMaxBatch() public {
+        uint256[] memory ids = new uint256[](region.MAX_BATCH() + 1);
+        vm.expectRevert(RegionAuthority.BatchTooLarge.selector);
+        vm.prank(alice);
+        region.unstakeBatch(ids);
+    }
+
+    /// @dev CEI under batching: a hostile token reentering `unstake` on the aggregated
+    ///      refund finds the NFT already burned (Phase 1 burns before the Phase 2 transfer)
+    ///      and reverts — no second withdrawal draining a co-staker's pooled funds.
+    function test_unstakeBatch_reentrantHolderCannotDrainPool() public {
+        HookToken evil = new HookToken();
+        RegionAuthority r = new RegionAuthority(address(evil), STAKE, owner);
+        ReentrantHolder attacker = new ReentrantHolder(r, evil);
+
+        // Honest staker funds a distinct region so the pool holds 2*STAKE when the
+        // attacker batch-exits — enough to pay a reentrant double-withdraw if it lands.
+        uint256 aliceTile = uint256(keccak256("region:9,9,0"));
+        evil.transfer(alice, STAKE);
+        vm.prank(alice);
+        evil.approve(address(r), type(uint256).max);
+        vm.prank(alice);
+        r.claim(aliceTile, STAKE);
+
+        evil.transfer(address(attacker), STAKE);
+        attacker.claim(TILE, STAKE);
+        assertEq(evil.balanceOf(address(r)), 2 * STAKE);
+
+        evil.arm(); // fire the holder's reentry on the aggregated refund
+        attacker.unstakeBatch();
+
+        assertTrue(attacker.reentered());
+        assertTrue(attacker.reentryReverted(), "reentry blocked: the NFT was burned in Phase 1");
+        assertEq(evil.balanceOf(address(attacker)), STAKE, "recovered exactly its own stake");
+        assertEq(evil.balanceOf(address(r)), STAKE, "honest staker's funds intact");
+        assertEq(r.balanceOf(address(attacker)), 0);
+    }
+
     /// @dev The fairness property: a region sale must not hand the buyer the fees the
     ///      seller earned. On transfer the accrued balance settles to the OUTGOING
     ///      holder's pull ledger; the new holder inherits nothing.
@@ -960,6 +1155,12 @@ contract ReentrantHolder {
 
     function unstake() external {
         region.unstake(tokenId);
+    }
+
+    function unstakeBatch() external {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = tokenId;
+        region.unstakeBatch(ids);
     }
 
     function onPayout() external {
