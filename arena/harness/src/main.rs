@@ -30,8 +30,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arena_core::{
-    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, Match, Rules,
-    SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
+    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, Match,
+    MatchRecord, Rules, SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
 };
 use arena_match::{
     JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker, RegistrySnapshot,
@@ -77,6 +77,15 @@ struct Args {
     /// back atomically after the match. Only a `--mode` run moves a ladder, so the flag
     /// is consulted on that path; `None` keeps the in-memory-only behaviour.
     ladder_file: Option<PathBuf>,
+    /// Serialize the finished match's self-determining [`MatchRecord`] (config + rules +
+    /// replay + result) to this path as JSON — the fetchable artifact a settlement grader, a
+    /// dispute, or a spectator/replay feed re-runs from ALONE (`MatchRecord::verify` reproduces
+    /// the outcomes and the replay digest the settlement path commits). The harness commits
+    /// that digest but otherwise DISCARDS the record; this emits it so the committed hash points
+    /// at a replay a third party can actually fetch and re-verify. `None` (no `--emit-replay`)
+    /// writes nothing — byte-identical to the pre-flag harness; the record rides a side file,
+    /// never the per-seat stdout frame stream, so the match output is unperturbed.
+    emit_replay: Option<PathBuf>,
     /// On-chain-registered agent addresses eligible for a ranked seat, each supplied by a
     /// repeated `--registered <addr>[:<reputation>]` — the arena-side view of
     /// `AgentRegistry.isRegistered` + `reputationOf` the matchmaker gates ranked
@@ -718,6 +727,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut mode: Option<MatchMode> = None;
     let mut human_seats: Vec<SeatId> = Vec::new();
     let mut ladder_file: Option<PathBuf> = None;
+    let mut emit_replay: Option<PathBuf> = None;
     let mut registered: Vec<(String, i128)> = Vec::new();
     let mut min_reputation: Option<i128> = None;
     let mut arena: &'static str = "";
@@ -812,6 +822,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     .collect();
             }
             "--ladder-file" => ladder_file = Some(it.next().expect("--ladder-file needs a value").into()),
+            "--emit-replay" => emit_replay = Some(it.next().expect("--emit-replay needs a value").into()),
             "--registered" => {
                 let raw = it.next().expect("--registered needs an agent address");
                 let raw = raw.trim();
@@ -997,6 +1008,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         mode,
         human_seats,
         ladder_file,
+        emit_replay,
         registered,
         min_reputation,
         arena,
@@ -1893,6 +1905,41 @@ fn write_ladder(path: &Path, snapshot: &LadderSnapshot) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// Serialize a finished match's canonical [`MatchRecord`] to `path` as JSON — the
+/// fetchable, self-determining artifact a settlement grader, a dispute, or a
+/// spectator/replay feed re-runs from ALONE ([`MatchRecord::verify`] reproduces the
+/// outcomes and the replay digest the settlement path commits toward the contract). The
+/// harness derives that digest to settle but otherwise DISCARDS the record, so today the
+/// committed hash points at a replay no third party can fetch; this closes that gap.
+///
+/// A no-op when `path` is `None` — byte-identical to the pre-flag harness. The record
+/// rides a side FILE, never the per-seat stdout frame stream, so the match output is
+/// unperturbed. [`Match::to_record`] is `None` only before a match ends; every call site
+/// is past the terminal result, so a `None` here is unreachable in practice — it WARNS and
+/// emits nothing rather than panic. A failed write is loud and fatal: a requested artifact
+/// that cannot be persisted is an error, not a silent drop.
+fn emit_replay_record(path: Option<&Path>, m: &Match) {
+    let Some(path) = path else { return };
+    let Some(record) = m.to_record() else {
+        eprintln!("[emit-replay] match has not reached a terminal state; no record to emit");
+        return;
+    };
+    if let Err(e) = write_replay_record(path, &record) {
+        eprintln!("[emit-replay] failed to persist to {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
+/// Persist `record` to `path` durably: serialize to a sibling temp file, then
+/// atomic-rename it over `path`, so a crash mid-write never leaves a reader a truncated
+/// record — the same discipline as [`write_ladder`].
+fn write_replay_record(path: &Path, record: &MatchRecord) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(record).expect("a MatchRecord always serializes");
+    let tmp = tmp_sibling_path(path);
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Refuse to start a run whose `--ladder-file` can't be trusted: a corrupt or
 /// stale-schema ladder is reported and the process exits non-zero, NEVER silently reset
 /// to `DEFAULT_RATING` (which would erase real standings under a transient read glitch
@@ -2207,6 +2254,7 @@ fn main() {
         // Settle the ladder while the roster is still alive (it maps seat→controller for
         // the rating readout); `settle_finished` then consumes the match.
         settle_ranked_ladder(&mm, &result, m.seats());
+        emit_replay_record(args.emit_replay.as_deref(), &m);
         settle_finished(&settler, &result, m, &[]);
         if let Some(path) = &args.ladder_file {
             // Persist the POST-settle ladder (the settle above moved it) so the next run
@@ -2310,6 +2358,7 @@ fn main() {
 
     let deadline = enforced_deadline(&args, &m);
     let result = drive_pump(&mut m, n, deadline, lines, &mut out);
+    emit_replay_record(args.emit_replay.as_deref(), &m);
     settle_finished(&settler, &result, m, &recovered);
 }
 
@@ -2899,6 +2948,7 @@ mod tests {
             mode: Some(mode),
             human_seats,
             ladder_file: None,
+            emit_replay: None,
             registered: Vec::new(),
             min_reputation: None,
             arena: "",
@@ -2994,6 +3044,7 @@ mod tests {
             mode: None,
             human_seats: vec![],
             ladder_file: None,
+            emit_replay: None,
             registered: Vec::new(),
             min_reputation: None,
             arena,
