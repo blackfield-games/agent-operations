@@ -32,6 +32,7 @@ contract AgentRegistryTest is Test {
     event ReputationWriterSet(address indexed writer, bool authorized);
     event MinBondSet(uint256 minBond);
     event HandleChanged(address indexed agent, bytes32 handle);
+    event BondIncreased(address indexed agent, uint256 additional, uint256 newBond);
 
     function setUp() public {
         token = new MockToken();
@@ -325,6 +326,135 @@ contract AgentRegistryTest is Test {
         registry.setHandle(bytes32(0));
         (,,,,, bytes32 handle) = registry.agents(alice);
         assertEq(handle, bytes32(0), "the label was cleared");
+    }
+
+    // --- increaseBond (raise an active identity's bond in place, increase-only) ---
+
+    function test_increaseBond_raisesBondAndPullsExactly() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+
+        uint256 additional = 40 ether;
+        vm.expectEmit(true, false, false, true);
+        emit BondIncreased(alice, additional, BOND + additional);
+        vm.prank(alice);
+        registry.increaseBond(additional);
+
+        (,,, uint256 bond,,) = registry.agents(alice);
+        assertEq(bond, BOND + additional, "bond rose by exactly additional");
+        assertTrue(registry.isRegistered(alice), "still an active identity");
+        assertEq(token.balanceOf(address(registry)), BOND + additional, "contract pulled exactly additional");
+        assertEq(token.balanceOf(alice), 10_000 ether - BOND - additional, "caller paid exactly additional");
+    }
+
+    /// @dev The += must accumulate, not overwrite: a second raise stacks on the first,
+    ///      so a batch of top-ups can never mis-account. A mutation to `bond = additional`
+    ///      passes a single raise but reddens here.
+    function test_increaseBond_accumulatesAcrossCalls() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(alice);
+        registry.increaseBond(30 ether);
+        vm.prank(alice);
+        registry.increaseBond(70 ether);
+
+        (,,, uint256 bond,,) = registry.agents(alice);
+        assertEq(bond, BOND + 100 ether, "both raises stacked on the original bond");
+        assertEq(token.balanceOf(address(registry)), BOND + 100 ether, "every raise was pulled");
+    }
+
+    /// @dev A raise touches ONLY the bond. Standing, match count, handle, active flag,
+    ///      and the registration timestamp are all untouched — even as time passes — so
+    ///      a re-bond is not a re-register and cannot reset the identity's age or standing.
+    function test_increaseBond_touchesNoOtherField() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(owner);
+        registry.recordMatchResult(alice, -30 ether); // give it standing + a match
+
+        (
+            bool registeredBefore,
+            uint64 registeredAtBefore,
+            uint64 matchesBefore,,
+            int256 repBefore,
+            bytes32 handleBefore
+        ) = registry.agents(alice);
+
+        vm.warp(block.timestamp + 1 days); // time moves; registeredAt must NOT
+        vm.prank(alice);
+        registry.increaseBond(15 ether);
+
+        (
+            bool registeredAfter,
+            uint64 registeredAtAfter,
+            uint64 matchesAfter,
+            uint256 bondAfter,
+            int256 repAfter,
+            bytes32 handleAfter
+        ) = registry.agents(alice);
+        assertEq(registeredAfter, registeredBefore, "active flag unchanged");
+        assertEq(registeredAtAfter, registeredAtBefore, "registeredAt unchanged by a re-bond");
+        assertEq(matchesAfter, matchesBefore, "match count unchanged");
+        assertEq(repAfter, repBefore, "a re-bond cannot reset a standing");
+        assertEq(handleAfter, handleBefore, "handle unchanged");
+        assertEq(bondAfter, BOND + 15 ether, "only the bond moved");
+    }
+
+    /// @dev Self-sovereign: no address parameter, so a raise only ever tops up
+    ///      msg.sender's own record — alice's raise never touches bob's bond.
+    function test_increaseBond_isPerSenderOnly() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(bob);
+        registry.register(bytes32("bob-bot"), BOND);
+
+        vm.prank(alice);
+        registry.increaseBond(50 ether);
+
+        (,,, uint256 aliceBond,,) = registry.agents(alice);
+        (,,, uint256 bobBond,,) = registry.agents(bob);
+        assertEq(aliceBond, BOND + 50 ether);
+        assertEq(bobBond, BOND, "another identity's bond is untouched");
+    }
+
+    function test_increaseBond_revertsForNeverRegistered() public {
+        vm.expectRevert(AgentRegistry.NotRegistered.selector);
+        vm.prank(alice);
+        registry.increaseBond(10 ether);
+    }
+
+    /// @dev A deregistered (inactive) identity cannot re-bond — its bond was refunded
+    ///      and the record is inactive; it must re-register to go active again. Mirrors
+    ///      deregister's gate, and the rejected call moves no token and leaves the
+    ///      zeroed bond intact (no bond added to a ghost record).
+    function test_increaseBond_revertsForDeregisteredIdentity() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+        vm.prank(alice);
+        registry.deregister();
+
+        vm.expectRevert(AgentRegistry.NotRegistered.selector);
+        vm.prank(alice);
+        registry.increaseBond(10 ether);
+
+        (,,, uint256 bond,,) = registry.agents(alice);
+        assertEq(bond, 0, "the rejected raise left the refunded bond at zero");
+        assertEq(token.balanceOf(address(registry)), 0, "no token moved");
+    }
+
+    /// @dev A zero raise is a permissive no-op (mirrors register skipping the pull for a
+    ///      zero bond): it does not revert, moves no token, and leaves the bond unchanged.
+    function test_increaseBond_zeroAdditionalIsNoOp() public {
+        vm.prank(alice);
+        registry.register(HANDLE, BOND);
+
+        vm.prank(alice);
+        registry.increaseBond(0);
+
+        (,,, uint256 bond,,) = registry.agents(alice);
+        assertEq(bond, BOND, "bond unchanged by a zero raise");
+        assertEq(token.balanceOf(address(registry)), BOND, "no token pulled for a zero raise");
+        assertTrue(registry.isRegistered(alice), "still active");
     }
 
     // --- reputation (FM2: only an authorized writer may move it) ---
