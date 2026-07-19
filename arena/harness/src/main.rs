@@ -2551,7 +2551,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arena_proto::{address_from_verifying_key, join_digest, Action, ActionButtons, SeatOutcome};
+    use arena_match::replay_frames;
+    use arena_proto::{address_from_verifying_key, join_digest, Action, ActionButtons, Broadcast, SeatOutcome};
     use k256::ecdsa::{RecoveryId, Signature, SigningKey};
 
     const MID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -2866,6 +2867,173 @@ mod tests {
             "a tampered record is a clean typed reject, never a panic",
         );
         assert!(buf.is_empty(), "a rejected record casts nothing — no partial frame reaches the writer");
+    }
+
+    /// The live-cast stream: every `{ "channel": "spectator" }` line on `out`, parsed back into
+    /// its [`SpectatorMsg`] — the per-seat Gateway lines interleaved on the same stdout are
+    /// skipped, so this is exactly what a caster subscribed to the spectator channel reads.
+    fn spectator_stream(out: &[u8]) -> Vec<SpectatorMsg> {
+        String::from_utf8(out.to_vec())
+            .expect("utf8 transcript")
+            .lines()
+            .filter_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).expect("each line is json");
+                (v.get("channel").and_then(|c| c.as_str()) == Some("spectator"))
+                    .then(|| serde_json::from_value(v["frame"].clone()).expect("a spectator frame is a SpectatorMsg"))
+            })
+            .collect()
+    }
+
+    /// The [`Broadcast`] payloads of a live-cast stream, in order (the terminal End dropped).
+    fn cast_frames(out: &[u8]) -> Vec<Broadcast> {
+        spectator_stream(out)
+            .into_iter()
+            .filter_map(|m| match m {
+                SpectatorMsg::Frame(b) => Some(b),
+                SpectatorMsg::End(_) => None,
+            })
+            .collect()
+    }
+
+    /// A deterministic idle 1v1 driven from a fixed script, live-cast through `cast`. The
+    /// match id/seed are fixed ([`direct_args`]), so two runs are byte-identical.
+    fn spectated_run(args: &Args, cast: Option<&SpectatorCast>) -> (MatchResult, Vec<u8>) {
+        let mut m = build_direct_match(args, 2);
+        let mid = m.match_id();
+        let script: Vec<String> =
+            (0..4).flat_map(|t| [act_line(0, mid, t), act_line(1, mid, t)]).collect();
+        let mut out: Vec<u8> = Vec::new();
+        let result = pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out, cast);
+        (result, out)
+    }
+
+    #[test]
+    fn parse_args_sets_the_spectate_flag() {
+        let with = parse_args_from(["--spectate", "--seats", "2"].into_iter().map(String::from));
+        assert!(with.spectate, "--spectate turns on the live cast");
+        let without = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert!(!without.spectate, "its absence keeps a byte-identical live run");
+    }
+
+    #[test]
+    fn spectate_sheds_overflow_and_never_stalls_the_sim() {
+        // FM1 (backpressure): a dead spectator — subscribed but NEVER drained — must never
+        // stall the tick loop. The feed sheds its ring's oldest message (counted in dropped()),
+        // and the match runs to a byte-identical MatchResult vs a no-spectate run.
+        let args = direct_args(2, "", 0);
+        let (baseline, _) = spectated_run(&args, None);
+
+        // A tiny ring plus a SECOND spectator that is never read: its ring fills and drops.
+        let cast = SpectatorCast::with_limits(1, 4);
+        let dead = cast.feed.subscribe().expect("a second spectator is admitted under the cap");
+        let (spectated, _) = spectated_run(&args, Some(&cast));
+
+        assert_eq!(baseline, spectated, "a slow/dead spectator never alters the match outcome");
+        assert!(
+            dead.dropped() > 0,
+            "the dead consumer's ring shed overflow rather than backpressuring the publisher",
+        );
+    }
+
+    #[test]
+    fn a_no_countdown_live_cast_matches_the_replay_of_the_same_match() {
+        // FM3 (live == replay): the live-cast Broadcast frames are byte-identical to that same
+        // match's replay_frames playback from its emitted record, so a live watcher and an
+        // after-the-fact replay watcher see the identical stream.
+        let cast = SpectatorCast::new();
+        let mut m = build_direct_match(&direct_args(2, "", 0), 2);
+        let mid = m.match_id();
+        let script: Vec<String> =
+            (0..4).flat_map(|t| [act_line(0, mid, t), act_line(1, mid, t)]).collect();
+        let mut out: Vec<u8> = Vec::new();
+        pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out, Some(&cast));
+
+        let record = m.to_record().expect("a finished match yields a record");
+        let replayed = replay_frames(&record).expect("a valid record replays");
+        let live = cast_frames(&out);
+        assert_eq!(live, replayed, "the live cast equals the record's replay, frame for frame");
+        assert_eq!(
+            live.last().unwrap().phase,
+            MatchPhase::Ended,
+            "the shared spine ends on the terminal state, carried before the End",
+        );
+    }
+
+    #[test]
+    fn live_cast_frames_expose_no_private_hud() {
+        // FM2 (parity leak): a live Broadcast frame carries only public on-stage state — the
+        // same public BroadcastEntity key set the replay cast pins, never a seat's private
+        // ammo/cooldown/intent x-ray. A participant reads only its own { "seat" } stream; the
+        // spectator channel is public by construction (the replay-path twin, live).
+        //
+        // Inspect the RAW emitted bytes a spectator actually receives, NOT a typed re-parse:
+        // deserializing back through BroadcastEntity would silently drop any leaked unknown
+        // field, hiding exactly the regression this guards.
+        let cast = SpectatorCast::new();
+        let (_, out) = spectated_run(&direct_args(2, "", 0), Some(&cast));
+
+        let text = String::from_utf8(out).expect("utf8 transcript");
+        let opening = text
+            .lines()
+            .find_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                (v.get("channel").and_then(|c| c.as_str()) == Some("spectator")
+                    && v["frame"]["type"] == "frame")
+                    .then(|| v["frame"].clone())
+            })
+            .expect("at least one live frame was cast");
+        let entities = opening["entities"].as_array().expect("a frame carries an entities array");
+        assert!(!entities.is_empty(), "the opening frame shows the roster");
+
+        let mut keys: Vec<&str> = entities[0].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["alive", "entity_id", "facing", "health", "kind", "max_health", "position", "score", "team", "z"],
+            "a cast entity's on-the-wire keys are exactly the public on-stage set",
+        );
+        for forbidden in ["ammo", "cooldown", "dash_cooldown", "intent", "velocity", "shield"] {
+            assert!(
+                entities[0].get(forbidden).is_none(),
+                "the live cast leaks private HUD field `{forbidden}` onto the wire",
+            );
+        }
+    }
+
+    #[test]
+    fn spectate_casts_the_countdown_then_live_ticks_then_one_end() {
+        // FM4 (phase gating): a --starting-ticks match casts a frame per pre-live countdown
+        // tick, then a frame per live tick (ending on the terminal state), then exactly one
+        // End — never a Lobby frame (the direct match opens in Starting and the cast only
+        // fires per simulated tick).
+        let cast = SpectatorCast::new();
+        let mut m = build_direct_match(&Args { starting_ticks: 2, ..direct_args(2, "reference", 0) }, 2);
+        assert_eq!(m.phase(), MatchPhase::Starting, "the countdown match opens in Starting");
+        let mid = m.match_id();
+        let script: Vec<String> =
+            (0..4).flat_map(|t| [act_line(0, mid, t), act_line(1, mid, t)]).collect();
+        let mut out: Vec<u8> = Vec::new();
+        pump_to_end(&mut m, 2, &mut pump_input(&script), &mut out, Some(&cast));
+
+        let stream = spectator_stream(&out);
+        assert!(matches!(stream.last(), Some(SpectatorMsg::End(_))), "the stream terminates with the End");
+        assert_eq!(
+            stream.iter().filter(|m| matches!(m, SpectatorMsg::End(_))).count(),
+            1,
+            "exactly one terminal End",
+        );
+
+        let frames = cast_frames(&out);
+        let countdown = frames.iter().take_while(|b| b.phase == MatchPhase::Starting).count();
+        assert_eq!(countdown, 2, "a frame per pre-live countdown tick (starting_ticks=2)");
+        assert!(
+            frames[countdown..].iter().all(|b| b.phase != MatchPhase::Starting),
+            "the countdown frames are a contiguous prefix — none interleave the Live stream",
+        );
+        for b in &frames[..countdown] {
+            assert_eq!(b.tick, 0, "the countdown observations all sit at Live tick 0");
+        }
+        assert_eq!(frames.last().unwrap().phase, MatchPhase::Ended, "the last frame is the terminal state");
     }
 
     fn ranked(rating_a: i32, rating_b: i32, k: i32) -> RankedContext {
