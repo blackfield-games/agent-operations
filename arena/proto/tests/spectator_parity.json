@@ -1,0 +1,123 @@
+{
+  "domain": "blackfield/arena/spectator-parity/v1",
+  "protocol_version": 1,
+  "match_id": "550e8400-e29b-41d4-a716-446655440000",
+  "frames": [
+    {
+      "label": "frame_populated",
+      "exact_reencode": true,
+      "frame": {
+        "entities": [
+          {
+            "alive": true,
+            "entity_id": 7,
+            "facing": 16384,
+            "health": 80,
+            "kind": "player",
+            "max_health": 100,
+            "position": {
+              "x": 1000,
+              "y": -2000
+            },
+            "score": 12,
+            "team": 2,
+            "z": 0
+          },
+          {
+            "alive": true,
+            "entity_id": 1000,
+            "facing": 16384,
+            "health": 0,
+            "kind": "projectile",
+            "max_health": 0,
+            "position": {
+              "x": 1200,
+              "y": -1800
+            },
+            "score": 0,
+            "team": 0,
+            "z": 0
+          }
+        ],
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "phase": "starting",
+        "protocol_version": 1,
+        "starting_remaining": 90,
+        "tick": 0,
+        "type": "frame"
+      }
+    },
+    {
+      "label": "end",
+      "exact_reencode": true,
+      "frame": {
+        "final_tick": 2,
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "outcomes": [
+          {
+            "alive_at_end": true,
+            "forfeited": false,
+            "placement": 1,
+            "score": 3,
+            "seat": 0,
+            "team": 1
+          },
+          {
+            "alive_at_end": false,
+            "forfeited": true,
+            "placement": 2,
+            "score": 1,
+            "seat": 1,
+            "team": 2
+          }
+        ],
+        "protocol_version": 1,
+        "replay_hash": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        "type": "end"
+      }
+    },
+    {
+      "label": "frame_legacy_omits_starting_remaining",
+      "exact_reencode": false,
+      "frame": {
+        "entities": [
+          {
+            "alive": true,
+            "entity_id": 7,
+            "facing": 16384,
+            "health": 80,
+            "kind": "player",
+            "max_health": 100,
+            "position": {
+              "x": 1000,
+              "y": -2000
+            },
+            "score": 12,
+            "team": 2,
+            "z": 0
+          },
+          {
+            "alive": true,
+            "entity_id": 1000,
+            "facing": 16384,
+            "health": 0,
+            "kind": "projectile",
+            "max_health": 0,
+            "position": {
+              "x": 1200,
+              "y": -1800
+            },
+            "score": 0,
+            "team": 0,
+            "z": 0
+          }
+        ],
+        "match_id": "550e8400-e29b-41d4-a716-446655440000",
+        "phase": "live",
+        "protocol_version": 1,
+        "tick": 128,
+        "type": "frame"
+      }
+    }
+  ]
+}
