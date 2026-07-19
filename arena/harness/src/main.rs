@@ -30,7 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arena_core::{
-    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, Match,
+    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, ArenaMap, Match,
     MatchRecord, ReplayError, Rules, SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
 };
 use arena_match::{
@@ -132,6 +132,16 @@ struct Args {
     /// reaches the named arena's cover + pickups (and an agent SDK receives them in
     /// [`GatewayMsg::Start`]) however the roster is formed.
     arena: &'static str,
+    /// A data-driven arena loaded from this JSON file ([`ArenaMap::from_json`]) instead of a
+    /// builtin `--map <key>`, so an operator/world-gen pipeline can run a match on an AUTHORED
+    /// arena. Set by `--map-file <path>`; when present it OVERRIDES `--map` on the direct-seating
+    /// path ([`direct_map`]), and a bad file (unreadable, malformed, or over the verify caps) is
+    /// a loud exit(1) — never a silently-empty arena. The matchmade (`--mode`) path resolves its
+    /// arena from a compile-time `&'static` key deep inside `arena_match`, which a runtime file map
+    /// cannot reach, so `--map-file` + `--mode` is a loud startup error, never a silent ignore.
+    /// `None` (no `--map-file`) keeps the builtin-key behaviour, byte-identical to the pre-flag
+    /// harness.
+    map_file: Option<PathBuf>,
     /// Perception-memory window in ticks (`Rules::perception_memory_ticks`): how long a
     /// seat remembers a lost entity's last-known position (surfaced as a `VisibleEntity`
     /// with `in_line_of_sight == false`). Set by `--perception-memory`; the default `0`
@@ -753,6 +763,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut registered: Vec<(String, i128)> = Vec::new();
     let mut min_reputation: Option<i128> = None;
     let mut arena: &'static str = "";
+    let mut map_file: Option<PathBuf> = None;
     let mut perception_memory: u16 = 0;
     let mut fov: u8 = 4;
     let mut aim_mode = AimMode::Octant;
@@ -871,6 +882,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                     Some(v.trim().parse::<i128>().expect("--min-reputation must be a signed integer"));
             }
             "--map" => arena = parse_arena(&it.next().expect("--map needs a value")),
+            "--map-file" => map_file = Some(it.next().expect("--map-file needs a value").into()),
             "--perception-memory" => {
                 perception_memory = it
                     .next()
@@ -1038,6 +1050,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         registered,
         min_reputation,
         arena,
+        map_file,
         perception_memory,
         fov,
         aim_mode,
@@ -2172,6 +2185,15 @@ fn floor_without_registry_is_inert(args: &Args) -> bool {
     args.min_reputation.is_some() && args.registered.is_empty()
 }
 
+/// True when `--map-file` is combined with `--mode`: the matchmade path resolves its arena
+/// from a compile-time `&'static` key deep inside `arena_match` (via [`MatchParams::arena`]),
+/// which a runtime file map cannot reach, so a `--map-file` there would be silently ignored —
+/// the match would play the DEFAULT arena while the operator believes the file loaded. The pure
+/// predicate `main` turns into a loud exit(1), never a silent fallback.
+fn map_file_conflicts_with_mode(args: &Args) -> bool {
+    args.map_file.is_some() && args.mode.is_some()
+}
+
 /// Map a seat's Join (its claimed `agent_id` + `signature_hex`) to a matchmaker
 /// [`JoinRequest`] for `mode`. The arena-01 Join carries no controller kind, so it is
 /// inferred from the mode and whether a signature is present:
@@ -2364,14 +2386,43 @@ fn rules_from(args: &Args) -> Rules {
     }
 }
 
+/// Load a data-driven [`ArenaMap`] from a JSON file, mapping every failure — a read error
+/// or a typed [`ArenaMapError`](arena_core::ArenaMapError) (malformed JSON, an unknown field,
+/// an over-cap or degenerate blocker, a zero-amount pickup) — to a human-readable string. Pure
+/// over the path so arena-core stays filesystem-free; the caller ([`direct_map`]) turns the Err
+/// into a loud exit(1). The `ArenaMap`-loading twin of [`load_record`].
+fn load_arena_map_file(path: &Path) -> Result<ArenaMap, String> {
+    let json =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    ArenaMap::from_json(&json).map_err(|e| e.to_string())
+}
+
+/// Resolve the direct-seating path's arena geometry: a `--map-file` loads a custom
+/// [`ArenaMap`] from JSON ([`load_arena_map_file`]) — a bad file is a loud exit(1), never a
+/// silently-empty arena — otherwise the builtin `--map <key>` arena ([`arena_map`], `""` = the
+/// empty default). A file OVERRIDES the key. Only `main`'s direct path calls this (the `--mode`
+/// path is gated off `--map-file` upstream), so the exit(1) never fires under a unit test that
+/// leaves `map_file` unset.
+fn direct_map(args: &Args) -> ArenaMap {
+    let Some(path) = args.map_file.as_deref() else {
+        return arena_map(args.arena);
+    };
+    load_arena_map_file(path).unwrap_or_else(|e| {
+        eprintln!("--map-file: {e}");
+        std::process::exit(1);
+    })
+}
+
 /// Build the direct-path (no `--mode`) match: a fixed `agent-{i}` free-for-all roster
 /// under the configured arena geometry. The matchmade path forms its own match through
 /// the [`Matchmaker`] ([`build_matchmaker`]); this is the hand-seated twin.
 ///
-/// Both paths resolve geometry through [`arena_map`], so `--map` reaches the direct
-/// path too. The default empty arena (`args.arena == ""`) yields empty blockers +
-/// pickups, which is exactly what [`Match::new`] produces (it is `new_with_pickups`
-/// with no pickups) — so a no-flag run is byte-identical to the pre-map harness.
+/// Geometry resolves through [`direct_map`]: a `--map-file` loads an authored [`ArenaMap`]
+/// from JSON, otherwise the builtin `--map <key>` arena reaches the direct path (the
+/// matchmade path carries `--map` via [`build_matchmaker`]). The default empty arena
+/// (`args.arena == ""`, no `--map-file`) yields empty blockers + pickups, which is exactly
+/// what [`Match::new`] produces (it is `new_with_pickups` with no pickups) — so a no-flag
+/// run is byte-identical to the pre-map harness.
 fn build_direct_match(args: &Args, n: u8) -> Match {
     let roster: Vec<SeatInfo> = (0..n)
         .map(|i| SeatInfo { seat: i, team: u16::from(i), controller: format!("agent-{i}") })
@@ -2382,7 +2433,7 @@ fn build_direct_match(args: &Args, n: u8) -> Match {
         bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
         seats: n,
     };
-    let map = arena_map(args.arena);
+    let map = direct_map(args);
     let rules = rules_from(args);
     Match::new_with_pickups(
         args.match_id,
@@ -2406,6 +2457,17 @@ fn main() {
         replay_cast(path, &mut out);
         return;
     }
+    // --map-file loads a custom arena into the direct-seating path only; the matchmade
+    // (--mode) path resolves its arena from a compile-time key deep in arena_match, which a
+    // runtime file map cannot reach. Reject the combination loudly rather than silently play
+    // the default arena while the operator believes the file loaded.
+    if map_file_conflicts_with_mode(&args) {
+        eprintln!(
+            "--map-file loads a custom arena into the direct path and cannot combine with --mode (the matchmade path's arena is a compile-time key — see arena-match-map-override); drop one"
+        );
+        std::process::exit(1);
+    }
+
     // Warn (never refuse) if a reputation floor can't gate anything — an operator config
     // slip the empty---registered guard doesn't cover. stderr only, so stdout stays the
     // byte-identical protocol stream.
@@ -3468,6 +3530,7 @@ mod tests {
             registered: Vec::new(),
             min_reputation: None,
             arena: "",
+            map_file: None,
             perception_memory: 0,
             fov: 4,
             aim_mode: AimMode::Octant,
@@ -3566,6 +3629,7 @@ mod tests {
             registered: Vec::new(),
             min_reputation: None,
             arena,
+            map_file: None,
             perception_memory,
             fov: 4,
             aim_mode: AimMode::Octant,
