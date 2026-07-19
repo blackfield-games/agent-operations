@@ -3084,6 +3084,21 @@ mod tests {
         }
     }
 
+    fn object_keys(v: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    fn cast_broadcasts(msgs: &[SpectatorMsg]) -> Vec<Broadcast> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                SpectatorMsg::Frame(b) => Some(b.clone()),
+                SpectatorMsg::End(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn replay_frames_reproduces_a_finished_match() {
         let record = finished_record();
@@ -3189,6 +3204,126 @@ mod tests {
         }
         assert!(over.replay.ticks.len() > arena_core::MAX_REPLAY_TICKS);
         assert!(matches!(replay_frames(&over), Err(ReplayError::TooManyTicks { .. })));
+    }
+
+    #[test]
+    fn replay_to_spectator_casts_frames_then_one_terminal_end() {
+        // FM3 (sequence): the cast is the replay_frames sequence as SpectatorMsg::Frames,
+        // in ascending contiguous tick order from the opening frame, then EXACTLY ONE
+        // terminal SpectatorMsg::End carrying the verified result — the shape a caster UI
+        // reads to render a finished match and its outcome.
+        let record = finished_record();
+        let msgs = replay_to_spectator(&record).expect("a valid record casts");
+        let frames = replay_frames(&record).expect("…the same record's frames");
+
+        assert_eq!(msgs.len(), frames.len() + 1, "one Frame per replay_frames frame plus one End");
+        assert_eq!(cast_broadcasts(&msgs), frames, "the Frame payloads ARE the replay_frames sequence, in order");
+        assert!(
+            msgs[..msgs.len() - 1].iter().all(|m| matches!(m, SpectatorMsg::Frame(_))),
+            "every message before the terminator is a Frame",
+        );
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, SpectatorMsg::End(_))).count(),
+            1,
+            "exactly one terminal End — never zero, never a mid-stream End",
+        );
+
+        let ticks: Vec<u64> = cast_broadcasts(&msgs).iter().map(|b| b.tick).collect();
+        assert_eq!(
+            ticks,
+            (0..frames.len() as u64).collect::<Vec<_>>(),
+            "frames ascend contiguously from the opening tick 0",
+        );
+
+        let Some(SpectatorMsg::End(result)) = msgs.last() else { panic!("the cast terminates with End") };
+        assert_eq!(*result, record.result, "the End carries the record's committed terminal result");
+        assert_eq!(*result, record.verify().unwrap(), "…which the re-run independently reproduces");
+    }
+
+    #[test]
+    fn replay_to_spectator_casts_public_only_frames() {
+        // FM2 (parity leak): a cast frame is the on-stage broadcast, never a tactical
+        // x-ray. Pin the exact public BroadcastEntity key set and the ABSENCE of the
+        // private-HUD fields on a REAL cast frame (not just the wire type), so a future
+        // change that sourced the cast from a seat's private observation reddens here —
+        // the replay-path twin of arena-07 broadcast_entity_exposes_no_private_hud_state.
+        let record = finished_record();
+        let msgs = replay_to_spectator(&record).expect("a valid record casts");
+        let SpectatorMsg::Frame(opening) = &msgs[0] else { panic!("the cast opens with a Frame") };
+        assert!(!opening.entities.is_empty(), "the opening frame shows the roster");
+
+        let entity = serde_json::to_value(opening.entities[0]).unwrap();
+        assert_eq!(
+            object_keys(&entity),
+            ["alive", "entity_id", "facing", "health", "kind", "max_health", "position", "score", "team", "z"],
+            "a cast BroadcastEntity carries exactly the public on-stage key set",
+        );
+        for forbidden in ["ammo", "cooldown", "dash_cooldown", "intent", "velocity", "shield"] {
+            assert!(entity.get(forbidden).is_none(), "the cast leaks private HUD field `{forbidden}`");
+        }
+    }
+
+    #[test]
+    fn replay_to_spectator_rebuilds_pickups_so_the_cast_matches_the_live_broadcast() {
+        // FM3 (pickup desync): the cast must rebuild the world pickups (new_with_pickups,
+        // not new) or a reconstruction drops the active Pickup entity and the cast diverges
+        // from the live broadcast. A corner pickup neither idle pawn reaches stays ACTIVE on
+        // every frame, so a `Match::new` re-run — which loads no pickups — would omit it.
+        let rules = Rules { spawn_radius: 5 * POSITION_SCALE, spawn_jitter: 0, ..Default::default() };
+        let seats = vec![
+            SeatInfo { seat: 0, team: 0, controller: "p0".into() },
+            SeatInfo { seat: 1, team: 1, controller: "p1".into() },
+        ];
+        let pickups = vec![PickupSpawn {
+            kind: PickupKind::Ammo,
+            position: Vec2 { x: 20 * POSITION_SCALE, y: 20 * POSITION_SCALE },
+            amount: 8,
+        }];
+        let config = MatchConfig {
+            tick_hz: 30,
+            max_ticks: 6,
+            bounds: Vec2 { x: 50 * POSITION_SCALE, y: 50 * POSITION_SCALE },
+            seats: 2,
+        };
+        let mut m = Match::new_with_pickups(FIXED_ID.parse().unwrap(), config, rules, seats, Vec::new(), pickups, 1);
+
+        let mut live = vec![m.broadcast()];
+        while m.phase() == MatchPhase::Live {
+            m.step(&BTreeMap::new());
+            live.push(m.broadcast());
+        }
+        assert!(
+            live.iter().all(|b| b.entities.iter().any(|e| e.kind == EntityKind::Pickup)),
+            "the corner pickup stays active on every frame — otherwise the test can't catch a new-vs-new_with_pickups bug",
+        );
+
+        let record = m.to_record().unwrap();
+        assert!(!record.replay.pickups.is_empty(), "the record carries the pickup determinant");
+        let msgs = replay_to_spectator(&record).expect("a valid pickup record casts");
+        assert_eq!(cast_broadcasts(&msgs), live, "the cast's Frame payloads reproduce the live match's active pickup");
+        let Some(SpectatorMsg::End(result)) = msgs.last() else { panic!("the cast terminates with End") };
+        assert_eq!(*result, record.result, "the terminal End carries the match's committed result");
+    }
+
+    #[test]
+    fn replay_to_spectator_rejects_a_corrupt_or_over_budget_record_and_casts_nothing() {
+        // FM1 (DoS bound): the cast VERIFIES first, so an over-budget record padded past
+        // MAX_REPLAY_TICKS is a typed rejection that re-runs and streams NOTHING — never a
+        // partial frame before the bound, an OOM, or a panic. The whole call is Err (no Vec),
+        // so a caller can emit nothing on a rejected artifact.
+        let mut over = finished_record();
+        let next = over.replay.ticks.len() as u64;
+        for k in 0..=arena_core::MAX_REPLAY_TICKS as u64 {
+            over.replay.ticks.push(arena_proto::TickRecord { tick: next + k, actions: Vec::new(), forfeits: Vec::new() });
+        }
+        assert!(over.replay.ticks.len() > arena_core::MAX_REPLAY_TICKS);
+        assert!(matches!(replay_to_spectator(&over), Err(ReplayError::TooManyTicks { .. })));
+
+        // A malformed setup (negative arena bound) would PANIC a naive re-run (a min > max
+        // clamp); the cast rejects it as a clean typed error before simulating anything.
+        let mut malformed = finished_record();
+        malformed.config.bounds.x = -1;
+        assert!(matches!(replay_to_spectator(&malformed), Err(ReplayError::MalformedSetup)));
     }
 
     #[test]
