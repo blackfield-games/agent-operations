@@ -4016,6 +4016,107 @@ mod tests {
         assert_eq!(m.pickup_spawns().len(), 2, "the reference arena has two health pickups");
     }
 
+    fn map_file_tmp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("arena-mapfile-test-{}-{tag}.json", std::process::id()))
+    }
+
+    #[test]
+    fn map_file_arg_parses_into_args() {
+        // --map-file <path> lands in Args.map_file; absent, it stays None (byte-identical).
+        let with =
+            parse_args_from(["--map-file", "/tmp/arena.json", "--seats", "2"].into_iter().map(String::from));
+        assert_eq!(with.map_file, Some(PathBuf::from("/tmp/arena.json")));
+        let without = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert_eq!(without.map_file, None);
+    }
+
+    #[test]
+    fn map_file_conflicts_with_mode_only_when_both_are_set() {
+        // FM1: --map-file + --mode is the ONE rejected combination (main turns it into exit(1))
+        // — the matchmade path can't take a runtime file map, so combining them would silently
+        // play the default arena. Neither alone, nor both absent, conflicts.
+        let file = || Some(PathBuf::from("/tmp/map.json"));
+        let both = Args { map_file: file(), mode: Some(MatchMode::Agent), ..direct_args(2, "", 0) };
+        let file_only = Args { map_file: file(), mode: None, ..direct_args(2, "", 0) };
+        let mode_only = Args { map_file: None, mode: Some(MatchMode::Agent), ..direct_args(2, "", 0) };
+
+        assert!(map_file_conflicts_with_mode(&both), "--map-file + --mode conflicts");
+        assert!(!map_file_conflicts_with_mode(&file_only), "--map-file alone is the supported direct path");
+        assert!(!map_file_conflicts_with_mode(&mode_only), "--mode alone (no file) is fine");
+        assert!(!map_file_conflicts_with_mode(&direct_args(2, "", 0)), "neither set is fine");
+    }
+
+    #[test]
+    fn direct_map_without_a_file_matches_the_builtin_arena() {
+        // FM3: no --map-file — direct_map resolves EXACTLY arena_map(args.arena), so the direct
+        // path is byte-identical to the pre-flag harness (the empty default and a named arena alike).
+        assert_eq!(direct_map(&direct_args(2, "", 0)), arena_map(""), "no file, empty key -> empty arena");
+        assert_eq!(
+            direct_map(&direct_args(2, "reference", 0)),
+            arena_map("reference"),
+            "no file, --map reference -> the builtin reference arena"
+        );
+    }
+
+    #[test]
+    fn load_arena_map_file_surfaces_each_arena_map_error_arm() {
+        // FM2: the loader forwards every typed ArenaMapError (and a read error) as a non-empty
+        // string — a bad map is a loud reject, never a panic and never a silently-empty arena.
+        // The per-arm rejection is arena-core's own test; here we pin the harness loader faithfully
+        // surfaces each through ArenaMap::from_json's Display, without simulating a match.
+        let path = map_file_tmp_path("errors");
+        let over_blockers = format!(
+            r#"{{"blockers":[{}]}}"#,
+            vec![r#"{"min":{"x":0,"y":0},"max":{"x":1,"y":1}}"#; arena_core::MAX_REPLAY_BLOCKERS + 1].join(",")
+        );
+        let over_pickups = format!(
+            r#"{{"pickups":[{}]}}"#,
+            vec![r#"{"kind":"health","position":{"x":0,"y":0},"amount":1}"#; arena_core::MAX_REPLAY_PICKUPS + 1]
+                .join(",")
+        );
+        let cases: Vec<(&str, &str)> = vec![
+            ("{ not json", "malformed arena map JSON"),
+            (r#"{"blocker":[]}"#, "malformed arena map JSON"), // unknown field (deny_unknown_fields)
+            (over_blockers.as_str(), "over the 1024 cap"),
+            (over_pickups.as_str(), "over the 256 cap"),
+            (r#"{"blockers":[{"min":{"x":1,"y":1},"max":{"x":-1,"y":-1}}]}"#, "degenerate (min > max)"),
+            (r#"{"pickups":[{"kind":"health","position":{"x":0,"y":0},"amount":0}]}"#, "grants nothing (amount == 0)"),
+        ];
+        for (body, expected) in cases {
+            std::fs::write(&path, body).expect("write the bad map");
+            let err = load_arena_map_file(&path).expect_err("a bad map must reject");
+            assert!(err.contains(expected), "expected {expected:?} in {err:?}");
+        }
+
+        // A read error (a path that does not exist) is surfaced too, not a panic.
+        let _ = std::fs::remove_file(&path);
+        let missing = load_arena_map_file(&path).expect_err("a missing file must reject");
+        assert!(missing.contains("cannot read"), "expected a read error in {missing:?}");
+    }
+
+    #[test]
+    fn direct_match_map_file_geometry_reaches_the_match() {
+        // FM4: a --map-file's blockers + pickups actually feed Match::new_with_pickups (parsed,
+        // not dropped) — the formed match's blockers()/pickup_spawns() are exactly the file's, in
+        // order. The args also set --map reference (its own single occluder + two HEALTH pickups),
+        // so the [health, shield] pickups proving on the match confirm the file OVERRODE the key.
+        let path = map_file_tmp_path("geometry");
+        let body = r#"{"blockers":[{"min":{"x":-500,"y":-500},"max":{"x":500,"y":500}}],"pickups":[{"kind":"health","position":{"x":1000,"y":0},"amount":25},{"kind":"shield","position":{"x":-1000,"y":0},"amount":40}]}"#;
+        std::fs::write(&path, body).expect("write the map");
+        let expected = ArenaMap::from_json(body).expect("the fixture map is valid");
+
+        let args = Args { map_file: Some(path.clone()), ..direct_args(2, "reference", 0) };
+        let m = build_direct_match(&args, 2);
+
+        assert_eq!(m.blockers(), expected.blockers.as_slice(), "the file's blocker reaches the match");
+        assert_eq!(
+            m.pickup_spawns(),
+            expected.pickups.as_slice(),
+            "the file's pickups reach the match in order (the file overrode --map reference)"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn direct_match_threads_the_perception_memory_window_into_rules() {
         // FM1/FM3: --perception-memory reaches the sim's Rules (the seat memory.rs reads),
