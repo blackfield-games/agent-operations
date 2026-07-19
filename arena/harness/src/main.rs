@@ -1872,12 +1872,12 @@ fn read_ladder_file(path: &Path) -> Result<Option<LadderSnapshot>, LadderFileErr
     serde_json::from_slice(&bytes).map(Some).map_err(LadderFileError::Parse)
 }
 
-/// The sibling temp path a ladder write stages to before its atomic rename: same
+/// The sibling temp path an atomic write stages to before its rename: same
 /// directory as `path` (so the rename stays on one filesystem and so is atomic) and
 /// process-unique (so a concurrent run, or a leftover temp from a crashed one, can't
-/// collide on it).
-fn ladder_tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().map_or_else(|| OsString::from("ladder"), |n| n.to_os_string());
+/// collide on it). Shared by the ladder and replay-record writers.
+fn tmp_sibling_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map_or_else(|| OsString::from("artifact"), |n| n.to_os_string());
     name.push(format!(".tmp.{}", std::process::id()));
     path.with_file_name(name)
 }
@@ -1888,7 +1888,7 @@ fn ladder_tmp_path(path: &Path) -> PathBuf {
 /// loses the new write, never corrupts the old one.
 fn write_ladder(path: &Path, snapshot: &LadderSnapshot) -> io::Result<()> {
     let json = serde_json::to_vec_pretty(snapshot).expect("a LadderSnapshot always serializes");
-    let tmp = ladder_tmp_path(path);
+    let tmp = tmp_sibling_path(path);
     std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)
 }
@@ -6929,17 +6929,17 @@ mod tests {
         // persist (one that never reached the rename) leaves the PRIOR good snapshot intact.
         let path = temp_ladder_path("atomic");
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(ladder_tmp_path(&path));
+        let _ = std::fs::remove_file(tmp_sibling_path(&path));
 
         let a = LadderSnapshot { version: arena_match::LADDER_SNAPSHOT_VERSION, ratings: BTreeMap::from([("0xa".to_string(), 1700)]) };
         write_ladder(&path, &a).expect("write A");
-        assert!(!ladder_tmp_path(&path).exists(), "the staging temp is renamed away, never left behind");
+        assert!(!tmp_sibling_path(&path).exists(), "the staging temp is renamed away, never left behind");
         assert_eq!(read_ladder_file(&path).unwrap(), Some(a.clone()), "the live file reads back as A");
-        assert_eq!(ladder_tmp_path(&path).parent(), path.parent(), "the temp is a same-directory sibling (atomic rename)");
+        assert_eq!(tmp_sibling_path(&path).parent(), path.parent(), "the temp is a same-directory sibling (atomic rename)");
 
         // A garbage half-write to the temp path (a persist interrupted before the rename) must
         // NOT touch the live file: it still reads as the prior good A.
-        std::fs::write(ladder_tmp_path(&path), b"half written {").expect("stage garbage on the temp");
+        std::fs::write(tmp_sibling_path(&path), b"half written {").expect("stage garbage on the temp");
         assert_eq!(read_ladder_file(&path).unwrap(), Some(a), "an unfinished temp leaves the prior snapshot intact");
 
         // A completed overwrite swaps the live file to B atomically (consuming the temp).
@@ -6948,6 +6948,6 @@ mod tests {
         assert_eq!(read_ladder_file(&path).unwrap(), Some(b), "the live file is now B, never a half-write");
 
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(ladder_tmp_path(&path));
+        let _ = std::fs::remove_file(tmp_sibling_path(&path));
     }
 }
