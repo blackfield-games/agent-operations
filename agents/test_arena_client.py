@@ -33,12 +33,15 @@ from arena_client.proto import (
     ActionButtons,
     ActionIntent,
     Blocker,
+    Broadcast,
+    BroadcastEntity,
     MatchResult,
     Observation,
     Start,
     Vec2,
     act_frame,
     decode_gateway,
+    decode_spectator,
     join_frame,
     leave_frame,
 )
@@ -147,6 +150,91 @@ def test_agent_frames_encode_to_rust_golden():
     for frame in agent.values():
         with pytest.raises(proto.ProtocolError):
             decode_gateway(frame)
+
+
+def _spectator_golden() -> dict:
+    """The SAME committed SPECTATOR wire-frame parity golden the Rust arena-proto drift-gate
+    pins (arena/proto/tests/spectator_parity.json), resolved by repo-relative path from THIS
+    file (never the CWD), so it holds under validate.sh's agents-dir pytest run. A missing
+    golden fails LOUD — it is the single source of truth for the Rust<->Python spectator
+    contract. Regenerate after an intentional wire change with `cargo test -p arena-proto
+    --test spectator_parity regenerate_spectator_parity_golden -- --ignored`."""
+    path = Path(__file__).resolve().parents[1] / "arena" / "proto" / "tests" / "spectator_parity.json"
+    assert path.is_file(), f"shared spectator-parity golden not found at {path}"
+    return json.loads(path.read_text())
+
+
+def test_spectator_golden_header_matches_proto():
+    golden = _spectator_golden()
+    assert golden["domain"] == "blackfield/arena/spectator-parity/v1"
+    assert golden["protocol_version"] == proto.PROTOCOL_VERSION
+    assert golden["match_id"] == FIXED_MATCH  # the fixed, byte-stable parity match id
+
+
+def test_spectator_frames_decode_and_reencode_against_rust_golden():
+    # Every frame in the SHARED spectator golden (emitted by Rust spectator_parity_vectors,
+    # diffed by the Rust drift-gate) decodes via decode_spectator into the typed model and
+    # re-encodes to the SAME wire body — the machine-checked cross-implementer pin a Python
+    # caster/grader relies on. A Rust wire change (which regenerates the golden) or a Python
+    # model drift breaks this against the one source of truth, including the frame/end newtype
+    # flattening next to "type" (a nested {"broadcast": ...} would fail to decode).
+    expected_type = {"frame": Broadcast, "end": MatchResult}
+    frames = _spectator_golden()["frames"]
+    seen = set()
+    for case in frames:
+        frame = case["frame"]
+        msg = decode_spectator(frame)
+        seen.add(frame["type"])
+        # decode_spectator must route each tag to the RIGHT concrete model — a mis-wired
+        # tag->type mapping is caught here, not only by field shape.
+        assert isinstance(msg, expected_type[frame["type"]]), f"{case['label']} decoded to {type(msg).__name__}"
+        body = {k: v for k, v in frame.items() if k != "type"}
+        if case["exact_reencode"]:
+            assert msg.model_dump(mode="json") == body, (
+                f"{case['label']} did not decode/re-encode to the golden body"
+            )
+    assert seen == {"frame", "end"}, "a SpectatorMsg variant is missing from the golden"
+
+    # decode_spectator REFUSES an untagged or unknown-tag frame (fail loud on drift, not a
+    # silent skip that would mask a real envelope change).
+    with pytest.raises(proto.ProtocolError):
+        decode_spectator({"tick": 0})
+    with pytest.raises(proto.ProtocolError):
+        decode_spectator({"type": "observe"})  # a gateway tag is not a spectator frame
+
+
+def test_spectator_golden_backcompat_frame_fills_default():
+    # The omit frame pins the serde(default) back-compat: a Live broadcast that OMITS
+    # starting_remaining decodes to 0 (not an error under extra=forbid). It omits the key
+    # entirely, so a re-encode can't reproduce it (the default is filled back) — the
+    # wire-shape pin is the decode-to-default here. The spectator twin of the Start omit frame.
+    by_label = {c["label"]: c["frame"] for c in _spectator_golden()["frames"]}
+    legacy = decode_spectator(by_label["frame_legacy_omits_starting_remaining"])
+    assert isinstance(legacy, Broadcast)
+    assert legacy.starting_remaining == 0
+
+
+def test_broadcast_entity_carries_scoreboard_but_no_private_hud():
+    # FM (wrong shape): BroadcastEntity is genuinely distinct from VisibleEntity — it ADDS the
+    # health bar + scoreboard a broadcast renders and DROPS in_line_of_sight (a spectator sees
+    # the whole map, not one seat's cone). The model REQUIRES those fields (the Rust wire always
+    # carries them, so a drift fails loud instead of silently defaulting).
+    entity = {
+        "entity_id": 7, "kind": "player", "team": 2, "position": {"x": 0, "y": 0}, "z": 0,
+        "facing": 0, "health": 80, "max_health": 100, "score": 12, "alive": True,
+    }
+    e = BroadcastEntity.model_validate(entity)
+    assert (e.health, e.max_health, e.score, e.alive) == (80, 100, 12, True)
+    for required in ("health", "max_health", "score", "alive"):
+        with pytest.raises(pydantic.ValidationError):
+            BroadcastEntity.model_validate({k: v for k, v in entity.items() if k != required})
+
+    # Security line: a spectator learns no more than a stream viewer, so the broadcast entity
+    # carries NO private HUD state — extra=forbid rejects ammo/cooldown (a tactical x-ray) and
+    # the perception-bounded in_line_of_sight (which is a per-seat concept, not a broadcast one).
+    for hidden in ("ammo", "cooldown", "in_line_of_sight"):
+        with pytest.raises(pydantic.ValidationError):
+            BroadcastEntity.model_validate({**entity, hidden: 1})
 
 
 def test_self_state_carries_cooldown_but_visible_entity_does_not():
