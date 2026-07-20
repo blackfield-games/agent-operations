@@ -711,6 +711,7 @@ def run_local_match(
     fov: int = 4,
     aim_mode: str = "octant",
     friendly_fire: bool = False,
+    team_size: int = 1,
     gravity: int = 0,
     starting_ticks: int = 0,
     weapon_mode: str = "hitscan",
@@ -825,11 +826,19 @@ def run_local_match(
     Set `friendly_fire=True` to allow allied damage (`Rules.friendly_fire`): a fire crossing a
     same-team body damages it but never scores a kill for the shooter. Unlike `aim_mode`/`fov` this
     is a BARE presence flag (`--friendly-fire`, no value) carried through BOTH paths via
-    `MatchParams.rules`. Default `False` adds no token — byte-identical argv. It is wired but DARK
-    in this roster: `run_local_match` seats every agent on its own team (free-for-all), and
-    `friendly_fire` only diverges hit resolution for same-team bodies, so it changes nothing here
-    until a teamed roster exists — the flag's reachability is the contract, its behavioural effect
-    is a separate teamed slice.
+    `MatchParams.rules`. Default `False` adds no token — byte-identical argv. It only diverges hit
+    resolution for same-team bodies, so it is inert under the default free-for-all roster and takes
+    effect once `team_size` groups seats onto a shared team.
+
+    Pass `team_size` (seats per team) to run a TEAMED match: `> 1` forwards `--teams <n>` on BOTH
+    paths, partitioning the roster into `len(seats) / team_size` balanced teams — the direct path
+    groups by seat index (`{0,1}` one team, `{2,3}` the next), the matchmade path threads
+    `MatchParams.team_size` (the matchmaker assigns balanced teams). This is what lights team
+    scoring and `friendly_fire`. Default `1` is free-for-all — each seat its own team, no token,
+    byte-identical argv. A `team_size` that cannot partition the seats — `< 1`, a non-divisor, or
+    one leaving fewer than two teams — is rejected here with a `ValueError` (mirroring the harness's
+    own `--teams` partition guard) before the harness spawns, so a bad roster fails fast and legibly
+    rather than as an opaque gateway close.
 
     Pass `gravity` (a downward magnitude, `0`..=`2**31-1`) to turn on vertical physics: core gates
     jumps/`z` trajectory on `gravity > 0`, so `0` (the default) is the 2D match. Forwarded as
@@ -1407,6 +1416,15 @@ def run_local_match(
         )
     if weapon_mode not in ("hitscan", "projectile", "melee"):
         raise ValueError(f"weapon_mode is 'hitscan', 'projectile', or 'melee'; got {weapon_mode!r}")
+    if team_size < 1 or (team_size > 1 and (len(seats) % team_size != 0 or len(seats) // team_size < 2)):
+        # Mirror the harness's teams_partition_is_invalid: a team holds >= 1 seat, and a teamed
+        # roster must divide the seats evenly into at least two teams. team_size 1 is free-for-all
+        # (always valid). Reject here so a bad roster fails fast and legibly instead of forwarding
+        # --teams to a harness that would exit(1) and surface as an opaque GatewayClosed.
+        raise ValueError(
+            f"team_size must be 1 (free-for-all) or a divisor of the {len(seats)} seats that leaves "
+            f">= 2 teams; got {team_size}"
+        )
     argv = [harness, "--match-id", match_id, "--seed", str(seed), "--seats", str(len(seats))]
     if max_ticks is not None:
         # Core MatchConfig bound, before the mode block: --max-ticks caps match length on the direct path
@@ -1442,6 +1460,12 @@ def run_local_match(
         # paths (the matchmaker carries it via MatchParams.rules). Default False adds no token —
         # byte-identical argv.
         argv += ["--friendly-fire"]
+    if team_size > 1:
+        # Unconditional, before the mode block: --teams partitions the roster into balanced teams on
+        # BOTH the direct (grouped by seat index) and --mode (matchmaker threads MatchParams.team_size)
+        # paths. Default 1 is free-for-all and adds no token — byte-identical argv. Validity is checked
+        # in the preflight above; the harness re-guards it as a backstop.
+        argv += ["--teams", str(team_size)]
     if gravity:
         # Same shape as --fov: a value-flag magnitude on both paths (the matchmaker carries it via
         # MatchParams.rules). Default 0 (physics off) adds no token — byte-identical argv.
