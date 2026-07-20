@@ -37,8 +37,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use arena_core::{
-    arena_map, ranked_delta, ranked_field_delta, Match, MatchRecord, RatingDelta, ReplayError,
-    Rules, SeatDelta, SplitMix64, DEFAULT_RATING,
+    arena_map, ranked_delta, ranked_field_delta, ArenaMap, Match, MatchRecord, RatingDelta,
+    ReplayError, Rules, SeatDelta, SplitMix64, DEFAULT_RATING,
 };
 use arena_proto::{
     verify_join_signature, ActionIntent, Broadcast, ControllerKind, MatchConfig, MatchMode,
@@ -329,7 +329,7 @@ impl JoinOutcome {
 /// read-only rules summary (tick rate, length cap, arena bounds). Mirrors the
 /// loopback harness defaults so a matchmade match plays identically to a
 /// hand-started one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchParams {
     /// Seats per formed match — at least 2 (a PvP match needs two seats to be a
     /// contest, and `Mixed` needs room for one of each kind). [`Matchmaker::new`]
@@ -384,6 +384,16 @@ pub struct MatchParams {
     /// that wants a perception-memory window (or an FOV cone, …) sets it here and every
     /// formed match plays under it.
     pub rules: Rules,
+    /// An optional runtime arena every formed match plays under, overriding the builtin
+    /// [`arena`](Self::arena) key when `Some`. `None` (the default) resolves the key through
+    /// [`arena_map`] exactly as before — byte-identical to the pre-override path — so an
+    /// unconfigured matchmaker is unchanged. `Some(map)` is an already-validated [`ArenaMap`]
+    /// (built via [`ArenaMap::from_json`], which enforces the same verify caps), so it admits no
+    /// geometry a formed match's [`MatchRecord::verify`] would reject; [`build`](Matchmaker::build)
+    /// feeds it to `new_with_pickups` exactly as the key path does, and it WINS over a set `arena`
+    /// key — mirroring the harness's file-over-key direct path. This is what lets a
+    /// matchmade/ranked match run on an authored arena the `&'static` key set cannot name.
+    pub map: Option<ArenaMap>,
 }
 
 impl Default for MatchParams {
@@ -398,6 +408,7 @@ impl Default for MatchParams {
             ranked_rating_tolerance: i32::MAX,
             max_pending_ranked: 4096,
             rules: Rules::default(),
+            map: None,
         }
     }
 }
@@ -846,10 +857,13 @@ impl<V: IdentityVerifier> Matchmaker<V> {
             bounds: self.params.bounds,
             seats: seats.len() as u8,
         };
-        // Load the configured arena's static geometry (vision blockers + world
-        // pickups) at formation; the empty/default key is byte-identical to the
-        // pre-map-loading path, and an unknown key degrades to the empty arena.
-        let map = arena_map(self.params.arena);
+        // Resolve the arena geometry (vision blockers + world pickups) at formation: a runtime
+        // MatchParams.map override wins when set — an authored arena the &'static key set cannot
+        // name — otherwise the configured builtin key through arena_map. `None` is byte-identical
+        // to the pre-override path (the empty/default key resolves empty, an unknown key degrades
+        // to empty), and the override is a from_json-validated map, so either way build() admits
+        // no geometry a downstream record's verify() would reject.
+        let map = self.params.map.clone().unwrap_or_else(|| arena_map(self.params.arena));
         // Form under the matchmaker's configured Rules — the server-authoritative tuning
         // carried on MatchParams — so a matchmade match runs the same perception cone,
         // memory window, and weapon model a hand-seated direct match does. The default is
