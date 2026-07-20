@@ -30,8 +30,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arena_core::{
-    arena_map, named_arena, ranked_delta, ranked_field_delta, settlement, AimMode, ArenaMap, Match,
-    MatchRecord, ReplayError, Rules, SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
+    arena_map, named_arena, ranked_delta, ranked_field_delta, run_match, settlement, AimMode,
+    ArenaMap, Match, MatchRecord, Policy, ReplayError, Rules, SeatDelta, Settlement, WeaponMode,
+    DEFAULT_RATING,
 };
 use arena_match::{
     replay_to_spectator, IdentityVerifier, JoinOutcome, JoinRequest, LadderSnapshot, MatchParams,
@@ -39,9 +40,10 @@ use arena_match::{
     StubIdentityVerifier,
 };
 use arena_proto::{
-    check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
-    MatchConfig, MatchMode, MatchPhase, MatchResult, ReplayRecord, SeatId, SeatInfo, SpectatorMsg,
-    Vec2, POSITION_SCALE, PROTOCOL_VERSION,
+    check_version, verify_join_signature, Action, ActionButtons, ActionIntent, AgentMsg, Bam,
+    GatewayMsg, JoinVerifyError, MatchConfig, MatchMode, MatchPhase, MatchResult, Observation,
+    ReplayRecord, SeatId, SeatInfo, SpectatorMsg, Vec2, MOVE_INTENT_SCALE, POSITION_SCALE,
+    PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -139,6 +141,12 @@ struct Args {
     /// is still refused. Inert without `--dev-auth` (warns); empty under `--dev-auth` admits
     /// nobody (every ranked seat rejected).
     dev_allow: Vec<String>,
+    /// Run a local self-play match (`--self-play`): seat `--seats` in-process [`SelfPlayBot`]
+    /// controllers and drive the whole match with NO network — no stdin, no external agents — then
+    /// route the result through the same `--emit-replay` + settle path. A CI / benchmark match
+    /// source. `false` (the default) is the network handshake path, byte-identical to before.
+    /// Conflicts with `--mode` (a different, network drive path) and needs `--seats >= 2`.
+    self_play: bool,
     /// The builtin arena whose static geometry — vision blockers + world pickups — the
     /// match plays under, resolved through [`arena_map`]. Set by `--map <key>`; the
     /// default `""` is the empty arena (no occlusion, no items), byte-identical to the
@@ -778,6 +786,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut min_reputation: Option<i128> = None;
     let mut dev_auth = false;
     let mut dev_allow: Vec<String> = Vec::new();
+    let mut self_play = false;
     let mut arena: &'static str = "";
     let mut map_file: Option<PathBuf> = None;
     let mut perception_memory: u16 = 0;
@@ -904,6 +913,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                 assert!(!id.is_empty(), "--dev-allow needs a non-empty agent id");
                 dev_allow.push(id.to_string());
             }
+            "--self-play" => self_play = true,
             "--map" => arena = parse_arena(&it.next().expect("--map needs a value")),
             "--map-file" => map_file = Some(it.next().expect("--map-file needs a value").into()),
             "--perception-memory" => {
@@ -1074,6 +1084,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         min_reputation,
         dev_auth,
         dev_allow,
+        self_play,
         arena,
         map_file,
         perception_memory,
@@ -2500,6 +2511,117 @@ fn direct_map(args: &Args) -> ArenaMap {
 /// Geometry resolves through [`direct_map`]: a `--map-file` loads an authored [`ArenaMap`]
 /// from JSON, otherwise the builtin `--map <key>` arena reaches the direct path (the
 /// matchmade path carries `--map` via [`build_matchmaker`]). The default empty arena
+const BOT_OCTANT_SCALE: i32 = 4096;
+/// `round(BOT_OCTANT_SCALE / sqrt(2))` — the diagonal octant component.
+const BOT_OCTANT_DIAG: i32 = 2896;
+/// The 8 compass octant unit vectors (E, NE, N, …) at [`BOT_OCTANT_SCALE`]; octant `i` maps to a
+/// BAM of `i * 8192`. The harness's own copy of arena-core's octant convention — core's `OCTANTS`
+/// / `octant_unit` / the `Seeker` policy are all test-private (`#[cfg(test)] mod tests`), so a
+/// self-play bot cannot import them and replicates the same integer-only quantization here, so a
+/// played match stays byte-reproducible and its aim lands on the octants [`AimMode::Octant`] resolves.
+const BOT_OCTANTS: [(i32, i32); 8] = [
+    (BOT_OCTANT_SCALE, 0),                // E
+    (BOT_OCTANT_DIAG, BOT_OCTANT_DIAG),   // NE
+    (0, BOT_OCTANT_SCALE),                // N
+    (-BOT_OCTANT_DIAG, BOT_OCTANT_DIAG),  // NW
+    (-BOT_OCTANT_SCALE, 0),               // W
+    (-BOT_OCTANT_DIAG, -BOT_OCTANT_DIAG), // SW
+    (0, -BOT_OCTANT_SCALE),               // S
+    (BOT_OCTANT_DIAG, -BOT_OCTANT_DIAG),  // SE
+];
+
+/// The octant index (`0..=7`) whose unit vector best aligns with `(dx, dy)` — an integer argmax
+/// over the dot products, float-free so the choice is identical on every platform.
+fn bot_octant_toward(dx: i32, dy: i32) -> usize {
+    let mut best = 0usize;
+    let mut best_dot = i64::MIN;
+    for (i, &(ox, oy)) in BOT_OCTANTS.iter().enumerate() {
+        let dot = dx as i64 * ox as i64 + dy as i64 * oy as i64;
+        if dot > best_dot {
+            best_dot = dot;
+            best = i;
+        }
+    }
+    best
+}
+
+/// A self-contained seeker for `--self-play`: close on the nearest visible enemy until within
+/// weapon range, then hold and fire — integer-only (no float anywhere), so a self-play match is
+/// byte-reproducible. The harness twin of arena-core's test `Seeker` (which, like the octant
+/// helpers it needs, is test-private and cannot be imported).
+struct SelfPlayBot;
+
+impl Policy for SelfPlayBot {
+    fn act(&mut self, obs: &Observation) -> Option<Action> {
+        let me = &obs.own;
+        if !me.alive {
+            return None;
+        }
+        let dist2 = |a: Vec2, b: Vec2| {
+            let dx = b.x as i64 - a.x as i64;
+            let dy = b.y as i64 - a.y as i64;
+            dx * dx + dy * dy
+        };
+        let target =
+            obs.visible.iter().filter(|e| e.team != me.team).min_by_key(|e| dist2(me.position, e.position))?;
+        let dx = target.position.x - me.position.x;
+        let dy = target.position.y - me.position.y;
+        let in_range = dist2(me.position, target.position) <= (Rules::default().weapon_range as i64).pow(2);
+        let oct = bot_octant_toward(dx, dy);
+        let (ox, oy) = BOT_OCTANTS[oct];
+        let move_dir = if in_range {
+            Vec2::ZERO
+        } else {
+            Vec2 { x: ox * MOVE_INTENT_SCALE / BOT_OCTANT_SCALE, y: oy * MOVE_INTENT_SCALE / BOT_OCTANT_SCALE }
+        };
+        Some(Action {
+            protocol_version: obs.protocol_version,
+            match_id: obs.match_id,
+            seat: obs.seat,
+            tick: obs.tick,
+            intent: ActionIntent {
+                move_dir,
+                aim: (oct as u32 * 8192) as Bam,
+                buttons: ActionButtons { fire: in_range, jump: false, ability: false, reload: false },
+            },
+        })
+    }
+}
+
+/// True when `--self-play` is combined with `--mode`: self-play drives a local in-process bot
+/// match with NO network, and `--mode` forms a match from network joins through the matchmaker —
+/// two mutually-exclusive drive paths, so the combination is a config error, not a precedence.
+fn self_play_conflicts_with_mode(args: &Args) -> bool {
+    args.self_play && args.mode.is_some()
+}
+
+/// True when `--self-play` is asked for a roster too small to be a match: it needs at least two
+/// bots to have an opponent, so `--seats 0`/`1` is a loud config error rather than a degenerate
+/// instant-win. (The network path allows any seat count — a human may drive one seat — but an
+/// autonomous self-play of fewer than two bots is meaningless.)
+fn self_play_roster_too_small(args: &Args) -> bool {
+    args.self_play && args.seats < 2
+}
+
+/// One [`SelfPlayBot`] per seat — exactly the roster size [`run_match`] requires (it asserts one
+/// policy per seat), built from the same `n` the match is, so the count can never mismatch.
+fn self_play_policies(n: u8) -> Vec<Box<dyn Policy>> {
+    (0..n).map(|_| Box::new(SelfPlayBot) as Box<dyn Policy>).collect()
+}
+
+/// Run a local `--self-play` bot match: seat the same direct roster [`build_direct_match`] forms,
+/// drive it to a terminal [`MatchResult`] with in-process [`SelfPlayBot`] policies (no stdin, no
+/// network), then route the finished match through the SAME `--emit-replay` + settle tail the
+/// network paths use — so the bot match is a drop-in, gradeable, byte-reproducible match source.
+fn run_self_play(args: &Args, n: u8, settler: &Option<MockSettler>) {
+    let m = build_direct_match(args, n);
+    let mut policies = self_play_policies(n);
+    let finished = run_match(m, &mut policies);
+    let result = finished.result().expect("a finished self-play match yields a result").clone();
+    emit_replay_record(args.emit_replay.as_deref(), &finished);
+    settle_finished(settler, &result, finished, &[]);
+}
+
 /// (`args.arena == ""`, no `--map-file`) yields empty blockers + pickups, which is exactly
 /// what [`Match::new`] produces (it is `new_with_pickups` with no pickups) — so a no-flag
 /// run is byte-identical to the pre-map harness.
@@ -2547,6 +2669,18 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // --self-play is a local no-network drive path; reject the config errors loudly at startup
+    // rather than run a degenerate match or panic mid-run inside run_match.
+    if self_play_conflicts_with_mode(&args) {
+        eprintln!(
+            "--self-play drives a local in-process bot match with no network and cannot combine with --mode (which forms a match from network joins); drop one"
+        );
+        std::process::exit(1);
+    }
+    if self_play_roster_too_small(&args) {
+        eprintln!("--self-play needs at least two bots to be a match; pass --seats 2 or more (got {})", args.seats);
+        std::process::exit(1);
+    }
 
     // Warn (never refuse) if a reputation floor can't gate anything — an operator config
     // slip the empty---registered guard doesn't cover. stderr only, so stdout stays the
@@ -2586,6 +2720,14 @@ fn main() {
     // --spectate: the live cast, shared by both the direct and matchmade drive paths. `None`
     // (the default) keeps every pump byte-identical to the pre-flag harness.
     let spectator = args.spectate.then(SpectatorCast::new);
+
+    // --self-play: a local in-process bot match, no network. Drive it and return BEFORE any stdin
+    // is locked, so it never blocks waiting on an agent line (STDIN COUPLING); the finished match
+    // routes through the same --emit-replay + settle tail as the network paths.
+    if args.self_play {
+        run_self_play(&args, n, &settler);
+        return;
+    }
 
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -3631,6 +3773,7 @@ mod tests {
             min_reputation: None,
             dev_auth: false,
             dev_allow: Vec::new(),
+            self_play: false,
             arena: "",
             map_file: None,
             perception_memory: 0,
@@ -3732,6 +3875,7 @@ mod tests {
             min_reputation: None,
             dev_auth: false,
             dev_allow: Vec::new(),
+            self_play: false,
             arena,
             map_file: None,
             perception_memory,
