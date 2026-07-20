@@ -3071,6 +3071,74 @@ mod tests {
         assert!(!path.exists(), "no path ⇒ no artifact written");
     }
 
+    fn self_play_record(seed: u64) -> MatchRecord {
+        // Drive a --self-play match to its terminal record, exactly as run_self_play does (build
+        // the direct roster, run_match with one SelfPlayBot per seat) — no stdin, no network.
+        let args = Args { seed, self_play: true, ..direct_args(2, "", 0) };
+        let mut policies = self_play_policies(2);
+        run_match(build_direct_match(&args, 2), &mut policies)
+            .to_record()
+            .expect("a finished self-play match yields a record")
+    }
+
+    #[test]
+    fn self_play_record_verifies_and_is_byte_stable_across_runs() {
+        // FM DIGEST DIVERGENCE: run_match is deterministic, so a seeded self-play match's record
+        // verify()s (re-runs to its own result + digest) and is byte-identical across two runs from
+        // the same seed. A different seed drives a different match (the seed actually feeds it).
+        assert!(self_play_record(42).verify().is_ok(), "a self-play record re-runs to its own result");
+        let a = serde_json::to_vec(&self_play_record(7)).unwrap();
+        let b = serde_json::to_vec(&self_play_record(7)).unwrap();
+        assert_eq!(a, b, "a seeded self-play match's record is byte-identical across runs");
+        let c = serde_json::to_vec(&self_play_record(99)).unwrap();
+        assert_ne!(a, c, "a different seed produces a different self-play match");
+    }
+
+    #[test]
+    fn self_play_emit_replay_writes_a_verifiable_record() {
+        // FM SETTLE/EMIT PARITY: --self-play honors --emit-replay through the SAME tail as the
+        // network path — run_self_play writes a MatchRecord that loads and verify()s.
+        let path = replay_test_path("self-play-emit");
+        let _ = std::fs::remove_file(&path);
+        let args = Args { seed: 5, self_play: true, emit_replay: Some(path.clone()), ..direct_args(2, "", 0) };
+        run_self_play(&args, 2, &None);
+        let record = load_record(&path).expect("the emitted self-play file loads as a record");
+        let _ = std::fs::remove_file(&path);
+        assert!(record.verify().is_ok(), "the emitted self-play record verifies");
+    }
+
+    #[test]
+    fn self_play_config_guards_reject_a_small_roster_and_the_mode_combo() {
+        // FM POLICY SEATING: a self-play roster too small to have an opponent, and the --mode combo
+        // (a network drive path), are loud STARTUP config errors — never a mid-run run_match panic.
+        assert!(self_play_roster_too_small(&Args { self_play: true, ..direct_args(1, "", 0) }));
+        assert!(self_play_roster_too_small(&Args { self_play: true, ..direct_args(0, "", 0) }));
+        assert!(!self_play_roster_too_small(&Args { self_play: true, ..direct_args(2, "", 0) }));
+        assert!(!self_play_roster_too_small(&direct_args(1, "", 0)), "no --self-play ⇒ no roster guard");
+        assert!(self_play_conflicts_with_mode(&Args {
+            self_play: true,
+            mode: Some(MatchMode::Agent),
+            ..direct_args(2, "", 0)
+        }));
+        assert!(!self_play_conflicts_with_mode(&Args { self_play: true, ..direct_args(2, "", 0) }));
+        assert!(
+            !self_play_conflicts_with_mode(&Args { mode: Some(MatchMode::Agent), ..direct_args(2, "", 0) }),
+            "no --self-play ⇒ no conflict",
+        );
+        // self_play_policies builds exactly one bot per seat, so run_match's one-policy-per-seat
+        // assert never trips (the mismatch the startup guards exist to pre-empt).
+        assert_eq!(self_play_policies(3).len(), 3);
+    }
+
+    #[test]
+    fn self_play_flag_parses_and_the_default_is_the_network_path() {
+        // FM STDIN COUPLING (parse half): --self-play is opt-in; the default leaves the network
+        // handshake path (run_self_play never touches stdin — it takes no reader — so it cannot
+        // block on an agent line, the behavioural half the real-binary e2e covers).
+        assert!(parse_args_from(["--self-play", "--seats", "2"].into_iter().map(String::from)).self_play);
+        assert!(!parse_args_from(["--seats", "2"].into_iter().map(String::from)).self_play);
+    }
+
     #[test]
     fn a_tampered_emitted_record_is_a_typed_reject_not_a_panic() {
         // A consumer that fetches the artifact must be safe against a doctored one:
