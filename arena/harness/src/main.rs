@@ -4436,6 +4436,88 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The team label of each seat in `m`, in seat order — the roster the core scores and gates
+    /// `friendly_fire` on ([`Match::seats`]).
+    fn seat_teams(m: &Match) -> Vec<u16> {
+        m.seats().iter().map(|s| s.team).collect()
+    }
+
+    /// Form an `n`-seat Human match through a matchmaker configured with `--teams teams`, joining
+    /// token-less Human seats until the last forms it — the team twin of the map-file matchmade
+    /// helper. Reads [`MatchParams::team_size`] threading + the matchmaker's balanced `assign_teams`
+    /// roster back off the formed match's [`Match::seats`].
+    fn form_matchmade_teams(teams: u8, n: u8) -> Match {
+        let mm = build_matchmaker(&Args { teams, ..direct_args(n, "", 0) }, n);
+        let mut formed = None;
+        for i in 0..n {
+            formed = mm
+                .join(MatchMode::Human, b"", JoinRequest::human(format!("h{i}")))
+                .unwrap()
+                .into_formed()
+                .or(formed);
+        }
+        formed.expect("the last Human seat forms the match")
+    }
+
+    #[test]
+    fn no_teams_flag_keeps_the_free_for_all_roster() {
+        // FM1: the default --teams 1 is byte-identical to the pre-flag harness — each seat its own
+        // team. The direct roster is team == seat (i / 1 == i); the matchmade path forms under
+        // team_size 1 (n singleton teams). Any grouping at the default would break every existing
+        // digest/settlement pin, so this locks the free-for-all default on both paths.
+        assert_eq!(
+            seat_teams(&build_direct_match(&direct_args(4, "", 0), 4)),
+            vec![0, 1, 2, 3],
+            "the default direct roster is free-for-all (team == seat)"
+        );
+        let matchmade: BTreeSet<u16> = seat_teams(&form_matchmade_teams(1, 4)).into_iter().collect();
+        assert_eq!(matchmade.len(), 4, "the default matchmade roster is four singleton teams (team_size 1)");
+    }
+
+    #[test]
+    fn teams_groups_the_direct_roster_by_seat_index() {
+        // FM2: --teams 2 --seats 4 partitions the direct roster into two teams of two BY INDEX —
+        // seats {0,1} on team 0, {2,3} on team 1 — the SeatInfo the core scores + gates friendly_fire
+        // on. Mutation: revert build_direct_match to team == seat and this reddens ([0,1,2,3]).
+        let teamed = build_direct_match(&Args { teams: 2, ..direct_args(4, "", 0) }, 4);
+        assert_eq!(seat_teams(&teamed), vec![0, 0, 1, 1], "seats 0 and 1 share team 0, seats 2 and 3 share team 1");
+        let distinct: BTreeSet<u16> = seat_teams(&teamed).into_iter().collect();
+        assert_eq!(distinct.len(), 2, "exactly two teams — a real partition, not per-seat singletons");
+    }
+
+    #[test]
+    fn teams_partition_is_invalid_rejects_only_unpartitionable_configs() {
+        // FM3: the pure predicate main turns into a loud exit(1). Valid: --teams 1 (FFA, any seats)
+        // and any divisor leaving >= 2 teams (2/4, 2/6, 3/6). Invalid: 0 (meaningless), a non-divisor
+        // (3/4), and a size leaving < 2 teams (4/4, 2/2 — one team, no opponent). --teams 1 is NEVER
+        // newly rejected — byte-identical to the pre-flag harness.
+        let a = |teams, seats| Args { teams, ..direct_args(seats, "", 0) };
+        assert!(!teams_partition_is_invalid(&a(1, 4)), "teams 1 (FFA) is always valid");
+        assert!(!teams_partition_is_invalid(&a(1, 2)), "teams 1 at the min seat count is valid");
+        assert!(!teams_partition_is_invalid(&a(2, 4)), "two teams of two is valid");
+        assert!(!teams_partition_is_invalid(&a(2, 6)), "three teams of two is valid");
+        assert!(!teams_partition_is_invalid(&a(3, 6)), "two teams of three is valid");
+        assert!(teams_partition_is_invalid(&a(0, 4)), "teams 0 is meaningless (a team holds >= 1 seat)");
+        assert!(teams_partition_is_invalid(&a(3, 4)), "3 does not divide 4");
+        assert!(teams_partition_is_invalid(&a(4, 4)), "4/4 is a single team (no opponent)");
+        assert!(teams_partition_is_invalid(&a(2, 2)), "2/2 is a single team (no opponent)");
+    }
+
+    #[test]
+    fn build_matchmaker_threads_teams_into_a_balanced_matchmade_roster() {
+        // FM4: --teams threads team_size onto MatchParams so a match the MATCHMAKER forms is teamed,
+        // not FFA. A --teams 2 --seats 4 matchmade match forms exactly two teams, each of two seats.
+        // The matchmaker's assign_teams balances + shuffles, so the exact seat->team labels differ
+        // from the direct path's index grouping — the SHAPE (2 teams of 2) is the team_size contract
+        // that reaches the sim. Mutation: drop team_size: args.teams from build_matchmaker and this
+        // forms four singleton teams instead, reddening the balance assertion.
+        let teams = seat_teams(&form_matchmade_teams(2, 4));
+        let distinct: BTreeSet<u16> = teams.iter().copied().collect();
+        assert_eq!(distinct.len(), 2, "two teams (team_size 2 over 4 seats), not the FFA four");
+        let counts: Vec<usize> = distinct.iter().map(|t| teams.iter().filter(|x| *x == t).count()).collect();
+        assert!(counts.iter().all(|&c| c == 2), "each team has exactly two seats (balanced): {counts:?}");
+    }
+
     #[test]
     fn direct_map_without_a_file_matches_the_builtin_arena() {
         // FM3: no --map-file — direct_map resolves EXACTLY arena_map(args.arena), so the direct
