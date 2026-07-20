@@ -34,8 +34,9 @@ use arena_core::{
     MatchRecord, ReplayError, Rules, SeatDelta, Settlement, WeaponMode, DEFAULT_RATING,
 };
 use arena_match::{
-    replay_to_spectator, JoinOutcome, JoinRequest, LadderSnapshot, MatchParams, Matchmaker,
-    RegistrySnapshot, SignatureVerifier, SnapshotError, Spectator, SpectatorFeed,
+    replay_to_spectator, IdentityVerifier, JoinOutcome, JoinRequest, LadderSnapshot, MatchParams,
+    Matchmaker, RegistrySnapshot, SignatureVerifier, SnapshotError, Spectator, SpectatorFeed,
+    StubIdentityVerifier,
 };
 use arena_proto::{
     check_version, verify_join_signature, ActionIntent, AgentMsg, GatewayMsg, JoinVerifyError,
@@ -125,6 +126,19 @@ struct Args {
     /// registration-only path. Gates only alongside `--registered` (reputation is sourced
     /// there), so a floor with no registered set is inert.
     min_reputation: Option<i128>,
+    /// Swap the ranked matchmaker's production signature verifier for a keyless
+    /// [`StubIdentityVerifier`] allowlist ([`harness_verifier`]), set by the bare `--dev-auth`.
+    /// A LOCAL / CI dev facility so a ranked (`Agent`/`Mixed`) match runs without each seat
+    /// holding a k256 key — NEVER production: `false` (the default) keeps real signature
+    /// admission, byte-identical to the pre-flag harness, and setting it warns loudly. Gates
+    /// only the `--mode` matchmaker (inert on the direct path).
+    dev_auth: bool,
+    /// Agent ids admitted to a ranked seat under `--dev-auth`, each supplied by a repeated
+    /// `--dev-allow <agent_id>`. Keyless but NOT authless: an id must be on this allowlist AND
+    /// present `signature_hex == <agent_id>` (the dev token convention), so an un-allowlisted id
+    /// is still refused. Inert without `--dev-auth` (warns); empty under `--dev-auth` admits
+    /// nobody (every ranked seat rejected).
+    dev_allow: Vec<String>,
     /// The builtin arena whose static geometry — vision blockers + world pickups — the
     /// match plays under, resolved through [`arena_map`]. Set by `--map <key>`; the
     /// default `""` is the empty arena (no occlusion, no items), byte-identical to the
@@ -762,6 +776,8 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut spectate = false;
     let mut registered: Vec<(String, i128)> = Vec::new();
     let mut min_reputation: Option<i128> = None;
+    let mut dev_auth = false;
+    let mut dev_allow: Vec<String> = Vec::new();
     let mut arena: &'static str = "";
     let mut map_file: Option<PathBuf> = None;
     let mut perception_memory: u16 = 0;
@@ -880,6 +896,13 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
                 let v = it.next().expect("--min-reputation needs an integer");
                 min_reputation =
                     Some(v.trim().parse::<i128>().expect("--min-reputation must be a signed integer"));
+            }
+            "--dev-auth" => dev_auth = true,
+            "--dev-allow" => {
+                let id = it.next().expect("--dev-allow needs an agent id");
+                let id = id.trim();
+                assert!(!id.is_empty(), "--dev-allow needs a non-empty agent id");
+                dev_allow.push(id.to_string());
             }
             "--map" => arena = parse_arena(&it.next().expect("--map needs a value")),
             "--map-file" => map_file = Some(it.next().expect("--map-file needs a value").into()),
@@ -1049,6 +1072,8 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         spectate,
         registered,
         min_reputation,
+        dev_auth,
+        dev_allow,
         arena,
         map_file,
         perception_memory,
@@ -1870,7 +1895,7 @@ fn settle_finished(
 /// can parse a machine-readable frame (never the old human-formatted delta line) to
 /// surface an A2A author's ladder standing. A no-op (casual / human / Mixed / replay)
 /// emits nothing and is not an error; the emission has no wire effect on the match.
-fn settle_ranked_ladder(mm: &Matchmaker<SignatureVerifier>, result: &MatchResult, seats: &[SeatInfo]) {
+fn settle_ranked_ladder<V: IdentityVerifier>(mm: &Matchmaker<V>, result: &MatchResult, seats: &[SeatInfo]) {
     // Fold both settle arms into one (seat, delta) list: the 1v1 delta lands `.a` on the
     // first outcome seat and `.b` on the second (canonical order); the field carries its
     // own seats. A no-op arm (never registered / already settled) bails before any emit.
@@ -2135,22 +2160,63 @@ fn abort_ladder(path: &Path, err: &LadderFileError) -> ! {
     std::process::exit(1);
 }
 
+/// The harness's ranked identity verifier, selected once at startup: the production
+/// [`SignatureVerifier`] (real k256 recovery) by DEFAULT, or the [`StubIdentityVerifier`]
+/// allowlist under `--dev-auth`. A single concrete enum — not a generic drive — so
+/// [`build_matchmaker`] and [`handshake_matchmade`] return ONE `Matchmaker<HarnessVerifier>`;
+/// `verify` delegates to the selected impl, so the default arm is byte-identical to the
+/// pre-flag `Matchmaker<SignatureVerifier>` (the `Signature` case monomorphizes to the same
+/// call). The `Stub` arm is reachable ONLY via the explicit, loudly-warned `--dev-auth`.
+enum HarnessVerifier {
+    Signature(SignatureVerifier),
+    Stub(StubIdentityVerifier),
+}
+
+impl IdentityVerifier for HarnessVerifier {
+    fn verify(&self, agent_id: &str, nonce: &[u8], signature_hex: &str) -> bool {
+        match self {
+            Self::Signature(v) => v.verify(agent_id, nonce, signature_hex),
+            Self::Stub(v) => v.verify(agent_id, nonce, signature_hex),
+        }
+    }
+}
+
+/// Pick the matchmaker's ranked identity verifier from the flags. The default is the
+/// production [`SignatureVerifier`] — a ranked seat MUST prove key possession. `--dev-auth`
+/// swaps in a [`StubIdentityVerifier`] allowlist so a LOCAL / CI ranked match runs keyless
+/// (no per-seat signature), an explicit dev facility, never the default. Each `--dev-allow
+/// <agent_id>` authorizes that id with a token equal to the id itself — the dev convention
+/// that an allowlisted seat is admitted by presenting `signature_hex == agent_id`, keyless
+/// but NOT authless (an un-allowlisted id is still refused, the stub's real reject path).
+fn harness_verifier(args: &Args) -> HarnessVerifier {
+    if !args.dev_auth {
+        return HarnessVerifier::Signature(SignatureVerifier);
+    }
+    let mut stub = StubIdentityVerifier::new();
+    for id in &args.dev_allow {
+        stub.authorize(id, id);
+    }
+    HarnessVerifier::Stub(stub)
+}
+
 /// Construct the matchmaker for a `--mode` run, seeding its rating ladder from
 /// `--ladder-file` when one is given and present so standings accumulate across runs. No
 /// flag, or a missing / empty file, starts a fresh `DEFAULT_RATING` ladder — byte-identical
 /// to the pre-persistence harness. A present but corrupt or wrong-schema file aborts the
-/// run via [`abort_ladder`] rather than silently resetting standings.
-fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<SignatureVerifier> {
+/// run via [`abort_ladder`] rather than silently resetting standings. The ranked verifier is
+/// [`harness_verifier`] — production signature check by default, `--dev-auth` allowlist opt-in.
+fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<HarnessVerifier> {
     // Carry the same Rules the direct path forms under (rules_from), so a matchmade match
     // plays under exactly the tuning a hand-seated one does — this is what threads
     // --perception-memory through the --mode/ranked path the matchmaker owns.
     let params = MatchParams { rules: rules_from(args), ..matchmaker_params(n, args.max_ticks, args.arena) };
     let registry = ranked_registry_from(args);
+    let verifier = harness_verifier(args);
     let base = match &args.ladder_file {
-        None => Matchmaker::new(SignatureVerifier, params),
+        None => Matchmaker::new(verifier, params),
         Some(path) => match read_ladder_file(path) {
-            Ok(None) => Matchmaker::new(SignatureVerifier, params),
-            Ok(Some(snapshot)) => Matchmaker::from_snapshot(SignatureVerifier, params, snapshot)
+            Ok(None) => Matchmaker::new(verifier, params),
+            Ok(Some(snapshot)) => Matchmaker::from_snapshot(verifier, params, snapshot)
                 .unwrap_or_else(|e| abort_ladder(path, &LadderFileError::Restore(e))),
             Err(e) => abort_ladder(path, &e),
         },
@@ -2183,6 +2249,20 @@ fn ranked_reputation_floor_from(args: &Args) -> i128 {
 /// guard (that rejects a set that would match nobody; this flags a floor that gates nobody).
 fn floor_without_registry_is_inert(args: &Args) -> bool {
     args.min_reputation.is_some() && args.registered.is_empty()
+}
+
+/// True when `--dev-auth` is set on a run with no `--mode`: the keyless verifier gates only
+/// the matchmaker (the `--mode` path), so on the direct path it changes nothing. A silent
+/// no-op worth warning about, the dev-auth twin of [`floor_without_registry_is_inert`].
+fn dev_auth_is_inert_without_mode(args: &Args) -> bool {
+    args.dev_auth && args.mode.is_none()
+}
+
+/// True when `--dev-allow` ids are supplied without `--dev-auth`: the allowlist is only ever
+/// consulted by the `--dev-auth` [`StubIdentityVerifier`], so under real signature admission
+/// the ids are ignored. Flags an operator who allowlisted a seat but forgot to enable dev-auth.
+fn dev_allow_ignored_without_dev_auth(args: &Args) -> bool {
+    !args.dev_auth && !args.dev_allow.is_empty()
 }
 
 /// True when `--map-file` is combined with `--mode`: the matchmade path resolves its arena
@@ -2269,7 +2349,7 @@ fn handshake_matchmade(
     settler: &Option<MockSettler>,
     lines: &mut impl Iterator<Item = io::Result<String>>,
     out: &mut impl Write,
-) -> (Matchmaker<SignatureVerifier>, Match) {
+) -> (Matchmaker<HarnessVerifier>, Match) {
     let mm = build_matchmaker(args, n);
 
     for seat in 0..n {
@@ -2474,6 +2554,26 @@ fn main() {
     if floor_without_registry_is_inert(&args) {
         eprintln!(
             "[matchmaker] --min-reputation is set without any --registered address; the reputation floor is inert (no registry to source reputation from)"
+        );
+    }
+    // --dev-auth relaxes ranked admission from real signature verification to a keyless
+    // allowlist. That is a SECURITY-relevant relaxation, so it is loud on every run that sets
+    // it — a production deploy that accidentally passed it must see it in the log — and its
+    // inert-config slips warn too. stderr only, so the protocol stdout stays byte-identical.
+    if args.dev_auth {
+        eprintln!(
+            "[dev-auth] WARNING: ranked seats are admitted by the keyless --dev-allow allowlist ({} id(s)), NOT signature verification — LOCAL/CI ONLY, never production",
+            args.dev_allow.len()
+        );
+    }
+    if dev_auth_is_inert_without_mode(&args) {
+        eprintln!(
+            "[dev-auth] --dev-auth is set without --mode; the keyless verifier gates only the matchmaker, so it changes nothing on the direct path"
+        );
+    }
+    if dev_allow_ignored_without_dev_auth(&args) {
+        eprintln!(
+            "[dev-auth] --dev-allow is set without --dev-auth; the allowlist is ignored (ranked admission still requires a real signature)"
         );
     }
     let n = args.seats;
@@ -3529,6 +3629,8 @@ mod tests {
             spectate: false,
             registered: Vec::new(),
             min_reputation: None,
+            dev_auth: false,
+            dev_allow: Vec::new(),
             arena: "",
             map_file: None,
             perception_memory: 0,
@@ -3628,6 +3730,8 @@ mod tests {
             spectate: false,
             registered: Vec::new(),
             min_reputation: None,
+            dev_auth: false,
+            dev_allow: Vec::new(),
             arena,
             map_file: None,
             perception_memory,
