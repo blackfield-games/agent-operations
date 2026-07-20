@@ -4519,6 +4519,60 @@ mod tests {
     }
 
     #[test]
+    fn teams_reach_the_sim_so_friendly_fire_gates_a_teammate_hit() {
+        // FM4 (the roster must reach the SIM, not just relabel SeatInfo): under --teams the seats
+        // that share a team must share it in the combat the core runs, so --friendly-fire decides
+        // whether seat 0's fire touches its teammate. A --teams 2 --seats 4 direct match groups
+        // {0,1} on team 0, {2,3} on team 1; --spawn-jitter 0 seats the roster exactly collinear on
+        // X (seat 0 at -20 m facing EAST, teammate seat 1 at ~-6.7 m and enemy seat 2 at ~+6.7 m
+        // both inside the 30 m beam, seat 3 at +20 m out of range). observe().own.team reads the
+        // pawn's team — the very field resolve_fire's same-team gate compares — so this drives a
+        // stepped match, not the SeatInfo vector.
+        let fire_east = || {
+            let mut intents: BTreeMap<SeatId, ActionIntent> = BTreeMap::new();
+            intents.insert(
+                0,
+                ActionIntent {
+                    move_dir: Vec2::ZERO,
+                    aim: 0, // EAST — down the collinear roster toward seats 1 and 2
+                    buttons: ActionButtons { fire: true, jump: false, ability: false, reload: false },
+                },
+            );
+            intents
+        };
+        let teamed = |ff| Args { teams: 2, friendly_fire: ff, spawn_jitter: 0, ..direct_args(4, "", 0) };
+
+        let seated = build_direct_match(&teamed(false), 4);
+        assert_eq!(
+            seated.observe(0).own.team,
+            seated.observe(1).own.team,
+            "seats 0 and 1 share a team in the sim (the pawn field the friendly-fire gate compares)"
+        );
+        assert_ne!(seated.observe(0).own.team, seated.observe(2).own.team, "seat 2 is on the opposing team");
+
+        // --friendly-fire off: seat 0's beam skips its teammate (seat 1) and lands on the enemy
+        // (seat 2) behind it, so the ally is untouched — the team label gated the shot.
+        let mut ff_off = build_direct_match(&teamed(false), 4);
+        let ally_full = ff_off.observe(1).own.health;
+        ff_off.step(&fire_east());
+        assert_eq!(
+            ff_off.observe(1).own.health,
+            ally_full,
+            "with --friendly-fire off a same-team seat takes no damage"
+        );
+
+        // --friendly-fire on: the teammate is now an eligible target and, as the nearest body in
+        // the beam, takes the hit. Mutation: revert build_direct_match to team == seat and seats 0
+        // and 1 become enemies — the shared-team assert reddens AND the ff-off ally takes the hit.
+        let mut ff_on = build_direct_match(&teamed(true), 4);
+        ff_on.step(&fire_east());
+        assert!(
+            ff_on.observe(1).own.health < ally_full,
+            "with --friendly-fire on the teammate is hit — the team reached the sim's combat, not only SeatInfo"
+        );
+    }
+
+    #[test]
     fn direct_map_without_a_file_matches_the_builtin_arena() {
         // FM3: no --map-file — direct_map resolves EXACTLY arena_map(args.arena), so the direct
         // path is byte-identical to the pre-flag harness (the empty default and a named arena alike).
