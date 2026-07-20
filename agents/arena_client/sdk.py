@@ -38,18 +38,21 @@ from .proto import (
     ActionButtons,
     ActionIntent,
     Blocker,
+    Broadcast,
     Challenge,
     MatchConfig,
     MatchResult,
     Observation,
     ProtocolError,
     Reject,
+    SpectatorMsg,
     Start,
     Vec2,
     Welcome,
     act_frame,
     address_from_private_key,
     decode_gateway,
+    decode_spectator,
     join_frame,
     leave_frame,
     sign_join,
@@ -591,6 +594,100 @@ class SeatTransport:
 
     def send(self, frame: dict) -> None:
         self._gateway.send(self._seat, frame)
+
+
+class SpectatorPolicy(Protocol):
+    """A consumer of the one-directional SPECTATOR stream. An `ArenaSpectator` decodes each
+    server→spectator `SpectatorMsg` and calls `on_frame` for every whole-battlefield `Broadcast`
+    and `on_end` EXACTLY ONCE with the terminal `MatchResult`. Both hooks are OPTIONAL
+    (getattr-guarded), so a policy implements only the one it needs — the terminal result is
+    also the `run()` return value regardless — but a useful grader implements at least
+    `on_frame`. Unlike a per-seat `Policy` a spectator NEVER sends: it only observes the public
+    view a stream viewer sees, never a seat's private HUD."""
+
+    def on_frame(self, broadcast: Broadcast) -> None: ...
+    def on_end(self, result: MatchResult) -> None: ...
+
+
+class ArenaSpectator:
+    """Consumes the `{"channel": "spectator"}` broadcast a `--spectate` (live) or `--replay`
+    (finished record) harness emits: decode each `SpectatorMsg` and dispatch `Frame(Broadcast)` /
+    `End(MatchResult)` to a `SpectatorPolicy`. The Python twin of a caster UI / the design's
+    eventual UE5 spectator client, so a grader analyses a whole match from the public
+    whole-battlefield view. The consumer counterpart to `ArenaClient`: that drives ONE seat
+    (parity-bounded observation in, validated action out); this watches the WHOLE match
+    (public broadcast in, nothing out — a spectator has no seat to move).
+
+    Attach it two ways:
+    - `ArenaSpectator.replay(harness, record_path)` spawns `--replay` and OWNS the gateway — the
+      clean offline-grading path: a pure spectator stream, no seats to drive, reaped on close.
+    - `ArenaSpectator(gateway)` wraps a gateway a caller is already driving live (`--spectate`,
+      opened `collect_spectator=True`), draining the broadcast frames buffered alongside the seat
+      frames. It does NOT own that gateway — the caller that drives the seats closes it (closing
+      it here would reap a match still mid-play)."""
+
+    def __init__(self, gateway: SubprocessGateway, *, _owns_gateway: bool = False) -> None:
+        self._gateway = gateway
+        self._owns_gateway = _owns_gateway
+        self.result: MatchResult | None = None
+        self.done = False
+
+    @classmethod
+    def replay(cls, harness: str, record_path: str | Path, *, timeout: float = 30.0) -> ArenaSpectator:
+        """Cast a finished match's `--emit-replay` `MatchRecord` as a spectator stream: spawn
+        `harness --replay <record_path>`, which verifies the record then casts every projected
+        `Broadcast` followed by one terminal `End` on the spectator channel alone (no seats to
+        drive). The gateway is owned, so `close()` / the context manager reaps the process."""
+        gateway = SubprocessGateway(
+            [harness, "--replay", str(record_path)], timeout=timeout, collect_spectator=True
+        )
+        return cls(gateway, _owns_gateway=True)
+
+    def poll(self, policy: SpectatorPolicy) -> MatchResult | None:
+        """Decode exactly one inbound spectator frame and dispatch it. A `Broadcast` fires
+        `on_frame` and returns None; the terminal `End` fires `on_end`, records `result`, marks
+        the stream `done`, and returns the `MatchResult`. A stream that closes before its End is
+        a truncated cast — a loud `ProtocolError`, never a silent mis-grade (FM2)."""
+        if self.done:
+            raise ProtocolError("spectator poll after the terminal End")
+        try:
+            frame = self._gateway.recv_spectator()
+        except GatewayClosed as e:
+            raise ProtocolError("spectator stream ended before its terminal End (truncated cast)") from e
+        msg: SpectatorMsg = decode_spectator(frame)
+        if isinstance(msg, Broadcast):
+            on_frame = getattr(policy, "on_frame", None)
+            if on_frame is not None:
+                on_frame(msg)
+            return None
+        # decode_spectator yields only Broadcast | MatchResult; a MatchResult is the End variant.
+        self.result = msg
+        self.done = True
+        on_end = getattr(policy, "on_end", None)
+        if on_end is not None:
+            on_end(msg)
+        return msg
+
+    def run(self, policy: SpectatorPolicy) -> MatchResult:
+        """Drain the whole spectator stream to its terminal End and return the `MatchResult`,
+        dispatching each frame to `policy`. The consumer twin of `ArenaClient.run`."""
+        while not self.done:
+            self.poll(policy)
+        assert self.result is not None
+        return self.result
+
+    def close(self) -> None:
+        """Reap the harness, but ONLY when this spectator spawned it (`replay`). A wrapped live
+        gateway belongs to the caller driving its seats — reaping it here would kill a match
+        still in play."""
+        if self._owns_gateway:
+            self._gateway.close()
+
+    def __enter__(self) -> ArenaSpectator:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 def run_local_match(
