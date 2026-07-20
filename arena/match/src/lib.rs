@@ -3556,6 +3556,69 @@ mod tests {
         assert!(replay.blockers.is_empty() && replay.pickups.is_empty(), "an unknown arena is empty");
     }
 
+    /// Form a 2-seat Human match under a runtime `map` override (with `arena` as the fallback
+    /// key), capped at a small tick count so [`run_to_end`] terminates cheaply. The map-override
+    /// twin of [`form_on`].
+    fn form_over(map: Option<ArenaMap>, arena: &'static str) -> Match {
+        let params = MatchParams { arena, map, max_ticks: 5, ..MatchParams::default() };
+        let mm = Matchmaker::new(StubIdentityVerifier::new(), params);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        mm.join(MatchMode::Human, b"", JoinRequest::human("b")).unwrap().into_formed().unwrap()
+    }
+
+    /// A runtime arena distinct from every builtin — one off-centre occluder and one shield
+    /// pickup — so a formed match carrying it can never be confused with the empty default or
+    /// the reference key.
+    fn custom_runtime_map() -> ArenaMap {
+        ArenaMap::from_json(
+            r#"{"blockers":[{"min":{"x":-100,"y":-100},"max":{"x":100,"y":100}}],"pickups":[{"kind":"shield","position":{"x":700,"y":0},"amount":40}]}"#,
+        )
+        .expect("the fixture runtime map is valid")
+    }
+
+    #[test]
+    fn a_runtime_map_override_wins_over_the_configured_key() {
+        // FM3: MatchParams.map Some overrides the builtin key deterministically — build() forms
+        // under the runtime map's blockers/pickups, never arena_map(self.params.arena)'s. The key
+        // is set to a NON-empty builtin ("reference") so the override is proven to WIN over a real
+        // map, not merely fill an empty one — mirroring the direct path's file-over-key precedence.
+        let custom = custom_runtime_map();
+        let replay = form_over(Some(custom.clone()), "reference").into_replay();
+        assert_eq!(replay.blockers, custom.blockers, "the runtime map's blockers reached the match");
+        assert_eq!(replay.pickups, custom.pickups, "the runtime map's pickups reached the match");
+        assert_ne!(replay.pickups, arena_map("reference").pickups, "the override WON over the configured key");
+    }
+
+    #[test]
+    fn a_runtime_override_and_the_matching_key_feed_identical_geometry() {
+        // FM1: the override feeds new_with_pickups EXACTLY as the key path does. A Some(reference
+        // map) over an empty key and a None override over the "reference" key resolve to
+        // byte-identical geometry on the formed match — so a matchmade match under a runtime map
+        // carries no geometry the key path wouldn't, and the None branch still reads the key
+        // (mutation-proving the unwrap_or_else fallback: drop it and via_key would resolve empty).
+        let via_override = form_over(Some(arena_map("reference")), "").into_replay();
+        let via_key = form_over(None, "reference").into_replay();
+        assert_eq!(via_override.blockers, via_key.blockers, "override feeds the same blockers as the key path");
+        assert_eq!(via_override.pickups, via_key.pickups, "override feeds the same pickups as the key path");
+    }
+
+    #[test]
+    fn a_match_formed_under_a_runtime_map_emits_a_verifiable_record() {
+        // FM2: a match the matchmaker forms under a runtime override drives to a terminal record
+        // that verify()s — the override geometry is carried in the record and re-run by verify(),
+        // never a digest divergence. The record publishes the override's blockers/pickups (not the
+        // key's), and verify() reproducing the same terminal result twice is the replay's
+        // determinism pin.
+        let custom = custom_runtime_map();
+        let record = run_to_end(form_over(Some(custom.clone()), "reference"))
+            .to_record()
+            .expect("a finished match yields a record");
+        assert_eq!(record.replay.blockers, custom.blockers, "the record carries the override's blockers");
+        assert_eq!(record.replay.pickups, custom.pickups, "the record carries the override's pickups");
+        let result = record.verify().expect("the runtime-map record verifies (no digest divergence)");
+        assert_eq!(result, record.verify().expect("verify is deterministic"), "the override replay re-runs identically");
+    }
+
     /// Form a 2-seat Human match under `rules` and hand back the built [`Match`] — the
     /// rules twin of [`form_on`], for confirming the matchmaker forms under its configured
     /// tuning rather than a hardcoded default.
