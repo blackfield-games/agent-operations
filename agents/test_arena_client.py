@@ -2690,6 +2690,88 @@ def test_run_matchmade_dev_auth_threads_onto_the_mixed_path():
     assert len([o for o in results[0].outcomes if o.alive_at_end]) == 1
 
 
+def test_run_local_match_forwards_emit_replay_and_omits_it_by_default(monkeypatch):
+    # FM1 (default omit) + path-type: emit_replay=None omits --emit-replay (byte-identical argv); a str
+    # and a Path both forward as [--emit-replay, str(path)] — one openable token. Mutation-proves the
+    # `if emit_replay is not None:` gate: dropping it would append str(None)="None" to EVERY run and
+    # redden the default-omit assert. Captured without a harness by stubbing the gateway before spawn.
+    from pathlib import Path
+
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {s: BaselinePolicy() for s in range(2)}
+
+    def emit_value(**kw):
+        with pytest.raises(_Stop):
+            sdk.run_local_match("h", [0, 1], policies, **kw)
+        argv = captured["argv"]
+        return [argv[i + 1] for i, tok in enumerate(argv) if tok == "--emit-replay"]
+
+    assert emit_value() == []  # default: no --emit-replay, byte-identical
+    assert emit_value(emit_replay="rec.json") == ["rec.json"]  # str forwarded verbatim
+    assert emit_value(emit_replay=Path("dir/rec.json")) == [str(Path("dir/rec.json"))]  # Path -> one str token
+
+
+def test_run_local_match_emit_replay_round_trips_through_arena_spectator(tmp_path):
+    # FM ROUND-TRIP (the value): run_local_match(emit_replay=path) WRITES a MatchRecord the SDK's own
+    # ArenaSpectator.replay re-casts to the SAME canonical result — its replay_hash equals the producing
+    # match's, re-verified from the artifact alone. Mutation: drop the --emit-replay forward and no file
+    # is written, so the replay spawn finds nothing and the cast raises. The produce->consume loop.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import ArenaSpectator, run_local_match
+
+    record = tmp_path / "match.json"
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    results = run_local_match(
+        harness, [0, 1], policies, seed=99,
+        match_id="cccccccc-1111-4222-8333-444444444444", emit_replay=record,
+    )
+    assert record.exists() and record.stat().st_size > 0, "the match wrote a MatchRecord artifact"
+
+    caster = _RecordingSpectator()
+    with ArenaSpectator.replay(harness, record) as spec:
+        cast = spec.run(caster)
+
+    assert cast.replay_hash == results[0].replay_hash, "the record re-verifies to the producing match"
+    assert caster.frames, "the record casts at least one broadcast frame"
+    assert all(isinstance(f, proto.Broadcast) for f in caster.frames)
+
+
+def test_run_local_match_emit_replay_written_on_both_the_direct_and_mode_paths(tmp_path):
+    # FM BOTH-PATHS: the --emit-replay forward sits BEFORE the mode block, so a record is produced on the
+    # direct (mode=None) AND the matchmade (--mode) paths alike — were it inside the mode block, the
+    # direct record would silently never be written. Each record re-casts to a 64-hex replay_hash. Uses
+    # dev_auth for the keyless ranked path so the --mode leg needs no real keys.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import ArenaSpectator, run_local_match
+
+    direct = tmp_path / "direct.json"
+    run_local_match(
+        harness, [0, 1], {0: BaselinePolicy(), 1: BaselinePolicy()}, seed=7,
+        match_id="11111111-1111-4111-8111-111111111111", emit_replay=direct,
+    )
+    ranked = tmp_path / "ranked.json"
+    run_local_match(
+        harness, [0, 1], {0: BaselinePolicy(), 1: BaselinePolicy()}, seed=7,
+        match_id="22222222-2222-4222-8222-222222222222", mode="agent", dev_auth=True, emit_replay=ranked,
+    )
+    for record in (direct, ranked):
+        assert record.exists() and record.stat().st_size > 0
+        with ArenaSpectator.replay(harness, record) as spec:
+            assert len(spec.run(_RecordingSpectator()).replay_hash) == 64
+
+
 def test_run_local_match_forwards_perception_memory_and_omits_it_by_default(monkeypatch):
     # perception_memory>0 forwards --perception-memory <ticks> as one argv token; omitted
     # (0) adds no flag, byte-identical argv. Captured without a harness via the spy gateway.
