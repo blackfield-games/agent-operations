@@ -7484,6 +7484,143 @@ mod tests {
     }
 
     #[test]
+    fn security_default_is_signature_verification_not_the_keyless_stub() {
+        // FM SECURITY DEFAULT (the mutation guard): with NO --dev-auth, build_matchmaker forms
+        // over the production SignatureVerifier. A valid k256-signed ranked join is admitted, and
+        // the keyless dev token (signature_hex == agent_id) is refused. If harness_verifier ever
+        // defaulted to the Stub, this VALID signature would be REJECTED (the empty-allowlist stub
+        // understands tokens, not signatures) — so the positive case pins the default is real crypto.
+        let sk = join_key();
+        let addr = address_from_verifying_key(sk.verifying_key());
+        let nonce0 = nonce_for(id(), 0);
+        let signed =
+            join_request_for(MatchMode::Agent, 0, &[], &addr, &sign_join_proof(&sk, &addr, nonce0.as_bytes()));
+        assert!(
+            matches!(
+                build_matchmaker(&direct_args(2, "", 0), 2).join(MatchMode::Agent, nonce0.as_bytes(), signed),
+                Ok(JoinOutcome::Queued)
+            ),
+            "the default verifier admits a valid signature",
+        );
+        // The keyless dev token is NOT a signature — refused by the default verifier.
+        let keyless = join_request_for(MatchMode::Agent, 1, &[], "alice", "alice");
+        assert!(
+            matches!(
+                build_matchmaker(&direct_args(2, "", 0), 2)
+                    .join(MatchMode::Agent, nonce_for(id(), 1).as_bytes(), keyless),
+                Err(JoinError::Unauthenticated { .. })
+            ),
+            "the keyless dev token never admits a ranked seat without --dev-auth",
+        );
+    }
+
+    #[test]
+    fn dev_auth_admits_an_allowlisted_id_keyless_and_refuses_a_non_allowlisted_one() {
+        // FM STUB ALLOWLIST: --dev-auth swaps in the keyless allowlist. An allowlisted id claims a
+        // ranked seat by presenting signature_hex == its id (no k256 key); an id NOT on the
+        // allowlist is still refused (keyless but not authless — the stub's reject path is real).
+        let args = Args { dev_auth: true, dev_allow: vec!["alice".into()], ..direct_args(2, "", 0) };
+        let mm = build_matchmaker(&args, 2);
+        let allowed = join_request_for(MatchMode::Agent, 0, &[], "alice", "alice");
+        assert!(
+            matches!(
+                mm.join(MatchMode::Agent, nonce_for(id(), 0).as_bytes(), allowed),
+                Ok(JoinOutcome::Queued)
+            ),
+            "an allowlisted id is admitted keyless under --dev-auth",
+        );
+        let refused = join_request_for(MatchMode::Agent, 1, &[], "mallory", "mallory");
+        assert!(
+            matches!(
+                mm.join(MatchMode::Agent, nonce_for(id(), 1).as_bytes(), refused),
+                Err(JoinError::Unauthenticated { .. })
+            ),
+            "an un-allowlisted id is refused even under --dev-auth",
+        );
+    }
+
+    #[test]
+    fn dev_auth_leaves_casual_seating_unchanged() {
+        // FM CASUAL UNCHANGED: the verifier gates only RANKED admission — a casual (empty-signature)
+        // seat never consults it, so a Mixed human + casual agent forms identically with or without
+        // --dev-auth.
+        for dev_auth in [false, true] {
+            let args = Args { dev_auth, ..direct_args(2, "", 0) };
+            let mm = build_matchmaker(&args, 2);
+            let human = join_request_for(MatchMode::Mixed, 0, &[0], "human-0", "");
+            assert!(
+                matches!(
+                    mm.join(MatchMode::Mixed, nonce_for(id(), 0).as_bytes(), human),
+                    Ok(JoinOutcome::Queued)
+                ),
+                "the human seat queues (dev_auth={dev_auth})",
+            );
+            let casual = join_request_for(MatchMode::Mixed, 1, &[0], "agent-1", "");
+            let formed =
+                mm.join(MatchMode::Mixed, nonce_for(id(), 1).as_bytes(), casual).expect("casual admitted");
+            assert!(
+                formed.into_formed().is_some(),
+                "a Mixed human + casual agent forms regardless of --dev-auth (dev_auth={dev_auth})",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_args_reads_dev_auth_and_a_trimmed_dev_allow_list() {
+        let args = parse_args_from(
+            ["--dev-auth", "--dev-allow", "alice", "--dev-allow", " bob\n", "--seats", "2"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert!(args.dev_auth);
+        assert_eq!(
+            args.dev_allow,
+            vec!["alice".to_string(), "bob".to_string()],
+            "each --dev-allow id is trimmed; the flag is repeatable",
+        );
+        let bare = parse_args_from(["--seats", "2"].into_iter().map(String::from));
+        assert!(!bare.dev_auth && bare.dev_allow.is_empty(), "neither flag defaults on");
+    }
+
+    #[test]
+    fn harness_verifier_defaults_to_signature_and_dev_auth_selects_the_stub() {
+        assert!(
+            matches!(harness_verifier(&direct_args(2, "", 0)), HarnessVerifier::Signature(_)),
+            "the default is the production signature verifier",
+        );
+        let dev = Args { dev_auth: true, dev_allow: vec!["alice".into()], ..direct_args(2, "", 0) };
+        let v = harness_verifier(&dev);
+        assert!(matches!(v, HarnessVerifier::Stub(_)), "--dev-auth selects the keyless stub");
+        // The stub admits exactly the allowlisted id with its own-id token, nobody else.
+        assert!(v.verify("alice", b"", "alice"), "the allowlisted id + its dev token is accepted");
+        assert!(!v.verify("alice", b"", ""), "an empty token is refused (the casual sentinel)");
+        assert!(!v.verify("mallory", b"", "mallory"), "an un-allowlisted id is refused");
+    }
+
+    #[test]
+    fn dev_auth_inert_config_predicates_flag_the_no_op_slips() {
+        // --dev-auth without --mode: the keyless verifier gates only the matchmaker.
+        assert!(dev_auth_is_inert_without_mode(&Args { dev_auth: true, ..direct_args(2, "", 0) }));
+        assert!(!dev_auth_is_inert_without_mode(&Args {
+            dev_auth: true,
+            mode: Some(MatchMode::Agent),
+            ..direct_args(2, "", 0)
+        }));
+        assert!(!dev_auth_is_inert_without_mode(&direct_args(2, "", 0)), "no --dev-auth is not the inert case");
+        // --dev-allow without --dev-auth: the allowlist is ignored.
+        assert!(dev_allow_ignored_without_dev_auth(&Args {
+            dev_allow: vec!["alice".into()],
+            ..direct_args(2, "", 0)
+        }));
+        assert!(!dev_allow_ignored_without_dev_auth(&Args {
+            dev_auth: true,
+            dev_allow: vec!["alice".into()],
+            ..direct_args(2, "", 0)
+        }));
+        assert!(!dev_allow_ignored_without_dev_auth(&direct_args(2, "", 0)));
+    }
+
+    #[test]
     fn registered_flag_does_not_gate_mixed_cross_play() {
         // Regression guard: --registered gates ranked (Agent) admission only. A signed agent
         // that is NOT registered must still join a Mixed casual match (which never settles),
