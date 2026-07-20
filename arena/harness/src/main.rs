@@ -55,6 +55,16 @@ struct Args {
     match_id: Uuid,
     seed: u64,
     seats: u8,
+    /// Seats per team (`MatchParams::team_size` on the matchmade path). Set by `--teams <size>`;
+    /// the default `1` is free-for-all — each seat its own team, byte-identical to the pre-this-flag
+    /// harness. `> 1` partitions the roster into `seats / teams` balanced teams of `teams` seats:
+    /// the direct path groups by seat index (`team = seat / teams`, so seats `{0,1}` are one team,
+    /// `{2,3}` the next), the matchmade path threads `team_size` onto [`MatchParams`] (the matchmaker
+    /// assigns balanced teams itself). This lights up team scoring + `--friendly-fire` (which are dark
+    /// under the all-singleton FFA roster). A `--teams` that cannot partition `--seats` — `0`, a
+    /// non-divisor, or one that leaves fewer than two teams — is a loud startup exit(1)
+    /// ([`teams_partition_is_invalid`]), mirroring the matchmaker's own `team_size` contract.
+    teams: u8,
     max_ticks: u64,
     /// Drive the off-chain settlement path through a [`MockSettler`] after the
     /// match (logging to stderr), mirroring mesh's `--relay-dev-mock`. Off by
@@ -773,6 +783,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
     let mut match_id = DEFAULT_MATCH_ID.to_string();
     let mut seed: u64 = 0;
     let mut seats: u8 = 2;
+    let mut teams: u8 = 1;
     let mut max_ticks: u64 = 3600;
     let mut settle_dev_mock = false;
     let mut mode: Option<MatchMode> = None;
@@ -865,6 +876,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
             "--match-id" => match_id = it.next().expect("--match-id needs a value"),
             "--seed" => seed = it.next().expect("--seed needs a value").parse().expect("seed is a u64"),
             "--seats" => seats = it.next().expect("--seats needs a value").parse().expect("seats is a u8"),
+            "--teams" => teams = it.next().expect("--teams needs a value").parse().expect("teams is a u8"),
             "--max-ticks" => {
                 max_ticks = it.next().expect("--max-ticks needs a value").parse().expect("max-ticks is a u64")
             }
@@ -1071,6 +1083,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Args {
         match_id: Uuid::parse_str(&match_id).expect("--match-id is a valid UUID"),
         seed,
         seats,
+        teams,
         max_ticks,
         settle_dev_mock,
         mode,
@@ -2225,6 +2238,7 @@ fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<HarnessVerifier> {
     let params = MatchParams {
         rules: rules_from(args),
         map: map_override(args),
+        team_size: args.teams,
         ..matchmaker_params(n, args.max_ticks, args.arena)
     };
     let registry = ranked_registry_from(args);
@@ -2606,6 +2620,20 @@ fn self_play_roster_too_small(args: &Args) -> bool {
     args.self_play && args.seats < 2
 }
 
+/// True when `--teams <size>` cannot partition `--seats` into a valid team roster, so the harness
+/// exits at startup rather than seat a lopsided match or panic deep in `Matchmaker::new`.
+/// `--teams 0` is meaningless (a team holds at least one seat). `--teams 1` is the free-for-all
+/// default — each seat its own team — always valid for any `--seats` the harness already accepts, so
+/// it is never newly rejected here (byte-identical to the pre-flag harness). A `--teams > 1` must
+/// divide `--seats` evenly AND leave at least two teams (`seats / teams >= 2`) — a single team has no
+/// opponent and the core ends the match on its first tick. Mirrors the matchmaker's own `team_size`
+/// contract ([`Matchmaker::new`] asserts divisibility + `>= 2` teams), so the direct and matchmade
+/// paths reject exactly the same degenerate configs.
+fn teams_partition_is_invalid(args: &Args) -> bool {
+    args.teams == 0
+        || (args.teams > 1 && (!args.seats.is_multiple_of(args.teams) || args.seats / args.teams < 2))
+}
+
 /// One [`SelfPlayBot`] per seat — exactly the roster size [`run_match`] requires (it asserts one
 /// policy per seat), built from the same `n` the match is, so the count can never mismatch.
 fn self_play_policies(n: u8) -> Vec<Box<dyn Policy>> {
@@ -2629,8 +2657,13 @@ fn run_self_play(args: &Args, n: u8, settler: &Option<MockSettler>) {
 /// what [`Match::new`] produces (it is `new_with_pickups` with no pickups) — so a no-flag
 /// run is byte-identical to the pre-map harness.
 fn build_direct_match(args: &Args, n: u8) -> Match {
+    // Group the roster into teams of `args.teams` by seat index — seats {0,1} on team 0,
+    // {2,3} on team 1, ... The default `teams == 1` is `i / 1 == i`, so each seat is its own
+    // team, byte-identical to the pre-flag free-for-all roster. `teams > 1` is validated up
+    // front (teams_partition_is_invalid), so the division always yields `seats / teams` balanced
+    // teams here. The matchmade path assigns balanced teams itself off MatchParams.team_size.
     let roster: Vec<SeatInfo> = (0..n)
-        .map(|i| SeatInfo { seat: i, team: u16::from(i), controller: format!("agent-{i}") })
+        .map(|i| SeatInfo { seat: i, team: u16::from(i / args.teams), controller: format!("agent-{i}") })
         .collect();
     let config = MatchConfig {
         tick_hz: 30,
@@ -2672,6 +2705,15 @@ fn main() {
     }
     if self_play_roster_too_small(&args) {
         eprintln!("--self-play needs at least two bots to be a match; pass --seats 2 or more (got {})", args.seats);
+        std::process::exit(1);
+    }
+    // --teams must partition --seats into >= 2 balanced teams; reject a degenerate roster loudly at
+    // startup rather than seat a lopsided match (direct path) or panic inside Matchmaker::new (matchmade).
+    if teams_partition_is_invalid(&args) {
+        eprintln!(
+            "--teams {} cannot partition --seats {}: teams must be >= 1, divide seats evenly, and leave at least two teams",
+            args.teams, args.seats
+        );
         std::process::exit(1);
     }
 
@@ -3822,6 +3864,7 @@ mod tests {
             match_id: id(),
             seed: 0,
             seats,
+            teams: 1,
             max_ticks: 4,
             settle_dev_mock: false,
             mode: Some(mode),
@@ -3924,6 +3967,7 @@ mod tests {
             match_id: id(),
             seed: 0,
             seats,
+            teams: 1,
             max_ticks: 4,
             settle_dev_mock: false,
             mode: None,
