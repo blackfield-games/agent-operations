@@ -7549,6 +7549,44 @@ mod tests {
     }
 
     #[test]
+    fn matchmade_map_file_reaches_the_start_frame() {
+        // FM2/FM4: --map-file reaches the MATCHMADE path (it was a startup exit(1) before), and the
+        // authored geometry crosses the wire — the Start frame an agent receives carries the file's
+        // cover + pickups, over a set --map reference (whose two health pickups it overrides). Two
+        // agents sign their seat's challenge and form an Agent match through handshake_matchmade;
+        // the file's single pickup (vs reference's two) is the file-over-key tell.
+        let path = map_file_tmp_path("matchmade-start");
+        let body = r#"{"blockers":[{"min":{"x":-400,"y":-400},"max":{"x":400,"y":400}}],"pickups":[{"kind":"shield","position":{"x":800,"y":0},"amount":40}]}"#;
+        std::fs::write(&path, body).expect("write the map");
+
+        let sk0 = join_key();
+        let sk1 = other_join_key();
+        let addr0 = address_from_verifying_key(sk0.verifying_key());
+        let addr1 = address_from_verifying_key(sk1.verifying_key());
+        let sig0 = sign_join_proof(&sk0, &addr0, nonce_for(id(), 0).as_bytes());
+        let sig1 = sign_join_proof(&sk1, &addr1, nonce_for(id(), 1).as_bytes());
+        let input = format!("{}\n{}\n", join_line(0, &addr0, &sig0), join_line(1, &addr1, &sig1));
+        let mut lines = io::BufReader::new(io::Cursor::new(input)).lines();
+        let mut out: Vec<u8> = Vec::new();
+        let mut args = mode_args(2, MatchMode::Agent, vec![]);
+        args.arena = "reference";
+        args.map_file = Some(path.clone());
+
+        let (_mm, m) = handshake_matchmade(&args, MatchMode::Agent, 2, &None, &mut lines, &mut out);
+        assert_eq!(m.pickup_spawns().len(), 1, "the file's single pickup overrode --map reference's two");
+        assert!(!m.blockers().is_empty(), "the formed match plays under the file's cover");
+
+        let stdout = String::from_utf8(out).unwrap();
+        let GatewayMsg::Start { blockers, pickup_points, .. } = first_start(&stdout) else {
+            unreachable!("first_start returns a Start variant")
+        };
+        assert!(!blockers.is_empty(), "the agent's Start frame carries the file's cover");
+        assert_eq!(pickup_points.len(), 1, "the agent's Start frame carries the file's single pickup point");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn join_request_for_infers_controller_kind_from_mode_and_signature() {
         // Human mode: a token-less seat is a human; a SIGNED join is an agent intruder.
         assert_eq!(join_request_for(MatchMode::Human, 0, &[], "h", "").kind, ControllerKind::Human);
