@@ -1221,10 +1221,11 @@ def run_local_match(
             "ladder_file persists the matchmaker's ranked ladder, which only moves on the "
             "--mode path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
         )
-    if dev_auth and mode is None:
+    if dev_auth and mode not in ("agent", "mixed"):
         raise ValueError(
-            "dev_auth swaps in the keyless ranked verifier, which only gates the matchmaker "
-            "(--mode) path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
+            "dev_auth swaps in the keyless verifier for RANKED admission, which only exists on the "
+            "agent/mixed matchmaker path; it is inert (and mis-seats a pure-human roster) under "
+            f"mode={mode!r} — pass mode='agent' (or 'mixed')"
         )
     if dev_auth and keys:
         # The --dev-auth StubIdentityVerifier admits a ranked seat iff signature_hex == agent_id;

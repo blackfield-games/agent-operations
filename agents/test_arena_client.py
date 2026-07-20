@@ -2617,6 +2617,8 @@ def test_run_local_match_rejects_dev_auth_misuse():
     policies = {s: BaselinePolicy() for s in range(2)}
     with pytest.raises(ValueError, match="dev_auth"):
         run_local_match("h", [0, 1], policies, dev_auth=True)  # no mode
+    with pytest.raises(ValueError, match="mixed"):
+        run_local_match("h", [0, 1], policies, mode="human", dev_auth=True)  # human mode has no ranked seats
     with pytest.raises(ValueError, match="signing_keys"):
         run_local_match("h", [0, 1], policies, mode="agent", dev_auth=True, signing_keys={0: _DEV_KEY})
     with pytest.raises(ValueError, match="dev_allow"):
