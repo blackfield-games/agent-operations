@@ -432,9 +432,24 @@ class SubprocessGateway:
     With `capture_stderr`, the harness's stderr is drained on a background thread so a
     post-match `[ladder]` line can be read back via `ladder()` without ever blocking the
     stdout frame pump; without it, stderr inherits the parent's (today's behaviour, so a
-    panic backtrace still surfaces to the console)."""
+    panic backtrace still surfaces to the console).
 
-    def __init__(self, argv: list[str], timeout: float = 30.0, *, capture_stderr: bool = False) -> None:
+    With `collect_spectator`, the interleaved `{"channel": "spectator"}` broadcast (a
+    `--spectate`/`--replay` run) is BUFFERED for `recv_spectator()` instead of dropped:
+    `recv(seat)` still delivers only seat frames, but a spectator frame it steps over is
+    kept for an `ArenaSpectator`. Default `False` keeps today's behaviour — a participant
+    transport drops the channel so an unwatched match never accumulates a sink this side
+    never drains (the collector is opt-in precisely because the buffer is only bounded when
+    someone drains it)."""
+
+    def __init__(
+        self,
+        argv: list[str],
+        timeout: float = 30.0,
+        *,
+        capture_stderr: bool = False,
+        collect_spectator: bool = False,
+    ) -> None:
         self._proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -444,6 +459,9 @@ class SubprocessGateway:
             bufsize=1,
         )
         self._queues: dict[int, deque[dict]] = defaultdict(deque)
+        # None = drop the spectator channel (participant transport, back-compat); a deque =
+        # buffer it for recv_spectator (an ArenaSpectator is attached).
+        self._spectator: deque[dict] | None = deque() if collect_spectator else None
         self._timeout = timeout
         # Drain stderr on its own thread so a full stderr pipe can never deadlock the
         # stdout read the match loop blocks on (e.g. a mid-match panic backtrace).
@@ -492,22 +510,46 @@ class SubprocessGateway:
         finally:
             timer.cancel()
 
+    def _dispatch(self, env: dict) -> None:
+        """Route one parsed stdout envelope to its channel's buffer, so `recv`/`recv_spectator`
+        stay in lockstep: a `{"channel": "spectator"}` whole-battlefield broadcast to the
+        spectator buffer when an `ArenaSpectator` is attached (else dropped — a participant
+        transport never accumulates a sink it does not drain), a `{"seat"}` frame to its seat
+        queue. A line that is neither is drift — a loud `ProtocolError`, never a silent skip
+        (which would mask a real envelope-format change) nor the raw `KeyError` a bare
+        `env["seat"]` would once have raised on a spectator line."""
+        if env.get("channel") == "spectator":
+            if self._spectator is not None:
+                self._spectator.append(env["frame"])
+            return
+        if "seat" not in env:
+            raise ProtocolError(f"gateway envelope has neither a seat nor a known channel: {env!r}")
+        self._queues[env["seat"]].append(env["frame"])
+
     def recv(self, seat: int) -> dict:
         while not self._queues[seat]:
             line = self._readline()
             if not line:
                 raise GatewayClosed("harness closed the stream")
-            env = json.loads(line)
-            if env.get("channel") == "spectator":
-                # A --spectate/--replay whole-battlefield broadcast, interleaved on the
-                # same stdout as the per-seat frames. A participant transport is not its
-                # consumer (the spectator client reads this channel): drop it rather than
-                # crash on the absent "seat" key or buffer a stream this side never drains.
-                continue
-            if "seat" not in env:
-                raise ProtocolError(f"gateway envelope has neither a seat nor a known channel: {env!r}")
-            self._queues[env["seat"]].append(env["frame"])
+            self._dispatch(json.loads(line))
         return self._queues[seat].popleft()
+
+    def recv_spectator(self) -> dict:
+        """Drain the next `{"channel": "spectator"}` broadcast (the inner SpectatorMsg dict),
+        reading past any interleaved per-seat frames — routed to their seat queues, never
+        dropped — until a spectator frame arrives. The spectator twin of `recv(seat)`: that
+        returns the next SEAT frame stepping over spectator ones, this the next SPECTATOR frame
+        stepping over seat ones. Requires `collect_spectator=True` (else there is no buffer and
+        a spectator frame would be dropped by the shared router); raises `GatewayClosed` at end
+        of stream."""
+        if self._spectator is None:
+            raise ProtocolError("recv_spectator needs a gateway opened with collect_spectator=True")
+        while not self._spectator:
+            line = self._readline()
+            if not line:
+                raise GatewayClosed("harness closed the stream")
+            self._dispatch(json.loads(line))
+        return self._spectator.popleft()
 
     def send(self, seat: int, frame: dict) -> None:
         assert self._proc.stdin is not None
