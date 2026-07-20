@@ -2567,6 +2567,127 @@ def test_run_matchmade_team_size_forms_balanced_teams():
     assert all(n == 2 for n in sizes.values()), f"the matchmaker balances teams 2-and-2; got {dict(sizes)}"
 
 
+def test_run_local_match_forwards_dev_auth_and_omits_it_by_default(monkeypatch):
+    # FM1 (default omit) + FM2 (forward) + FM3 (allowlist scope): dev_auth=True forwards
+    # --dev-auth and one --dev-allow per allowlisted id; the default omits both. Mutation-proves
+    # the `if dev_auth:` gate — a mode=set call with dev_auth off must NOT carry --dev-auth
+    # (dropping the gate would append it to every --mode run and redden that assert). Captured
+    # without a harness by stubbing the gateway before it spawns.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {s: BaselinePolicy() for s in range(2)}
+
+    def argv_for(**kw):
+        with pytest.raises(_Stop):
+            sdk.run_local_match("h", [0, 1], policies, **kw)
+        return captured["argv"]
+
+    def dev_allow_ids(argv):
+        return [argv[i + 1] for i, tok in enumerate(argv) if tok == "--dev-allow"]
+
+    assert "--dev-auth" not in argv_for()  # default: byte-identical direct path
+    assert "--dev-auth" not in argv_for(mode="human")  # mode set, dev_auth off: still no flag
+
+    on = argv_for(mode="agent", dev_auth=True)
+    assert "--dev-auth" in on
+    assert dev_allow_ids(on) == ["agent-0", "agent-1"]  # default allowlist = every ranked seat's id
+
+    scoped = argv_for(mode="agent", dev_auth=True, dev_allow=["alice", "bob"])
+    assert dev_allow_ids(scoped) == ["alice", "bob"]  # explicit allowlist forwarded verbatim, in order
+
+
+def test_run_local_match_rejects_dev_auth_misuse():
+    # The three preflight fences, all raised before any harness spawns: dev_auth gates only the
+    # matchmaker so it needs a mode; its Stub verifier rejects a real signature so signing_keys is
+    # contradictory (refused loud, never silently dropped — FM4's real hazard); and dev_allow is
+    # inert without dev_auth. Each fails fast and legibly instead of an opaque gateway close.
+    from arena_client.sdk import run_local_match
+
+    policies = {s: BaselinePolicy() for s in range(2)}
+    with pytest.raises(ValueError, match="dev_auth"):
+        run_local_match("h", [0, 1], policies, dev_auth=True)  # no mode
+    with pytest.raises(ValueError, match="signing_keys"):
+        run_local_match("h", [0, 1], policies, mode="agent", dev_auth=True, signing_keys={0: _DEV_KEY})
+    with pytest.raises(ValueError, match="dev_allow"):
+        run_local_match("h", [0, 1], policies, dev_allow=["agent-0"])  # allowlist without dev_auth
+
+
+def test_run_matchmade_dev_auth_agent_forms_and_credits_keyless_identities():
+    # FM2 + FM4-identity: --dev-auth swaps the matchmaker to the keyless Stub allowlist, so a
+    # mode='agent' ranked match forms + settles with NO signing keys — each seat presents
+    # signature_hex == agent_id (the dev token). Forming is the proof: under the default
+    # SignatureVerifier a keyless join is Unauthenticated and connect() raises before tick 0
+    # (mutation: drop the --dev-auth forward and both seats are rejected). Each keyless identity
+    # settles on the ranked ladder (ratings not None), so the dev seats are credited by their id.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    ratings: dict[int, object] = {}
+    results = run_local_match(
+        harness, [0, 1], policies, seed=5,
+        match_id="aaaaaaaa-2222-4333-8444-555555555555",
+        mode="agent", dev_auth=True, ratings=ratings,
+    )
+    assert set(results) == {0, 1}
+    assert results[0] == results[1], "every seat sees the same canonical result"
+    assert 0 < results[0].final_tick < 3600
+    assert len([o for o in results[0].outcomes if o.alive_at_end]) == 1
+    assert len(results[0].replay_hash) == 64
+    assert ratings[0] is not None and ratings[1] is not None, "each keyless dev identity settles ranked"
+
+
+def test_run_matchmade_dev_auth_refuses_a_seat_off_the_allowlist():
+    # FM3 (allowlist scope, end to end): the Stub admits ONLY allowlisted ids — an id off
+    # --dev-allow is refused even keyless (keyless, not authless). dev_allow=['agent-1'] omits
+    # seat 0 (id 'agent-0'), so the harness rejects seat 0's join and never forms the match. Seat
+    # 0 is routed first and gets an explicit Reject, so it surfaces as HandshakeRejected; a
+    # GatewayClosed is the equivalent teardown-race outcome — either proves the refusal.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import GatewayClosed, HandshakeRejected, run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    with pytest.raises((HandshakeRejected, GatewayClosed)):
+        run_local_match(
+            harness, [0, 1], policies, seed=5,
+            match_id="bbbbbbbb-2222-4333-8444-555555555555",
+            mode="agent", dev_auth=True, dev_allow=["agent-1"],
+        )
+
+
+def test_run_matchmade_dev_auth_threads_onto_the_mixed_path():
+    # FM4 (corrected): a real keyed seat and a dev-token seat CANNOT coexist in one match — the
+    # --dev-auth Stub is match-wide (harness_verifier is one verifier, not per-seat) and rejects a
+    # real signature. The achievable "mixed" is the both-paths cut: dev_auth threads onto --mode
+    # mixed too, so a token-less HUMAN seat plus a dev-auth ranked AGENT seat forms. The agent
+    # presents a NON-empty token, so without --dev-auth the default SignatureVerifier would reject
+    # it (mutation: drop the forward and the match never forms) — forming is the proof the Stub
+    # admitted the ranked agent alongside the human. dev_allow defaults to the ranked seat's id.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    results = run_local_match(
+        harness, [0, 1], policies, seed=8,
+        match_id="dddddddd-2222-4333-8444-555555555555",
+        mode="mixed", human_seats=[0], dev_auth=True,
+    )
+    assert set(results) == {0, 1}
+    assert 0 < results[0].final_tick < 3600
+    assert len([o for o in results[0].outcomes if o.alive_at_end]) == 1
+
+
 def test_run_local_match_forwards_perception_memory_and_omits_it_by_default(monkeypatch):
     # perception_memory>0 forwards --perception-memory <ticks> as one argv token; omitted
     # (0) adds no flag, byte-identical argv. Captured without a harness via the spy gateway.
