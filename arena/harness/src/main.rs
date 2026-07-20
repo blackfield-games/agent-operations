@@ -156,13 +156,12 @@ struct Args {
     arena: &'static str,
     /// A data-driven arena loaded from this JSON file ([`ArenaMap::from_json`]) instead of a
     /// builtin `--map <key>`, so an operator/world-gen pipeline can run a match on an AUTHORED
-    /// arena. Set by `--map-file <path>`; when present it OVERRIDES `--map` on the direct-seating
-    /// path ([`direct_map`]), and a bad file (unreadable, malformed, or over the verify caps) is
-    /// a loud exit(1) — never a silently-empty arena. The matchmade (`--mode`) path resolves its
-    /// arena from a compile-time `&'static` key deep inside `arena_match`, which a runtime file map
-    /// cannot reach, so `--map-file` + `--mode` is a loud startup error, never a silent ignore.
-    /// `None` (no `--map-file`) keeps the builtin-key behaviour, byte-identical to the pre-flag
-    /// harness.
+    /// arena. Set by `--map-file <path>`; when present it OVERRIDES `--map` ([`map_override`]),
+    /// and a bad file (unreadable, malformed, or over the verify caps) is a loud exit(1) — never a
+    /// silently-empty arena. It reaches BOTH paths: the direct-seating one via [`direct_map`] and
+    /// the matchmade (`--mode`) one via [`MatchParams::map`] ([`build_matchmaker`]), so a
+    /// formed/ranked match can play an authored arena too. `None` (no `--map-file`) keeps the
+    /// builtin-key behaviour, byte-identical to the pre-flag harness.
     map_file: Option<PathBuf>,
     /// Perception-memory window in ticks (`Rules::perception_memory_ticks`): how long a
     /// seat remembers a lost entity's last-known position (surfaced as a `VisibleEntity`
@@ -2217,10 +2216,17 @@ fn harness_verifier(args: &Args) -> HarnessVerifier {
 /// run via [`abort_ladder`] rather than silently resetting standings. The ranked verifier is
 /// [`harness_verifier`] — production signature check by default, `--dev-auth` allowlist opt-in.
 fn build_matchmaker(args: &Args, n: u8) -> Matchmaker<HarnessVerifier> {
-    // Carry the same Rules the direct path forms under (rules_from), so a matchmade match
-    // plays under exactly the tuning a hand-seated one does — this is what threads
-    // --perception-memory through the --mode/ranked path the matchmaker owns.
-    let params = MatchParams { rules: rules_from(args), ..matchmaker_params(n, args.max_ticks, args.arena) };
+    // Carry the same Rules the direct path forms under (rules_from) AND the same --map-file
+    // override the direct path takes (map_override, via MatchParams.map), so a matchmade match
+    // plays under exactly the tuning and geometry a hand-seated one does — this is what threads
+    // --perception-memory and an authored --map-file through the --mode/ranked path the
+    // matchmaker owns. No --map-file leaves map None, so the matchmaker resolves --map exactly
+    // as before (byte-identical).
+    let params = MatchParams {
+        rules: rules_from(args),
+        map: map_override(args),
+        ..matchmaker_params(n, args.max_ticks, args.arena)
+    };
     let registry = ranked_registry_from(args);
     let verifier = harness_verifier(args);
     let base = match &args.ladder_file {
@@ -2274,15 +2280,6 @@ fn dev_auth_is_inert_without_mode(args: &Args) -> bool {
 /// the ids are ignored. Flags an operator who allowlisted a seat but forgot to enable dev-auth.
 fn dev_allow_ignored_without_dev_auth(args: &Args) -> bool {
     !args.dev_auth && !args.dev_allow.is_empty()
-}
-
-/// True when `--map-file` is combined with `--mode`: the matchmade path resolves its arena
-/// from a compile-time `&'static` key deep inside `arena_match` (via [`MatchParams::arena`]),
-/// which a runtime file map cannot reach, so a `--map-file` there would be silently ignored —
-/// the match would play the DEFAULT arena while the operator believes the file loaded. The pure
-/// predicate `main` turns into a loud exit(1), never a silent fallback.
-fn map_file_conflicts_with_mode(args: &Args) -> bool {
-    args.map_file.is_some() && args.mode.is_some()
 }
 
 /// Map a seat's Join (its claimed `agent_id` + `signature_hex`) to a matchmaker
@@ -2488,20 +2485,26 @@ fn load_arena_map_file(path: &Path) -> Result<ArenaMap, String> {
     ArenaMap::from_json(&json).map_err(|e| e.to_string())
 }
 
-/// Resolve the direct-seating path's arena geometry: a `--map-file` loads a custom
-/// [`ArenaMap`] from JSON ([`load_arena_map_file`]) — a bad file is a loud exit(1), never a
-/// silently-empty arena — otherwise the builtin `--map <key>` arena ([`arena_map`], `""` = the
-/// empty default). A file OVERRIDES the key. Only `main`'s direct path calls this (the `--mode`
-/// path is gated off `--map-file` upstream), so the exit(1) never fires under a unit test that
-/// leaves `map_file` unset.
-fn direct_map(args: &Args) -> ArenaMap {
-    let Some(path) = args.map_file.as_deref() else {
-        return arena_map(args.arena);
-    };
-    load_arena_map_file(path).unwrap_or_else(|e| {
+/// The runtime arena override a `--map-file` supplies, or `None` when it is unset. `Some` loads
+/// the authored [`ArenaMap`] from JSON ([`load_arena_map_file`]) — a bad file is a loud exit(1),
+/// never a silently-empty arena. Both the direct path ([`direct_map`]) and the matchmade path
+/// ([`build_matchmaker`], via [`MatchParams::map`]) fold this on, so `--map-file` reaches a
+/// hand-seated and a `--mode`-formed match alike; `None` leaves each resolving the builtin
+/// `--map <key>` exactly as before. Returns `None` early when `map_file` is unset, so the exit(1)
+/// never fires under a unit test that leaves it unset.
+fn map_override(args: &Args) -> Option<ArenaMap> {
+    let path = args.map_file.as_deref()?;
+    Some(load_arena_map_file(path).unwrap_or_else(|e| {
         eprintln!("--map-file: {e}");
         std::process::exit(1);
-    })
+    }))
+}
+
+/// Resolve the direct-seating path's arena geometry: a `--map-file` override ([`map_override`])
+/// when set, otherwise the builtin `--map <key>` arena ([`arena_map`], `""` = the empty default).
+/// A file OVERRIDES the key.
+fn direct_map(args: &Args) -> ArenaMap {
+    map_override(args).unwrap_or_else(|| arena_map(args.arena))
 }
 
 /// Build the direct-path (no `--mode`) match: a fixed `agent-{i}` free-for-all roster
@@ -2658,16 +2661,6 @@ fn main() {
         let mut out = stdout.lock();
         replay_cast(path, &mut out);
         return;
-    }
-    // --map-file loads a custom arena into the direct-seating path only; the matchmade
-    // (--mode) path resolves its arena from a compile-time key deep in arena_match, which a
-    // runtime file map cannot reach. Reject the combination loudly rather than silently play
-    // the default arena while the operator believes the file loaded.
-    if map_file_conflicts_with_mode(&args) {
-        eprintln!(
-            "--map-file loads a custom arena into the direct path and cannot combine with --mode (the matchmade path resolves its arena from a fixed builtin key); drop one"
-        );
-        std::process::exit(1);
     }
     // --self-play is a local no-network drive path; reject the config errors loudly at startup
     // rather than run a degenerate match or panic mid-run inside run_match.
@@ -4347,19 +4340,56 @@ mod tests {
     }
 
     #[test]
-    fn map_file_conflicts_with_mode_only_when_both_are_set() {
-        // FM1: --map-file + --mode is the ONE rejected combination (main turns it into exit(1))
-        // — the matchmade path can't take a runtime file map, so combining them would silently
-        // play the default arena. Neither alone, nor both absent, conflicts.
-        let file = || Some(PathBuf::from("/tmp/map.json"));
-        let both = Args { map_file: file(), mode: Some(MatchMode::Agent), ..direct_args(2, "", 0) };
-        let file_only = Args { map_file: file(), mode: None, ..direct_args(2, "", 0) };
-        let mode_only = Args { map_file: None, mode: Some(MatchMode::Agent), ..direct_args(2, "", 0) };
+    fn build_matchmaker_threads_a_map_file_into_a_matchmade_match() {
+        // The frontier this slice closes: --map-file now reaches the --mode path (it was a loud
+        // exit(1) before). build_matchmaker carries the loaded ArenaMap on MatchParams.map, so a
+        // match the MATCHMAKER forms plays the authored geometry — not the --map key it resolved
+        // before. Proven by forming a 2-seat match through the built matchmaker (Human seats are
+        // token-less, so no signing) and reading blockers()/pickup_spawns() back — the same
+        // accessors direct_match_map_file_geometry_reaches_the_match uses, so matchmade and
+        // hand-seated agree on the file geometry.
+        let path = map_file_tmp_path("matchmade");
+        let body = r#"{"blockers":[{"min":{"x":-500,"y":-500},"max":{"x":500,"y":500}}],"pickups":[{"kind":"shield","position":{"x":-1000,"y":0},"amount":40}]}"#;
+        std::fs::write(&path, body).expect("write the map");
+        let expected = ArenaMap::from_json(body).expect("the fixture map is valid");
 
-        assert!(map_file_conflicts_with_mode(&both), "--map-file + --mode conflicts");
-        assert!(!map_file_conflicts_with_mode(&file_only), "--map-file alone is the supported direct path");
-        assert!(!map_file_conflicts_with_mode(&mode_only), "--mode alone (no file) is fine");
-        assert!(!map_file_conflicts_with_mode(&direct_args(2, "", 0)), "neither set is fine");
+        // --map reference sets a NON-empty builtin key too, so the file WINNING proves the override
+        // beats the key on the matchmade path (mirroring direct_map's file-over-key).
+        let args = Args { map_file: Some(path.clone()), ..direct_args(2, "reference", 0) };
+        let mm = build_matchmaker(&args, 2);
+        mm.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let formed = mm
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("the second Human seat forms the match");
+        assert_eq!(formed.blockers(), expected.blockers.as_slice(), "the file's blocker reached the matchmade match");
+        assert_eq!(
+            formed.pickup_spawns(),
+            expected.pickups.as_slice(),
+            "the file's pickups reached it in order (the file overrode --map reference)"
+        );
+        assert_ne!(
+            formed.pickup_spawns(),
+            arena_map("reference").pickups.as_slice(),
+            "the file override beat the configured key on the matchmade path"
+        );
+
+        // No --map-file still forms on the --map key — byte-identical to the pre-flag matchmaker.
+        let off = build_matchmaker(&direct_args(2, "reference", 0), 2);
+        off.join(MatchMode::Human, b"", JoinRequest::human("a")).unwrap();
+        let off = off
+            .join(MatchMode::Human, b"", JoinRequest::human("b"))
+            .unwrap()
+            .into_formed()
+            .expect("forms");
+        assert_eq!(
+            off.pickup_spawns(),
+            arena_map("reference").pickups.as_slice(),
+            "no --map-file: the matchmaker forms on the --map key (byte-identical)"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
