@@ -705,6 +705,7 @@ def run_local_match(
     ladder_file: str | Path | None = None,
     ratings: dict[int, LadderStanding | None] | None = None,
     arena: str | None = None,
+    map_file: str | Path | None = None,
     starts: dict[int, MatchStart] | None = None,
     perception_memory: int = 0,
     fov: int = 4,
@@ -787,6 +788,16 @@ def run_local_match(
     a silent empty arena). Pass a `starts` dict to read back each seat's received geometry
     as a `MatchStart` (filled in place at connect), so a caller can confirm what arena the
     match played under.
+
+    Pass a `map_file` (a path to an authored `ArenaMap` JSON — vision blockers + pickup
+    spawns) to play the match on that arena instead of a builtin `--map` key: it forwards as
+    `--map-file <path>` and the harness OVERRIDES any `arena` key with the file on BOTH the
+    direct and `--mode` paths (so a world-gen / A2A author can feed its own emitted geometry
+    to a local match). A `str` or `Path` both forward as `str(map_file)` — one token the
+    harness opens; a bad/unreadable path aborts the harness loudly (surfacing as a
+    `GatewayClosed`/timeout here, not a silent empty arena). Omitting it (`map_file=None`)
+    adds no flag — byte-identical to before; combine it with `starts` to read back the
+    authored geometry each seat received.
 
     Pass `perception_memory` (ticks > 0) to turn on perception memory: a seat then
     remembers a lost entity's last-known position for that many ticks, surfaced as a
@@ -1407,6 +1418,14 @@ def run_local_match(
         # Unconditional, before the mode block: --map drives both the direct and --mode
         # paths in the harness, so the arena loads however the roster is formed.
         argv += ["--map", arena]
+    if map_file is not None:
+        # Unconditional, before the mode block: --map-file loads an AUTHORED ArenaMap on
+        # both the direct and --mode paths (arena-match-map-override made it valid with
+        # --mode). The file OVERRIDES a --map key exactly as the harness resolves it, so
+        # forward BOTH and let the harness decide precedence — never drop --map here to
+        # force it SDK-side. str(map_file) so a Path forwards as one openable token. None
+        # adds no token — byte-identical argv.
+        argv += ["--map-file", str(map_file)]
     if perception_memory:
         argv += ["--perception-memory", str(perception_memory)]
     if fov != 4:
