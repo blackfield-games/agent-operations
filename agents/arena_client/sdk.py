@@ -708,6 +708,7 @@ def run_local_match(
     ratings: dict[int, LadderStanding | None] | None = None,
     arena: str | None = None,
     map_file: str | Path | None = None,
+    emit_replay: str | Path | None = None,
     starts: dict[int, MatchStart] | None = None,
     perception_memory: int = 0,
     fov: int = 4,
@@ -814,6 +815,19 @@ def run_local_match(
     `GatewayClosed`/timeout here, not a silent empty arena). Omitting it (`map_file=None`)
     adds no flag — byte-identical to before; combine it with `starts` to read back the
     authored geometry each seat received.
+
+    Pass an `emit_replay` path to persist the finished match's `MatchRecord` (config + rules
+    + the full replay stream + result) as a JSON artifact at that path — the durable,
+    third-party-re-verifiable record the arena settles/grades from. It forwards as
+    `--emit-replay <path>` on BOTH the direct and `--mode` paths, so the record is written
+    however the roster is formed, and the artifact is exactly what `ArenaSpectator.replay(
+    harness, path)` re-casts (the produce→consume round-trip). A `str` or `Path` both forward
+    as `str(emit_replay)`. Omitting it (`emit_replay=None`) writes nothing — byte-identical
+    argv. NOTE (contract): a persist failure is non-fatal harness-side — it logs to stderr
+    and the match still completes (unlike `map_file`, which aborts on a bad path) — so a
+    returned `MatchResult` does NOT by itself guarantee the record landed; pass a writable
+    path. The record is only emitted once the match reaches a terminal state (every
+    `run_local_match` runs to completion, so it always is).
 
     Pass `perception_memory` (ticks > 0) to turn on perception memory: a seat then
     remembers a lost entity's last-known position for that many ticks, surfaced as a
@@ -1479,6 +1493,13 @@ def run_local_match(
         # force it SDK-side. str(map_file) so a Path forwards as one openable token. None
         # adds no token — byte-identical argv.
         argv += ["--map-file", str(map_file)]
+    if emit_replay is not None:
+        # Unconditional, before the mode block: the harness persists the finished match's
+        # MatchRecord on BOTH the direct and --mode paths, so the record is produced however
+        # the roster is formed. str(emit_replay) so a Path forwards as one openable token.
+        # None adds no token — byte-identical argv. The written record is exactly what
+        # ArenaSpectator.replay(harness, path) re-casts, closing the produce→consume loop.
+        argv += ["--emit-replay", str(emit_replay)]
     if perception_memory:
         argv += ["--perception-memory", str(perception_memory)]
     if fov != 4:
