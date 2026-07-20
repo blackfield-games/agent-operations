@@ -703,6 +703,8 @@ def run_local_match(
     mode: str | None = None,
     human_seats: list[int] | None = None,
     ladder_file: str | Path | None = None,
+    dev_auth: bool = False,
+    dev_allow: list[str] | None = None,
     ratings: dict[int, LadderStanding | None] | None = None,
     arena: str | None = None,
     map_file: str | Path | None = None,
@@ -779,6 +781,19 @@ def run_local_match(
     `ratings`). The ladder only MOVES on the `--mode` path, so `ladder_file` with `mode=None`
     is rejected up front (the direct path would silently ignore it); a human/Mixed run loads
     and rewrites the file with no movement. Omitting it adds no flag — byte-identical to before.
+
+    Set `dev_auth=True` to run a RANKED match KEYLESS for local / CI use: it forwards `--dev-auth`,
+    swapping the matchmaker's production signature verifier for a `StubIdentityVerifier` allowlist,
+    and seats every ranked (non-human) seat with `signature_hex == agent_id` — the dev token the
+    stub admits — instead of a real k256 signature. `dev_allow` is that allowlist (each id forwarded
+    as `--dev-allow <id>`); omit it (`None`) and it defaults to every ranked seat's `agent_ids` id,
+    so `dev_auth=True` alone admits the whole roster. An id off the allowlist is refused even keyless
+    (keyless, not authless — the stub's real reject path), so passing a narrower `dev_allow` proves
+    the scope. `dev_auth` gates only the matchmaker, so it requires a `mode` (a `mode=None` call is
+    rejected up front, like `ladder_file`). It is FULLY keyless — the stub rejects a real signature,
+    so mixing `signing_keys` with `dev_auth` is rejected up front, not silently dropped; a keyed
+    ranked match and a dev-auth one are separate calls. Omitting it adds no flag — byte-identical to
+    before, and the default signature verifier still demands a key for every Agent-mode seat.
 
     Pass an `arena` (a builtin map key, e.g. `"reference"`) to play the match under that
     arena's static geometry — its vision blockers and pickup spawns, forwarded to the
@@ -1206,6 +1221,25 @@ def run_local_match(
             "ladder_file persists the matchmaker's ranked ladder, which only moves on the "
             "--mode path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
         )
+    if dev_auth and mode is None:
+        raise ValueError(
+            "dev_auth swaps in the keyless ranked verifier, which only gates the matchmaker "
+            "(--mode) path; the direct (mode=None) path ignores it — pass mode='agent' (or 'mixed')"
+        )
+    if dev_auth and keys:
+        # The --dev-auth StubIdentityVerifier admits a ranked seat iff signature_hex == agent_id;
+        # a real k256 signature (what signing_keys would produce) is NOT that token and the stub
+        # rejects it. So the two are mutually exclusive per match, not composable — fail loud
+        # rather than silently drop the keys (or form a match the harness would reject).
+        raise ValueError(
+            "dev_auth seats ranked agents keyless (signature_hex == agent_id); its Stub verifier "
+            "rejects a real signature, so a dev-auth match is fully keyless — don't also pass signing_keys"
+        )
+    if dev_allow is not None and not dev_auth:
+        raise ValueError(
+            "dev_allow is the --dev-auth allowlist; it is only consulted by the keyless verifier, "
+            "inert without dev_auth=True (mirrors the harness's dev_allow_ignored_without_dev_auth warn)"
+        )
     if not 0 <= fov <= 4:
         raise ValueError(f"fov is an octant spread in 0..=4 (4 = full circle); got {fov}")
     if aim_mode not in ("octant", "fine"):
@@ -1592,7 +1626,7 @@ def run_local_match(
         if mode not in ("human", "agent", "mixed"):
             raise ValueError(f"mode is human, agent, or mixed (or None); got {mode!r}")
         argv += ["--mode", mode]
-        if mode == "agent":
+        if mode == "agent" and not dev_auth:
             unkeyed = [s for s in seats if s not in keys]
             if unkeyed:
                 raise ValueError(f"agent mode is ranked-only; seats {unkeyed} need a signing key")
@@ -1604,18 +1638,34 @@ def run_local_match(
             argv += ["--human-seats", ",".join(str(s) for s in humans)]
         if ladder_file is not None:
             argv += ["--ladder-file", str(ladder_file)]
+        if dev_auth:
+            # Swap the matchmaker's ranked verifier to the keyless allowlist (--dev-auth) and
+            # authorize each keyless seat's id (--dev-allow <id>, repeatable). Default the
+            # allowlist to every non-human (ranked) seat's id so dev_auth=True alone admits the
+            # whole roster; an explicit dev_allow forwards verbatim, so a caller can omit an id
+            # to prove the harness refuses that seat. Empty --dev-allow admits nobody, mirroring
+            # the harness. Inert on the direct path — fenced above to require a mode.
+            argv += ["--dev-auth"]
+            allowlist = dev_allow if dev_allow is not None else [ids[s] for s in seats if s not in humans]
+            for agent_id in allowlist:
+                argv += ["--dev-allow", agent_id]
     with SubprocessGateway(argv, timeout=timeout, capture_stderr=ratings is not None) as gateway:
         # The loopback harness blocks for one frame per seat per tick and enforces no
         # wall-clock, so the client must always answer — never drop a frame on a
         # deadline (that is a real-transport behaviour and would deadlock here). A seat
         # declared human (Mixed) is token-less, so it joins unranked even if a stray key
         # is present — the harness gates kind on --human-seats, not the signature.
-        clients = {
-            s: ArenaClient.ranked(SeatTransport(gateway, s), keys[s], enforce_deadline=False)
-            if s in keys and s not in humans
-            else ArenaClient(SeatTransport(gateway, s), agent_id=ids[s], enforce_deadline=False)
-            for s in seats
-        }
+        clients: dict[int, ArenaClient] = {}
+        for s in seats:
+            transport = SeatTransport(gateway, s)
+            if dev_auth and s not in humans:
+                # Ranked-keyless: present the dev token (signature_hex == agent_id) the --dev-auth
+                # Stub verifier admits. No k256 key — the keys fence above rejects mixing the two.
+                clients[s] = ArenaClient(transport, agent_id=ids[s], signature_hex=ids[s], enforce_deadline=False)
+            elif s in keys and s not in humans:
+                clients[s] = ArenaClient.ranked(transport, keys[s], enforce_deadline=False)
+            else:
+                clients[s] = ArenaClient(transport, agent_id=ids[s], enforce_deadline=False)
         if mode is None:
             for client in clients.values():
                 client.connect()
