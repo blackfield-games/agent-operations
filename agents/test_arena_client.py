@@ -1774,14 +1774,18 @@ def test_gateway_ladder_fails_loud_on_a_drifted_emission_but_skips_a_foreign_mat
     assert emit(foreign).ladder("m") == {}
 
 
-def _stdout_gateway(*lines: str):
+def _stdout_gateway(*lines: str, collect_spectator: bool = False):
     # A portable stand-in for the harness: write the given stdout lines and exit, so recv
     # reads them line by line — no cargo, no real match. The stderr `emit` helper's twin
-    # for the stdout frame stream.
+    # for the stdout frame stream. `collect_spectator` opts the gateway into buffering the
+    # spectator channel for `recv_spectator` (default off = today's drop-it behaviour).
     from arena_client.sdk import SubprocessGateway
 
     text = "".join(lines)
-    return SubprocessGateway([sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", text])
+    return SubprocessGateway(
+        [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", text],
+        collect_spectator=collect_spectator,
+    )
 
 
 def test_gateway_recv_tolerates_the_interleaved_spectator_channel():
@@ -1819,6 +1823,205 @@ def test_gateway_recv_rejects_an_envelope_with_neither_seat_nor_channel():
             gw.recv(0)
     finally:
         gw.close()
+
+
+def _spectator_envelope(frame: dict) -> str:
+    # The { "channel": "spectator", "frame": <SpectatorMsg> } line emit_spectator writes — a
+    # stdout stand-in for one cast frame, so the consumer is exercised without cargo.
+    return json.dumps({"channel": "spectator", "frame": frame}) + "\n"
+
+
+class _RecordingSpectator:
+    # A SpectatorPolicy that records the dispatched stream, so a test can assert the
+    # frames-then-terminal-End shape and the public-only field set.
+    def __init__(self) -> None:
+        self.frames: list = []
+        self.ended: list = []
+
+    def on_frame(self, broadcast) -> None:
+        self.frames.append(broadcast)
+
+    def on_end(self, result) -> None:
+        self.ended.append(result)
+
+
+# The public on-stage BroadcastEntity key set a caster sees — the scoreboard, never a seat's
+# private HUD (no ammo/cooldown/intent/velocity/shield). The consumer-side twin of the Rust
+# live_cast_frames_expose_no_private_hud pin.
+_PUBLIC_ENTITY_KEYS = {
+    "entity_id", "kind", "team", "position", "z", "facing",
+    "health", "max_health", "score", "alive",
+}
+
+
+def test_recv_spectator_requires_a_collecting_gateway():
+    # recv_spectator on a participant transport (collect_spectator=False, the default) has no
+    # buffer — a spectator frame would be dropped by the shared router — so calling it is a loud
+    # misconfiguration, never a silent read of a channel that is being discarded.
+    gw = _stdout_gateway(_spectator_envelope({"type": "frame", "tick": 0}))
+    try:
+        with pytest.raises(proto.ProtocolError, match="collect_spectator"):
+            gw.recv_spectator()
+    finally:
+        gw.close()
+
+
+def test_recv_spectator_drains_only_the_spectator_channel_routing_seat_frames():
+    # FM4 (channel isolation) at the gateway seam: on ONE stdout carrying both channels,
+    # recv_spectator returns only { "channel": "spectator" } frames in order, and a seat frame it
+    # steps over is ROUTED to its queue for recv(seat) — never leaked into the spectator stream
+    # nor lost. The mirror of recv(seat) stepping over the spectator channel.
+    seat0 = json.dumps({"seat": 0, "frame": {"type": "observe", "tick": 0}}) + "\n"
+    gw = _stdout_gateway(
+        seat0,
+        _spectator_envelope({"type": "frame", "tick": 0}),
+        _spectator_envelope({"type": "frame", "tick": 1}),
+        collect_spectator=True,
+    )
+    try:
+        assert gw.recv_spectator() == {"type": "frame", "tick": 0}
+        assert gw.recv_spectator() == {"type": "frame", "tick": 1}
+        # The seat frame the drain stepped over was routed, not dropped.
+        assert gw.recv(0) == {"type": "observe", "tick": 0}
+    finally:
+        gw.close()
+
+
+def test_arena_spectator_dispatches_golden_frames_then_end_and_returns_result():
+    # The decode+dispatch contract a --replay grader relies on, exercised without cargo against
+    # the SHARED golden's real wire shapes: two Broadcast frames to on_frame, the terminal End to
+    # on_end EXACTLY once, and the MatchResult returned. FM1 (public-only) + FM2 (frames-then-End).
+    from arena_client.sdk import ArenaSpectator
+
+    by_label = {c["label"]: c["frame"] for c in _spectator_golden()["frames"]}
+    gw = _stdout_gateway(
+        _spectator_envelope(by_label["frame_populated"]),
+        _spectator_envelope(by_label["frame_legacy_omits_starting_remaining"]),
+        _spectator_envelope(by_label["end"]),
+        collect_spectator=True,
+    )
+    policy = _RecordingSpectator()
+    try:
+        result = ArenaSpectator(gw).run(policy)
+    finally:
+        gw.close()
+
+    assert [type(f) for f in policy.frames] == [proto.Broadcast, proto.Broadcast]
+    assert len(policy.ended) == 1 and policy.ended[0] is result
+    assert isinstance(result, MatchResult)
+    # FM1: the decoded broadcast entities carry the public scoreboard and no seat-private HUD.
+    assert set(policy.frames[0].entities[0].model_dump()) == _PUBLIC_ENTITY_KEYS
+    # The legacy frame that omitted starting_remaining decoded to the back-compat default 0.
+    assert policy.frames[1].starting_remaining == 0
+
+
+def test_arena_spectator_truncated_stream_before_end_is_loud():
+    # FM2: a cast that ends before its terminal End is a truncated/killed cast — fail LOUD, never
+    # return a partial or mis-grade a match that never actually ended.
+    from arena_client.sdk import ArenaSpectator
+
+    by_label = {c["label"]: c["frame"] for c in _spectator_golden()["frames"]}
+    gw = _stdout_gateway(_spectator_envelope(by_label["frame_populated"]), collect_spectator=True)
+    try:
+        with pytest.raises(proto.ProtocolError, match="before its terminal End"):
+            ArenaSpectator(gw).run(_RecordingSpectator())
+    finally:
+        gw.close()
+
+
+def _drive_live_spectate(harness: str, record: Path, *, seed: int, match_id: str):
+    # Drive a real 2-seat --spectate match to completion, emitting its replay record AND
+    # collecting the live broadcast stream off the SAME gateway. recv(seat) buffers each cast
+    # frame while the seats play (so the OS pipe never backs up), then an ArenaSpectator drains
+    # the buffered frames plus the trailing terminal End. Returns (live_msgs, seat_results).
+    from arena_client.sdk import ArenaClient, ArenaSpectator, SeatTransport, SubprocessGateway
+
+    argv = [
+        harness, "--match-id", match_id, "--seed", str(seed), "--seats", "2",
+        "--spectate", "--emit-replay", str(record),
+    ]
+    live: list = []
+
+    class _Collect:
+        def on_frame(self, b) -> None:
+            live.append(b)
+
+        def on_end(self, r) -> None:
+            live.append(r)
+
+    with SubprocessGateway(argv, collect_spectator=True) as gw:
+        clients = {
+            s: ArenaClient(SeatTransport(gw, s), agent_id=f"agent-{s}", enforce_deadline=False)
+            for s in (0, 1)
+        }
+        for client in clients.values():
+            client.connect()
+        results: dict[int, MatchResult] = {}
+        while len(results) < 2:
+            for seat, client in clients.items():
+                if client.done:
+                    continue
+                outcome = client.poll(BaselinePolicy())
+                if outcome is not None:
+                    results[seat] = outcome
+        # The seats hold their Ends; the buffered cast frames + the trailing terminal End remain
+        # on the spectator channel — drain them from the SAME gateway.
+        ArenaSpectator(gw).run(_Collect())
+    return live, results
+
+
+def test_spectator_replay_casts_public_frames_then_one_terminal_end(tmp_path):
+    # FM1 + FM2 + FM4 on REAL cast data: a --replay of a finished match's record casts a stream of
+    # public Broadcast frames then EXACTLY ONE terminal End (the stream EOFs right after it), every
+    # broadcast entity carries only the public scoreboard, and the cast rides ONLY the spectator
+    # channel — no per-seat frame ever arrives. The offline-grading path, end to end.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import ArenaSpectator, GatewayClosed
+
+    record = tmp_path / "match.json"
+    _drive_live_spectate(harness, record, seed=777, match_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+
+    policy = _RecordingSpectator()
+    with ArenaSpectator.replay(harness, record) as spec:
+        result = spec.run(policy)
+        # FM2: the End was terminal — the cast stream is exhausted right after it.
+        with pytest.raises(GatewayClosed):
+            spec._gateway.recv_spectator()
+        # FM4: a --replay cast emits no per-seat frames (its own channel alone).
+        assert dict(spec._gateway._queues) == {}, "a replay cast routes no seat frames"
+
+    assert isinstance(result, MatchResult)
+    assert len(policy.ended) == 1 and policy.ended[0] is result
+    assert policy.frames, "a real match casts at least one broadcast frame"
+    assert all(isinstance(f, proto.Broadcast) for f in policy.frames)
+    for frame in policy.frames:
+        for entity in frame.entities:
+            assert set(entity.model_dump()) == _PUBLIC_ENTITY_KEYS
+
+
+def test_spectator_live_cast_equals_replay_of_the_same_match(tmp_path):
+    # FM3 (live == replay): a live --spectate cast and a --replay of that same seeded match's
+    # record decode to the SAME Broadcast sequence, frame for frame, and the same terminal result
+    # — the Python mirror of the Rust a_no_countdown_live_cast_matches_the_replay_of_the_same_match.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import ArenaSpectator
+
+    record = tmp_path / "match.json"
+    live, results = _drive_live_spectate(
+        harness, record, seed=4242, match_id="12121212-3434-4545-8656-767676767676"
+    )
+
+    replay = _RecordingSpectator()
+    with ArenaSpectator.replay(harness, record) as spec:
+        replay_result = spec.run(replay)
+
+    live_frames = [m for m in live if isinstance(m, proto.Broadcast)]
+    live_end = [m for m in live if isinstance(m, MatchResult)]
+    # Guard the equality against a vacuous [] == [] pass: a real match casts frames on both paths.
+    assert live_frames, "the live cast produced at least one broadcast frame"
+    assert live_frames == replay.frames, "the live cast equals the record's replay, frame for frame"
+    assert live_end == [replay_result], "and the same terminal result"
+    assert replay_result.match_id == results[0].match_id
 
 
 def test_run_matchmade_ladder_file_accumulates_a_seat_rating_across_two_runs(tmp_path):
