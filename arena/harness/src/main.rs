@@ -7558,6 +7558,7 @@ mod tests {
         let path = map_file_tmp_path("matchmade-start");
         let body = r#"{"blockers":[{"min":{"x":-400,"y":-400},"max":{"x":400,"y":400}}],"pickups":[{"kind":"shield","position":{"x":800,"y":0},"amount":40}]}"#;
         std::fs::write(&path, body).expect("write the map");
+        let expected = ArenaMap::from_json(body).expect("the fixture map is valid");
 
         let sk0 = join_key();
         let sk1 = other_join_key();
@@ -7573,15 +7574,18 @@ mod tests {
         args.map_file = Some(path.clone());
 
         let (_mm, m) = handshake_matchmade(&args, MatchMode::Agent, 2, &None, &mut lines, &mut out);
-        assert_eq!(m.pickup_spawns().len(), 1, "the file's single pickup overrode --map reference's two");
-        assert!(!m.blockers().is_empty(), "the formed match plays under the file's cover");
+        // Exact geometry, not just non-empty: reference also has a blocker, so `!is_empty()` alone
+        // would pass even without the override — the file's single shield pickup (vs reference's two
+        // health) is the file-over-key tell, and the blocker AABB is the file's, not the key's.
+        assert_eq!(m.pickup_spawns(), expected.pickups.as_slice(), "the file's single pickup overrode --map reference's two");
+        assert_eq!(m.blockers(), expected.blockers.as_slice(), "the formed match plays under the file's exact cover");
 
         let stdout = String::from_utf8(out).unwrap();
         let GatewayMsg::Start { blockers, pickup_points, .. } = first_start(&stdout) else {
             unreachable!("first_start returns a Start variant")
         };
-        assert!(!blockers.is_empty(), "the agent's Start frame carries the file's cover");
-        assert_eq!(pickup_points.len(), 1, "the agent's Start frame carries the file's single pickup point");
+        assert_eq!(blockers.len(), expected.blockers.len(), "the agent's Start frame carries the file's cover");
+        assert_eq!(pickup_points.len(), 1, "the agent's Start frame carries the file's single pickup point (over reference's two)");
 
         let _ = std::fs::remove_file(&path);
     }

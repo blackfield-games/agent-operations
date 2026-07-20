@@ -3598,6 +3598,12 @@ mod tests {
         // (mutation-proving the unwrap_or_else fallback: drop it and via_key would resolve empty).
         let via_override = form_over(Some(arena_map("reference")), "").into_replay();
         let via_key = form_over(None, "reference").into_replay();
+        // Guard against a vacuous equality: the reference key must resolve NON-empty geometry, or
+        // both sides would trivially match at empty (and the None-fallback pin would go silent).
+        assert!(
+            !via_key.blockers.is_empty() && !via_key.pickups.is_empty(),
+            "precondition: arena_map(\"reference\") carries geometry, else this equality is vacuous"
+        );
         assert_eq!(via_override.blockers, via_key.blockers, "override feeds the same blockers as the key path");
         assert_eq!(via_override.pickups, via_key.pickups, "override feeds the same pickups as the key path");
     }
