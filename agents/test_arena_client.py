@@ -2457,6 +2457,116 @@ def test_run_local_match_unknown_arena_fails_loud_not_silent_empty():
         )
 
 
+def test_run_local_match_forwards_teams_and_omits_it_by_default(monkeypatch):
+    # FM1 (default omit) + FM2 (verbatim forward) + FM3 (both paths): team_size > 1 forwards
+    # --teams <n> as ONE ordered value pair on the direct AND matchmade (mode=) paths; the
+    # default 1 appends nothing, so an existing caller's argv is byte-identical. Mutation-proves
+    # the `if team_size > 1:` gate — dropping it makes the default append `--teams 1` and reddens
+    # the omit assert. Captured without a harness by stubbing the gateway before it spawns.
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {s: BaselinePolicy() for s in range(4)}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1, 2, 3], policies)
+    assert "--teams" not in captured["argv"]  # default 1: byte-identical argv
+
+    # team_size=2 on the direct path: the exact integer is the one token after the flag.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1, 2, 3], policies, team_size=2)
+    argv = captured["argv"]
+    assert argv[argv.index("--teams") + 1] == "2"
+
+    # team_size=2 on the matchmade (mode=) path too: the flag reaches the harness however the
+    # roster is formed — an SDK that dropped it under --mode would silently un-team the match.
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1, 2, 3], policies, mode="human", team_size=2)
+    argv = captured["argv"]
+    assert argv[argv.index("--teams") + 1] == "2"
+
+
+def test_run_local_match_rejects_a_team_size_that_cannot_partition_the_seats(monkeypatch):
+    # The preflight mirrors the harness teams_partition_is_invalid: a non-divisor, a size leaving
+    # fewer than two teams, or a sub-1 size is rejected with a ValueError BEFORE the harness spawns
+    # — so a bad roster fails fast and legibly, never as an opaque gateway close. A valid size (or
+    # the default) passes the gate and reaches the gateway. Mutation-proves the preflight: dropping
+    # it lets an invalid size forward to the (stubbed) gateway and raise _Stop, reddening the raises.
+    from arena_client import sdk
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, *_a, **_kw):
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {s: BaselinePolicy() for s in range(4)}
+
+    for bad in (0, -1, 3, 4):  # 0/-1 sub-1; 3 non-divisor of 4; 4 leaves a single team
+        with pytest.raises(ValueError, match="team_size"):
+            sdk.run_local_match("h", [0, 1, 2, 3], policies, team_size=bad)
+
+    for ok in (1, 2):  # 1 = free-for-all, 2 = two teams of two; both partition 4 seats
+        with pytest.raises(_Stop):  # passes the gate, reaches the gateway
+            sdk.run_local_match("h", [0, 1, 2, 3], policies, team_size=ok)
+
+
+def test_run_local_match_team_size_partitions_the_direct_roster_into_teams():
+    # FM4 (end-to-end team effect): a real 4-seat team_size=2 match runs to a MatchResult whose
+    # seat outcomes carry TWO teams, not four singletons — the direct path groups by seat index
+    # ({0,1} one team, {2,3} the next). Proves the flag reaches the sim's team assignment, not just
+    # the argv. The FFA default (no team_size) would surface four distinct teams here.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    policies = {s: BaselinePolicy() for s in range(4)}
+    results = run_local_match(
+        harness, [0, 1, 2, 3], policies, seed=7,
+        match_id="88888888-2222-4333-8444-555555555555", team_size=2,
+    )
+    teams = {o.seat: o.team for o in results[0].outcomes}
+    assert set(teams) == {0, 1, 2, 3}
+    assert len(set(teams.values())) == 2, f"a 2-per-team roster has exactly two teams; got {teams}"
+    assert teams[0] == teams[1] and teams[2] == teams[3], f"seats grouped by index; got {teams}"
+    assert teams[0] != teams[2], f"the two teams are distinct; got {teams}"
+
+
+def test_run_matchmade_team_size_forms_balanced_teams():
+    # FM4 on the matchmade path: --teams threads onto the --mode (matchmaker) path too, so a ranked
+    # 2v2 forms two BALANCED teams of two — the matchmaker assigns teams itself (labels shuffled
+    # from the minted match_id, unlike the direct path's index grouping), so we assert the balanced
+    # partition (two teams, two seats each), not a specific lineup.
+    harness = _require_or_skip_harness()
+    from collections import Counter
+
+    from arena_client.sdk import run_local_match
+
+    key3 = bytes.fromhex("11" * 32)
+    key4 = bytes.fromhex("22" * 32)
+    policies = {s: BaselinePolicy() for s in range(4)}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2, 2: key3, 3: key4}
+    results = run_local_match(
+        harness, [0, 1, 2, 3], policies, seed=9,
+        match_id="99999999-2222-4333-8444-555555555555",
+        mode="agent", signing_keys=keys, team_size=2,
+    )
+    sizes = Counter(o.team for o in results[0].outcomes)
+    assert len(sizes) == 2, f"a 2v2 forms exactly two teams; got {dict(sizes)}"
+    assert all(n == 2 for n in sizes.values()), f"the matchmaker balances teams 2-and-2; got {dict(sizes)}"
+
+
 def test_run_local_match_forwards_perception_memory_and_omits_it_by_default(monkeypatch):
     # perception_memory>0 forwards --perception-memory <ticks> as one argv token; omitted
     # (0) adds no flag, byte-identical argv. Captured without a harness via the spy gateway.
