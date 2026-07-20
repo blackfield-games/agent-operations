@@ -2142,6 +2142,48 @@ def test_run_local_match_forwards_map_as_one_argv_token_and_omits_it_by_default(
     assert argv[argv.index("--map") + 1] == "reference"  # set: the key is the one next token
 
 
+def test_run_local_match_forwards_map_file_as_one_argv_token_and_omits_it_by_default(monkeypatch):
+    # FM1 (default omit) + FM3 (path-type): map_file forwards --map-file <path> as ONE argv
+    # token, a str and a Path producing the SAME token (str(map_file)); omitted, no
+    # --map-file appears so an existing caller's argv is byte-identical. Both directions
+    # mutation-prove the `if map_file is not None:` gate — dropping the block reddens the
+    # set-forwards asserts, making it always-forward reddens the omit assert. Captured
+    # without a harness by stubbing the gateway before it spawns.
+    from pathlib import Path
+
+    from arena_client import sdk
+
+    captured: dict[str, list[str]] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class _SpyGateway:
+        def __init__(self, argv, **_kw):
+            captured["argv"] = argv
+            raise _Stop
+
+    monkeypatch.setattr(sdk, "SubprocessGateway", _SpyGateway)
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies)
+    assert "--map-file" not in captured["argv"]  # omitted: byte-identical argv
+
+    # Set as a str: the exact path is the one token after the flag (spaces intact, one token).
+    spaced = "/tmp/a b/authored arena.json"
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, map_file=spaced)
+    argv = captured["argv"]
+    assert argv[argv.index("--map-file") + 1] == spaced
+
+    # Set as a Path: forwards as the SAME stringified token, never a repr / PosixPath(...).
+    with pytest.raises(_Stop):
+        sdk.run_local_match("h", [0, 1], policies, map_file=Path(spaced))
+    argv = captured["argv"]
+    assert argv[argv.index("--map-file") + 1] == spaced
+
+
 def test_run_local_match_forwards_starting_ticks_and_omits_it_by_default(monkeypatch):
     # starting_ticks forwards --starting-ticks <n> as a value-flag when nonzero; omitted (0),
     # no --starting-ticks appears, so an existing caller's argv is byte-identical (the match
@@ -2337,6 +2379,68 @@ def test_run_matchmade_named_arena_surfaces_geometry_on_the_agent_path():
     )
     for seat in (0, 1):
         assert starts[seat].blockers and len(starts[seat].pickup_points) == 2
+
+
+def test_run_local_match_map_file_overrides_the_arena_key_geometry(tmp_path):
+    # FM2 (override precedence forwarded): with BOTH arena="reference" (two health pickups)
+    # and map_file=<file> (one shield pickup), the SDK forwards both flags and the harness
+    # resolves the FILE over the key — each seat's Start carries the file's single pickup, not
+    # reference's two. The SDK never drops --map to force precedence; the harness owns it.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    authored = tmp_path / "authored.json"
+    authored.write_text(
+        '{"blockers":[{"min":{"x":-400,"y":-400},"max":{"x":400,"y":400}}],'
+        '"pickups":[{"kind":"shield","position":{"x":800,"y":0},"amount":40}]}'
+    )
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    starts: dict = {}
+    run_local_match(
+        harness, [0, 1], policies, seed=3, match_id="66666666-2222-4333-8444-555555555555",
+        arena="reference", map_file=authored, starts=starts,
+    )
+    assert set(starts) == {0, 1}
+    for seat in (0, 1):
+        assert starts[seat].blockers, f"seat {seat} received the file's cover"
+        assert len(starts[seat].pickup_points) == 1, (
+            f"seat {seat} played the FILE's single pickup, not reference's two — the file won over the key"
+        )
+
+
+def test_run_matchmade_map_file_surfaces_authored_geometry_on_the_agent_path(tmp_path):
+    # FM4 (matchmade path): --map-file reaches the --mode (matchmaker) path too — an Agent-mode
+    # match forms under the authored file (arena-match-map-override made --map-file valid with
+    # --mode), surfacing the file's single pickup to each ranked seat, not the empty default.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import run_local_match
+
+    authored = tmp_path / "authored.json"
+    authored.write_text(
+        '{"blockers":[{"min":{"x":-400,"y":-400},"max":{"x":400,"y":400}}],'
+        '"pickups":[{"kind":"shield","position":{"x":800,"y":0},"amount":40}]}'
+    )
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    keys = {0: _DEV_KEY, 1: _DEV_KEY2}
+    starts: dict = {}
+    run_local_match(
+        harness, [0, 1], policies, seed=5, match_id="77777777-2222-4333-8444-555555555555",
+        mode="agent", signing_keys=keys, map_file=authored, starts=starts,
+    )
+    for seat in (0, 1):
+        assert starts[seat].blockers and len(starts[seat].pickup_points) == 1
+
+
+def test_run_local_match_bad_map_file_fails_loud_not_silent_empty():
+    # FM3 (bad path is loud): an unreadable --map-file aborts the harness at load (like an
+    # unknown --map key), so the stream closes — never a silent fall-through to an empty arena
+    # that would mask a mis-pathed authored map.
+    harness = _require_or_skip_harness()
+    from arena_client.sdk import GatewayClosed, run_local_match
+
+    policies = {0: BaselinePolicy(), 1: BaselinePolicy()}
+    with pytest.raises(GatewayClosed):
+        run_local_match(harness, [0, 1], policies, seed=3, map_file="/no/such/authored/map.json")
 
 
 def test_run_local_match_unknown_arena_fails_loud_not_silent_empty():
